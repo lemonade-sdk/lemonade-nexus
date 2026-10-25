@@ -606,6 +606,8 @@ const std::vector<std::pair<std::string, std::string>> kTreeRoutes = {
     {"GET", "/api/account/keys/envelope"},
     {"POST", "/api/account/keys/envelope"},
     {"GET", "/api/account/keys/pending"},
+    {"POST", "/api/account/delete/challenge"},
+    {"POST", "/api/account/delete"},
     {"GET", "/api/certs/host.example"},
     {"POST", "/api/certs/issue"},
     {"POST", "/api/relay/register"},

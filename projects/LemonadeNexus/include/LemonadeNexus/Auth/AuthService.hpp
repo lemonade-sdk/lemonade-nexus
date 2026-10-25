@@ -10,6 +10,8 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -78,6 +80,22 @@ public:
     /// Restore a link token that a join consumed but did not use (see
     /// TokenLinkAuthProvider::refund). False when nothing was restored.
     bool refund_link_token(std::string_view token, const LinkTokenRecord& record);
+
+    /// Verify the fresh proof that deletes the account of `pubkey_b64` (raw
+    /// base64 key): a signature over auth::account_delete_proof_message for a
+    /// challenge issued by issue_ed25519_challenge. Consumes the challenge.
+    /// See Ed25519AuthProvider::verify_account_delete_proof.
+    [[nodiscard]] bool verify_account_delete_proof(const std::string& pubkey_b64,
+                                                   const std::string& challenge_b64,
+                                                   const std::string& signature_b64,
+                                                   std::string& error);
+
+    /// Remove every passkey credential of `user_id`. Idempotent.
+    bool remove_passkey_credentials(const std::string& user_id);
+
+    /// Delete the link tokens on this server whose record matches `match`.
+    /// Returns the number deleted.
+    std::size_t revoke_link_tokens(const std::function<bool(const LinkTokenRecord&)>& match);
 
     /// Validate an existing session token (JWT).
     [[nodiscard]] bool validate_session(std::string_view token);

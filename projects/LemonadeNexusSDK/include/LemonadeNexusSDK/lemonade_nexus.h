@@ -662,6 +662,42 @@ ln_error_t ln_move_node(ln_client_t* client,
                         const char* new_parent_id,
                         char** out_json);
 
+/* ------------------------------------------------------------------ */
+/* Account deletion                                                    */
+/* ------------------------------------------------------------------ */
+
+/** Permanently delete this identity's account. IRREVERSIBLE.
+ *  The SDK asks the session's server for a challenge, signs an account
+ *  deletion proof with the identity set by ln_set_identity (a session token
+ *  alone cannot delete an account), and sends it. The server removes:
+ *   - this account's groups (its "customer-<user_id>" group and every group
+ *     or device its key owns) and everything beneath them, including devices
+ *     that other users placed there through invites (those users keep their
+ *     own accounts and lose access to this network);
+ *   - this identity's memberships in other users' groups and every grant
+ *     that names its keys;
+ *   - its group-key envelopes, chat blobs, link tokens (invites), passkey
+ *     credentials, device certificates, DNS names, and tunnel addresses;
+ *   - its key: it can no longer authenticate, and its sessions end.
+ *  The application root is never removed or changed. When this key also
+ *  owns the root, the root and the key stay; only the account goes.
+ *  On success (status "deleted") the client stops the mesh, clears its
+ *  session token and node id, and stops the account image service. With tree
+ *  operations on, the answer can be status "pending" with an op_id while
+ *  Tier 1 commits the deletion.
+ *  Local files stay. The caller deletes them after success: the identity
+ *  file (ln_identity_save path), the account image cache
+ *  (ln_account_avatar_configure cache_root), the certificate directory
+ *  (ln_mesh_port_set_cert_dir), and any copy of the session token.
+ *  On success *out_json is {success, status, account_id, removed_nodes?,
+ *  op_id?}; on failure it carries "error". The caller owns *out_json and must
+ *  release it with ln_free(). Returns LN_ERR_NULL_ARG for a NULL argument,
+ *  LN_ERR_NO_IDENTITY without an identity, LN_ERR_AUTH for a refused proof or
+ *  session, LN_ERR_CONNECT when the server cannot be reached, else the mapped
+ *  HTTP result. Requires an established mesh session. Not thread-safe with
+ *  other calls on the same client. */
+ln_error_t ln_account_delete(ln_client_t* client, char** out_json);
+
 /** Publish a local service to mesh peers: our mesh IP:vport bridges to `target`
  *  ("tcp:127.0.0.1:PORT"). Requires an active mesh; re-applied on re-join. */
 ln_error_t ln_mesh_expose_service(ln_client_t* client, uint16_t vport, const char* target);

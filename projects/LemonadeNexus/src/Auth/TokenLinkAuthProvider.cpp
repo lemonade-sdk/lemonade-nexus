@@ -178,6 +178,34 @@ bool TokenLinkAuthProvider::refund(std::string_view token, const LinkTokenRecord
     return true;
 }
 
+std::size_t TokenLinkAuthProvider::revoke_where(
+        const std::function<bool(const LinkTokenRecord&)>& match) {
+    const auto dir = storage_.data_root() / "link_tokens";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return 0;
+    std::vector<std::filesystem::path> doomed;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (entry.path().extension() != ".json") continue;
+        std::ifstream ifs(entry.path());
+        if (!ifs) continue;
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        const auto j = json::parse(ss.str(), nullptr, false);
+        if (j.is_discarded() || !j.is_object()) continue;
+        LinkTokenRecord record;
+        record.owner_user_id = j.value("owner_user_id", std::string{});
+        record.owner_pubkey  = j.value("owner_pubkey", std::string{});
+        record.group_node_id = j.value("group_node_id", std::string{});
+        if (match(record)) doomed.push_back(entry.path());
+    }
+    std::size_t removed = 0;
+    for (const auto& path : doomed) {
+        if (std::filesystem::remove(path, ec)) ++removed;
+    }
+    if (removed > 0) spdlog::info("[token-link] Deleted {} link token(s)", removed);
+    return removed;
+}
+
 std::filesystem::path TokenLinkAuthProvider::token_path(std::string_view token) const {
     // Store hashed so a data-root leak doesn't expose live tokens.
     auto hash = crypto_.sha256(std::span<const uint8_t>(

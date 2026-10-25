@@ -862,6 +862,8 @@ class LemonadeNexusFfi {
       _lib.lookupFunction<_LnStringJson, _LnStringJsonDart>('ln_membership_leave');
   late final _lnMoveNode =
       _lib.lookupFunction<_LnMoveNode, _LnMoveNodeDart>('ln_move_node');
+  late final _lnAccountDelete =
+      _lib.lookupFunction<_LnClientJson, _LnClientJsonDart>('ln_account_delete');
 
   // Health
   late final _lnHealth =
@@ -1010,6 +1012,7 @@ class LemonadeNexusFfi {
     'ln_memberships_list',
     'ln_membership_leave',
     'ln_move_node',
+    'ln_account_delete',
     'ln_private_api_call',
     'ln_group_key_generate',
     'ln_group_key_wrap',
@@ -1325,6 +1328,11 @@ class LemonadeNexusFfi {
       malloc.free(parent);
     }
   }
+
+  /// Permanently delete this identity's account. Irreversible. See
+  /// ln_account_delete.
+  (LnError, String?) accountDelete(LnClientHandle client) =>
+      _jsonOut((out) => _lnAccountDelete(client, out));
 
   // =========================================================================
   // Health

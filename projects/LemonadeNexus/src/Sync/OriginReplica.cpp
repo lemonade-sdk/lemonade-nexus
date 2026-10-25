@@ -201,6 +201,14 @@ std::size_t OriginReplica::prune_tombstones(uint64_t cutoff_timestamp) {
     return removed;
 }
 
+std::size_t OriginReplica::erase_keys(const std::function<bool(const std::string&)>& match) {
+    std::lock_guard lock(mutex_);
+    const auto removed =
+        std::erase_if(entries_, [&match](const auto& kv) { return match(kv.first); });
+    if (removed) ++version_;
+    return removed;
+}
+
 std::map<std::string, PeerSyncStatus> OriginReplica::peer_status() const {
     std::lock_guard lock(mutex_);
     const Digest ours = digest_locked();

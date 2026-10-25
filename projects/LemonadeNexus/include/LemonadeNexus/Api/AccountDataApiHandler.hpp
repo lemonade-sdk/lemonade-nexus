@@ -5,6 +5,7 @@
 #include <memory>
 
 namespace nexus::account { class AccountDataStore; }
+namespace nexus::tree { struct AccountDeletion; }
 
 namespace nexus::api {
 
@@ -22,7 +23,20 @@ class AccountDataApiHandler : public IRequestHandler<AccountDataApiHandler> {
     friend class IRequestHandler<AccountDataApiHandler>;
 
 public:
+    /// Installs the gossip envelope sink and the tree's account-deleted hook.
     explicit AccountDataApiHandler(ApiContext& ctx);
+    /// Clears the account-deleted hook.
+    ~AccountDataApiHandler();
+    AccountDataApiHandler(const AccountDataApiHandler&) = delete;
+    AccountDataApiHandler& operator=(const AccountDataApiHandler&) = delete;
+
+    /// The account-level cleanup of an applied account deletion on this
+    /// server: the account's chat blobs and group-key envelopes (on disk and
+    /// in the replicated envelope stream), the link tokens it minted or that
+    /// target a removed group, its passkey credentials, and, when its key owns
+    /// no node any longer, the key itself (which ends its sessions). Called by
+    /// the tree's account-deleted hook. Idempotent.
+    void cleanup_deleted_account(const tree::AccountDeletion& deletion);
 
 private:
     void do_register_routes(httplib::Server& pub, httplib::Server& priv);

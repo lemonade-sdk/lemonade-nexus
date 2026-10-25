@@ -260,6 +260,26 @@ bool AccountDataStore::apply_replicated_envelope(const gossip::AccountEnvelopeRe
     return write_envelope(record.group_id, record, {});
 }
 
+std::size_t AccountDataStore::purge_account(const std::vector<std::string>& group_ids,
+                                            const std::vector<std::string>& recipients) {
+    std::size_t deleted = 0;
+    for (const auto& group : group_ids) {
+        for (const auto& category : {chat_category(group), keyenv_category(group)}) {
+            for (const auto& name : storage_.list_files(category)) {
+                if (storage_.delete_file(category, name + ".json")) ++deleted;
+            }
+        }
+    }
+    if (recipients.empty()) return deleted;
+    for (const auto& group : tree_.get_nodes_by_type(tree::NodeType::Customer)) {
+        const auto category = keyenv_category(group.id);
+        for (const auto& recipient : recipients) {
+            if (storage_.delete_file(category, principal_hash(recipient) + ".json")) ++deleted;
+        }
+    }
+    return deleted;
+}
+
 Result AccountDataStore::get_envelope(const std::string& caller_node,
                                       const std::string& caller_pubkey) const {
     auto group = group_of(caller_node);

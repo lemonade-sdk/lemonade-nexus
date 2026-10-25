@@ -1015,4 +1015,31 @@ bool PasskeyAuthProvider::update_sign_count(const std::string& credential_id,
     return true;
 }
 
+bool PasskeyAuthProvider::remove_user_credentials(const std::string& user_id) {
+    if (user_id.empty()) return false;
+    if (!cache_loaded_.load(std::memory_order_acquire)) {
+        load_credentials_from_disk();
+    }
+    std::lock_guard lock(cache_mutex_);
+    std::erase_if(credential_cache_,
+                  [&](const auto& kv) { return kv.second.user_id == user_id; });
+
+    auto cred_path = storage_.data_root() / "credentials" / (user_id + ".json");
+    auto rf = read_user_credential_file(cred_path);
+    if (rf.state == UserCredentialFileState::Absent) return true;
+    if (rf.state == UserCredentialFileState::Error) {
+        spdlog::error("[passkey] cannot remove credentials: file {} is unreadable or invalid",
+                      cred_path.string());
+        return false;
+    }
+    if (!rf.data.contains("credentials") || rf.data["credentials"].empty()) return true;
+    rf.data["credentials"] = json::array();
+    if (!atomic_write_json(cred_path, rf.data.dump(2))) {
+        spdlog::error("[passkey] failed to remove credentials for '{}'", user_id);
+        return false;
+    }
+    spdlog::info("[passkey] removed every credential of '{}'", user_id);
+    return true;
+}
+
 } // namespace nexus::auth

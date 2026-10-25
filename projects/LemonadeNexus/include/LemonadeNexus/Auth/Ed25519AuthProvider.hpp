@@ -64,7 +64,28 @@ public:
     /// True if this key is on the device-revocation blocklist.
     [[nodiscard]] bool is_pubkey_revoked(const std::string& pubkey_b64);
 
+    /// True if `user_id` is the user id (derive_user_id) of a revoked key. A
+    /// session token that names no key (a passkey session) is refused by this
+    /// check.
+    [[nodiscard]] bool is_user_revoked(const std::string& user_id);
+
+    /// Verify the fresh proof of an account deletion: `signature_b64` is the
+    /// key's Ed25519 signature over account_delete_proof_message (see
+    /// AccountDeletionProof.hpp) for a challenge this provider issued to this
+    /// key. Consumes the challenge (single use, kChallengeTtlSec). Refuses a
+    /// revoked key. Issues no session and registers nothing. On refusal,
+    /// `error` receives the reason. Thread-safe.
+    [[nodiscard]] bool verify_account_delete_proof(const std::string& pubkey_b64,
+                                                   const std::string& challenge_b64,
+                                                   const std::string& signature_b64,
+                                                   std::string& error);
+
 private:
+    // Check and consume the pending challenge `challenge_b64` for the canonical
+    // key `pubkey_b64`. Empty on success, otherwise the refusal reason.
+    [[nodiscard]] std::string consume_challenge(const std::string& challenge_b64,
+                                                const std::string& pubkey_b64);
+
     // Derive a deterministic user_id from an Ed25519 public key.
     [[nodiscard]] std::string derive_user_id(const crypto::Ed25519PublicKey& pubkey) const;
 
@@ -114,6 +135,11 @@ private:
     // Device-revocation blocklist (deleted devices). Guarded by cache_mutex_,
     // loaded lazily alongside pubkey_to_user_ from credentials/revoked.json.
     std::unordered_set<std::string> revoked_pubkeys_;
+    // derive_user_id of each decodable revoked key. Guarded by cache_mutex_.
+    std::unordered_set<std::string> revoked_user_ids_;
+
+    // derive_user_id for a base64 key, or empty when it does not decode to 32 bytes.
+    [[nodiscard]] std::string user_id_of(const std::string& pubkey_b64) const;
 
     static constexpr uint32_t kChallengeTtlSec = 60;    // 60 second challenge window
     static constexpr std::size_t kChallengeSize = 32;    // 32 bytes of randomness
