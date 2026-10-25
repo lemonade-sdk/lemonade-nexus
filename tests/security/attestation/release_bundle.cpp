@@ -17,6 +17,8 @@
 #include <fstream>
 #include <string>
 
+#include <unistd.h>
+
 namespace {
 
 using namespace nexus;
@@ -24,7 +26,9 @@ using namespace nexus::security;
 namespace fs = std::filesystem;
 
 fs::path write_artifact(const std::string& name, const std::string& content) {
-    const fs::path path = fs::temp_directory_path() / ("nexus_release_bundle_" + name);
+    // Per process: CTest runs each case as its own process, in parallel.
+    const fs::path path = fs::temp_directory_path() /
+                          ("nexus_release_bundle_" + std::to_string(::getpid()) + "_" + name);
     std::ofstream(path, std::ios::binary | std::ios::trunc) << content;
     return path;
 }
