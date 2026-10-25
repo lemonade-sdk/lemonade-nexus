@@ -17,6 +17,7 @@
 // comes from the op's principal and, where one exists, the statement the
 // principal signed (a TreeDelta or a join challenge).
 
+#include <LemonadeNexus/Auth/LinkTokenLedger.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 #include <LemonadeNexus/Tree/TreeRules.hpp>
@@ -52,6 +53,14 @@ inline constexpr std::string_view kTreeNodeDomain = "lemonade-nexus/tree-node:v1
 inline constexpr std::string_view kTreeDigestDomain = "lemonade-nexus/tree-digest:v1";
 /// Domain of the tunnel address start offset (derive_tunnel_address).
 inline constexpr std::string_view kTreeTunnelDomain = "lemonade-nexus/tree-tunnel-address:v1";
+/// Tag that opens the link extension of a Join or AcceptInvite op encoding
+/// (TreeOpBody::link_extension). An op without the extension encodes exactly
+/// as before the extension existed.
+inline constexpr std::string_view kTreeOpLinkExtensionTag =
+    "lemonade-nexus/tree-op-link-extension:v1";
+/// Domain of an invite's redemption id (redemption_id_hex).
+inline constexpr std::string_view kTreeOpRedemptionDomain =
+    "lemonade-nexus/tree-op-invite-redemption:v1";
 
 /// Freshness, relative to the block time: an op is fresh when its signed time
 /// is at most kTreeOpMaxAgeSec older and at most kTreeOpMaxFutureSec newer
@@ -143,6 +152,20 @@ struct TreeOpBody {
     std::string              inviter;                 ///< AcceptInvite: link token owner key
     std::vector<std::string> invite_permissions;      ///< AcceptInvite: permissions granted
     std::string              new_parent_id;           ///< MoveNode
+    /// Join with a link token, and AcceptInvite: the encoding carries the
+    /// link extension. A submitter on this release sets it; an op from an
+    /// earlier release has no extension and keeps that release's rules. With
+    /// it, a linked join gives each same-group sibling device read and
+    /// connect_private on the new device even when the sibling's key already
+    /// holds an entry there (rules::grant_link_peer_access); without it, a key
+    /// that already holds an entry gains nothing, as before.
+    bool                     link_extension{false};
+    /// With link_extension: the signed mint of the redeemed invite. Every
+    /// replica verifies it (origin is a trusted submitter, network, expiry
+    /// against the block time, binding to the op) and refuses a second op
+    /// that redeems the same token (redemption_id_hex), so an invite is
+    /// redeemed once across all Tier 1 servers.
+    std::optional<auth::LinkTokenEvent> invite_grant;
 };
 
 /// One signed change to the tree.
@@ -300,8 +323,15 @@ struct TreeOpEffect {
 /// for the Session source.
 [[nodiscard]] std::optional<std::string> statement_id_hex(const TreeOp& op);
 
+/// Redemption id of the invite the op redeems (lowercase hex of SHA-256 over
+/// the token hash under kTreeOpRedemptionDomain). nullopt when the op
+/// carries no invite grant.
+[[nodiscard]] std::optional<std::string> redemption_id_hex(const TreeOp& op);
+
 /// Record the op id and, when the op wraps a statement, the statement id in
-/// `committed`, both with the op's signed time.
+/// `committed`, both with the op's signed time. An invite's redemption id is
+/// recorded with the invite's expiry, so it is kept until no block time can
+/// accept the invite again.
 void record_committed(CommittedOpIds& committed, const TreeOp& op);
 
 /// Set `op.author` to `key`'s public key, then `op.op_id`, then sign. Call
@@ -318,7 +348,8 @@ void sign_tree_op(crypto::SodiumCryptoService& crypto, TreeOp& op,
 /// Decide whether `op` is acceptable against `state` at `block_time_sec`.
 /// Checks, in order: format and kind/source pair, network, size, op id,
 /// trusted submitter and signature, freshness against the block time, replay
-/// against `committed`, the wrapped statement, target existence and
+/// against `committed` (op id, statement id, invite redemption id), the
+/// wrapped statement and the invite grant, target existence and
 /// base_version, the principal's permission and the content rules shared with
 /// the delta and assignment paths (rules::), and finally that plan_op succeeds.
 /// Deterministic: the same arguments give the same verdict on every machine.

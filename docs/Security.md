@@ -452,9 +452,18 @@ moves, and no other node changes. At acceptance the server checks the rules
 again against the current tree (`tree::rules::invite_acceptance_refusal`):
 an inviter that lost its authority voids the invite, and an identity that
 already joined inside the target, or administers it, is refused. A refused
-acceptance does not spend the token. Tokens stay single use, expire after at
-most one hour, are stored hashed, and are valid only on the server that
-minted them.
+acceptance does not spend the token. Tokens stay single use and expire after
+at most one hour. Any Tier 1 server redeems a token, whichever Tier 1 server
+minted it (see "Invite replication" below).
+
+**Linked devices see each other.** When a new device joins with a token, each
+device already in the target group (same parent group, Endpoint nodes only)
+and the new device get `read` and `connect_private` on each other
+(`tree::rules::grant_link_peer_access`). The group owner's key already holds
+an entry on the new device (it keeps control of the device), so the grant
+adds the two permissions to that entry; earlier releases skipped it, and the
+owner's first device did not list devices linked later. No other group and
+no other permission is touched.
 
 **Membership reach.** A literal `connect_private` or `connect_shared` entry
 for key K on a group G is a membership. It lets each device whose management
@@ -501,6 +510,72 @@ moved device's key owns no other node, the entries that its old group and old
 sibling devices held for that key (the link-join grants) are removed, as a
 delete removes them.
 
+### Invite replication
+
+A token is minted on one Tier 1 server and can be redeemed on any Tier 1
+server (`Auth/LinkTokenLedger.hpp`, `TokenLinkAuthProvider`).
+
+- **The token never leaves the minting server.** Every record names it by
+  `link_token_hash_hex(token)`, SHA-256 under the domain
+  `lemonade-nexus/link-token-hash:v1`. The token is returned once, to the
+  inviter.
+- **Events, not mutable records.** A token's life is a set of events: `Mint`
+  (target group, permissions, inviter, network id, issue and expiry times),
+  `Spend` (a server consumed generation g), and `Refund` (the server whose
+  spend counts restored the token as generation g + 1). Each event is signed
+  by the gossip identity of the server that made it, under the domain
+  `lemonade-nexus/link-token-event:v1`, and binds the network id. Replicas
+  that hold the same events derive the same state in any arrival order. When
+  two servers spend the same generation, the spend with the smallest origin
+  key counts on every server, and a refund by any other server never restores
+  the token. A `Revoke` from any server ends the token for good: an account
+  deletion revokes the tokens the account minted and the tokens that target
+  a removed group (`TokenLinkAuthProvider::revoke_where`), and the revocation
+  replicates like every other event.
+- **Transport.** Events use the change-numbered catch-up replication
+  (`sync::OriginReplica`, stream `link`, gossip type `LinkTokenSync`) that DNS
+  records and account envelopes use. They travel only on the encrypted
+  backbone, only from a sender that is a current Tier 1 member, and only to
+  Tier 1: a Tier 2 server neither receives, requests, nor serves them, and a
+  server that leaves Tier 1 deletes them with the tree files. A receiver
+  checks the network id, the origin signature, and that the origin holds a
+  root-signed certificate, the same origin rule as account envelopes.
+- **Bounds.** At most 64 live tokens per inviter, 16384 tokens per server, 64
+  events per token, and 8 refunds per token. A token's events are kept for 10
+  minutes after its expiry and then pruned on every server; an event outside
+  that window, or with an expiry or timestamp too far ahead of the receiver's
+  clock, is refused.
+- **Storage.** The provider's ledger (`link_tokens/ledger.json`) and the
+  replica file (`link_replica/replica.json`) are storage-vault files,
+  encrypted under the data key once the vault runs encrypted. On restart the
+  replica entries are verified again before use. A plaintext token file from
+  an earlier release (`link_tokens/<sha256>.json`) is still redeemed, once, on
+  the server that minted it, until it expires.
+
+**Single use with tree operations.** A `Join` with a token and an
+`AcceptInvite` carry the signed `Mint` in a link extension of the op
+(`TreeOpBody::invite_grant`). Every replica checks, against the block: the
+grant is a well-formed mint signed by a trusted submitter of the block's
+epoch, for this network, unexpired at the block time, and bound to the op's
+group, inviter, and permissions. The op records the invite's redemption id in
+the committed id set until the invite expires, so a second op that redeems
+the same token is refused (`Replayed`) on every replica, whichever server
+submitted it. A refused op does not commit the redemption, and its submitter
+restores the token. An invite minted by a server that is not a trusted
+submitter of the block's epoch is refused.
+
+**Single use without tree operations (current default).** Without consensus,
+single use rests on the replicated `Spend` events. The redeeming server
+records and sends its spend, waits `kDefaultSettleWindow` (500 ms) for a
+concurrent spend of the same generation from another Tier 1 server, and
+refuses the token when that other spend counts. Limit: when a spend takes
+longer than the window to arrive (a lost datagram is repaired only by the
+next 30-second digest), two servers can both use one token. Both log the
+double redemption, and every server agrees on which spend counts. This race
+cannot be closed without consensus or a synchronous request path between
+servers, which the backbone does not have. A redemption also fails while the
+token's `Mint` has not reached the redeeming server yet (normally under a
+second after minting).
 ### Account deletion
 
 An account deletes itself through `POST /api/account/delete` (SDK
@@ -540,7 +615,8 @@ no node, releases IPAM allocations, removes mesh peers, removes the private
 DNS name, and removes the device and group certificates. The account cleanup
 (`AccountDataApiHandler::cleanup_deleted_account`) deletes the account's chat
 blobs and group-key envelopes (on disk and in the replicated envelope
-stream), the link tokens it minted or that target a removed group, and its
+stream), revokes the link tokens it minted or that target a removed group
+(a replicated `Revoke` event, see "Invite replication"), and deletes its
 passkey credentials. When the account key owns no node any longer, the
 server revokes it. A revoked key cannot authenticate, and its sessions end,
 including a session that names only the user id (passkey).
@@ -563,9 +639,11 @@ Limits:
   peer that has not yet applied the deletion can offer it again; a server
   that applied the deletion refuses it, because its tree no longer
   authorizes the envelope.
-- Link tokens, revocations, passkey credentials, and chat blobs are stored
-  per server. With tree operations off, only the server that served the
-  request removes them.
+- Key revocations, passkey credentials, and chat blobs are stored per server.
+  With tree operations off, only the server that served the request removes
+  them. Link token revocations replicate to every Tier 1 server; a token whose
+  `Mint` has not reached the deleting server yet (normally under a second
+  after minting) is not revoked there.
 - Local files (the identity key, the account image cache, and certificate
   directories) stay on the client. The client deletes them (see
   [Client SDK](Client-SDK#account-deletion)).
@@ -580,9 +658,11 @@ root:
 - **Server admission** (certificate issuance, enrollment tokens, supersede)
   is root-gated or token-gated. It grants transport membership, not Tier 1.
 - **Replicated application stores** (ACL, DNS records, backbone IPAM, NS
-  slots, account group-key envelopes) sync through gossip under root-signed
-  peer certificates. A Tier 2 server holds no tree, so it accepts no account
-  envelope. Their
+  slots, account group-key envelopes, link token events) sync through gossip
+  under root-signed peer certificates. A Tier 2 server holds no tree, so it
+  accepts no account envelope and no link token event. Without tree
+  operations, link token single use is not consensus-authorized (see "Invite
+  replication"). Their
   mutation paths are audited against permission rules but are not yet
   consensus-authorized.
 - **Author-signed record receipt is not authorization.** Receiving a

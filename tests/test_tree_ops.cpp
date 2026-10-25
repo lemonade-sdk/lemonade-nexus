@@ -1455,3 +1455,231 @@ TEST_F(TreeAccountDeletionTest, TheDeletionSurvivesARestart) {
     EXPECT_TRUE(tree_svc->get_node("alpha").has_value());
     EXPECT_EQ(run(op).refusal, TreeOpRefusal::Replayed) << "replay stays refused after a restart";
 }
+
+// =========================================================================
+// Invite redemption across Tier 1 servers (link extension, invite grant)
+// =========================================================================
+
+/// Server A (server_kp) and server B (server_b_kp) are both trusted
+/// submitters. An invite is minted on one and redeemed through the other.
+class TreeInviteRedemptionTest : public TreeMembershipTest {
+protected:
+    crypto::Ed25519Keypair server_b_kp;
+
+    void SetUp() override {
+        TreeMembershipTest::SetUp();
+        server_b_kp = crypto_svc->ed25519_keygen();
+        policy.trusted_submitters.push_back(principal_of(server_b_kp));
+    }
+
+    /// The signed mint a Tier 1 server makes for an invite to `group`.
+    auth::LinkTokenEvent grant(const crypto::Ed25519Keypair& minter, const std::string& group,
+                               const std::string& owner, std::vector<std::string> perms,
+                               const std::string& token = "lnk_invite", uint64_t ttl = 600) {
+        auth::LinkTokenEvent g;
+        g.kind = auth::LinkTokenEventKind::Mint;
+        g.token_hash = auth::link_token_hash_hex(token);
+        g.network_id = crypto::to_hex(std::span<const uint8_t>(network.data(), network.size()));
+        g.expires_at = kBlock + ttl;
+        g.group_node_id = group;
+        g.permissions = std::move(perms);
+        g.owner_user_id = "owner";
+        g.owner_pubkey = owner;
+        g.created_at = kBlock;
+        g.timestamp = kBlock;
+        g.origin_pubkey = b64(minter.public_key);
+        g.origin_seq = 1;
+        resign(g, minter);
+        return g;
+    }
+
+    void resign(auth::LinkTokenEvent& g, const crypto::Ed25519Keypair& minter) {
+        const auto bytes = auth::link_token_event_signing_bytes(g);
+        g.signature = crypto::to_base64(
+            crypto_svc->ed25519_sign(minter.private_key, std::span<const uint8_t>(bytes)));
+    }
+
+    /// A linked join op that carries the link extension and `g`.
+    TreeOp linked_join(const crypto::Ed25519Keypair& device, const auth::LinkTokenEvent& g) {
+        auto op = join_op(device, g.group_node_id, g.owner_pubkey);
+        op.body.link_extension = true;
+        op.body.invite_grant = g;
+        return op;
+    }
+
+    TreeOp accept_with(const std::string& invitee, const auth::LinkTokenEvent& g) {
+        auto op = accept_op(g.group_node_id, invitee, g.owner_pubkey, g.permissions);
+        op.body.link_extension = true;
+        op.body.invite_grant = g;
+        return op;
+    }
+
+    TreeOp seal_by(TreeOp op, const crypto::Ed25519Keypair& submitter) {
+        return seal(std::move(op), ++clock, &submitter);
+    }
+};
+
+TEST_F(TreeInviteRedemptionTest, AnInviteMintedOnOneServerIsRedeemedThroughAnother) {
+    const auto g = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    const auto device = crypto_svc->ed25519_keygen();
+    auto v = run(seal_by(linked_join(device, g), server_b_kp));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    const auto id = tree::derive_join_node_id(*crypto_svc, principal_of(device));
+    EXPECT_EQ(tree_svc->get_node(id)->parent_id, "alpha");
+
+    // An invite for an existing identity redeems through either server too.
+    const auto g2 = grant(server_b_kp, "alpha", pa, {"read", "connect_private"}, "lnk_member");
+    auto accepted = run(seal_by(accept_with(pb, g2), server_kp));
+    ASSERT_TRUE(accepted.ok()) << accepted.reason;
+}
+
+// Two servers submit ops that redeem the same invite. Whatever order
+// consensus fixes, every replica applies the first and refuses the second.
+TEST_F(TreeInviteRedemptionTest, ASecondRedemptionIsRefusedOnEveryReplica) {
+    auto storage_b = make_storage("redeem-b");
+    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
+    tree_b.start();
+    build(tree_b);
+
+    const auto g = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    const auto d1 = crypto_svc->ed25519_keygen();
+    const auto d2 = crypto_svc->ed25519_keygen();
+    const auto first = seal_by(linked_join(d1, g), server_kp);
+    const auto second = seal_by(linked_join(d2, g), server_b_kp);
+    const auto as_member = seal_by(accept_with(pb, g), server_b_kp);
+
+    for (auto* svc : {tree_svc.get(), &tree_b}) {
+        ASSERT_TRUE(run(first, svc).ok());
+        const auto again = run(second, svc);
+        EXPECT_EQ(again.refusal, TreeOpRefusal::Replayed) << again.reason;
+        const auto member = run(as_member, svc);
+        EXPECT_EQ(member.refusal, TreeOpRefusal::Replayed) << member.reason;
+    }
+    EXPECT_EQ(tree_svc->tree_digest(), tree_b.tree_digest());
+    EXPECT_FALSE(tree_svc->get_node(tree::derive_join_node_id(*crypto_svc, principal_of(d2))));
+
+    // The redemption id outlives the freshness window until the invite expires.
+    tree::CommittedOpIds committed;
+    tree::record_committed(committed, first);
+    committed.prune_signed_before(tree::committed_id_cutoff(g.expires_at));
+    EXPECT_TRUE(committed.contains(*tree::redemption_id_hex(first)));
+    committed.prune_signed_before(g.expires_at + 1);
+    EXPECT_FALSE(committed.contains(*tree::redemption_id_hex(first)));
+    tree_b.stop();
+    storage_b->stop();
+}
+
+TEST_F(TreeInviteRedemptionTest, AForgedExpiredOrMismatchedGrantIsRefused) {
+    const auto device = crypto_svc->ed25519_keygen();
+    const auto refusal_of = [&](const auth::LinkTokenEvent& g) {
+        auto op = seal_by(linked_join(device, g), server_b_kp);
+        return submit(op, clock).refusal;
+    };
+
+    auto tampered = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    tampered.permissions.push_back("add_child");
+    EXPECT_EQ(refusal_of(tampered), TreeOpRefusal::BadStatement);
+
+    const auto untrusted = grant(stranger_kp, "alpha", pa, {"read"});
+    EXPECT_EQ(refusal_of(untrusted), TreeOpRefusal::BadStatement);
+
+    auto other_network = grant(server_kp, "alpha", pa, {"read"});
+    other_network.network_id = std::string(64, 'f');
+    resign(other_network, server_kp);
+    EXPECT_EQ(refusal_of(other_network), TreeOpRefusal::WrongNetwork);
+
+    const auto short_lived = grant(server_kp, "alpha", pa, {"read"}, "lnk_short", 60);
+    clock = kBlock + 60;
+    EXPECT_EQ(refusal_of(short_lived), TreeOpRefusal::Stale) << "expired by the block time";
+
+    clock = kBlock;
+    auto spend = grant(server_kp, "alpha", pa, {});
+    spend.kind = auth::LinkTokenEventKind::Spend;
+    resign(spend, server_kp);
+    EXPECT_EQ(refusal_of(spend), TreeOpRefusal::BadStatement);
+
+    // The op must match the grant: another group, or other permissions.
+    const auto g = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    auto wrong_group = linked_join(device, g);
+    wrong_group.body.join.link_group_id = "beta";
+    EXPECT_EQ(submit(seal_by(wrong_group, server_b_kp), clock).refusal,
+              TreeOpRefusal::BadStatement);
+    auto wrong_perms = accept_with(pb, g);
+    wrong_perms.body.invite_permissions = {"read", "connect_private", "add_child"};
+    EXPECT_EQ(submit(seal_by(wrong_perms, server_b_kp), clock).refusal,
+              TreeOpRefusal::BadStatement);
+
+    // A grant needs the extension, and only a join or an acceptance has one.
+    auto no_extension = linked_join(device, g);
+    no_extension.body.link_extension = false;
+    EXPECT_EQ(submit(seal_by(no_extension, server_b_kp), clock).refusal,
+              TreeOpRefusal::Malformed);
+    auto on_move = move_op("alpha-dev2", "alpha-sub1", pa);
+    on_move.body.link_extension = true;
+    EXPECT_EQ(submit(seal_by(on_move, server_b_kp), clock).refusal, TreeOpRefusal::Malformed);
+    EXPECT_FALSE(tree_svc->get_node(tree::derive_join_node_id(*crypto_svc, principal_of(device))));
+}
+
+// The extension is appended only when set: an op without it encodes (and
+// gets the op id) exactly as an earlier release computes, and one with it
+// round-trips through the wire form.
+TEST_F(TreeInviteRedemptionTest, TheLinkExtensionRoundTripsAndOldOpsKeepTheirEncoding) {
+    const auto device = crypto_svc->ed25519_keygen();
+    const auto g = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    auto plain = join_op(device, "alpha", pa);
+    auto extended = plain;
+    extended.body.link_extension = true;
+    auto with_grant = extended;
+    with_grant.body.invite_grant = g;
+
+    const auto plain_bytes = tree::encode_tree_op(plain);
+    const auto extended_bytes = tree::encode_tree_op(extended);
+    ASSERT_GT(extended_bytes.size(), plain_bytes.size());
+    EXPECT_TRUE(std::equal(plain_bytes.begin(), plain_bytes.end(), extended_bytes.begin()))
+        << "the extension only appends";
+
+    for (auto op : {plain, extended, with_grant}) {
+        op = seal_by(op, server_kp);
+        const auto decoded =
+            tree::decode_tree_op(tree::encode_tree_op(op), *tree::tree_op_signature_bytes(op));
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(decoded->body.link_extension, op.body.link_extension);
+        EXPECT_EQ(decoded->body.invite_grant, op.body.invite_grant);
+        EXPECT_EQ(tree::op_id_hex(*decoded), tree::op_id_hex(op));
+    }
+
+    // An extension on another op kind does not decode.
+    auto move = seal_by(move_op("alpha-dev2", "alpha-sub1", pa), server_kp);
+    auto bytes = tree::encode_tree_op(move);
+    bytes.insert(bytes.end(),
+                 extended_bytes.begin() + static_cast<std::ptrdiff_t>(plain_bytes.size()),
+                 extended_bytes.end());
+    EXPECT_FALSE(tree::decode_tree_op(bytes, *tree::tree_op_signature_bytes(move)).has_value());
+}
+
+// The group owner's key already holds an entry on a linked device. With the
+// extension, the join completes that entry, so the owner's first device and
+// the new device reach each other. An op from an earlier release (no
+// extension) keeps that release's result on every replica.
+TEST_F(TreeInviteRedemptionTest, ALinkedJoinGivesTheOwnersDeviceAccessToTheNewDevice) {
+    const auto with_ext = crypto_svc->ed25519_keygen();
+    auto op = join_op(with_ext, "alpha", pa);
+    op.body.link_extension = true;
+    ASSERT_TRUE(run(seal_by(op, server_kp)).ok());
+    const auto id = tree::derive_join_node_id(*crypto_svc, principal_of(with_ext));
+    EXPECT_TRUE(connects(pa, "alpha-dev", id)) << "the owner's device misses the new device";
+    EXPECT_TRUE(connects(principal_of(with_ext), id, "alpha-dev"));
+    EXPECT_TRUE(connects(pa2, "alpha-dev2", id));
+    EXPECT_TRUE(connects(principal_of(with_ext), id, "alpha-dev2"));
+    EXPECT_FALSE(connects(pb, "beta-dev", id));
+    // The owner keeps control of the device and gains nothing else.
+    const auto node = *tree_svc->get_node(id);
+    EXPECT_TRUE(tree::rules::signer_has_permission(node, pa, acl::Permission::DeleteNode));
+    EXPECT_FALSE(tree::rules::signer_has_permission(node, pa, acl::Permission::Admin));
+
+    const auto without_ext = crypto_svc->ed25519_keygen();
+    ASSERT_TRUE(run(seal_by(join_op(without_ext, "alpha", pa), server_kp)).ok());
+    const auto old_id = tree::derive_join_node_id(*crypto_svc, principal_of(without_ext));
+    EXPECT_FALSE(connects(pa, "alpha-dev", old_id)) << "an earlier release's op keeps its result";
+    EXPECT_TRUE(connects(pa2, "alpha-dev2", old_id));
+}

@@ -107,6 +107,10 @@ std::vector<VaultCoverage> StorageVault::default_coverage() {
         {"jwt-secret", "identity", "jwt_secret.hex", ""},
         {"ddns-credentials", "identity", "ddns_credentials.enc", ""},
         {"account-replica", "account", "replica.json", ""},
+        // Link token (invite) events: the grants an invite carries and its
+        // single-use state. The tokens themselves are never stored.
+        {"link-token-ledger", "link_tokens", "ledger.json", ""},
+        {"link-token-replica", "link_replica", "replica.json", ""},
         {"tree-node", "tree/nodes", "", ".json"},
         {"tree-delta", "tree/deltas", "", ".json"},
         {"tree-log", "tree/log", "", ".json"},

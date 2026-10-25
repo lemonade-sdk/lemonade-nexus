@@ -15,6 +15,8 @@
 
 #include <LemonadeNexus/ACL/ACLService.hpp>
 #include <LemonadeNexus/ACL/Permission.hpp>
+#include <LemonadeNexus/Auth/AuthService.hpp>
+#include <LemonadeNexus/Auth/LinkTokenLedger.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
@@ -3141,6 +3143,296 @@ TEST_F(GossipIngressSecurityTest, AccountEnvelopesReplicateOverTheBackbone) {
     EXPECT_TRUE(holds("a", "dev3"));
 
     for (auto* v : {&va, &vb, &vc}) v->stop();
+}
+
+// Link tokens (invites) replicate between Tier 1 servers over the backbone:
+// a token minted on A is redeemed on B, a spend on one server reaches the
+// other, a refund restores the token everywhere, and two concurrent spends
+// settle on the same winner on both servers. Tier 2 never receives a token
+// event. Forged, tampered, off-network, and off-backbone events are refused.
+// Events survive a restart (the ledger and the replica file) and catch up
+// from a Tier 1 digest.
+TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
+    auto root_kp = kc->ed25519_keygen();
+    auto a_kp    = kc->ed25519_keygen();
+    auto b_kp    = kc->ed25519_keygen();
+    auto c_kp    = kc->ed25519_keygen();
+    const auto a_b64  = crypto::to_base64(a_kp.public_key);
+    const auto b_b64  = crypto::to_base64(b_kp.public_key);
+    const auto c_b64  = crypto::to_base64(c_kp.public_key);
+    const auto a_cert = issue_cert(a_b64, "srv-a", root_kp);
+    const auto b_cert = issue_cert(b_b64, "srv-b", root_kp);
+    const auto c_cert = issue_cert(c_b64, "srv-c", root_kp);
+    const std::set<std::string> members{a_b64, b_b64};  // C is Tier 2
+    const auto seed_own_cert = [](Node& n, const std::string& cert) {
+        storage::SignedEnvelope env;
+        env.type = "server_certificate";
+        env.data = cert;
+        ASSERT_TRUE(n.storage->write_file("identity", "server_cert.json", env));
+    };
+
+    std::map<std::string, std::unique_ptr<auth::AuthService>> auths;
+    const auto make_auth = [&](Node& n, const std::string& tag) {
+        auths[tag] = std::make_unique<auth::AuthService>(*n.storage, *n.crypto, "rp",
+                                                         std::string(64, '1'));
+    };
+    bool accept_b = true;  // false: B's store refuses replicated events
+    const auto configure = [&](Node& n, const std::string& tag) {
+        n.gossip->set_root_pubkey(root_kp.public_key);
+        n.gossip->set_network_id(kTestNetworkHex);
+        n.gossip->set_ipam(n.ipam.get());
+        n.gossip->set_tier1_membership_source(
+            [&members](const std::string& pk) { return members.count(pk) > 0; });
+        auto* g = n.gossip.get();
+        auto* au = auths[tag].get();
+        au->set_link_token_replication(
+            [g](auth::LinkTokenEvent& e) { return g->sign_link_token_event(e); },
+            [g](const auth::LinkTokenEvent& e) { return g->broadcast_link_token_event(e); },
+            std::chrono::milliseconds{0});
+        n.gossip->set_link_token_sink(
+            [au, refuses = tag == "b", &accept_b](const auth::LinkTokenEvent& e) {
+                if (refuses && !accept_b) return false;
+                return au->apply_replicated_link_token(e);
+            });
+    };
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_keypair(*n.storage, a_kp);
+            seed_own_cert(n, a_cert);
+            attach_ipam(n);
+            seed_peers(*n.storage, nlohmann::json::array(
+                {peer_entry(b_b64, "127.0.0.1:9", b_cert), peer_entry(c_b64, "127.0.0.1:10", c_cert)}));
+            make_auth(n, "a");
+        },
+        [&](Node& n) { configure(n, "a"); });
+    const auto make_late = [&](const std::string& tag, const crypto::Ed25519Keypair& kp,
+                               const std::string& cert) -> Node& {
+        return make_node(
+            tag,
+            [&](Node& n) {
+                seed_keypair(*n.storage, kp);
+                seed_own_cert(n, cert);
+                attach_ipam(n);
+                seed_peers(*n.storage, nlohmann::json::array({peer_entry(a_b64, a.endpoint(), a_cert)}));
+                make_auth(n, tag);
+            },
+            [&](Node& n) { configure(n, tag); });
+    };
+    auto& b = make_late("b", b_kp, b_cert);
+    auto& c = make_late("c", c_kp, c_cert);
+    a.gossip->add_peer(b.endpoint(), b_b64);
+    a.gossip->add_peer(c.endpoint(), c_b64);
+
+    network::VirtualNetService va, vb, vc;
+    std::map<std::string, network::VirtualNetService*> by_ip{
+        {"172.16.0.1", &va}, {"172.16.0.2", &vb}, {"172.16.0.3", &vc}};
+    const auto route = [&by_ip](std::span<const uint8_t> p) {
+        if (p.size() < 20) return;
+        const std::string dst = std::to_string(p[16]) + "." + std::to_string(p[17]) + "." +
+                                std::to_string(p[18]) + "." + std::to_string(p[19]);
+        if (auto it = by_ip.find(dst); it != by_ip.end()) it->second->deliver_inbound_ip_packet(p);
+    };
+    const auto mesh_key = [](uint8_t fill) {
+        std::array<uint8_t, crypto::kX25519PublicKeySize> k{};
+        k.fill(fill);
+        return crypto::to_base64(std::span<const uint8_t>(k.data(), k.size()));
+    };
+    struct Wire { Node* n; network::VirtualNetService* v; const char* ip; const char* id; uint8_t key; };
+    for (const auto& w : {Wire{&a, &va, "172.16.0.1", "node-a", 0xA1},
+                          Wire{&b, &vb, "172.16.0.2", "node-b", 0xB2},
+                          Wire{&c, &vc, "172.16.0.3", "node-c", 0xC3}}) {
+        w.v->start();
+        w.v->set_outbound_sink(route);
+        ASSERT_TRUE(w.v->add_local_ip(std::string(w.ip) + "/22"));
+        w.n->gossip->set_our_mesh_pubkey(mesh_key(w.key));
+        w.n->gossip->set_our_backbone_claim(w.id, w.ip);
+        w.n->gossip->set_virtual_net(w.v);
+    }
+    const auto status_for = [](Node& n, const std::string& pk) {
+        const auto status = n.gossip->account_sync_status();
+        for (const auto& p : status["peers"]) {
+            if (p["pubkey"] == pk) return p;
+        }
+        return nlohmann::json::object();
+    };
+    for (Node* n : {&a, &b, &c}) gossip::GossipBallotTestAccess::run_gossip_tick(*n->gossip);
+    ASSERT_TRUE(pump_until([&] {
+        return status_for(a, b_b64).value("mesh_key_known", false) &&
+               status_for(a, c_b64).value("mesh_key_known", false) &&
+               status_for(b, a_b64).value("mesh_key_known", false) &&
+               status_for(c, a_b64).value("mesh_key_known", false);
+    }));
+
+    auto& A = *auths["a"];
+    const auto auth_b = [&]() -> auth::AuthService& { return *auths["b"]; };
+    auto& C = *auths["c"];
+    const auto mint = [](auth::AuthService& s, uint64_t ttl = 600) {
+        auto minted = s.mint_link_token("owner", "ed25519:OWNER", "customer-g",
+                                        std::chrono::seconds{ttl});
+        EXPECT_TRUE(minted.has_value());
+        return minted ? minted->first : std::string{};
+    };
+
+    // Minted on A, redeemed on B; the spend reaches A.
+    const auto t1 = mint(A);
+    ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token(t1).has_value(); }));
+    auto r1 = auth_b().consume_link_token(t1);
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(r1->spent_by, b_b64);
+    EXPECT_EQ(r1->group_node_id, "customer-g");
+    ASSERT_TRUE(pump_until([&] { return !A.verify_link_token(t1).has_value(); }));
+    EXPECT_FALSE(A.consume_link_token(t1).has_value());
+
+    // B's refund restores the token on A as the next generation.
+    ASSERT_TRUE(auth_b().refund_link_token(t1, *r1));
+    ASSERT_TRUE(pump_until([&] {
+        const auto v = A.verify_link_token(t1);
+        return v && v->generation == 1;
+    }));
+    auto r1b = A.consume_link_token(t1);
+    ASSERT_TRUE(r1b.has_value());
+    ASSERT_TRUE(pump_until([&] { return !auth_b().verify_link_token(t1).has_value(); }));
+
+    // Both servers spend one generation before either hears the other. Both
+    // settle on the same winner (the smaller origin key): only the winner's
+    // refund restores the token, on both servers.
+    const auto t2 = mint(A);
+    ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token(t2).has_value(); }));
+    const auto ra = A.consume_link_token(t2);
+    const auto rb = auth_b().consume_link_token(t2);
+    ASSERT_TRUE(ra.has_value());
+    ASSERT_TRUE(rb.has_value());
+    pump_for(std::chrono::milliseconds(300));
+    const bool a_wins = a_b64 < b_b64;
+    EXPECT_EQ(A.refund_link_token(t2, *ra), a_wins);
+    EXPECT_EQ(auth_b().refund_link_token(t2, *rb), !a_wins);
+    ASSERT_TRUE(pump_until([&] {
+        return A.verify_link_token(t2).has_value() && auth_b().verify_link_token(t2).has_value();
+    }));
+
+    // Expiry follows the redeeming server's clock.
+    const auto t3 = mint(A, 60);
+    ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token(t3).has_value(); }));
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
+    auth_b().set_link_token_clock_for_testing([now] { return now + 61; });
+    EXPECT_FALSE(auth_b().consume_link_token(t3).has_value());
+    auth_b().set_link_token_clock_for_testing({});
+
+    // Tier 2 holds nothing, and what it mints stays on it.
+    const auto tc = mint(C);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(C.verify_link_token(t2).has_value());
+    EXPECT_FALSE(A.verify_link_token(tc).has_value());
+    EXPECT_FALSE(fs::exists(c.dir / "link_replica" / "replica.json"));
+
+    // Hand-built events over the backbone.
+    const auto a_port = gossip::GossipBallotTestAccess::port(*a.gossip);
+    const auto b_port = gossip::GossipBallotTestAccess::port(*b.gossip);
+    const auto c_port = gossip::GossipBallotTestAccess::port(*c.gossip);
+    uint64_t seq = 1'000'000;
+    const auto event_for = [&](const std::string& token, const crypto::Ed25519Keypair& author,
+                               const std::string& network = kTestNetworkHex) {
+        auth::LinkTokenEvent e;
+        e.kind = auth::LinkTokenEventKind::Mint;
+        e.token_hash = auth::link_token_hash_hex(token);
+        e.network_id = network;
+        e.created_at = now;
+        e.expires_at = now + 600;
+        e.group_node_id = "customer-g";
+        e.permissions = {"read"};
+        e.owner_user_id = "owner";
+        e.owner_pubkey = "ed25519:OWNER";
+        e.timestamp = now;
+        e.origin_pubkey = crypto::to_base64(author.public_key);
+        e.origin_seq = ++seq;
+        const auto bytes = auth::link_token_event_signing_bytes(e);
+        e.signature = crypto::to_base64(kc->ed25519_sign(author.private_key,
+                                                         std::span<const uint8_t>(bytes)));
+        return auth::link_token_event_to_wire(e);
+    };
+    const auto over_backbone = [&](network::VirtualNetService& from_stack, const char* from_ip,
+                                   uint16_t from_port, const crypto::Ed25519Keypair& sender,
+                                   const char* to_ip, uint16_t to_port, const nlohmann::json& wire) {
+        const auto pkt =
+            build_packet(sender, gossip::GossipMsgType::LinkTokenSync, msgpack_of(wire));
+        ASSERT_TRUE(from_stack.send_udp(from_ip, from_port, to_ip, to_port, pkt));
+    };
+
+    // Positive control.
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port, event_for("lnk_ok", a_kp));
+    ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token("lnk_ok").has_value(); }));
+
+    // Refused: a field changed after A signed it.
+    auto tampered = event_for("lnk_tampered", a_kp);
+    tampered["permissions"] = nlohmann::json::array({"read", "add_child"});
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port, tampered);
+    // Refused: signed for another network.
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  event_for("lnk_network", a_kp, std::string(64, 'b')));
+    // Refused: authored by a key the root never certified, relayed by A.
+    const auto stranger = kc->ed25519_keygen();
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  event_for("lnk_stranger", stranger));
+    // Refused: a valid B event delivered by C, which is not Tier 1.
+    over_backbone(vc, "172.16.0.3", c_port, c_kp, "172.16.0.1", a_port,
+                  event_for("lnk_via_c", b_kp));
+    // Refused: the public socket, even from Tier 1.
+    inject(build_packet(a_kp, gossip::GossipMsgType::LinkTokenSync,
+                        msgpack_of(event_for("lnk_public", a_kp))),
+           b);
+    // Refused: malformed.
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  nlohmann::json{{"kind", 1}, {"token_hash", "x"}});
+    pump_for(std::chrono::milliseconds(400));
+    for (const auto* t : {"lnk_tampered", "lnk_network", "lnk_stranger", "lnk_public"}) {
+        EXPECT_FALSE(auth_b().verify_link_token(t).has_value()) << t;
+    }
+    EXPECT_FALSE(A.verify_link_token("lnk_via_c").has_value());
+
+    // An account deletion on A revokes the account's tokens; the revocation
+    // reaches B, where the token stops being redeemable. Other tokens stay.
+    const auto t5 = A.mint_link_token("doomed", "ed25519:DOOMED", "customer-doomed",
+                                      std::chrono::seconds{600});
+    ASSERT_TRUE(t5.has_value());
+    ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token(t5->first).has_value(); }));
+    EXPECT_EQ(A.revoke_link_tokens(
+                  [](const auth::LinkTokenRecord& r) { return r.owner_user_id == "doomed"; }),
+              1u);
+    EXPECT_FALSE(A.verify_link_token(t5->first).has_value());
+    ASSERT_TRUE(pump_until([&] { return !auth_b().verify_link_token(t5->first).has_value(); }));
+    EXPECT_FALSE(auth_b().consume_link_token(t5->first).has_value());
+    EXPECT_TRUE(auth_b().verify_link_token(t2).has_value());
+
+    // B misses a live event (its store refuses it), then catches up from A's
+    // next digest. C gets no link digest and requests nothing.
+    accept_b = false;
+    const auto t4 = mint(A);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(auth_b().verify_link_token(t4).has_value());
+    accept_b = true;
+    gossip::GossipBallotTestAccess::send_sync_digests(*a.gossip);
+    ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token(t4).has_value(); },
+                           std::chrono::seconds(5)));
+    EXPECT_FALSE(C.verify_link_token(t4).has_value());
+    for (auto* v : {&va, &vb, &vc}) v->stop();
+
+    // B restarts without its ledger file: the replica file restores every
+    // event, re-verified, with no peer contact. Then without the replica
+    // file: the ledger file restores them.
+    for (const char* missing : {"link_tokens/ledger.json", "link_replica/replica.json"}) {
+        restart_node(b, [&](Node& n) {
+            fs::remove(n.dir / missing);
+            make_auth(n, "b");
+            configure(n, "b");
+        });
+        EXPECT_TRUE(auth_b().verify_link_token(t2).has_value()) << missing;
+        EXPECT_TRUE(auth_b().verify_link_token(t4).has_value()) << missing;
+        EXPECT_TRUE(auth_b().verify_link_token("lnk_ok").has_value()) << missing;
+        EXPECT_FALSE(auth_b().verify_link_token(t1).has_value()) << "spent stays spent";
+        EXPECT_FALSE(auth_b().verify_link_token(t5->first).has_value()) << "revoked stays revoked";
+    }
 }
 
 // A removal is a change made now. Its delta carries the removal time, not the

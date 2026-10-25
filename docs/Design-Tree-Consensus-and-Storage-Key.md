@@ -172,6 +172,19 @@ TreeOp {
   subgroup under another group (`rules::move_refusal`). Both are appended
   values; no existing kind is renumbered. See [Security](Security) for the
   rules.
+- A `join` with a link token and an `accept_invite` carry a link extension,
+  appended to the canonical encoding only when present (tag
+  `lemonade-nexus/tree-op-link-extension:v1`), so an op without it keeps the
+  encoding and op id of earlier releases. The extension holds the invite's
+  signed mint (`invite_grant`). Every replica verifies the grant (a trusted
+  submitter of the block's epoch signed it, for this network, unexpired at
+  the block time, bound to the op) and records its redemption id in the
+  committed id set until the invite expires, so a second redemption on any
+  server is refused as `Replayed`. A linked `join` with the extension gives
+  same-group sibling devices `read` and `connect_private` on the new device
+  even when the sibling's key already holds an entry there
+  (`rules::grant_link_peer_access`); a `join` without it keeps the earlier
+  result. See [Security](Security#invite-replication).
 - `delete_account` (kind 10) deletes the principal's own account in one
   atomic step. Its target is the account id that the principal's key
   derives, and its base version is 0. Every replica computes the same scope
@@ -718,7 +731,8 @@ Always on, no setting (`Security/Storage/StorageVault.hpp`):
   The associated data is `aead_aad("storage-file-at-rest", {domain, relative
   path, key id})`. The key id is a second HKDF output of the DEK.
 - **Covered.** `identity/keypair.enc`, `identity/jwt_secret.hex`,
-  `identity/ddns_credentials.enc`, `account/replica.json`, `tree/nodes`,
+  `identity/ddns_credentials.enc`, `account/replica.json`,
+  `link_tokens/ledger.json`, `link_replica/replica.json`, `tree/nodes`,
   `tree/deltas`, `tree/log`, and the TLS and ACME private keys
   (`certs/<fqdn>/privkey.pem` and `certs/account.key`;
   `StorageVault::default_coverage()`). `FileStorageService`,

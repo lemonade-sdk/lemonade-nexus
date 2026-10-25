@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>   // complete SessionClaims
 #include <LemonadeNexus/Auth/AuthService.hpp>
+#include <LemonadeNexus/Auth/LinkTokenLedger.hpp>
 #include <LemonadeNexus/Auth/PasskeyAuthProvider.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
@@ -15,6 +16,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <span>
@@ -260,26 +262,204 @@ TEST_F(AuthTest, LinkTokenExpiredRejected) {
                                         "customer-owner", std::chrono::seconds{60});
     ASSERT_TRUE(minted.has_value());
     const auto& token = minted->first;
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
 
-    // Rewind the stored expiry (tokens are stored hashed by sha256(token))
-    auto hash = crypto->sha256(std::span<const uint8_t>(
-        reinterpret_cast<const uint8_t*>(token.data()), token.size()));
-    auto path = temp_dir / "link_tokens"
-              / (crypto::to_hex(std::span<const uint8_t>(hash)) + ".json");
-    ASSERT_TRUE(fs::exists(path));
-    nlohmann::json j;
-    {
-        std::ifstream ifs(path);
-        ifs >> j;
-    }
-    j["expires_at"] = 1;
-    {
-        std::ofstream ofs(path, std::ios::trunc);
-        ofs << j.dump();
-    }
-
+    auth->set_link_token_clock_for_testing([now] { return now + 61; });
+    EXPECT_FALSE(auth->verify_link_token(token).has_value());
     EXPECT_FALSE(auth->consume_link_token(token).has_value());
-    EXPECT_FALSE(fs::exists(path));  // expired tokens are removed on sight
+    // The refused consume spent nothing: on time, the token still works.
+    auth->set_link_token_clock_for_testing([now] { return now; });
+    EXPECT_TRUE(auth->consume_link_token(token).has_value());
+}
+
+// The token itself is never stored: only its domain-separated hash.
+TEST_F(AuthTest, LinkTokenLedgerStoresOnlyTheHash) {
+    auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA",
+                                        "customer-owner", std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+    const auto env = storage->read_file("link_tokens", "ledger.json");
+    ASSERT_TRUE(env.has_value());
+    EXPECT_EQ(env->data.find(minted->first.substr(4)), std::string::npos);
+    EXPECT_NE(env->data.find(auth::link_token_hash_hex(minted->first)), std::string::npos);
+    EXPECT_EQ(minted->second.token_hash, auth::link_token_hash_hex(minted->first));
+}
+
+// A token an earlier release minted (one plaintext file named by plain
+// SHA-256 of the token) is still redeemed once on this server, and an expired
+// one is removed on sight.
+TEST_F(AuthTest, LegacyLinkTokenFilesStillRedeem) {
+    const auto write_legacy = [&](const std::string& token, uint64_t expires_at) {
+        auto hash = crypto->sha256(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(token.data()), token.size()));
+        auto path = temp_dir / "link_tokens" /
+                    (crypto::to_hex(std::span<const uint8_t>(hash)) + ".json");
+        fs::create_directories(path.parent_path());
+        std::ofstream ofs(path, std::ios::trunc);
+        ofs << nlohmann::json{{"owner_user_id", "owner-user"},
+                              {"owner_pubkey", "ed25519:CCCC"},
+                              {"group_node_id", "customer-owner"},
+                              {"created_at", 1},
+                              {"expires_at", expires_at}}
+                   .dump();
+        return path;
+    };
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
+    write_legacy("lnk_legacy_live", now + 600);
+    auto consumed = auth->consume_link_token("lnk_legacy_live");
+    ASSERT_TRUE(consumed.has_value());
+    EXPECT_TRUE(consumed->token_hash.empty());
+    EXPECT_EQ(consumed->group_node_id, "customer-owner");
+    EXPECT_FALSE(auth->consume_link_token("lnk_legacy_live").has_value());
+    EXPECT_TRUE(auth->refund_link_token("lnk_legacy_live", *consumed));
+    EXPECT_TRUE(auth->consume_link_token("lnk_legacy_live").has_value());
+
+    const auto expired = write_legacy("lnk_legacy_old", 1);
+    EXPECT_FALSE(auth->consume_link_token("lnk_legacy_old").has_value());
+    EXPECT_FALSE(fs::exists(expired));
+}
+
+TEST_F(AuthTest, ARefundRestoresTheTokenOnce) {
+    auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA",
+                                        "customer-owner", std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+    const auto& token = minted->first;
+    auto first = auth->consume_link_token(token);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->generation, 0u);
+    EXPECT_FALSE(auth->consume_link_token(token).has_value());
+
+    EXPECT_TRUE(auth->refund_link_token(token, *first));
+    EXPECT_FALSE(auth->refund_link_token(token, *first)) << "a spend is restored once";
+    auto second = auth->consume_link_token(token);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->generation, 1u);
+    EXPECT_FALSE(auth->refund_link_token("lnk_other", *second)) << "the record names the token";
+}
+
+TEST_F(AuthTest, LinkTokensSurviveARestart) {
+    auto live = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                      std::chrono::seconds{600});
+    auto spent = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                       std::chrono::seconds{600});
+    ASSERT_TRUE(live && spent);
+    ASSERT_TRUE(auth->consume_link_token(spent->first).has_value());
+
+    auth->stop();
+    auth = std::make_unique<auth::AuthService>(*storage, *crypto, rp_id, jwt_secret);
+    auth->start();
+    EXPECT_FALSE(auth->consume_link_token(spent->first).has_value());
+    EXPECT_TRUE(auth->consume_link_token(live->first).has_value());
+}
+
+TEST_F(AuthTest, AnOwnerHoldsABoundedNumberOfLiveTokens) {
+    for (std::size_t i = 0; i < auth::kLinkTokenMaxPerOwner; ++i) {
+        ASSERT_TRUE(auth->mint_link_token("busy", "ed25519:AAAA", "customer-busy",
+                                          std::chrono::seconds{600})
+                        .has_value());
+    }
+    EXPECT_FALSE(auth->mint_link_token("busy", "ed25519:AAAA", "customer-busy",
+                                       std::chrono::seconds{600})
+                     .has_value());
+    EXPECT_TRUE(auth->mint_link_token("other", "ed25519:BBBB", "customer-other",
+                                      std::chrono::seconds{600})
+                    .has_value());
+}
+
+namespace {
+
+/// Signs link token events the way GossipService::sign_link_token_event does,
+/// with a fixed origin key.
+struct TestSigner {
+    crypto::SodiumCryptoService& crypto;
+    crypto::Ed25519Keypair       key;
+    uint64_t                     seq = 0;
+
+    std::string origin() const { return crypto::to_base64(key.public_key); }
+
+    bool sign(auth::LinkTokenEvent& e) {
+        e.network_id = std::string(64, 'a');
+        e.origin_pubkey = origin();
+        e.origin_seq = ++seq;
+        const auto bytes = auth::link_token_event_signing_bytes(e);
+        e.signature = crypto::to_base64(
+            crypto.ed25519_sign(key.private_key, std::span<const uint8_t>(bytes)));
+        return true;
+    }
+};
+
+}  // namespace
+
+// Without consensus, a redemption waits for a concurrent redemption of the
+// same generation on another server. The spend with the smallest origin
+// counts; the other server refuses the token.
+TEST_F(AuthTest, ARedemptionThatLosesTheTieIsRefused) {
+    for (const bool other_is_smaller : {true, false}) {
+        TestSigner self{*crypto, crypto->ed25519_keygen()};
+        TestSigner other{*crypto, crypto->ed25519_keygen()};
+        while ((other.origin() < self.origin()) != other_is_smaller) {
+            other.key = crypto->ed25519_keygen();
+        }
+        // The publisher delivers the other server's spend of the same
+        // generation while this server waits.
+        auth->set_link_token_replication(
+            [&](auth::LinkTokenEvent& e) { return self.sign(e); },
+            [&](const auth::LinkTokenEvent& e) -> std::size_t {
+                if (e.kind == auth::LinkTokenEventKind::Spend) {
+                    auto competing = e;
+                    EXPECT_TRUE(other.sign(competing));
+                    EXPECT_TRUE(auth->apply_replicated_link_token(competing));
+                }
+                return 1;
+            },
+            std::chrono::milliseconds{1});
+        auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                            std::chrono::seconds{600});
+        ASSERT_TRUE(minted.has_value());
+        ASSERT_TRUE(minted->second.grant.has_value());
+        ASSERT_FALSE(minted->second.grant->signature.empty());
+        const auto consumed = auth->consume_link_token(minted->first);
+        EXPECT_EQ(consumed.has_value(), !other_is_smaller);
+        if (consumed) {
+            EXPECT_EQ(consumed->spent_by, self.origin());
+            EXPECT_TRUE(auth->refund_link_token(minted->first, *consumed));
+        }
+    }
+}
+
+// A refund by a server whose spend does not count never revives the token.
+TEST_F(AuthTest, ARefundByTheLosingServerDoesNotRestore) {
+    TestSigner self{*crypto, crypto->ed25519_keygen()};
+    TestSigner other{*crypto, crypto->ed25519_keygen()};
+    while (!(other.origin() < self.origin())) other.key = crypto->ed25519_keygen();
+    auth->set_link_token_replication([&](auth::LinkTokenEvent& e) { return self.sign(e); },
+                                     [](const auth::LinkTokenEvent&) -> std::size_t { return 0; },
+                                     std::chrono::milliseconds{0});
+    auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                        std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+    auto consumed = auth->consume_link_token(minted->first);
+    ASSERT_TRUE(consumed.has_value());
+
+    auth::LinkTokenEvent competing;
+    competing.kind = auth::LinkTokenEventKind::Spend;
+    competing.token_hash = consumed->token_hash;
+    competing.generation = 0;
+    competing.expires_at = consumed->expires_at;
+    competing.timestamp = consumed->created_at;
+    ASSERT_TRUE(other.sign(competing));
+    ASSERT_TRUE(auth->apply_replicated_link_token(competing));
+
+    EXPECT_FALSE(auth->refund_link_token(minted->first, *consumed));
+    EXPECT_FALSE(auth->consume_link_token(minted->first).has_value());
+
+    // An unsigned or malformed event is never taken from a peer.
+    auto unsigned_event = competing;
+    unsigned_event.signature.clear();
+    unsigned_event.generation = 1;
+    EXPECT_FALSE(auth->apply_replicated_link_token(unsigned_event));
+    auto malformed = competing;
+    malformed.token_hash = "not-hex";
+    EXPECT_FALSE(auth->apply_replicated_link_token(malformed));
 }
 
 TEST_F(AuthTest, LinkTokenMintRequiresGroup) {
