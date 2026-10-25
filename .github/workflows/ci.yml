@@ -138,6 +138,12 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build --output-on-failure -C ${{ env.BUILD_TYPE }}
 
+      # The crate's own Rust tests (partials, proofs, plans, and the C ABI);
+      # ctest runs only the C++ side of the storage-threshold crate.
+      - name: storage-threshold crate tests
+        if: runner.os != 'Windows'
+        run: cargo test --locked --manifest-path crates/storage-threshold/Cargo.toml
+
       # End-to-end over the assembled daemon + sidecar: per-listener TLS, the
       # closed-registration join gate, no/wrong-bearer 401s, and the private API
       # over the mesh. Hermetic — a test CA is seeded into the ACME cache; no

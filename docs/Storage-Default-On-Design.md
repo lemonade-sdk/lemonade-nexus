@@ -203,6 +203,14 @@ Platform rules, kept behind the existing boundaries:
   remove this path: a Tier 2 node that cannot seal must keep running, and it
   must still be able to hold a share, because the holder set includes Tier 2
   (B4).
+- **Hosts without SEV-SNP never unlock a data key.** A holder answers an
+  unlock only after a `StorageUnlock` verdict that proves every claim of the
+  Tier 1 attestation profile (`StorageKeyService::on_verdict`). A
+  certificate-only host cannot produce that evidence, so it never completes
+  the B10 round trip, its vault stays `Plaintext`, and its files stay as they
+  are. The root server of the production mesh is such a host: its files stay
+  plaintext. It still holds a share and answers other servers' unlocks. This
+  is the current behaviour, not a decision to keep it.
 - **macOS / dev hosts without attestd:** file store, as above. The
   `FileStorageShareStore` is the fallback for every build and host without a
   sealing backend, and it is the one tests use.
@@ -368,8 +376,11 @@ Rolling back to the `c382d2d` binary after the upgrade:
   `StorageKeyService` instances, real eligibility and consensus, real
   holder sessions, and vaults. It covers key creation, cold start at `t` and
   `t − 1`, bad partials, attestation-gated unlock, replay, budgets,
-  per-epoch refresh, holder loss down to three, rotation grace period, and a
-  full file migration through a holder round trip. It constructs the
+  per-epoch refresh, holder loss down to three, the retiring plan after a
+  rotation (a server away for two rotation intervals, and the hard cap), a
+  rewrap interrupted before its verification, requests for another server's
+  `R`, lost or foreign storage state, and a full file migration through a
+  holder round trip. It constructs the
   services directly with a `StorageKeyServiceConfig`; it does not read
   `ServerConfig` and does not run `main.cpp`.
 - `tests/security/storage/records.cpp` and `share_store.cpp`: record
@@ -408,11 +419,8 @@ Rolling back to the `c382d2d` binary after the upgrade:
    plaintext in the same run. A test is missing that pre-seeds an encrypted
    data directory with a real wrapped key and a real multi-node holder set,
    restarts the requester, and asserts it unlocks and reads.
-5. **CI coverage of the crate's own unit tests.** `cargo test` in
-   `crates/storage-threshold` does not run in CI (B3 package, section 6.3);
-   only the C ABI test does. That gap predates this design but the review
-   gate makes it load-bearing; the release that ships default-on should add
-   the `cargo test` step. This is a CI change, not a code change.
+5. **CI coverage of the crate's own unit tests.** Done: the native Linux and
+   macOS CI jobs run `cargo test --locked` for `crates/storage-threshold`.
 
 The infrastructure that is genuinely absent is items 2 and 3: a startup-path
 test harness (the `main.cpp` sequence as a testable unit) and a

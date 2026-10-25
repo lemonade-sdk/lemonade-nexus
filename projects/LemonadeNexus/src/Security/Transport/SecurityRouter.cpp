@@ -39,7 +39,8 @@ bool storage_kind(SecurityMessageKind kind) {
            kind == SecurityMessageKind::StorageKeyPackage ||
            kind == SecurityMessageKind::StorageUnlockRequest ||
            kind == SecurityMessageKind::StorageUnlockPartial ||
-           kind == SecurityMessageKind::StoragePlanRequest;
+           kind == SecurityMessageKind::StoragePlanRequest ||
+           kind == SecurityMessageKind::StorageWrapClaim;
 }
 
 }  // namespace
@@ -250,6 +251,8 @@ bool SecurityRouter::sender_bound(const SecurityMessage& message,
                 return body.requester == authenticated_sender;
             } else if constexpr (std::is_same_v<T, StorageUnlockPartialMsg>) {
                 return body.holder == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, StorageWrapClaimMsg>) {
+                return body.node == authenticated_sender;
             } else {
                 return true;
             }
@@ -385,7 +388,8 @@ RouteResult SecurityRouter::receive(const NodeId& authenticated_sender,
                             // session rejects a second different package.
                             message.kind == SecurityMessageKind::StoragePlanProof ||
                             message.kind == SecurityMessageKind::StorageKeyPackage ||
-                            message.kind == SecurityMessageKind::StoragePlanRequest;
+                            message.kind == SecurityMessageKind::StoragePlanRequest ||
+                            message.kind == SecurityMessageKind::StorageWrapClaim;
     if (!idempotent && !remember(envelope)) {
         return drop(DropReason::Duplicate);
     }
@@ -502,6 +506,7 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) 
         case SecurityMessageKind::StorageUnlockRequest:
         case SecurityMessageKind::StorageUnlockPartial:
         case SecurityMessageKind::StoragePlanRequest:
+        case SecurityMessageKind::StorageWrapClaim:
             events_.on_storage_message(message);
             return delivered();
     }

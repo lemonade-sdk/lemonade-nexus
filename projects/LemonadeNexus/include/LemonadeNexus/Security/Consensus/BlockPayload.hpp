@@ -33,7 +33,8 @@ enum class BlockPayloadKind : uint16_t {
     TreeBatch = 1,
     /// A storage holder record for the first key or a share refresh (design
     /// B4, B5): a holder selection, or the finalized holder plan with S and
-    /// the share commitments (StorageRecords.hpp wire form).
+    /// the share commitments; also a batch of servers' wrap claims (B5a, B7)
+    /// (StorageRecords.hpp wire form).
     StorageHolderPlan = 2,
     /// A storage key rotation record (design B5a): the selection of a new key
     /// generation, or the finalized rotation that names the new S, its share

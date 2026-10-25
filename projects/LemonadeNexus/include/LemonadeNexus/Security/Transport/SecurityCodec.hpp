@@ -72,6 +72,7 @@ enum class SecurityMessageKind : uint16_t {
     StorageUnlockRequest = 34,
     StorageUnlockPartial = 35,
     StoragePlanRequest = 36,
+    StorageWrapClaim = 37,
 };
 
 /// A restarted node asks for quorum-certified state; the answer carries the
@@ -157,6 +158,34 @@ struct StorageUnlockRequestMsg {
     /// R = r*G of the wrapped data key.
     std::array<uint8_t, 32> ephemeral_point{};
     Nonce nonce{};
+};
+
+/// One wrapped data key a server keeps: the storage public key S it names and
+/// its ephemeral point R.
+struct StorageWrapRef {
+    std::array<uint8_t, 32> storage_public_key{};
+    std::array<uint8_t, 32> ephemeral_point{};
+
+    auto operator<=>(const StorageWrapRef&) const = default;
+};
+
+/// A server's signed statement of the wrapped data keys it keeps (design B5a,
+/// B7): its committed wrap and, while it stages a rewrap or a replacement, the
+/// staged wrap. Tier 1 finalizes claims in StorageWrapBatch records. A holder
+/// serves s_i*R only for an R in the requester's latest finalized claim, and
+/// the retiring S stays live while a finalized claim still names it.
+/// `signature` is the node's identity signature over
+/// storage_wrap_claim_digest().
+struct StorageWrapClaimMsg {
+    NodeId node{};
+    /// Strictly increasing per node. A finalized claim replaces the node's
+    /// previous one.
+    uint64_t counter = 0;
+    /// 1 to constants::kStorageMaxWrapsPerClaim distinct entries.
+    std::vector<StorageWrapRef> wraps;
+    crypto::Ed25519Signature signature{};
+
+    bool operator==(const StorageWrapClaimMsg&) const = default;
 };
 
 /// One holder's answer: s_i*R and its DLEQ proof, sealed to the requester with
@@ -260,7 +289,8 @@ using SecurityBody = std::variant<AttestationChallenge,
                                   StorageKeyPackageMsg,
                                   StorageUnlockRequestMsg,
                                   StorageUnlockPartialMsg,
-                                  StoragePlanRequestMsg>;
+                                  StoragePlanRequestMsg,
+                                  StorageWrapClaimMsg>;
 
 struct SecurityMessage {
     SecurityMessageKind kind = SecurityMessageKind::AttestationChallenge;

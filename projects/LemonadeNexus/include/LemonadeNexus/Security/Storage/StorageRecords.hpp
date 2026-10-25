@@ -4,7 +4,7 @@
 // select the holders of the threshold storage key and finalize its plan, and
 // the pure rules every replica uses to derive, check, and apply them.
 //
-// A record has one of two stages:
+// A record has one of three stages:
 //
 // - StorageSelection. Tier 1 finalizes who holds the key next, the threshold,
 //   and the operation: the first key (Create), a share refresh that keeps S
@@ -14,6 +14,10 @@
 //   (the storage-threshold plan bytes), and each selected holder's identity
 //   signature over those exact bytes. The holders' byte-for-byte comparison of
 //   the plan they derived is therefore part of the finalized record.
+// - StorageWrapBatch. Servers' signed wrap claims: each names the wrapped data
+//   keys (S and R) the server keeps. The finalized claims bind each R to one
+//   server, so a holder serves s_i*R only to the server that owns R, and they
+//   prove each server's rewrap after a rotation, which ends the retiring plan.
 //
 // Records chain by sequence and previous-record digest. A rotation record has
 // payload kind StorageKeyRotation; every other record has StorageHolderPlan.
@@ -54,6 +58,7 @@ enum class StorageOperation : uint16_t {
 enum class StorageRecordStage : uint16_t {
     Selection = 1,
     Final = 2,
+    Wraps = 3,
 };
 
 [[nodiscard]] std::string_view storage_operation_name(StorageOperation operation);
@@ -112,17 +117,35 @@ struct StorageFinalPlan {
     /// One identity signature per holder, in holder order, over
     /// storage_confirmation_digest().
     std::vector<crypto::Ed25519Signature> confirmations;
-    /// The last final plan with a different S that still unwraps data keys,
-    /// and the last epoch it does (design B5a grace period). Zero when none.
+    /// The last final plan with a different S that may still unwrap data keys
+    /// (design B5a), and the hard cap: the block time (Unix milliseconds)
+    /// after which it unwraps nothing. Zero when none. Before the cap, the
+    /// retiring plan unwraps only while a finalized wrap claim names its S
+    /// (storage_retiring_live()). A plan finalized before the cap was a block
+    /// time carries a small epoch number here, so its retiring plan ends at
+    /// once.
     Digest retiring_plan{};
-    EpochId retiring_until{};
+    uint64_t retiring_until_ms = 0;
     uint64_t block_time_ms = 0;
     /// Block time of the record that created this S: the daily rotation
     /// counts from here.
     uint64_t key_created_ms = 0;
 };
 
-using StorageRecord = std::variant<StorageSelection, StorageFinalPlan>;
+/// A server's signed wrap claim (see StorageWrapClaimMsg).
+using StorageWrapClaim = StorageWrapClaimMsg;
+
+/// Wrap claims Tier 1 finalized in one block (design B5a, B7).
+struct StorageWrapBatch {
+    NetworkId network_id{};
+    uint64_t sequence = 0;
+    Digest previous_record{};
+    uint64_t block_time_ms = 0;
+    /// 1 to kStorageMaxClaimsPerBatch claims, ascending node, one per node.
+    std::vector<StorageWrapClaim> claims;
+};
+
+using StorageRecord = std::variant<StorageSelection, StorageFinalPlan, StorageWrapBatch>;
 
 /// The canonical encoding (CanonicalEncoder fields). Empty when a field
 /// exceeds its bound.
@@ -135,7 +158,8 @@ using StorageRecord = std::variant<StorageSelection, StorageFinalPlan>;
 /// SHA-256 of the canonical encoding.
 [[nodiscard]] Digest storage_record_digest(const StorageRecord& record);
 
-/// StorageKeyRotation for a Rotate record, StorageHolderPlan otherwise.
+/// StorageKeyRotation for a Rotate record, StorageHolderPlan otherwise
+/// (including every wrap batch).
 [[nodiscard]] BlockPayloadKind storage_record_kind(const StorageRecord& record);
 
 /// The block payload that carries `record`.
@@ -165,6 +189,15 @@ using StorageRecord = std::variant<StorageSelection, StorageFinalPlan>;
 /// sealed partial bind to.
 [[nodiscard]] Digest storage_unlock_request_digest(const NetworkId& network_id,
                                                    const StorageUnlockRequestMsg& request);
+
+/// What a server signs for one wrap claim: network, node, counter, and every
+/// wrap in order, under the storage domain.
+[[nodiscard]] Digest storage_wrap_claim_digest(const NetworkId& network_id,
+                                               const StorageWrapClaim& claim);
+
+/// Signs `claim` in place with the node's identity key.
+void sign_storage_wrap_claim(const NetworkId& network_id, StorageWrapClaim& claim,
+                             const crypto::Ed25519PrivateKey& identity);
 
 /// A node's rank in the holder selection: H(checkpoint_seed || node_id) under
 /// the storage domain. Lower ranks first; no node chooses its own rank.
@@ -199,7 +232,27 @@ struct StorageChainState {
     /// The plan named by current->retiring_plan, when this node holds it.
     std::optional<StorageFinalPlan> retiring;
     Digest retiring_digest{};
+
+    /// Each server's latest finalized wrap claim, while it names an S that
+    /// the current or retiring plan holds.
+    std::map<NodeId, StorageWrapClaim> wrap_claims;
+    /// Every wrap a finalized claim named, with the server that claimed it
+    /// first, for each S the current or retiring plan holds. A wrap never
+    /// moves to another server while its S is live, even after its owner's
+    /// later claim drops it.
+    std::map<StorageWrapRef, NodeId> wrap_owners;
 };
+
+/// True when `node`'s latest finalized claim names `wrap`.
+[[nodiscard]] bool storage_wrap_claimed(const StorageChainState& state, const NodeId& node,
+                                        const StorageWrapRef& wrap);
+
+/// True while the current plan's retiring plan still unwraps at block time
+/// `block_time_ms`: this node holds the retiring plan, the block time is
+/// before current->retiring_until_ms, and at least one server's latest
+/// finalized claim still names the retiring S (B5a: the old S stays valid
+/// until every server proved its rewrap).
+[[nodiscard]] bool storage_retiring_live(const StorageChainState& state, uint64_t block_time_ms);
 
 /// Applies one finalized record. A record newer than the head replaces the
 /// state it supersedes; an older final plan is accepted only when it is the
@@ -212,13 +265,17 @@ bool apply_storage_record(StorageChainState& state, const StorageRecord& record)
 ///  - a pending selection blocks everything until its session timed out (in
 ///    block time); then the next boundary's selection replaces it, or a retry
 ///    without `silent` (holders of the pending selection whose round-1
-///    package this replica never observed), up to kStorageMaxSessionAttempts;
+///    package this replica never observed, and, once any holder confirmed,
+///    holders whose confirmation it never observed), up to
+///    kStorageMaxSessionAttempts;
 ///  - a boundary newer than the last committed one selects from its pool:
 ///    Create with at least 5 holders; with a current plan, Refresh when the
 ///    holders are a subset of the current ones, t is unchanged, and no
 ///    rotation is due, else Rotate with at least 3 holders;
 ///  - otherwise, a due daily rotation rotates among the current holders.
 /// Fewer than 3 holders (5 for Create) selects nothing: the last plan stays.
+/// No new rotation (daily or at a boundary) is selected while the retiring
+/// plan is live at `block_time_ms`; a refresh still is.
 [[nodiscard]] std::optional<StorageSelection> derive_storage_selection(
     const NetworkId& network_id, const StorageChainState& state,
     const StorageEligibleSnapshot* snapshot, const std::set<NodeId>& silent,
@@ -251,5 +308,37 @@ enum class StorageFinalFailure : uint16_t {
 [[nodiscard]] StorageFinalFailure check_storage_final(const StorageChainState& state,
                                                       const StorageFinalPlan& plan,
                                                       EpochId effective_epoch);
+
+/// Why a proposed wrap batch does not follow from the state.
+enum class StorageWrapFailure : uint16_t {
+    None,
+    ChainMismatch,
+    Empty,
+    Order,
+    ClaimInvalid,
+};
+
+/// Checks one claim against the state at block time `block_time_ms`: the
+/// network signature verifies, the counter is above the node's finalized
+/// claim, the wraps are 1 to kStorageMaxWrapsPerClaim distinct entries, each
+/// names the current S or the live retiring S, no wrap belongs to another
+/// server, and a new server fits under kStorageMaxWrapOwners.
+[[nodiscard]] bool check_storage_wrap_claim(const StorageChainState& state,
+                                            const NetworkId& network_id,
+                                            const StorageWrapClaim& claim,
+                                            uint64_t block_time_ms);
+
+/// The batch the next block may carry from `pool` (claims keyed by node): the
+/// claims that pass check_storage_wrap_claim(), at most
+/// kStorageMaxClaimsPerBatch, ascending node. nullopt when none passes.
+[[nodiscard]] std::optional<StorageWrapBatch> make_storage_wrap_batch(
+    const NetworkId& network_id, const StorageChainState& state,
+    const std::map<NodeId, StorageWrapClaim>& pool, uint64_t block_time_ms);
+
+/// Full check of a proposed batch: it extends the chain, holds 1 to
+/// kStorageMaxClaimsPerBatch claims in ascending node order, and every claim
+/// passes check_storage_wrap_claim().
+[[nodiscard]] StorageWrapFailure check_storage_wrap_batch(const StorageChainState& state,
+                                                          const StorageWrapBatch& batch);
 
 }  // namespace nexus::security
