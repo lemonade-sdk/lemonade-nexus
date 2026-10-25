@@ -233,10 +233,9 @@ every OS change comes through a release.
 
 ## Limits
 
-- **Upgrade turns are not production-ready.** The turn gate answers from
-  finalized UpgradeProgress records (Phase 5). A pre-existing HotStuff
-  restart catch-up defect on the memory mesh blocks production use for Tier 1
-  servers until it is fixed (Design-Auto-Update, Known limits).
+- **Upgrade turns have no hardware qualification yet.** The turn gate answers
+  from finalized UpgradeProgress records (Phase 5). The tests inject the
+  `UpgradeHealth` attestation verdicts; no rollout has run on the fleet.
 - **A halted rollout blocks the workflow.** The rollout guard refuses to
   publish after a halt. A release that fixes a halted rollout would need both
   the halted release's hashes and the hashes of the release before it, and an

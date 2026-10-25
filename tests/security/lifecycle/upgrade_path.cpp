@@ -195,10 +195,8 @@ protected:
     }
 
     /// The updater's swap for a Tier 1 member, restarting the release chain
-    /// and the upgrade service but not consensus. A full process restart of
-    /// several Tier 1 members in a row hits a HotStuff restart catch-up
-    /// defect that predates this change (a restarted member sometimes never
-    /// commits again; reproduced on the base commit with plain restarts).
+    /// and the upgrade service but not consensus. Sequential full restarts are
+    /// covered by DriverMesh.SequentialRestartsKeepEveryMemberCommitting, and
     /// ARestartWithANewerApprovalKeepsTheEpochChainAndTheTier1Role covers the
     /// full restart of one member.
     void swap_upgrade_stack(Node& node, uint64_t number, uint64_t previous) {
