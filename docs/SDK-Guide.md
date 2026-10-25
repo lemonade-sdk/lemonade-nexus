@@ -248,6 +248,45 @@ C ABI equivalents: `ln_mesh_enable`, `ln_mesh_enable_config`,
 `ln_mesh_expose_service`, `ln_mesh_open_egress`, plus
 `ln_private_api_call` for generic authenticated private routes.
 
+### Mesh port
+
+The mesh port is a listener on `127.0.0.1:13306` that serves the devices of
+this device's group by name. It never binds another address.
+
+```c
+ln_mesh_port_set_cert_dir(client, "/path/to/private/certs/group-loopback");
+ln_error_t rc = ln_mesh_port_start(client, 0, "http://127.0.0.1:13305");
+if (rc == LN_ERR_PORT_IN_USE) {
+    /* Another process (for example lemond) owns the port. Do not retry. */
+}
+ln_mesh_port_set_selection(client, "auto", NULL);
+
+char* status = NULL;
+ln_mesh_port_status(client, &status);  /* URLs, selection, TLS state */
+ln_free(status);
+
+ln_mesh_port_stop(client);
+```
+
+- The port serves plain HTTP until the group loopback certificate
+  `*.<group-label>.lo.<base>` is in the certificate directory, then TLS. The
+  SDK certificate renewer keeps the certificate current, and the port reloads
+  each renewed certificate for new connections.
+- The TLS server name and the `Host` header must name the same host, otherwise
+  the answer is 421. Another device's `<device>.<group-label>.lo.<base>` is
+  forwarded over mesh egress to its lemond on mesh port 13305. That device must
+  be online and Tier 3 (409 otherwise), and this device must hold
+  `connect_private`, `connect_shared` or `admin` on it (403 otherwise). An
+  unknown name answers 404.
+- This device's own name and the loopback names serve the selection: `local`
+  (the local service URL given to `ln_mesh_port_start`), `auto`, or one node ID.
+  Without a selection, or when the selected device is offline, the answer is
+  409. The port never falls back to another device.
+- One process owns the port. A second `ln_mesh_port_start` on the same port
+  returns `LN_ERR_PORT_IN_USE`.
+
+The C++ class is `lnsdk::MeshPort` in `LemonadeNexusSDK/MeshPort.hpp`.
+
 ## Error Handling
 
 C++:
@@ -274,6 +313,7 @@ C error codes (`ln_error_t`):
 | -6 | `LN_ERR_NO_IDENTITY` | No identity attached |
 | -7 | `LN_ERR_PARSE` | Malformed response (2xx with unparseable body) |
 | -8 | `LN_ERR_UNSUPPORTED` | Retired operation; no server endpoint exists |
+| -9 | `LN_ERR_PORT_IN_USE` | Another socket owns the requested loopback port |
 | -99 | `LN_ERR_INTERNAL` | Internal error |
 
 ## Retired C Functions
