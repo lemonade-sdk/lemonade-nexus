@@ -23,8 +23,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 namespace nexus::acme {
@@ -244,7 +246,12 @@ bool AcmeService::write_secret_file(const std::filesystem::path& path,
     return write_raw_file(path, content);
 }
 
-uint64_t AcmeService::parse_cert_expiry(const std::string& pem) {
+namespace {
+
+/// Parse the first certificate of a PEM chain and return one of its validity
+/// bounds as Unix seconds, or 0 on failure.
+uint64_t parse_cert_time(const std::string& pem, bool not_after) {
+    if (pem.empty() || pem.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) return 0;
     BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
     if (!bio) return 0;
 
@@ -252,29 +259,29 @@ uint64_t AcmeService::parse_cert_expiry(const std::string& pem) {
     BIO_free(bio);
     if (!cert) return 0;
 
-    const ASN1_TIME* not_after = X509_get0_notAfter(cert);
-    if (!not_after) {
-        X509_free(cert);
-        return 0;
-    }
-
-    // Convert ASN1_TIME to tm structure
+    const ASN1_TIME* when = not_after ? X509_get0_notAfter(cert) : X509_get0_notBefore(cert);
     struct tm t{};
-    if (ASN1_TIME_to_tm(not_after, &t) != 1) {
-        X509_free(cert);
-        return 0;
-    }
-
+    const bool ok = when != nullptr && ASN1_TIME_to_tm(when, &t) == 1;
     X509_free(cert);
+    if (!ok) return 0;
 
     // Convert to Unix timestamp (UTC)
-    // Use timegm on POSIX or _mkgmtime on Windows
 #if defined(_WIN32)
-    time_t epoch = _mkgmtime(&t);
+    const time_t epoch = _mkgmtime(&t);
 #else
-    time_t epoch = timegm(&t);
+    const time_t epoch = timegm(&t);
 #endif
-    return static_cast<uint64_t>(epoch);
+    return epoch > 0 ? static_cast<uint64_t>(epoch) : 0;
+}
+
+} // anonymous namespace
+
+uint64_t AcmeService::parse_cert_expiry(const std::string& pem) {
+    return parse_cert_time(pem, /*not_after=*/true);
+}
+
+uint64_t AcmeService::parse_cert_not_before(const std::string& pem) {
+    return parse_cert_time(pem, /*not_after=*/false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,8 +1346,34 @@ bool AcmeService::remove_local_dns_txt(const std::string& fqdn) {
 
 bool AcmeService::is_valid_domain(const std::string& domain) {
     if (domain.empty() || domain.size() > 253) return false;
+    // One leading wildcard label at most ("*.<name>"), never a bare "*".
+    const std::string_view name = std::string_view(domain).starts_with("*.")
+        ? std::string_view(domain).substr(2)
+        : std::string_view(domain);
+    if (name.empty()) return false;
     static const std::regex domain_re(R"(^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$)");
-    return std::regex_match(domain, domain_re);
+    return std::regex_match(name.begin(), name.end(), domain_re);
+}
+
+std::string AcmeService::certificate_directory_name(const std::string& domain) {
+    if (domain.starts_with("*.")) return "_wildcard." + domain.substr(2);
+    return domain;
+}
+
+std::string AcmeService::challenge_record_name(const json& authorization,
+                                               const std::string& domain) {
+    std::string base;
+    if (authorization.is_object()) {
+        const auto it = authorization.find("identifier");
+        if (it != authorization.end() && it->is_object()) {
+            const auto value = it->find("value");
+            if (value != it->end() && value->is_string()) base = value->get<std::string>();
+        }
+    }
+    if (base.empty()) base = domain.starts_with("*.") ? domain.substr(2) : domain;
+    // The identifier is the name being validated, never a wildcard itself.
+    if (base.starts_with("*.") || !is_valid_domain(base)) return {};
+    return "_acme-challenge." + base;
 }
 
 AcmeResult AcmeService::do_request_certificate(const std::string& domain) {
@@ -1363,7 +1396,7 @@ AcmeResult AcmeService::do_request_certificate(const std::string& domain) {
         return result;
     }
 
-    auto cert_dir = storage_.data_root() / "certs" / domain;
+    auto cert_dir = storage_.data_root() / "certs" / certificate_directory_name(domain);
     result.cert_path = (cert_dir / "fullchain.pem").string();
     result.key_path  = (cert_dir / "privkey.pem").string();
 
@@ -1471,8 +1504,14 @@ AcmeResult AcmeService::do_request_certificate(const std::string& domain) {
             return result;
         }
 
-        // Step 5b: Set the DNS TXT record
-        std::string acme_fqdn = "_acme-challenge." + domain;
+        // Step 5b: Set the DNS TXT record. A wildcard order validates its
+        // base name, so the record name comes from the authorization.
+        const std::string acme_fqdn = challenge_record_name(auth, domain);
+        if (acme_fqdn.empty()) {
+            result.error_message = "Authorization identifier is not a valid domain";
+            spdlog::error("[{}] {}", name(), result.error_message);
+            return result;
+        }
         spdlog::info("[{}] setting DNS-01 challenge: {} = {}", name(), acme_fqdn, digest);
 
         {
@@ -1632,8 +1671,15 @@ AcmeResult AcmeService::do_request_certificate(const std::string& domain) {
 AcmeResult AcmeService::do_renew_certificate(const std::string& domain) {
     spdlog::info("[{}] certificate renewal requested for '{}'", name(), domain);
 
+    if (!is_valid_domain(domain)) {
+        AcmeResult result;
+        result.domain = domain;
+        result.error_message = "Invalid domain name: " + domain;
+        return result;
+    }
+
     // Check existing certificate
-    auto cert_dir = storage_.data_root() / "certs" / domain;
+    auto cert_dir = storage_.data_root() / "certs" / certificate_directory_name(domain);
     auto fullchain_path = cert_dir / "fullchain.pem";
     auto privkey_path   = cert_dir / "privkey.pem";
 
@@ -1693,7 +1739,10 @@ AcmeResult AcmeService::do_renew_certificate(const std::string& domain) {
 std::optional<CertBundle> AcmeService::do_get_certificate(const std::string& domain) {
     std::lock_guard lock(mutex_);
 
-    auto cert_dir = storage_.data_root() / "certs" / domain;
+    // The domain names a directory: refuse anything that could leave certs/.
+    if (!is_valid_domain(domain)) return std::nullopt;
+
+    auto cert_dir = storage_.data_root() / "certs" / certificate_directory_name(domain);
     auto fullchain_path = cert_dir / "fullchain.pem";
     auto privkey_path   = cert_dir / "privkey.pem";
 
@@ -1703,7 +1752,9 @@ std::optional<CertBundle> AcmeService::do_get_certificate(const std::string& dom
     }
 
     auto fullchain = read_raw_file(fullchain_path);
-    auto privkey   = read_raw_file(privkey_path);
+    // The key was written with write_secret_file, so it is read back the same
+    // way. A raw read returns the DEK ciphertext while the vault is active.
+    auto privkey   = read_secret_file(privkey_path);
 
     if (fullchain.empty() || privkey.empty()) {
         spdlog::warn("[{}] certificate files for '{}' exist but are empty or unreadable",
@@ -1714,10 +1765,13 @@ std::optional<CertBundle> AcmeService::do_get_certificate(const std::string& dom
     CertBundle bundle;
     bundle.fullchain_pem = std::move(fullchain);
     bundle.privkey_pem   = std::move(privkey);
+    // The certificate itself is authoritative for its validity period.
+    bundle.not_before    = parse_cert_not_before(bundle.fullchain_pem);
+    bundle.expires_at    = parse_cert_expiry(bundle.fullchain_pem);
 
-    // Attempt to read the expiry timestamp from a metadata file
+    // Fall back to the metadata file for the expiry timestamp.
     auto meta_path = cert_dir / "meta.json";
-    if (fs::exists(meta_path)) {
+    if (bundle.expires_at == 0 && fs::exists(meta_path)) {
         auto meta_contents = read_raw_file(meta_path);
         if (!meta_contents.empty()) {
             try {
@@ -1735,6 +1789,53 @@ std::optional<CertBundle> AcmeService::do_get_certificate(const std::string& dom
     spdlog::debug("[{}] loaded certificate bundle for '{}' (expires_at: {})",
                    name(), domain, bundle.expires_at);
     return bundle;
+}
+
+// The two directory operations below do not take mutex_: an ACME order holds
+// it for minutes, and the post-delete cleanup must not wait for one.
+std::vector<std::string> AcmeService::stored_certificate_domains() {
+    std::vector<std::string> domains;
+    const auto certs_dir = storage_.data_root() / "certs";
+    std::error_code ec;
+    if (!fs::is_directory(certs_dir, ec)) return domains;
+
+    for (fs::directory_iterator it(certs_dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_directory(ec) || it->is_symlink(ec)) continue;
+        std::string domain = it->path().filename().string();
+        if (domain.starts_with("_wildcard.")) domain = "*." + domain.substr(10);
+        if (!is_valid_domain(domain)) continue;
+        if (!fs::exists(it->path() / "fullchain.pem") ||
+            !fs::exists(it->path() / "privkey.pem")) {
+            continue;
+        }
+        domains.push_back(std::move(domain));
+    }
+    std::sort(domains.begin(), domains.end());
+    return domains;
+}
+
+bool AcmeService::remove_certificate(const std::string& domain) {
+    if (!is_valid_domain(domain)) return false;
+
+    const auto cert_dir = storage_.data_root() / "certs" / certificate_directory_name(domain);
+    std::error_code ec;
+    if (!fs::exists(cert_dir, ec)) return true;
+
+    // The key may be a vault file; the vault also removes any staged copy.
+    const auto privkey_path = cert_dir / "privkey.pem";
+    if (vault_ != nullptr && !vault_->remove(privkey_path)) {
+        spdlog::warn("[{}] could not remove the key for '{}' through the storage vault",
+                     name(), domain);
+        return false;
+    }
+    fs::remove_all(cert_dir, ec);
+    if (ec) {
+        spdlog::warn("[{}] could not remove certificate files for '{}': {}",
+                     name(), domain, ec.message());
+        return false;
+    }
+    spdlog::info("[{}] removed stored certificate for '{}'", name(), domain);
+    return true;
 }
 
 // ---------------------------------------------------------------------------

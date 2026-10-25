@@ -590,3 +590,92 @@ TEST_F(DnsResolveTest, PublishPortConfigWithoutPortConfigIsNoop) {
     dns_svc->publish_port_config("central");
     EXPECT_EQ(dns_svc->soa_serial(), serial_before);
 }
+
+// ===========================================================================
+// Group loopback names: <device>.<group-label>.lo.<base> -> 127.0.0.1
+// ===========================================================================
+
+namespace {
+
+tree::TreeNode loopback_group(const std::string& id, const std::string& owner) {
+    tree::TreeNode group;
+    group.id          = id;
+    group.parent_id   = "root";
+    group.type        = tree::NodeType::Customer;
+    group.hostname    = "family";
+    group.mgmt_pubkey = owner;
+    return group;
+}
+
+} // namespace
+
+TEST(DnsGroupLoopback, LabelIsStableDnsSafeAndDerivedFromTheGroupId) {
+    const auto label = network::group_loopback_label("customer-abc");
+    ASSERT_EQ(label.size(), 21u);
+    EXPECT_EQ(label[0], 'g');
+    EXPECT_EQ(label.find_first_not_of("0123456789abcdef", 1), std::string::npos);
+    EXPECT_EQ(label, network::group_loopback_label("customer-abc"));
+    EXPECT_NE(label, network::group_loopback_label("customer-abd"));
+    EXPECT_EQ(network::group_loopback_wildcard("customer-abc", "Lemonade-Nexus.IO"),
+              "*." + label + ".lo.lemonade-nexus.io");
+    EXPECT_EQ(network::group_loopback_wildcard("customer-abc", ""), "");
+}
+
+TEST_F(DnsResolveTest, GroupLoopbackAnswersLoopbackForAnyDeviceNameInTheGroup) {
+    ASSERT_TRUE(tree_svc->insert_join_node(loopback_group("customer-abc", root_pubkey_str)));
+    const auto label = network::group_loopback_label("customer-abc");
+    for (const std::string device : {"my-laptop", "work-pc", "any-name", "x1"}) {
+        auto result = dns_svc->resolve(device + "." + label + ".lo.lemonade-nexus.io");
+        ASSERT_TRUE(result.has_value()) << device;
+        EXPECT_EQ(result->ipv4_address, "127.0.0.1");
+        EXPECT_EQ(result->ttl, 300u);
+    }
+    auto upper = dns_svc->resolve("MY-LAPTOP." + label + ".LO.LEMONADE-NEXUS.IO.");
+    ASSERT_TRUE(upper.has_value());
+    EXPECT_EQ(upper->ipv4_address, "127.0.0.1");
+}
+
+TEST_F(DnsResolveTest, GroupLoopbackRefusesUnknownOrMalformedNames) {
+    ASSERT_TRUE(tree_svc->insert_join_node(loopback_group("customer-abc", root_pubkey_str)));
+    const auto label = network::group_loopback_label("customer-abc");
+    const std::string tail = ".lo.lemonade-nexus.io";
+    EXPECT_FALSE(dns_svc->resolve("dev.g00000000000000000000" + tail).has_value());
+    EXPECT_FALSE(dns_svc->resolve(label + tail).has_value());               // no device label
+    EXPECT_FALSE(dns_svc->resolve("a.b." + label + tail).has_value());      // two device labels
+    EXPECT_FALSE(dns_svc->resolve("-bad." + label + tail).has_value());
+    EXPECT_FALSE(dns_svc->resolve("dev.family" + tail).has_value());        // hostname is not a label
+    EXPECT_FALSE(dns_svc->resolve("my-laptop" + tail).has_value());         // reserved, no fallthrough
+}
+
+TEST_F(DnsResolveTest, GroupLoopbackAnswersOnEveryReplicaAndEndsWithTheGroup) {
+    ASSERT_TRUE(tree_svc->insert_join_node(loopback_group("customer-abc", root_pubkey_str)));
+    const auto name = "laptop." + network::group_loopback_label("customer-abc") +
+                      ".lo.lemonade-nexus.io";
+
+    // A second Tier 1 server holds the same replicated tree.
+    const auto replica_dir = temp_dir.string() + "_replica";
+    fs::remove_all(replica_dir);
+    fs::copy(temp_dir, replica_dir, fs::copy_options::recursive);
+    storage::FileStorageService replica_storage(replica_dir);
+    replica_storage.start();
+    tree::PermissionTreeService replica_tree(replica_storage, *crypto_svc);
+    replica_tree.start();
+    asio::io_context replica_io;
+    network::DnsService replica_dns(replica_io, 0, replica_tree, "lemonade-nexus.io");
+
+    for (auto* dns : {dns_svc.get(), &replica_dns}) {
+        auto result = dns->resolve(name);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->ipv4_address, "127.0.0.1");
+    }
+
+    // The group is deleted on both servers: the names stop resolving.
+    ASSERT_TRUE(tree_svc->delete_node_direct("customer-abc"));
+    ASSERT_TRUE(replica_tree.delete_node_direct("customer-abc"));
+    EXPECT_FALSE(dns_svc->resolve(name).has_value());
+    EXPECT_FALSE(replica_dns.resolve(name).has_value());
+
+    replica_tree.stop();
+    replica_storage.stop();
+    fs::remove_all(replica_dir);
+}

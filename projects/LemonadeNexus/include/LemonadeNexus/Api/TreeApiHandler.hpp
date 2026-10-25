@@ -40,7 +40,8 @@ private:
     // Post-delete cleanup shared by both delete routes (tree operations off)
     // and cleanup_removed_nodes (tree operations on), so they stay
     // behaviorally identical: (1) credential revocation (owner-protected), (2) IPAM releases,
-    // (3) mesh peer removal, (4) private EP DNS record removal. All steps are
+    // (3) mesh peer removal, (4) private EP DNS record removal, (5) removal of
+    // the stored device or group loopback certificate. All steps are
     // best-effort; a failure never aborts the cascade. `doomed` is the
     // pre-delete snapshot of the node.
     void cascade_node_cleanup(const std::string& node_id,

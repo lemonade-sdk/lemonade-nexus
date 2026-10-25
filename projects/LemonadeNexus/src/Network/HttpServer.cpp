@@ -5,6 +5,8 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
+#include <climits>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -155,6 +157,55 @@ bool HttpServer::reload_tls_certs(const std::string& cert_path,
 
     spdlog::info("HttpServer: TLS certificates hot-reloaded (cert={}, key={})",
                   cert_path, key_path);
+    return true;
+}
+
+bool HttpServer::reload_tls_certs_inmemory_key(const std::string& cert_path,
+                                               const std::string& key_pem,
+                                               const std::string& key_path) {
+    std::lock_guard lock(mutex_);
+
+    if (!is_tls_) {
+        spdlog::warn("HttpServer: cannot reload certs — not running in TLS mode");
+        return false;
+    }
+    if (key_pem.empty() || key_pem.size() > static_cast<std::size_t>(INT32_MAX)) {
+        spdlog::warn("HttpServer: in-memory TLS key empty — keeping the current cert "
+                     "(key path={})", key_path);
+        return false;
+    }
+
+    FILE* cert_fp = std::fopen(cert_path.c_str(), "r");
+    if (!cert_fp) {
+        spdlog::error("HttpServer: cannot open cert file: {}", cert_path);
+        return false;
+    }
+    X509* cert = PEM_read_X509(cert_fp, nullptr, nullptr, nullptr);
+    std::fclose(cert_fp);
+
+    BIO* key_bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
+    EVP_PKEY* pkey = key_bio ? PEM_read_bio_PrivateKey(key_bio, nullptr, nullptr, nullptr)
+                             : nullptr;
+    if (key_bio) BIO_free(key_bio);
+
+    const bool usable = cert && pkey && X509_check_private_key(cert, pkey) == 1;
+    if (usable) {
+        // SSLServer inherits from Server; downcast is safe because is_tls_ is true.
+        auto* ssl_srv = static_cast<httplib::SSLServer*>(server_.get());
+        ssl_srv->update_certs(cert, pkey);
+    }
+    if (cert) X509_free(cert);
+    if (pkey) EVP_PKEY_free(pkey);
+    if (!usable) {
+        spdlog::error("HttpServer: in-memory cert/key unusable for hot-reload (cert={})",
+                      cert_path);
+        return false;
+    }
+
+    tls_cert_path_ = cert_path;
+    tls_key_path_  = key_path;
+    spdlog::info("HttpServer: TLS certificates hot-reloaded with in-memory key (cert={}, "
+                 "key path={})", cert_path, key_path);
     return true;
 }
 

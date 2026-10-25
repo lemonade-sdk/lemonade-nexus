@@ -194,6 +194,11 @@ struct LemonadeNexusClient::Impl {
         private_cli_port = 0;
     }
 
+    // Device and group loopback certificates kept current on disk. Declared
+    // before mesh_orchestrator: the orchestrator's renewal thread uses it
+    // until the orchestrator is stopped.
+    CertRenewer cert_renewer;
+
     // Mesh P2P orchestrator
     std::unique_ptr<MeshOrchestrator> mesh_orchestrator;
     LemonadeNexusClient::MeshStateCallback mesh_callback;
@@ -1484,6 +1489,14 @@ Result<CertStatus> LemonadeNexusClient::get_cert_status(const std::string& domai
 }
 
 Result<IssuedCertBundle> LemonadeNexusClient::request_certificate(const std::string& hostname) {
+    return issue_certificate(json{{"hostname", hostname}});
+}
+
+Result<IssuedCertBundle> LemonadeNexusClient::request_group_loopback_certificate() {
+    return issue_certificate(json{{"scope", "group_loopback"}});
+}
+
+Result<IssuedCertBundle> LemonadeNexusClient::issue_certificate(const json& fields) {
     Result<IssuedCertBundle> result;
 
     // Copy identity under lock to avoid racing with other threads
@@ -1498,8 +1511,7 @@ Result<IssuedCertBundle> LemonadeNexusClient::request_certificate(const std::str
         return result;
     }
 
-    json body;
-    body["hostname"]      = hostname;
+    json body = fields;
     body["client_pubkey"] = local_identity.pubkey_string();
 
     int status = 0;
@@ -1638,6 +1650,52 @@ Result<DecryptedCert> LemonadeNexusClient::decrypt_certificate(const IssuedCertB
     result.value.expires_at    = bundle.expires_at;
     result.ok = true;
     return result;
+}
+
+namespace {
+
+uint64_t unix_now() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+} // namespace
+
+Result<DecryptedCert> LemonadeNexusClient::fetch_certificate(const std::string& target) {
+    auto issued = target == kGroupLoopbackCertTarget ? request_group_loopback_certificate()
+                                                     : request_certificate(target);
+    if (!issued.ok) {
+        Result<DecryptedCert> failed;
+        failed.http_status = issued.http_status;
+        failed.error       = issued.error;
+        return failed;
+    }
+    return decrypt_certificate(issued.value);
+}
+
+void LemonadeNexusClient::set_cert_renewed_callback(CertRenewedCallback cb) {
+    impl_->cert_renewer.set_callback(std::move(cb));
+}
+
+CertRenewalResult LemonadeNexusClient::renew_certificate_if_needed(const std::string& target,
+                                                                   const std::string& cert_dir) {
+    if (target.empty() || cert_dir.empty()) {
+        CertRenewalResult invalid;
+        invalid.error = "target and cert_dir required";
+        return invalid;
+    }
+    return impl_->cert_renewer.renew_if_needed(
+        target, cert_dir, unix_now(),
+        [this](const std::string& t) { return fetch_certificate(t); });
+}
+
+bool LemonadeNexusClient::certificate_renewal_pending() const {
+    return impl_->cert_renewer.renewal_pending(unix_now());
+}
+
+void LemonadeNexusClient::renew_managed_certificates() {
+    impl_->cert_renewer.renew_managed(
+        unix_now(), [this](const std::string& t) { return fetch_certificate(t); });
 }
 
 // ---------------------------------------------------------------------------

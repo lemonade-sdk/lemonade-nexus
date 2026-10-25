@@ -530,6 +530,84 @@ ln_error_t ln_cert_decrypt(ln_client_t* client,
     return result.ok ? LN_OK : LN_ERR_INTERNAL;
 }
 
+ln_error_t ln_cert_request_group(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    try {
+        auto result = client->client.request_group_loopback_certificate();
+        json j;
+        j["domain"]            = result.value.domain;
+        j["fullchain_pem"]     = result.value.fullchain_pem;
+        j["encrypted_privkey"] = result.value.encrypted_privkey;
+        j["crypto_version"]    = result.value.crypto_version;
+        j["nonce"]             = result.value.nonce;
+        j["ephemeral_pubkey"]  = result.value.ephemeral_pubkey;
+        j["expires_at"]        = result.value.expires_at;
+        if (!result.ok) j["error"] = result.error;
+
+        *out_json = strdup_json(j);
+        return result.ok ? LN_OK : ln_map_error(result.http_status);
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
+}
+
+ln_error_t ln_set_cert_renewed_callback(ln_client_t* client,
+                                        ln_cert_renewed_fn fn,
+                                        void* user) {
+    if (!client) return LN_ERR_NULL_ARG;
+    try {
+        if (!fn) {
+            client->client.set_cert_renewed_callback({});
+            return LN_OK;
+        }
+        client->client.set_cert_renewed_callback(
+            [fn, user](const lnsdk::CertRenewedEvent& event) {
+                try {
+                    json j;
+                    j["target"]         = event.target;
+                    j["domain"]         = event.domain;
+                    j["fullchain_path"] = event.fullchain_path;
+                    j["privkey_path"]   = event.privkey_path;
+                    j["expires_at"]     = event.expires_at;
+                    const auto text = j.dump();
+                    fn(text.c_str(), user);
+                } catch (...) {
+                    spdlog::warn("[CApi] certificate renewed event not delivered");
+                }
+            });
+        return LN_OK;
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
+}
+
+ln_error_t ln_cert_renew_if_needed(ln_client_t* client,
+                                   const char* hostname,
+                                   const char* cert_dir,
+                                   char** out_json) {
+    if (!client || !hostname || !cert_dir || !out_json) return LN_ERR_NULL_ARG;
+    try {
+        const auto result = client->client.renew_certificate_if_needed(hostname, cert_dir);
+        json j;
+        switch (result.status) {
+            case lnsdk::CertRenewalStatus::Renewed: j["status"] = "renewed"; break;
+            case lnsdk::CertRenewalStatus::NotDue:  j["status"] = "not_due"; break;
+            case lnsdk::CertRenewalStatus::Failed:  j["status"] = "failed";  break;
+        }
+        j["domain"]         = result.domain;
+        j["expires_at"]     = result.expires_at;
+        j["fullchain_path"] = result.fullchain_path;
+        j["privkey_path"]   = result.privkey_path;
+        if (!result.error.empty()) j["error"] = result.error;
+
+        *out_json = strdup_json(j);
+        if (result.status != lnsdk::CertRenewalStatus::Failed) return LN_OK;
+        return result.http_status != 0 ? ln_map_error(result.http_status) : LN_ERR_CONNECT;
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tree: children
 // ---------------------------------------------------------------------------

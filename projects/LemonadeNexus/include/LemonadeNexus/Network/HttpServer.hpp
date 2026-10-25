@@ -89,6 +89,14 @@ public:
     /// Hot-reload TLS certificates from specific file paths.
     bool reload_tls_certs(const std::string& cert_path, const std::string& key_path);
 
+    /// Hot-reload from a certificate file path plus an in-memory PEM private
+    /// key (Phase 7: the key file is vault-covered, so its bytes on disk are
+    /// DEK ciphertext). `key_path` is recorded for logging only. Returns false,
+    /// and keeps the current certificate, when the server is not TLS, the key
+    /// is empty or does not parse, or the key does not match the certificate.
+    bool reload_tls_certs_inmemory_key(const std::string& cert_path, const std::string& key_pem,
+                                       const std::string& key_path);
+
     void on_start();
     void on_stop();
     [[nodiscard]] static constexpr std::string_view name() { return "HttpServer"; }
