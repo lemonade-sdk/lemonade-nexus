@@ -24,7 +24,7 @@ Dependencies use a **mix** of sourcing mechanisms, not all FetchContent:
 - **Source builds** — TPM2-TSS 4.1.3 (Linux).
 - **Pinned static OpenSSL** — on Linux, the static libraries of Ubuntu 24.04
   `libssl-dev` (exactly 3.0.13); on macOS arm64 and Windows x64, a static
-  OpenSSL 3.5.9 archive from the `deps-openssl-3.5.9` release, checked by
+  OpenSSL 3.5.9 archive from the `deps-openssl-3.5.9-r2` release, checked by
   SHA-256 (`cmake/libraries/openssl.cmake`, `LEMONADE_NEXUS_STATIC_DEPS`). The
   build does not compile OpenSSL. With `LEMONADE_NEXUS_STATIC_DEPS=OFF`, the
   build uses the system OpenSSL.
