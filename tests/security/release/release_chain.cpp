@@ -129,6 +129,44 @@ TEST_F(ReleaseChainTest, AnOldApprovalReplayedAfterRestartIsRefused) {
               ReleaseOfferResult::Stale);
 }
 
+// A party that can write the security directory restores the record from
+// before N+1. The finalized floor (a Start record of N+1) makes the restored
+// approval unusable until N+1 returns.
+TEST_F(ReleaseChainTest, ARolledBackRecordBelowTheFinalizedFloorIsNotUsed) {
+    const auto path = dir / kReleaseChainFile;
+    std::string before_n1;
+    {
+        auto c = chain();
+        ASSERT_TRUE(c.load(signer.approval(kN)));
+        std::ifstream in(path);
+        before_n1.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        ASSERT_EQ(c.offer(signer.approval(kN1, kN)), ReleaseOfferResult::Adopted);
+    }
+    std::ofstream(path, std::ios::trunc) << before_n1;
+
+    auto restarted = chain();
+    ASSERT_TRUE(restarted.load(signer.approval(kN)));
+    EXPECT_EQ(restarted.highest_release_number(), kN) << "the rollback itself goes unnoticed";
+    ASSERT_TRUE(restarted.current().has_value());
+
+    EXPECT_TRUE(restarted.raise_floor(kN1));
+    EXPECT_TRUE(restarted.below_floor());
+    EXPECT_FALSE(restarted.current().has_value());
+    EXPECT_EQ(restarted.current_digest(), Digest{});
+    // The floor never falls.
+    EXPECT_FALSE(restarted.raise_floor(kN));
+    EXPECT_EQ(restarted.floor(), kN1);
+    // The rolled-back approval itself cannot be offered back into use.
+    EXPECT_EQ(restarted.offer(signer.approval(kN)), ReleaseOfferResult::Current);
+    EXPECT_FALSE(restarted.current().has_value());
+
+    // N+1 from a peer clears the condition.
+    EXPECT_EQ(restarted.offer(signer.approval(kN1, kN)), ReleaseOfferResult::Adopted);
+    EXPECT_FALSE(restarted.below_floor());
+    ASSERT_TRUE(restarted.current().has_value());
+    EXPECT_EQ(restarted.current()->approval.release_number, kN1);
+}
+
 TEST_F(ReleaseChainTest, AnOversizeOfferIsRefusedBeforeParsing) {
     auto c = chain();
     ASSERT_TRUE(c.load(signer.approval(kN)));

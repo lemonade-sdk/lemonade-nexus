@@ -95,7 +95,10 @@ Facts from the code at `37c359e` (r18):
   the four epoch-boundary stages.
 - **No committed log.** `hotstuff-commit-<epoch>.json` keeps only the latest
   commit; blocks live in memory (`ConsensusStore.cpp:96-104`). A restarted
-  replica fetches at most 8 uncommitted blocks (`kMaxSyncChainBlocks`).
+  replica fetches at most 8 uncommitted blocks (`kMaxSyncChainBlocks`). A
+  running replica that fell further behind fetches the committed chain from a
+  peer in pages of 8 blocks (`SyncRequest::after_height`); a peer serves only
+  blocks it holds, so a page starts no lower than that peer's restart anchor.
   Activation resets consensus and drops uncommitted blocks
   (`SecurityRuntime.cpp:154`).
 - **Tree changes apply locally only.** `TreeApiHandler` calls

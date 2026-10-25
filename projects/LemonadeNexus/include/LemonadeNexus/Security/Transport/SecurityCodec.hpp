@@ -107,6 +107,14 @@ struct UpgradeMsg {
 /// responder's high certificate, which proves the view the network reached.
 struct SyncRequest {
     EpochId epoch = 0;
+    /// Paging: the requester's last committed height. The responder answers
+    /// with the certified chain above this height, at most
+    /// kMaxSyncChainBlocks blocks. A running replica that fell further behind
+    /// than one uncommitted chain fetches the gap this way, one bounded page
+    /// at a time. Absent: the responder's uncommitted chain. The field is an
+    /// optional trailing u64 and is encoded only when set, so a request
+    /// without it keeps the earlier layout.
+    std::optional<Height> after_height;
 };
 
 struct SyncResponse;  // defined after ProposalMessage
@@ -227,11 +235,14 @@ struct StorageUnlockPartialMsg {
 };
 
 struct SyncResponse {
+    /// The certificate over the last chain block: the responder's high
+    /// certificate, or for a page that ends below the responder's tip, the
+    /// certificate the next block carried as its justify.
     QuorumCertificate high_qc;
-    /// The responder's uncommitted chain, oldest first: block k is certified
-    /// by block k+1's justify, the last block by high_qc. A restarted node
-    /// rebuilds chain state from these certified facts, and a replica that
-    /// missed a block fills the gap from them.
+    /// Oldest first: block k is certified by block k+1's justify, the last
+    /// block by high_qc. Without paging, the responder's uncommitted chain. A
+    /// restarted node rebuilds chain state from these certified facts, and a
+    /// replica that missed blocks fills the gap from them.
     std::vector<ProposalMessage> chain;
 };
 

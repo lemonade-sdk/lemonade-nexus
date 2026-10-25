@@ -3,13 +3,19 @@
 //
 //   nexus-release-bundle --spec <spec.json> --out <bundle.json>
 //                        [--approval-preimage <file>] [--authority-preimage <file>]
-//                        [--previous-approval <bundle.json>]
+//                        [--previous-approval <bundle.json> [--previous-halted]]
 //
 // --previous-approval reads the previous release's signed bundle. Its
 // approval must be signed by the same release key for the same network. Its
 // approved_paths become previous_release_paths (for the paths this release
 // still lists), so servers on both releases attest each other during the
 // rollout. It cannot be combined with "previous_release_paths" in the spec.
+//
+// --previous-halted: the rollout of the previous release halted, so servers
+// run that release or the release before it. previous_release_paths then
+// carries the hashes of both (release_overlap_paths). The release workflow
+// passes it only when nexus-rollout-check proved the halt, and checks the
+// result again with nexus-rollout-check --approval.
 //
 // Spec format:
 //   {
@@ -64,7 +70,14 @@ bool write_file(const std::string& path, const std::string& text) {
 int main(int argc, char** argv) {
     std::string spec_path, out_path, approval_preimage_path, authority_preimage_path;
     std::string previous_approval_path;
-    for (int i = 1; i + 1 < argc; i += 2) {
+    bool previous_halted = false;
+    for (int i = 1; i < argc; i += 2) {
+        if (std::strcmp(argv[i], "--previous-halted") == 0) {
+            previous_halted = true;
+            --i;
+            continue;
+        }
+        if (i + 1 >= argc) return fail(std::string("missing value for ") + argv[i]);
         if (std::strcmp(argv[i], "--spec") == 0) spec_path = argv[i + 1];
         else if (std::strcmp(argv[i], "--out") == 0) out_path = argv[i + 1];
         else if (std::strcmp(argv[i], "--approval-preimage") == 0) approval_preimage_path = argv[i + 1];
@@ -141,6 +154,7 @@ int main(int argc, char** argv) {
         if (!previous.has_value()) return fail(error);
         spec.previous = previous->approval;
     }
+    spec.previous_halted = previous_halted;
     const auto approval = nexus::security::generate_release_approval(spec, error);
     if (!approval.has_value()) return fail(error);
 

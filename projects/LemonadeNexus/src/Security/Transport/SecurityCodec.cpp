@@ -450,6 +450,9 @@ bool encode_genesis_eligibility_attest(Writer& w, const GenesisEligibilityAttest
 
 bool encode_sync_request(Writer& w, const SyncRequest& s) {
     w.u64(s.epoch);
+    if (s.after_height.has_value()) {
+        w.u64(s.after_height->underlying());
+    }
     return true;
 }
 
@@ -929,7 +932,20 @@ bool decode_genesis_eligibility_attest(Reader& r, GenesisEligibilityAttest& a) {
            r.fixed(a.identity_signature);
 }
 
-bool decode_sync_request(Reader& r, SyncRequest& s) { return r.u64(s.epoch); }
+bool decode_sync_request(Reader& r, SyncRequest& s) {
+    if (!r.u64(s.epoch)) {
+        return false;
+    }
+    if (r.remaining() == 0) {
+        return true;
+    }
+    uint64_t after = 0;
+    if (!r.u64(after)) {
+        return false;
+    }
+    s.after_height = Height{after};
+    return true;
+}
 
 bool decode_sync_response(Reader& r, SyncResponse& s) {
     if (!decode_certificate(r, s.high_qc)) {

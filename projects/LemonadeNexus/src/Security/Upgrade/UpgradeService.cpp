@@ -107,6 +107,7 @@ bool UpgradeService::start(uint64_t now_ms) {
         spdlog::warn("[upgrade] upgrade records are corrupt; this server proposes and votes "
                      "for no upgrade record");
     }
+    raise_release_floor();
     return healthy_;
 }
 
@@ -504,6 +505,16 @@ void UpgradeService::adopted() {
     broadcast_approval();
 }
 
+void UpgradeService::raise_release_floor() {
+    // The latest Start record finalized only when a quorum held its approval,
+    // so its release number is the network floor for accepted releases.
+    if (chain_ == nullptr || !state_.active()) return;
+    if (chain_->raise_floor(state_.release_number) && chain_->below_floor() &&
+        on_release_floor_) {
+        on_release_floor_();
+    }
+}
+
 void UpgradeService::broadcast_approval() {
     if (chain_ == nullptr || !chain_->current()) return;
     const auto text = release_approval_bundle_json(*chain_->current());
@@ -760,6 +771,7 @@ bool UpgradeService::accept_record(const UpgradeRecord& record, std::optional<Co
     observations_.clear();
     pending_witness_.reset();
     persist();
+    if (record.event == UpgradeEvent::Start) raise_release_floor();
     switch (record.event) {
         case UpgradeEvent::Start:
             spdlog::info("[upgrade] release {} rollout started: {} participants",

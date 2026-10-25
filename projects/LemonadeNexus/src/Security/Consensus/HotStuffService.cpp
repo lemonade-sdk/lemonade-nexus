@@ -376,6 +376,7 @@ void HotStuffService::apply_chain_rules(const QuorumCertificate& justify,
         commit.qc_digest = qc_digest(certifying->second);
         commits.push_back(commit);
         committed_digests_.insert(record->digest);
+        committed_by_height_[record->proposal.height] = record->digest;
         last_committed_height_ = record->proposal.height;
     }
 
@@ -634,6 +635,48 @@ std::vector<std::pair<Proposal, QuorumCertificate>> HotStuffService::uncommitted
     }
     std::reverse(chain.begin(), chain.end());
     return chain;
+}
+
+std::optional<HotStuffService::CertifiedPage> HotStuffService::certified_page_after(
+    Height after) const {
+    CertifiedPage page;
+    const auto linked = [&page](const Proposal& proposal) {
+        return page.chain.empty() ||
+               proposal.parent_digest == proposal_digest(page.chain.back().first);
+    };
+    for (Height height = after + 1;
+         height <= last_committed_height_ && page.chain.size() < constants::kMaxSyncChainBlocks;
+         height = height + 1) {
+        const auto committed = committed_by_height_.find(height);
+        if (committed == committed_by_height_.end()) break;
+        const auto block = blocks_.find(committed->second);
+        const auto certifying = qc_by_block_.find(committed->second);
+        if (block == blocks_.end() || certifying == qc_by_block_.end() ||
+            !linked(block->second.proposal)) {
+            break;
+        }
+        page.chain.emplace_back(block->second.proposal, block->second.justify);
+        page.certifying = certifying->second;
+    }
+    if (page.chain.empty()) return std::nullopt;
+    // A page that reached the committed tip continues with the uncommitted
+    // chain, so the last page links to the blocks that new proposals name.
+    if (page.chain.back().first.height == last_committed_height_) {
+        for (auto& [proposal, justify] : uncommitted_chain()) {
+            if (page.chain.size() >= constants::kMaxSyncChainBlocks || !linked(proposal)) break;
+            const Digest digest = proposal_digest(proposal);
+            const auto certifying = qc_by_block_.find(digest);
+            if (digest == high_qc_.proposal_digest) {
+                page.certifying = high_qc_;
+            } else if (certifying != qc_by_block_.end()) {
+                page.certifying = certifying->second;
+            } else {
+                break;
+            }
+            page.chain.emplace_back(std::move(proposal), std::move(justify));
+        }
+    }
+    return page;
 }
 
 std::optional<CommitProof> HotStuffService::commit_proof(const Digest& proposal_digest) const {

@@ -237,6 +237,43 @@ TEST_F(GeneratorFixture, ThePreviousApprovalFillsOnlyThePreviousReleasePaths) {
     EXPECT_FALSE(generate_release_approval(spec, error).has_value());
 }
 
+// After a halted rollout, servers run the halted release or the release
+// before it, so the fix carries the hashes of both.
+TEST_F(GeneratorFixture, AfterAHaltThePreviousPathsCarryBothReleases) {
+    std::string error;
+    auto halted = generate_release_approval(spec, error);
+    ASSERT_TRUE(halted.has_value()) << error;
+    const std::string before(64, 'b');
+    halted->previous_release_paths = {{"/usr/bin/lemonade-nexus", {before}}};
+    const auto preimage = canonical_release_approval_json(*halted);
+    std::array<unsigned char, crypto_sign_BYTES> sig{};
+    crypto_sign_detached(sig.data(), nullptr,
+                         reinterpret_cast<const unsigned char*>(preimage.data()), preimage.size(),
+                         authority_sk.data());
+    halted->signature_b64 = crypto::to_base64(sig);
+
+    const auto overlap = release_overlap_paths(*halted, true);
+    ASSERT_EQ(overlap.size(), halted->approved_paths.size());
+    EXPECT_EQ(overlap[0].sha256, (std::vector<std::string>{hex_sha256("app bytes"), before}));
+    EXPECT_EQ(release_overlap_paths(*halted, false)[0].sha256,
+              std::vector<std::string>{hex_sha256("app bytes")});
+
+    spec.release_number = 2026102501;
+    spec.artifacts[0] = {"/usr/bin/lemonade-nexus", write_artifact("app3", "app bytes v3")};
+    spec.previous = *halted;
+    spec.previous_halted = true;
+    const auto fix = generate_release_approval(spec, error);
+    ASSERT_TRUE(fix.has_value()) << error;
+    EXPECT_EQ(fix->previous_release_paths[0].sha256,
+              (std::vector<std::string>{hex_sha256("app bytes"), before}));
+    EXPECT_EQ(fix->approved_paths[0].sha256, std::vector<std::string>{hex_sha256("app bytes v3")});
+
+    // The halt flag means nothing without the halted approval.
+    auto orphaned = spec;
+    orphaned.previous.reset();
+    EXPECT_FALSE(generate_release_approval(orphaned, error).has_value());
+}
+
 TEST_F(GeneratorFixture, TheBootLineIsRequiredAndWellFormed) {
     std::string error;
     for (int field = 0; field < 4; ++field) {

@@ -29,9 +29,16 @@
 // Freshness: a proof shows a state that was finalized, not the newest state.
 // Completion of a release is final (a rollout never reopens), so a stale proof
 // can only fail to show completion; it cannot show a completion that did not
-// happen.
+// happen. A halt is final in the same way.
+//
+// After a halt: the servers in the Upgraded records run the halted release,
+// and every other server runs the release before it (the Halt subject rolled
+// back). The release that fixes the halt therefore lists the hashes of both
+// in previous_release_paths. release_follows_rollout checks that the new
+// approval carries exactly the overlap that the proven state requires.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Security/Attestation/ReleaseApproval.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 #include <LemonadeNexus/Security/Upgrade/UpgradeProgress.hpp>
 
@@ -69,6 +76,9 @@ struct VerifiedRollout {
     UpgradeChainState state;
     /// The newest epoch the authority chain reaches.
     EpochId epoch{};
+    /// The Genesis key and network the proof verified against.
+    crypto::Ed25519PublicKey genesis_public_key{};
+    NetworkId network_id{};
 };
 
 /// Verifies the proof for the pinned `network_id`. nullopt with `error` set on
@@ -83,5 +93,39 @@ struct VerifiedRollout {
 /// `release_number` complete and not halted. `reason` says why not.
 [[nodiscard]] bool rollout_complete(const VerifiedRollout& rollout, uint64_t release_number,
                                     std::string& reason);
+
+/// The finalized end state of a previous release's rollout.
+enum class PreviousRollout : uint8_t {
+    Complete = 1,
+    /// A finalized Halt record. Servers run the halted release or the
+    /// release before it.
+    Halted = 2,
+};
+
+/// The end state of the rollout of `release_number`, for the release guard.
+/// `previous` is that release's signed approval bundle, as published. When
+/// given, its digest must equal the approval digest of the finalized Start
+/// record, and its Genesis delegation and release signature must verify for
+/// the proof's network. Halted requires `previous`: only the approval the
+/// Start record names says which hashes the halted rollout left in use.
+/// nullopt, with `reason`, for an open rollout, another release, no records,
+/// or an approval that is not the finalized one.
+[[nodiscard]] std::optional<PreviousRollout> previous_rollout_state(
+    const VerifiedRollout& rollout, uint64_t release_number,
+    const ReleaseApprovalBundleV1* previous, std::string& reason);
+
+/// The release guard with the new approval `next` (unsigned is enough: its
+/// canonical form is what the release key signs). True only when
+/// previous_rollout_state accepts `previous`, `next` names the same network
+/// and release signer with a higher release number, and for every path of
+/// next.approved_paths, next.previous_release_paths holds exactly the hashes
+/// of release_overlap_paths(previous, halted): the previous release after a
+/// completed rollout, the halted release and the release before it after a
+/// halt. A fix that omits either release's hashes, or an approval that keeps
+/// an older release after a completed rollout, is refused.
+[[nodiscard]] bool release_follows_rollout(const VerifiedRollout& rollout,
+                                           uint64_t release_number,
+                                           const ReleaseApprovalBundleV1& previous,
+                                           const ReleaseApprovalV1& next, std::string& reason);
 
 }  // namespace nexus::security
