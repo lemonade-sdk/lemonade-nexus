@@ -2,6 +2,7 @@
 
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
 #include <LemonadeNexus/Security/DurableWrite.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 #include <LemonadeNexus/Tree/TreeRules.hpp>
 
 #include <spdlog/spdlog.h>
@@ -636,15 +637,34 @@ bool PermissionTreeService::persist_committed_ops_locked() const {
         ids.push_back(json::array({id, signed_at}));
     }
     const json doc{{"format", 1}, {"ids", std::move(ids)}};
-    return security::write_durable(committed_ops_path(storage_), doc.dump());
+    const auto path = committed_ops_path(storage_);
+    if (auto* vault = storage_.vault_for(path)) return vault->write(path, doc.dump());
+    return security::write_durable(path, doc.dump());
 }
 
 void PermissionTreeService::load_committed_ops_locked() {
-    std::ifstream in(committed_ops_path(storage_), std::ios::binary);
-    if (!in) return;  // nothing committed yet
-    std::ostringstream text;
-    text << in.rdbuf();
-    const auto doc = json::parse(text.str(), nullptr, false);
+    const auto path = committed_ops_path(storage_);
+    std::string text;
+    if (auto* vault = storage_.vault_for(path)) {
+        auto read = vault->read(path);
+        if (read.status == security::VaultReadStatus::Missing) return;  // nothing committed yet
+        if (read.status != security::VaultReadStatus::Ok) {
+            // Locked or refused: the ids are unknown, which is not the same as
+            // none committed.
+            spdlog::error("[{}] committed op id record does not open under the data key; "
+                          "refusing tree operations", name());
+            committed_ops_unreadable_ = true;
+            return;
+        }
+        text = std::move(read.bytes);
+    } else {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return;  // nothing committed yet
+        std::ostringstream buffer;
+        buffer << in.rdbuf();
+        text = std::move(buffer).str();
+    }
+    const auto doc = json::parse(text, nullptr, false);
     const bool shaped = !doc.is_discarded() && doc.is_object() && doc.value("format", 0) == 1 &&
                         doc.contains("ids") && doc["ids"].is_array();
     if (!shaped) {

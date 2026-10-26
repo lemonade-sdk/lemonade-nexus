@@ -613,9 +613,11 @@ server (`Auth/LinkTokenLedger.hpp`, `TokenLinkAuthProvider`).
 - **Storage.** The provider's ledger (`link_tokens/ledger.json`) and the
   replica file (`link_replica/replica.json`) are storage-vault files,
   encrypted under the data key once the vault runs encrypted. On restart the
-  replica entries are verified again before use. A plaintext token file from
-  an earlier release (`link_tokens/<sha256>.json`) is still redeemed, once, on
-  the server that minted it, until it expires.
+  replica entries are verified again before use. A token file from an
+  earlier release (`link_tokens/<sha256>.json`) is still redeemed, once, on
+  the server that minted it, until it expires. It is a storage-vault file
+  too: an encrypted server encrypts it in place, and a record that does not
+  open refuses redemption.
 
 **Single use.** A `Join` with a token and an
 `AcceptInvite` carry the signed `Mint` in a link extension of the op

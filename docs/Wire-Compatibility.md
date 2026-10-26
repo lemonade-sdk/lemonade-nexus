@@ -102,10 +102,12 @@ the old binary as an invalid baseline.
   stores nor answers link token events. Nothing an earlier release sends
   changes. During a rollout a token minted on an earlier release is redeemed
   only on that server (as before), and a token minted on N+1 is redeemed on
-  any N+1 Tier 1 server. N+1 still reads the plaintext per-token files
-  (`link_tokens/<sha256>.json`) an earlier release wrote. The new files
-  (`link_tokens/ledger.json`, `link_replica/replica.json`) are storage-vault
-  files; an earlier release does not read them.
+  any N+1 Tier 1 server. N+1 still reads the per-token files
+  (`link_tokens/<sha256>.json`) an earlier release wrote; a server whose
+  files are encrypted encrypts them in place (storage-vault coverage
+  generation 2). The new files (`link_tokens/ledger.json`,
+  `link_replica/replica.json`) are storage-vault files; an earlier release
+  does not read them.
 - **Tree op link extension.** A `Join` with a link token and an
   `AcceptInvite` from N+1 append a link extension to the canonical op
   encoding. An op without it encodes exactly as before, and N+1
