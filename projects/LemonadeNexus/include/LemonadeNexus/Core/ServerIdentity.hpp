@@ -125,14 +125,18 @@ void resolve_server_region(
     const std::string& server_hostname,
     const std::string& dns_base_domain);
 
-/// Allocate tunnel IP for this server:
-/// existing IPAM allocation > gossip assignment > self-allocate.
-/// Returns IP with CIDR stripped (e.g. "10.64.0.1").
+/// Resolve this server's client-plane tunnel address, where it answers its
+/// private API. The address follows the server's backbone allocation
+/// (IPAMService::allocate_backbone_ip, keyed on `gossip_pubkey_b64`, the base64
+/// gossip identity key) through IPAMService::server_tunnel_for_backbone, so it
+/// is unique in the fleet and the same after a restart. Records the address in
+/// IPAM. Returns the address without a prefix (e.g. "10.64.252.37"), or an
+/// empty string when `server_node_id` or `gossip_pubkey_b64` is empty or no
+/// address can be derived. Throws what allocate_backbone_ip throws.
 [[nodiscard]] std::string resolve_tunnel_ip(
     const std::string& server_node_id,
-    const ServerConfig& config,
-    ipam::IPAMService& ipam,
-    gossip::GossipService& gossip);
+    const std::string& gossip_pubkey_b64,
+    ipam::IPAMService& ipam);
 
 /// Resolve the TLS certificate for `server_fqdn`. The cert is always
 /// ACME-issued (public CA on the SEIP FQDN); this returns the cert on disk for

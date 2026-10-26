@@ -89,7 +89,7 @@ bool request_not_sent(httplib::Error error) {
 
 /// Resolve a hostname to its first IPv4 address (dotted string), or "" on
 /// failure. Used to learn the server's mesh IP from its private FQDN (which the
-/// authoritative DNS maps to the in-mesh address, e.g. 10.64.0.1).
+/// authoritative DNS maps to the in-mesh address, e.g. 10.64.252.37).
 std::string resolve_ipv4(const std::string& host) {
     struct addrinfo hints{};
     hints.ai_family   = AF_INET;
@@ -118,7 +118,7 @@ struct LemonadeNexusClient::Impl {
     std::vector<std::pair<uint16_t, std::string>> exposed_services;  // vport -> target
     std::string  server_seip_fqdn;     // e.g. "<id>.<region>.seip.lemonade-nexus.io" — public API after join
     std::string  server_private_fqdn;  // e.g. "private.<id>.<region>.seip.lemonade-nexus.io"
-    std::string  server_tunnel_ip;    // e.g. "10.64.0.1" — HTTPS fallback
+    std::string  server_tunnel_ip;    // session server in-mesh address, e.g. "10.64.252.37"
     uint16_t     private_port{9101};
     mutable std::mutex mutex;
 
@@ -2246,12 +2246,11 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         std::lock_guard lock(impl_->mutex);
         impl_->node_id = node_id;
         impl_->link_token.clear();  // consumed server-side on successful join
-        // Store server private FQDN for HTTPS over the mesh
-        // Store server tunnel IP for HTTP fallback
+        // The private API lives at the tunnel address of the server that
+        // answered this join. Each server has its own address, so never keep
+        // the address of a server from an earlier join.
         auto srv_tunnel = resp->value("server_tunnel_ip", std::string{});
-        if (!srv_tunnel.empty()) {
-            impl_->server_tunnel_ip = srv_tunnel;
-        }
+        impl_->server_tunnel_ip = srv_tunnel;
 
         // Store SEIP FQDN — this is the server's canonical hostname
         auto srv_seip_fqdn = resp->value("server_seip_fqdn", std::string{});
@@ -2270,7 +2269,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
 
         // Store private FQDN, and resolve it to the server's in-mesh IP so the
         // mesh dataplane can egress to the private API (the FQDN maps to the
-        // server's tunnel IP, e.g. 10.64.0.1, via the authoritative DNS).
+        // server's tunnel IP via the authoritative DNS).
         auto srv_priv_fqdn = resp->value("server_private_fqdn", std::string{});
         impl_->private_port = static_cast<uint16_t>(
             resp->value("private_api_port", 9101));
@@ -2307,6 +2306,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
 
         {
             std::lock_guard lock(impl_->mutex);
+            bt.server_tunnel_ip = impl_->server_tunnel_ip;
             impl_->boringtun_config = bt;
         }
         if (!impl_->meshplane.start(bt)) {

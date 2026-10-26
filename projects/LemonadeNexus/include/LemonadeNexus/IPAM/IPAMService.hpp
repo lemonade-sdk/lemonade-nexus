@@ -91,6 +91,26 @@ public:
     /// changed. Returns the number of records added, updated, or removed.
     std::size_t sync_tree_tunnel_addresses(const std::map<std::string, std::string>& assigned);
 
+    // --- Server tunnel address (client plane) ---
+
+    /// The client-plane tunnel address ("a.b.c.d/32") of the server with
+    /// backbone address `backbone_cidr` ("172.16.x.y/32" or a bare address):
+    /// kServerTunnelBase plus the backbone offset. Returns nullopt when
+    /// `backbone_cidr` is not an allocatable backbone address (offset 10 to
+    /// 1023, prefix /32). Pure function.
+    [[nodiscard]] static std::optional<std::string>
+    server_tunnel_for_backbone(std::string_view backbone_cidr);
+
+    /// Record the tunnel address of `server_node_id`, derived from the
+    /// server's backbone allocation with server_tunnel_for_backbone. Call
+    /// allocate_backbone_ip first. The record replaces any earlier tunnel
+    /// record of the server, for example an address that a peer or the
+    /// sequential allocator assigned. Server records never expire through the
+    /// lease sweep and never move the sequential cursor. Persists only when
+    /// the record changed. Returns the record, or an allocation with an empty
+    /// base_network when the server has no valid backbone allocation.
+    [[nodiscard]] Allocation assign_server_tunnel_ip(std::string_view server_node_id);
+
     /// Set callback for allocation changes (gossip broadcast).
     using BackboneCallback = std::function<void(const BackboneAllocationDelta&)>;
     void set_backbone_callback(BackboneCallback cb) { backbone_callback_ = std::move(cb); }

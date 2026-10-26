@@ -51,4 +51,15 @@ struct BackboneAllocationDelta {
 //   Shared:   172.20.0.0/14,  default /30, expandable
 //   Backbone: 172.16.0.0/22,  per-server /32 (server mesh)
 
+/// First address of the server tunnel range, 10.64.252.0/22, inside the
+/// client plane. A server answers its private API on the address at the same
+/// offset as its backbone address in 172.16.0.0/22 (172.16.1.7 maps to
+/// 10.64.253.7). The backbone allocation is unique across the fleet, so the
+/// server tunnel address is unique too. The range is above the addresses that
+/// the sequential allocator gave out before tree operations.
+inline constexpr uint32_t kServerTunnelBase = (10u << 24) | (64u << 16) | (252u << 8);
+
+/// Number of addresses in the server tunnel range (the backbone block size).
+inline constexpr uint32_t kServerTunnelSize = 1024;
+
 } // namespace nexus::ipam

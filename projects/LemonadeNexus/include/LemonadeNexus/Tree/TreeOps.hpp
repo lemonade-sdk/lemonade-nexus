@@ -379,9 +379,10 @@ void apply_effect(TreeState::NodeMap& nodes, const TreeOpEffect& effect);
 //
 // Endpoint tunnel addresses come from the tree, not
 // from a per-server IPAM file. The tunnel pool is 10.64.0.0/10. Offsets below
-// kTreeTunnelFirstOffset (10.64.0.0/16) stay with IPAMService, which allocates
-// server addresses and /api/ipam/allocate requests sequentially from the
-// bottom of the pool. A join takes the first free /32 at or after a start
+// kTreeTunnelFirstOffset (10.64.0.0/16) stay with IPAMService: server
+// addresses in 10.64.252.0/22 follow each server's backbone allocation
+// (ipam::kServerTunnelBase), and addresses below that are records from before
+// tree operations. A join takes the first free /32 at or after a start
 // offset derived from the node id, probing upward and wrapping inside
 // [kTreeTunnelFirstOffset, kTreeTunnelLastOffset]. "Free" means that no tree
 // node holds the address, so a deleted node's address is free again at once on

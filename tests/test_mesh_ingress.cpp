@@ -96,6 +96,101 @@ TEST(MeshIngress, ExposedServiceReachableFromPeer) {
     if (api_thread.joinable()) api_thread.join();
 }
 
+// A client reaches the private API of the server it joined at the server's
+// tunnel address, through the server peer's plane route. When every server
+// bound 10.64.0.10, the first endpoint that a server allocated held that
+// address too. A listed peer on the server's address would get a /32 route, a
+// longer match than the plane route, and the client's private API requests
+// would go to that peer. The client must refuse the peer's claim.
+TEST(MeshIngress, PrivateApiStaysOnTheServerWhenAPeerClaimsItsAddress) {
+    ASSERT_GE(sodium_init(), 0);
+    const std::string server_ip = "10.64.252.37";
+    constexpr uint16_t kPrivatePort = 9101;
+
+    const auto serve = [](httplib::Server& api, const std::string& body) {
+        api.Get("/who", [body](const httplib::Request&, httplib::Response& res) {
+            res.set_content(body, "text/plain");
+        });
+        return api.bind_to_any_port("127.0.0.1");
+    };
+    httplib::Server server_api;
+    httplib::Server peer_api;
+    const int server_api_port = serve(server_api, "server");
+    const int peer_api_port = serve(peer_api, "peer");
+    ASSERT_GT(server_api_port, 0);
+    ASSERT_GT(peer_api_port, 0);
+    std::thread server_thread([&] { server_api.listen_after_bind(); });
+    std::thread peer_thread([&] { peer_api.listen_after_bind(); });
+
+    const auto server_keys = lnsdk::BoringtunMesh::generate_keypair();
+    const auto peer_keys = lnsdk::BoringtunMesh::generate_keypair();
+    const auto client_keys = lnsdk::BoringtunMesh::generate_keypair();
+    const auto config = [](const std::pair<std::string, std::string>& keys,
+                           const std::string& tunnel_ip) {
+        lnsdk::BoringtunConfig cfg;
+        cfg.private_key = keys.first;
+        cfg.public_key = keys.second;
+        cfg.tunnel_ip = tunnel_ip + "/32";
+        cfg.allowed_ips = {"10.64.0.0/10"};
+        return cfg;
+    };
+
+    // The server and the peer both answer on the server's address.
+    lnsdk::BoringtunMesh server;
+    lnsdk::BoringtunMesh peer;
+    ASSERT_TRUE(server.start(config(server_keys, server_ip)));
+    ASSERT_TRUE(peer.start(config(peer_keys, server_ip)));
+    ASSERT_TRUE(server.tcp_ingress(kPrivatePort,
+                                   "tcp:127.0.0.1:" + std::to_string(server_api_port)));
+    ASSERT_TRUE(peer.tcp_ingress(kPrivatePort, "tcp:127.0.0.1:" + std::to_string(peer_api_port)));
+
+    // The client joined the server; the join gave it the server's address.
+    auto client_cfg = config(client_keys, "10.65.0.9");
+    client_cfg.server_public_key = server_keys.second;
+    client_cfg.server_endpoint = "127.0.0.1:" + std::to_string(server.bound_port());
+    client_cfg.server_tunnel_ip = server_ip;
+    lnsdk::BoringtunMesh client;
+    ASSERT_TRUE(client.start(client_cfg));
+
+    lnsdk::MeshPeer client_entry;
+    client_entry.mesh_pubkey = client_keys.second;
+    client_entry.tunnel_ip = "10.65.0.9/32";
+    client_entry.endpoint = "127.0.0.1:" + std::to_string(client.bound_port());
+    ASSERT_TRUE(server.sync_peers({client_entry}).ok);
+    ASSERT_TRUE(peer.sync_peers({client_entry}).ok);
+
+    lnsdk::MeshPeer claimant;
+    claimant.node_id = "claimant";
+    claimant.mesh_pubkey = peer_keys.second;
+    claimant.tunnel_ip = server_ip + "/32";
+    claimant.endpoint = "127.0.0.1:" + std::to_string(peer.bound_port());
+    ASSERT_TRUE(client.sync_peers({claimant}).ok);
+
+    const uint16_t egress = client.tcp_egress(server_ip, kPrivatePort);
+    ASSERT_NE(egress, 0);
+    httplib::Client http("127.0.0.1", egress);
+    http.set_connection_timeout(5, 0);
+    http.set_read_timeout(5, 0);
+    httplib::Result res;
+    const auto deadline = std::chrono::steady_clock::now() + 15s;
+    do {
+        res = http.Get("/who");
+        if (res && res->status == 200) break;
+        std::this_thread::sleep_for(200ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+
+    ASSERT_TRUE(res) << "no response from the private API address";
+    EXPECT_EQ(res->body, "server") << "the private API request went to a peer";
+
+    client.stop();
+    peer.stop();
+    server.stop();
+    server_api.stop();
+    peer_api.stop();
+    server_thread.join();
+    peer_thread.join();
+}
+
 TEST(MeshIngress, IngressRejectedWhenInactive) {
     lnsdk::BoringtunMesh idle;
     EXPECT_FALSE(idle.tcp_ingress(8080, "tcp:127.0.0.1:80"));

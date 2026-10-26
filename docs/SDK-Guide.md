@@ -207,7 +207,7 @@ Join is composite — one call does everything:
 
 1. Authenticate (Ed25519 challenge-response when an identity is set)
 2. Create the endpoint node in the permission tree
-3. Allocate the tunnel IP from IPAM (`10.64.0.x`)
+3. Receive the tunnel IP that the join operation assigns from the tree (`10.65.x.x`)
 4. Bring the in-process dataplane up
 
 **Response fields:**
@@ -215,8 +215,8 @@ Join is composite — one call does everything:
 | Field | Example | Description |
 |-------|---------|-------------|
 | `node_id` | `09ba6947...` | Your unique node ID |
-| `tunnel_ip` | `10.64.0.10/32` | Your mesh tunnel IP |
-| `server_tunnel_ip` | `10.64.0.1` | Server's tunnel IP |
+| `tunnel_ip` | `10.65.12.34/32` | Your mesh tunnel IP |
+| `server_tunnel_ip` | `10.64.252.37` | The tunnel IP of the server that answered the join; its private API listens there |
 | `mesh_pubkey` | `base64...` | Server's mesh public key |
 | `mesh_endpoint` | `<ip>:51940` | Server's mesh endpoint |
 

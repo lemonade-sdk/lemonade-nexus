@@ -99,7 +99,7 @@ public:
     /// cannot accept any binding.
     [[nodiscard]] bool verify_identity_binding(const ServerCertificate& cert) const;
 
-    /// Set the IPAM service for tunnel IP allocation during ServerHello exchange.
+    /// Set the IPAM service that receives the backbone allocations gossip replicates.
     void set_ipam(ipam::IPAMService* ipam);
 
     /// Set the boringtun service for backbone peer provisioning.
@@ -116,9 +116,6 @@ public:
     /// server holds no tree.
     [[nodiscard]] bool retain_local_delta(
             const storage::FileStorageService::RetainedDelta& rec);
-
-    /// Get the tunnel IP assigned to this server (empty if not yet assigned).
-    [[nodiscard]] std::string our_tunnel_ip() const;
 
     /// Our own server_id from the installed certificate (nullopt if unenrolled).
     /// Used by admission to stop a candidate claiming the root's own identity.
@@ -684,7 +681,7 @@ private:
     /// Tier 1 membership per finalized state; unset denies tier1 labels.
     std::function<bool(const std::string&)> tier1_membership_;
 
-    // --- Shared mesh state (tunnel IP + NS slots) ---
+    // --- Shared mesh state (backbone identity, region, NS slots) ---
     // One lock for the mutable mesh-contact state written on the io thread
     // and read from the main thread and the status API. Never held together
     // with peers_mutex_ or transfer_mutex_; external calls (DNS, packet
@@ -774,10 +771,9 @@ private:
     }
     [[nodiscard]] bool test_pool_has_uncertain_write() const;
 
-    // IPAM for tunnel IP allocation during ServerHello exchange
+    // IPAM that holds the backbone allocations gossip replicates.
     ipam::IPAMService*               ipam_{nullptr};
     boringtun::BoringtunService*     boringtun_{nullptr};
-    std::string                      our_tunnel_ip_;     // assigned by peer or self
     // Backbone identity, under mesh_state_mutex_.
     std::string                      our_backbone_ip_;   // 172.16.0.X backbone
     std::string                      our_backbone_node_id_;

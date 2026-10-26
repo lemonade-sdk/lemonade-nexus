@@ -273,6 +273,19 @@ protected:
         return heartbeat_endpoints;
     }
 
+    // The tunnel address the peer list gives the other endpoint.
+    std::mutex  listed_peer_mtx;
+    std::string listed_peer_ip{"10.64.0.4/32"};
+
+    void set_listed_peer_ip(std::string ip) {
+        std::lock_guard lock(listed_peer_mtx);
+        listed_peer_ip = std::move(ip);
+    }
+    std::string listed_peer_tunnel_ip() {
+        std::lock_guard lock(listed_peer_mtx);
+        return listed_peer_ip;
+    }
+
     // The stand-in server is the one Tier 1 member of a four-member epoch:
     // the client verifies it before it sends a tree request.
     nexus::crypto::Ed25519Keypair server_identity{};
@@ -307,7 +320,7 @@ protected:
             nlohmann::json peer = {
                 {"node_id", kPeerId},
                 {"mesh_pubkey", peer_keys.second},
-                {"tunnel_ip", "10.64.0.4/32"},
+                {"tunnel_ip", listed_peer_tunnel_ip()},
                 {"endpoint", "127.0.0.1:" + std::to_string(peer_mesh.bound_port())},
                 {"last_seen", 0},
             };
@@ -595,6 +608,28 @@ TEST_F(SdkMeshPrivateApiTest, HandshakeIsMatchedToItsPeerByMeshKey) {
         auto peers = client->get_mesh_peers();
         return peers.size() == 1 && peers[0].last_handshake > 0 && peers[0].is_online;
     }, std::chrono::seconds(15))) << "the peer's handshake was not attributed to it";
+    client->disable_mesh();
+}
+
+// The private API answers on the tunnel address of the server that the client
+// joined. A listed peer that claims the same address (all servers and the
+// first endpoint each server allocated once held 10.64.0.10) must not take
+// that traffic: the private API must still reach the server.
+TEST_F(SdkMeshPrivateApiTest, APeerOnTheServerAddressDoesNotTakeThePrivateApi) {
+    LN_REQUIRE_TEST_TRUST();
+    set_listed_peer_ip("10.64.0.1/32");  // the stand-in server's tunnel address
+    auto client = joined_client();
+    lnsdk::MeshConfig cfg;
+    cfg.heartbeat_interval_sec = 3600;
+    client->enable_mesh(cfg);
+    // The orchestrator stores the list only after it synced the routes.
+    ASSERT_TRUE(wait_for([&] { return client->get_mesh_peers().size() == 1; },
+                         std::chrono::seconds(10)));
+
+    const int before = peer_list_gets.load();
+    auto peers = client->fetch_mesh_peers(kNodeId);
+    EXPECT_TRUE(peers.ok) << "the private API did not reach the server: " << peers.error;
+    EXPECT_GT(peer_list_gets.load(), before);
     client->disable_mesh();
 }
 
