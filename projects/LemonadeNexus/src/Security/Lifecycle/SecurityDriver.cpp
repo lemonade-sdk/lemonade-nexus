@@ -762,6 +762,12 @@ bool SecurityDriver::is_founding_member(const NodeId& node) const {
                        [&node](const auto& entry) { return entry.first == node; });
 }
 
+bool SecurityDriver::is_verified_authority_member(const NodeId& node) const {
+    return authority_.has_value() &&
+           std::find(authority_->members.begin(), authority_->members.end(), node) !=
+               authority_->members.end();
+}
+
 void SecurityDriver::begin_founding_observations() {
     // One challenge per peer per pass: the service holds one pending challenge
     // per subject. The liveness cadence repeats the pass until continuity has
@@ -1673,8 +1679,11 @@ std::optional<CandidateReadiness> SecurityDriver::derive_readiness() const {
             // from its plan, so nothing here is proposable.
             return std::nullopt;
         }
-        readiness.entries.push_back({node, incarnation->second,
-                                     verdict->second.evidence_digest, key->second});
+        // The plan-bound context, not this member's evidence digest: each
+        // member verified different evidence (its own nonce), and readiness
+        // commits only when every voter derives the same record.
+        readiness.entries.push_back({node, incarnation->second, verdict->second.context_digest,
+                                     key->second});
     }
     std::sort(readiness.entries.begin(), readiness.entries.end());
     return readiness;
@@ -2074,8 +2083,8 @@ void SecurityDriver::fail_starved_attempt() {
 
 void SecurityDriver::maybe_renew_final_attestation() {
     // Only while the readiness set is still forming. Once it committed, the
-    // finalized record carries the evidence digests and freshness no longer
-    // gates anything.
+    // finalized record stands for a quorum of fresh verifications and
+    // freshness no longer gates anything.
     const EpochManager* epochs = runtime_.epochs();
     const EpochTransition* transition = epochs->transition();
     if (transition == nullptr || readiness_.has_value() || !plan_.has_value() ||

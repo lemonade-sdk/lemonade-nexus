@@ -92,6 +92,10 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
                       [this](const NodeId& node) {
                           return driver_.is_founding_member(node);
                       },
+                  .authority_member =
+                      [this](const NodeId& node) {
+                          return driver_.is_verified_authority_member(node);
+                      },
                   // Address-only capture as above: the storage service, when
                   // enabled, is built after the router.
                   .storage_unlock_challenger =

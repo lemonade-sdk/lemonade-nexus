@@ -130,7 +130,11 @@ bool SecurityRouter::challenger_is_member(const NodeId& from) const {
     };
     const EpochManager* epochs = runtime_.epochs();
     if (epochs == nullptr) {
-        return pre_epoch_challenger(from);
+        // No epoch state here: before Epoch 1, or a Tier 2 server after it.
+        // The Tier 2 case knows the current Tier 1 from its verified
+        // authority chain, never from a peer's claim.
+        return pre_epoch_challenger(from) ||
+               (config_.authority_member && config_.authority_member(from));
     }
     const EpochState& cur = epochs->current();
     if (cur.id == 0) {
@@ -418,7 +422,7 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) 
             return route_challenge(std::get<AttestationChallenge>(message.body), message.sender,
                                    now_ms);
         case SecurityMessageKind::AttestationEvidence:
-            return route_evidence(std::get<AttestationEvidence>(message.body));
+            return route_evidence(std::get<AttestationEvidence>(message.body), now_ms);
         case SecurityMessageKind::AttestationEvidenceStart:
             return route_evidence_start(std::get<AttestationEvidenceStart>(message.body), now_ms);
         case SecurityMessageKind::AttestationEvidenceChunk:
@@ -429,10 +433,10 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) 
                                       message.sender, now_ms);
         case SecurityMessageKind::SvsmAkActivationOffer:
             return route_activation_offer(std::get<SvsmAkActivationOfferMessage>(message.body),
-                                          message.sender);
+                                          message.sender, now_ms);
         case SecurityMessageKind::SvsmAkActivationResponse:
             return route_activation_response(
-                std::get<SvsmAkActivationResponseMessage>(message.body));
+                std::get<SvsmAkActivationResponseMessage>(message.body), now_ms);
         case SecurityMessageKind::HotStuffProposal:
             return route_proposal(std::get<ProposalMessage>(message.body), message.sender);
         case SecurityMessageKind::HotStuffVote:
@@ -879,15 +883,17 @@ RouteResult SecurityRouter::route_challenge(const AttestationChallenge& challeng
     return delivered();
 }
 
-RouteResult SecurityRouter::route_evidence(const AttestationEvidence& evidence) {
+RouteResult SecurityRouter::route_evidence(const AttestationEvidence& evidence,
+                                           uint64_t now_ms) {
     if (evidence.purpose == AttestationPurpose::PlatformEnrollment) {
         EnrollmentRefusal refusal{EnrollmentRefusal::None};
         auto offer = runtime_.attestation().receive_enrollment_evidence(
             evidence, runtime_.self(), &refusal);
         if (!offer) return drop(DropReason::ServiceRejected, code(refusal));
-        (void)send(evidence.node_id,
-                   compose(SecurityMessageKind::SvsmAkActivationOffer, *offer,
-                           evidence.epoch));
+        (void)reply(evidence.node_id,
+                    compose(SecurityMessageKind::SvsmAkActivationOffer, *offer,
+                            evidence.epoch),
+                    now_ms);
         return delivered();
     }
     const AttestationVerdict verdict = runtime_.attestation().receive_evidence(evidence);
@@ -902,46 +908,52 @@ RouteResult SecurityRouter::route_evidence_start(const AttestationEvidenceStart&
     if (!challenge) return drop(DropReason::ServiceRejected,
                                 code(EvidenceTransferFailure::NoLiveChallenge));
     return settle_transfer(
-        transfer_receiver_.begin(start.evidence.node_id, start, *challenge, now_ms));
+        transfer_receiver_.begin(start.evidence.node_id, start, *challenge, now_ms), now_ms);
 }
 
 RouteResult SecurityRouter::route_evidence_chunk(const AttestationEvidenceChunk& chunk,
                                                  const NodeId& from, uint64_t now_ms) {
-    return settle_transfer(transfer_receiver_.chunk(from, chunk, now_ms));
+    return settle_transfer(transfer_receiver_.chunk(from, chunk, now_ms), now_ms);
 }
 
 RouteResult SecurityRouter::route_evidence_end(const AttestationEvidenceEnd& end,
                                                const NodeId& from, uint64_t now_ms) {
-    return settle_transfer(transfer_receiver_.end(from, end, now_ms));
+    return settle_transfer(transfer_receiver_.end(from, end, now_ms), now_ms);
 }
 
-RouteResult SecurityRouter::settle_transfer(EvidenceTransferResult result) {
-    if (result.ok()) return route_evidence(*result.evidence);
+RouteResult SecurityRouter::settle_transfer(EvidenceTransferResult result, uint64_t now_ms) {
+    if (result.ok()) return route_evidence(*result.evidence, now_ms);
     return result.failure == EvidenceTransferFailure::None
                ? delivered() : drop(DropReason::ServiceRejected, code(result.failure));
 }
 
 RouteResult SecurityRouter::route_activation_offer(const SvsmAkActivationOfferMessage& offer,
-                                                   const NodeId& from) {
+                                                   const NodeId& from, uint64_t now_ms) {
+    // Loopback is exempt from the membership gate, as for a challenge: this
+    // node enrolling its own AK is the observer of its own final attestation.
     if (offer.subject_node != runtime_.self() || offer.observer != from ||
-        !(challenger_is_member(from) || storage_challenger(from, Digest{})))
+        !(from == runtime_.self() || challenger_is_member(from) ||
+          storage_challenger(from, Digest{})))
         return drop(DropReason::NotMember);
     if (evidence_producer_ == nullptr) return drop(DropReason::NoService);
     auto response = evidence_producer_->activate(offer);
     if (!response) return drop(DropReason::NoService);
-    (void)send(from, compose(SecurityMessageKind::SvsmAkActivationResponse,
-                             *response, response->epoch));
+    (void)reply(from,
+                compose(SecurityMessageKind::SvsmAkActivationResponse, *response,
+                        response->epoch),
+                now_ms);
     return delivered();
 }
 
 RouteResult SecurityRouter::route_activation_response(
-    const SvsmAkActivationResponseMessage& response) {
+    const SvsmAkActivationResponseMessage& response, uint64_t now_ms) {
     if (response.observer != runtime_.self()) return drop(DropReason::SenderMismatch);
     auto challenge = runtime_.attestation().receive_activation_response(response);
     if (!challenge) return drop(DropReason::ServiceRejected);
-    (void)send(response.subject_node,
-               compose(SecurityMessageKind::AttestationChallenge, *challenge,
-                       challenge->epoch));
+    (void)reply(response.subject_node,
+                compose(SecurityMessageKind::AttestationChallenge, *challenge,
+                        challenge->epoch),
+                now_ms);
     return delivered();
 }
 
@@ -964,6 +976,13 @@ SecurityMessage SecurityRouter::compose(SecurityMessageKind kind, SecurityBody b
     message.sender = runtime_.self();
     message.body = std::move(body);
     return message;
+}
+
+bool SecurityRouter::reply(const NodeId& to, SecurityMessage message, uint64_t now_ms) {
+    if (to == runtime_.self()) {
+        return deliver_local(std::move(message), now_ms).delivered;
+    }
+    return send(to, message);
 }
 
 bool SecurityRouter::send(const NodeId& to, const SecurityMessage& message) {

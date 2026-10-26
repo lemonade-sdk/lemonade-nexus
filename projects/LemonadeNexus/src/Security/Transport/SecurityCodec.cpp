@@ -430,7 +430,7 @@ bool encode_readiness(Writer& w, const CandidateReadiness& r) {
     for (const auto& entry : r.entries) {
         put_node(w, entry.node);
         w.u64(entry.incarnation);
-        w.fixed(entry.evidence_digest);
+        w.fixed(entry.attestation_context);
         w.fixed(entry.vote_key);
     }
     return true;
@@ -916,7 +916,7 @@ bool decode_readiness(Reader& r, CandidateReadiness& out) {
     out.entries.resize(count);
     for (auto& entry : out.entries) {
         if (!(get_node(r, entry.node) && r.u64(entry.incarnation) &&
-              r.fixed(entry.evidence_digest) && r.fixed(entry.vote_key))) {
+              r.fixed(entry.attestation_context) && r.fixed(entry.vote_key))) {
             return false;
         }
     }

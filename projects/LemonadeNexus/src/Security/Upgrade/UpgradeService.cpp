@@ -288,6 +288,16 @@ void UpgradeService::witness() {
         now_ms_ - pending_witness_->sent_ms < constants::kUpgradeWitnessIntervalMs) {
         return;
     }
+    // Challenge only a subject whose signed status says it runs the release
+    // and is healthy; on_verdict requires the same before it observes. The
+    // attempt budget per chain position is small, and an updater installs on
+    // its own timer, minutes after its turn opens. Challenges sent before the
+    // install would spend the whole budget and leave the turn open forever.
+    const auto status = fresh_status(*subject);
+    if (!status || status->running_release != state_.release_number ||
+        (status->flags & kUpgradeStatusHealthy) == 0) {
+        return;
+    }
     const Digest context = upgrade_health_attestation_context(
         config_.network_id, state_.release_number, *subject, state_.head);
     auto challenge = runtime_.attestation().create_challenge(
