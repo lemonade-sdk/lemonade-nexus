@@ -728,10 +728,19 @@ std::vector<NodeId> UpgradeService::tier2_participants(const std::vector<NodeId>
     return out;
 }
 
-std::optional<UpgradeRecord> UpgradeService::derive_start() const {
-    if (chain_ == nullptr || !chain_->current() || state_.in_turn.has_value()) {
-        return std::nullopt;
-    }
+UpgradeService::StartBase UpgradeService::start_base() const {
+    StartBase base{state_.sequence, state_.head, state_.in_turn.has_value()};
+    if (pending_records_.empty()) return base;
+    const auto& [sequence, entry] = *pending_records_.rbegin();
+    if (sequence <= state_.sequence) return base;
+    // Turn opens a turn; Upgraded and Halt close it; a Start would have
+    // replaced this node's state when it arrived.
+    return StartBase{sequence, upgrade_record_digest(entry.first),
+                     entry.first.event == UpgradeEvent::Turn};
+}
+
+std::optional<UpgradeRecord> UpgradeService::derive_start(const StartBase& base) const {
+    if (chain_ == nullptr || !chain_->current() || base.turn_open) return std::nullopt;
     const auto& approval = chain_->current()->approval;
     if (approval.release_number <= state_.release_number) return std::nullopt;
     const auto members = current_members();
@@ -765,6 +774,10 @@ std::optional<UpgradeRecord> UpgradeService::derive_start() const {
 std::optional<UpgradeRecord> UpgradeService::next_record() const {
     std::optional<UpgradeRecord> record;
     const auto members = current_members();
+    const StartBase base = start_base();
+    // Behind the finalized head, this node cannot judge the open rollout's
+    // next record; it derives a Start only.
+    const bool behind = base.sequence != state_.sequence;
     const auto threshold_for = [&](const NodeId& subject) {
         return witness_threshold(
             established_fact_context(config_.network_id, current_epoch(), members), subject);
@@ -788,7 +801,7 @@ std::optional<UpgradeRecord> UpgradeService::next_record() const {
         out.observations = std::move(held);
         return out;
     };
-    if (state_.active() && !state_.halted) {
+    if (!behind && state_.active() && !state_.halted) {
         if (state_.in_turn.has_value()) {
             const NodeId subject = *state_.in_turn;
             if (const auto status = fresh_status(subject);
@@ -826,11 +839,13 @@ std::optional<UpgradeRecord> UpgradeService::next_record() const {
             }
         }
     }
-    if (!record) record = derive_start();
+    if (!record) record = derive_start(base);
     if (record) {
+        // A Start extends the base; every other record extends this node's
+        // own state, and the two are the same when it is not behind.
         record->network_id = config_.network_id;
-        record->sequence = state_.sequence + 1;
-        record->previous = state_.head;
+        record->sequence = base.sequence + 1;
+        record->previous = base.head;
     }
     return record;
 }
@@ -859,7 +874,7 @@ std::optional<ProposedPayload> UpgradeService::propose(const HotStuffService& co
     ProposedPayload out;
     out.payload = upgrade_record_payload(*record);
     if (out.payload.body.empty()) return std::nullopt;
-    out.previous_state_root = state_.head;
+    out.previous_state_root = record->previous;
     out.proposed_state_root = upgrade_record_digest(*record);
     out.timestamp_hint = 0;
     return out;
@@ -874,15 +889,27 @@ bool UpgradeService::validate(const HotStuffService& consensus, const Proposal& 
         spdlog::debug("[upgrade] vote withheld: an earlier upgrade block is not committed");
         return false;
     }
-    if (proposal.previous_state_root != state_.head ||
-        proposal.proposed_state_root != upgrade_record_digest(*record)) {
+    // A Start may extend a verified record this node holds ahead of a gap;
+    // every other record must extend this node's own state.
+    const StartBase base = record->event == UpgradeEvent::Start
+                               ? start_base()
+                               : StartBase{state_.sequence, state_.head, false};
+    const bool rebased = base.sequence != state_.sequence;
+    if (proposal.previous_state_root != base.head ||
+        proposal.proposed_state_root != upgrade_record_digest(*record) ||
+        (rebased && (record->sequence != base.sequence + 1 || record->previous != base.head))) {
         spdlog::debug("[upgrade] vote withheld: record {} does not extend sequence {}",
-                      record->sequence, state_.sequence);
+                      record->sequence, base.sequence);
+        return false;
+    }
+    if (rebased && base.turn_open) {
+        spdlog::debug("[upgrade] vote withheld: {}",
+                      upgrade_record_failure_name(UpgradeRecordFailure::TurnOpen));
         return false;
     }
     const auto witnesses = witnesses_for(proposal.epoch);
     const auto failure =
-        check_upgrade_record(state_, *record, witnesses ? &*witnesses : nullptr, false);
+        check_upgrade_record(state_, *record, witnesses ? &*witnesses : nullptr, rebased);
     if (failure != UpgradeRecordFailure::None) {
         spdlog::debug("[upgrade] vote withheld: {}", upgrade_record_failure_name(failure));
         return false;
