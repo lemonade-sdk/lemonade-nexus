@@ -2160,15 +2160,7 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
     (void)store_.append_authority({to_epoch, epochs->current().authority_public_key,
                                    epochs->current().participant_set_digest, dkg_digest});
     store_.discard_vote_key(old_epoch);
-    plan_.reset();
-    readiness_.reset();
-    state_ready_.clear();
-    boundary_failed_.clear();
-    final_verdict_ms_.clear();
-    final_challenge_ms_.clear();
-    transition_attests_.clear();
-    plans_committed_ = 0;
-    dkg_authorized_ms_ = 0;
+    clear_boundary_state();
     // Observations expire at the boundary: the new epoch's members are the new
     // observers, and continuity has to be re-established under them.
     if (!enter_eligibility_epoch(to_epoch, epochs->current().tier1_members)) {
@@ -2184,6 +2176,123 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
         handler->on_consensus_reset();
     }
     announce_epoch(checkpoint, dkg_digest);
+}
+
+void SecurityDriver::clear_boundary_state() {
+    plan_.reset();
+    readiness_.reset();
+    state_ready_.clear();
+    boundary_failed_.clear();
+    final_verdict_ms_.clear();
+    final_challenge_ms_.clear();
+    transition_attests_.clear();
+    plans_committed_ = 0;
+    dkg_authorized_ms_ = 0;
+}
+
+bool SecurityDriver::follow_finalized_handoff(const EpochHandoffProofMsg& link) {
+    EpochManager* epochs = runtime_.epochs();
+    if (epochs == nullptr || !authority_.has_value() ||
+        (phase_ != DriverPhase::Active && phase_ != DriverPhase::Syncing)) {
+        return false;
+    }
+    const EpochHandoff& handoff = link.handoff;
+    const EpochId old_epoch = epochs->current().id;
+    if (authority_->epoch != old_epoch || handoff.from_epoch != old_epoch) {
+        return false;
+    }
+    // The same chain-link verification a stranger runs: linkage, membership,
+    // key hygiene, and the commit proof under this epoch's frozen vote keys.
+    // The sender's word and this node's local boundary state count for
+    // nothing; a link that does not verify changes nothing.
+    auto advanced = advance_epoch_authority(*authority_, handoff, link.proof);
+    auto* verified = std::get_if<VerifiedEpochAuthority>(&advanced);
+    if (verified == nullptr) {
+        return false;
+    }
+    VerifiedEpochAuthority next = std::move(*verified);
+    const Digest checkpoint = next.checkpoint;
+
+    // Serving the new epoch needs exactly what an activating newcomer needs:
+    // the handoff names this node with the vote key it registered, and this
+    // node holds the DKG outcome the handoff names.
+    const bool named = std::find(handoff.members.begin(), handoff.members.end(), config_.self) !=
+                       handoff.members.end();
+    std::optional<DkgResult> dkg =
+        pending_dkg_.has_value() ? std::move(pending_dkg_) : take_dkg_result_keeping_outbox();
+    pending_dkg_.reset();
+    if (named && !dkg.has_value()) {
+        // A named participant whose own ceremony is still running waits for
+        // its outcome. Waiting grants nothing, and it ends: the stall window
+        // abandons the session, and the next verified link then finds none.
+        const DkgSession* session = runtime_.authority().dkg();
+        if (session != nullptr && session->target_epoch() == handoff.to_epoch &&
+            session->phase() != DkgPhase::Failed) {
+            return false;
+        }
+    }
+    const auto own_key = vote_pubs_mine_.find(handoff.to_epoch);
+    const auto listed_key = handoff.vote_keys.find(config_.self);
+    const bool can_serve = named && dkg.has_value() &&
+                           dkg->group_public_key == handoff.group_public_key &&
+                           dkg->transcript_digest == handoff.dkg_transcript_digest &&
+                           own_key != vote_pubs_mine_.end() &&
+                           vote_keys_mine_.contains(handoff.to_epoch) &&
+                           listed_key != handoff.vote_keys.end() &&
+                           own_key->second == listed_key->second;
+    if (!can_serve) {
+        dkg.reset();
+    }
+
+    // The finished epoch ends here, before anything of the next one starts.
+    (void)runtime_.leave_epoch();
+    dkg_outbox_.reset();
+    clear_boundary_state();
+    store_.discard_vote_key(old_epoch);
+    vote_keys_mine_.erase(old_epoch);
+    vote_pubs_mine_.erase(old_epoch);
+    for (const auto& [kind, handler] : payload_handlers_) {
+        handler->on_consensus_reset();
+    }
+    (void)store_.append_chain_link(encode_security_message(
+        router_.compose(SecurityMessageKind::EpochHandoffProof, link, handoff.to_epoch)));
+    install_authority(std::move(next));
+    epoch_started_ms_ = now_ms_;
+    last_progress_ms_ = now_ms_;
+    last_proposed_view_ = 0;
+    last_committed_root_ = Digest{};
+    last_committed_height_ = 0;
+    behind_since_ms_.reset();
+
+    if (!can_serve) {
+        // The restart rule, applied live: a stored epoch that the verified
+        // chain superseded is history, and the node continues as Tier 2.
+        set_phase(DriverPhase::Idle,
+                  named ? "a finalized handoff names this node, but it holds no matching DKG "
+                          "outcome; it continues as Tier 2"
+                        : "a finalized handoff ended this node's epoch without it; it continues "
+                          "as Tier 2");
+        return true;
+    }
+    EpochVoteKey vote_key = take_own_vote_key(handoff.to_epoch);
+    if (!runtime_.adopt_epoch_from_handoff(handoff, std::move(dkg), std::move(vote_key),
+                                           checkpoint)) {
+        set_phase(DriverPhase::Failed, "verified handoff did not adopt");
+        return true;
+    }
+    spdlog::info("[security] epoch {} adopted from its verified handoff",
+                 handoff.to_epoch.underlying());
+    persist_current_epoch(checkpoint);
+    (void)store_.append_authority({handoff.to_epoch, handoff.group_public_key,
+                                   runtime_.epochs()->current().participant_set_digest,
+                                   handoff.dkg_transcript_digest});
+    if (!enter_eligibility_epoch(handoff.to_epoch,
+                                 runtime_.epochs()->current().tier1_members)) {
+        set_phase(DriverPhase::Failed, "durable eligibility state is corrupt");
+        return true;
+    }
+    set_phase(DriverPhase::Active, "finalized handoff verified; the new epoch role begins");
+    return true;
 }
 
 void SecurityDriver::persist_current_epoch(const Digest& checkpoint) {
@@ -2224,14 +2333,25 @@ void SecurityDriver::on_epoch_announcement(const EpochAnnouncement& announcement
 void SecurityDriver::maybe_request_chain() {
     // An idle Tier 2 node walks toward the head; a member stuck in Syncing
     // asks too, because unanswered sync may mean the mesh moved past its
-    // epoch. Active members are at the head by construction, and Genesis is a
-    // one-shot authority, not a walker.
+    // epoch. An active epoch holder is usually at the head, but it can miss
+    // an activation: its own commit then never moves it. It asks once a hint
+    // of a newer epoch outlived the sync window. Genesis is a one-shot
+    // authority, not a walker.
     if (genesis_node() && (genesis_ == nullptr || !genesis_->finalized())) {
         return;
     }
-    const bool idle_walker = runtime_.epochs() == nullptr && phase_ == DriverPhase::Idle;
+    const EpochManager* epochs = runtime_.epochs();
+    const bool idle_walker = epochs == nullptr && phase_ == DriverPhase::Idle;
     const bool stale_member = phase_ == DriverPhase::Syncing;
-    if (!idle_walker && !stale_member) {
+    const bool behind = epochs != nullptr && phase_ == DriverPhase::Active &&
+                        chain_hint_epoch_ > epochs->current().id;
+    if (!behind) {
+        behind_since_ms_.reset();
+    } else if (!behind_since_ms_.has_value()) {
+        behind_since_ms_ = now_ms_;
+    }
+    const bool stale_holder = behind && now_ms_ - *behind_since_ms_ >= config_.sync_window_ms;
+    if (!idle_walker && !stale_member && !stale_holder) {
         return;
     }
     const EpochId have = authority_.has_value() ? authority_->epoch : 0;
@@ -2316,10 +2436,11 @@ void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& req
 void SecurityDriver::on_authority_chain_page(const AuthorityChainPage& page, const NodeId& from) {
     // Candidate data from a peer. Everything is verified from the pinned
     // Genesis key and the advancing anchor; a page that proves nothing
-    // changes nothing. A stale member in Syncing may advance its ANCHOR here
-    // — a record of verified facts — but its runtime state never moves this
-    // way: on restart the advanced anchor makes it resume as Tier 2.
-    if (runtime_.epochs() != nullptr && phase_ != DriverPhase::Syncing) {
+    // changes nothing. A node that still holds an epoch the page proves
+    // finished follows the verified link off it (follow_finalized_handoff)
+    // and walks on from there like any Tier 2 node.
+    if (runtime_.epochs() != nullptr && phase_ != DriverPhase::Syncing &&
+        phase_ != DriverPhase::Active) {
         return;
     }
     const EpochId before = authority_.has_value() ? authority_->epoch : 0;
@@ -2338,6 +2459,12 @@ void SecurityDriver::on_authority_chain_page(const AuthorityChainPage& page, con
     }
     for (const auto& link : page.links) {
         if (link.handoff.from_epoch != authority_->epoch) {
+            continue;
+        }
+        if (runtime_.epochs() != nullptr) {
+            if (!follow_finalized_handoff(link)) {
+                break;
+            }
             continue;
         }
         auto advanced = advance_epoch_authority(*authority_, link.handoff, link.proof);
@@ -2596,6 +2723,22 @@ void SecurityDriver::on_readiness_proof(const ReadinessProofMsg& message) {
 }
 
 void SecurityDriver::on_epoch_handoff_proof(const EpochHandoffProofMsg& message) {
+    if (runtime_.epochs() != nullptr) {
+        // A holder of the epoch this handoff ends. When it prepared exactly
+        // this handoff, its own commit activates it. When it did not — it
+        // missed a stage of the boundary, or it restarted inside it — its own
+        // commit can never activate it, and the verified proof is the only
+        // way off the finished epoch. The proof also counts as a hint, so a
+        // node that cannot act on it yet keeps asking for the chain.
+        const EpochId held = runtime_.epochs()->current().id;
+        if (message.handoff.from_epoch == held) {
+            chain_hint_epoch_ = std::max(chain_hint_epoch_, held + 1);
+        }
+        if (pending_handoff_digest() != epoch_handoff_digest(message.handoff)) {
+            (void)follow_finalized_handoff(message);
+        }
+        return;
+    }
     if (phase_ != DriverPhase::PendingNextEpoch || !adoption_.has_value()) {
         return;
     }

@@ -321,6 +321,16 @@ Membership and rule changes apply only at the epoch boundary. An epoch can
 legitimately outlive its target duration; the target is a pacing goal, not a
 timer that expires authority.
 
+A current member can miss a boundary stage, for example a lost message or a
+restart inside the boundary. Its own commit of the handoff then does not
+activate it, because it did not prepare the same handoff. It leaves the
+finished epoch when it verifies the finalized handoff proof: the broadcast
+proof, or the authority chain it requests after an announcement of a newer
+epoch. It enters the new epoch as a member only when the handoff names it
+with its registered vote key and it holds the DKG outcome the handoff names.
+Otherwise it continues as Tier 2, as a restart would make it. A proof that
+does not verify changes nothing.
+
 ## Genesis and Trust Continuity
 
 Genesis is a temporary bootstrap authority, not a permanent root:

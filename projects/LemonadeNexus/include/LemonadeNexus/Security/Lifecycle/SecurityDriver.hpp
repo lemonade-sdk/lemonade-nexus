@@ -325,6 +325,19 @@ private:
     /// Asks the mesh for chain links when something hints this node is
     /// behind. The ask is idempotent and free of authority.
     void maybe_request_chain();
+    /// Moves a node that still holds the epoch `link` ends onto the finalized
+    /// result. `link` must verify as the next chain link from this node's
+    /// verified authority, or nothing changes. The node leaves its finished
+    /// epoch. It enters the new one as a member only when the handoff names
+    /// it with its registered vote key and it holds the DKG outcome the
+    /// handoff names; otherwise it continues as Tier 2, the role a restart
+    /// gives it. A named node whose DKG session for that epoch still runs
+    /// changes nothing yet and waits for the session to end. Returns true
+    /// when the node left the epoch.
+    bool follow_finalized_handoff(const EpochHandoffProofMsg& link);
+    /// Clears the member-side boundary pipeline: plan, readiness, final
+    /// verdicts, exclusions, and transcript attests.
+    void clear_boundary_state();
     void broadcast_proof(SecurityMessageKind kind, SecurityBody body, EpochId epoch);
     [[nodiscard]] bool candidate_verify_proof(const Digest& transitions_digest,
                                               const CommitProof& proof) const;
@@ -468,6 +481,10 @@ private:
     /// prompt a chain request; it never becomes state by itself.
     EpochId chain_hint_epoch_ = 0;
     uint64_t chain_request_ms_ = 0;
+    /// When an active epoch holder first saw a hint of a newer epoch. Its own
+    /// commit normally activates that epoch within the sync window; only a
+    /// holder still behind after the window asks for the chain.
+    std::optional<uint64_t> behind_since_ms_;
     std::size_t consumed_equivocations_ = 0;
     /// Peers whose transport certificate the mesh verified. Tier 2 candidates
     /// are challenged from here; the list decides nothing on its own.
