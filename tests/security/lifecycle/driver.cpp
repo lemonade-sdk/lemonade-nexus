@@ -5,8 +5,11 @@
 
 #include "support/lifecycle_mesh.hpp"
 
+#include <LemonadeNexus/Security/Consensus/ConsensusStore.hpp>
+
 #include <algorithm>
 #include <map>
+#include <variant>
 
 namespace lifecycle_test {
 namespace {
@@ -590,6 +593,64 @@ TEST_F(DriverMesh, EveryMemberRestartedAtOnceCommitsAgain) {
             EXPECT_GT(member->runtime->consensus()->state().last_voted_view, voted[member->id])
                 << "round " << round << ": a member did not vote again";
         }
+    }
+}
+
+// Production incident: the committee stopped while its members had last
+// voted in different views (a stage no quorum agreed on, then timed-out views
+// in which only some members voted), and every member restarted at once.
+// Each member resumed at the view after its own last vote; the sync floor is
+// the shared high certificate, below all of them. No view held a quorum and
+// no member led its own view, so nobody proposed a block the others would
+// accept, no timeout certificate formed, and every member re-sent the same
+// timeout vote for hours. The members' timeouts must bring them together.
+TEST_F(DriverMesh, CommitteeRestartedWithDivergentViewsMeetsAgain) {
+    bootstrap();
+    run_until_committed(3);
+    ASSERT_FALSE(HasFatalFailure());
+    const Height before = highest_commit(founders);
+    const HotStuffService& live = *founders[0]->runtime->consensus();
+    const EpochId epoch = *founders[0]->driver->current_epoch();
+
+    // Pairwise different last voted views above every stored view, none of
+    // them a view its own member leads: the state a committee that stopped
+    // mid-stage leaves behind, chosen so that no leader can recover it alone.
+    View floor = 0;
+    for (Node* member : founders) {
+        const HotStuffState state = member->runtime->consensus()->state();
+        floor = std::max({floor, state.last_voted_view, state.high_qc.view});
+    }
+    std::map<NodeId, View> resumed;
+    View next = floor + 2;
+    for (Node* member : founders) {
+        while (live.leader_of(next) == member->id) next = next + 1;
+        resumed[member->id] = next;
+        next = next + 1;
+    }
+
+    mesh.queue.clear();
+    for (Node* member : founders) {
+        restart_node(*member);
+        FileConsensusStore store(member->dir / "consensus");
+        const auto loaded = store.load(epoch);
+        ASSERT_TRUE(std::holds_alternative<HotStuffState>(loaded));
+        HotStuffState state = std::get<HotStuffState>(loaded);
+        state.last_voted_view = resumed[member->id];
+        ASSERT_TRUE(store.store_before_vote(state));
+    }
+    for (Node* member : founders) {
+        member->driver->start(mesh.now_ms);
+        ASSERT_EQ(member->driver->phase(), DriverPhase::Syncing);
+        ASSERT_EQ(member->runtime->consensus()->current_view(), resumed[member->id] + 1);
+    }
+
+    // The pacemaker backs off to kViewTimeoutMaxMs while the views meet.
+    run_until_committed(before + 3, 1500);
+    ASSERT_FALSE(HasFatalFailure()) << "no commit after the divergent restart";
+    for (Node* member : founders) {
+        EXPECT_EQ(member->driver->phase(), DriverPhase::Active);
+        EXPECT_GT(member->runtime->consensus()->state().last_voted_view, resumed[member->id])
+            << "a member did not vote again";
     }
 }
 

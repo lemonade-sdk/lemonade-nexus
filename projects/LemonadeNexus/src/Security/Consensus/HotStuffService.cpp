@@ -552,6 +552,7 @@ HotStuffService::receive_timeout(const TimeoutVote& vote) {
     // is simply not counted.
     auto& ledger = timeouts_by_view_[vote.view];
     if (!ledger.emplace(vote.voter, vote).second) return std::monostate{};
+    synchronize_view();
     if (ledger.size() < config_.quorum) return std::monostate{};
     if (!formed_tcs_.insert(vote.view).second) return std::monostate{};
 
@@ -567,6 +568,38 @@ HotStuffService::receive_timeout(const TimeoutVote& vote) {
 
     current_view_ = std::max(current_view_, vote.view + 1);
     return certificate;
+}
+
+// A member enters a view through a certificate it formed itself or the
+// justify of a proposal it received, and through nothing else. When the whole
+// committee restarts, each member resumes from the view its own safety state
+// names, and those differ by however many views the members voted in before
+// the stop. If no view then holds a quorum of members, no leader proposes a
+// view the others accept, no quorum of timeouts for one view exists, and
+// every member re-sends the same timeout vote until something restarts it
+// again. The timeouts the members already exchange carry their views, so
+// they are enough to meet: f + 1 distinct members' timeouts for views above
+// this one include at least one honest member's, and this member joins the
+// lowest of the f + 1 highest such views. Liveness only. Entering a view is
+// not a vote: last_voted_view_ and the locked certificate still bound every
+// vote, and the view window already bounded what the ledgers hold.
+void HotStuffService::synchronize_view() {
+    const std::size_t members = config_.leader_order.size();
+    if (config_.quorum > members) return;  // no f to derive; a view cannot be proved
+    const std::size_t witnesses = members - config_.quorum + 1;
+    std::map<NodeId, View> highest;
+    for (auto entry = timeouts_by_view_.upper_bound(current_view_);
+         entry != timeouts_by_view_.end(); ++entry) {
+        for (const auto& [node, timeout] : entry->second) {
+            highest[node] = entry->first;  // ascending, so the last write is the highest
+        }
+    }
+    if (highest.size() < witnesses) return;
+    std::vector<View> views;
+    views.reserve(highest.size());
+    for (const auto& [node, view] : highest) views.push_back(view);
+    std::sort(views.begin(), views.end(), [](View a, View b) { return b < a; });
+    current_view_ = std::max(current_view_, views[witnesses - 1]);
 }
 
 std::variant<Proposal, ConsensusFailure> HotStuffService::make_proposal(

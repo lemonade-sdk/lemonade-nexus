@@ -129,6 +129,13 @@ public:
     [[nodiscard]] std::variant<std::monostate, QuorumCertificate, ConsensusFailure> receive_vote(
         const Vote& vote);
 
+    // monostate: counted, no certificate yet. A TC forms once per view at
+    // exactly config.quorum distinct voters. Counting also moves this node's
+    // view: once f + 1 distinct voters hold timeouts for views above the
+    // current one, the node enters the lowest of the f + 1 highest such
+    // views (liveness only; no vote is cast and the safety state is
+    // untouched). Without that, a committee whose members resume from
+    // different views after a restart never forms a certificate again.
     [[nodiscard]] std::variant<std::monostate, TimeoutCertificate, ConsensusFailure>
     receive_timeout(const TimeoutVote& vote);
 
@@ -241,6 +248,9 @@ private:
     [[nodiscard]] bool extends_locked(const Proposal& proposal) const;
     [[nodiscard]] std::size_t pending_count() const;
     [[nodiscard]] std::optional<ConsensusFailure> view_window_failure(View view) const;
+    /// Enters the view that f + 1 distinct timeout voters above the current
+    /// view prove at least one honest member reached. Liveness only.
+    void synchronize_view();
     /// The header and certificate checks every adopted or restored block
     /// passes: binding, justify, and a valid certificate over this block.
     [[nodiscard]] std::optional<ConsensusFailure> certified_block_failure(
