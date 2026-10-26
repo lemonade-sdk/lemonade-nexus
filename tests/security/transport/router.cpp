@@ -82,7 +82,10 @@ struct MemoryTransport : ISecurityTransport {
     MemoryTransport(MemoryMesh& mesh, NodeId self) : mesh(mesh), self(self) {}
 
     bool send_to(const NodeId& peer, std::span<const uint8_t> envelope) override {
-        if (!mesh.nodes.contains(peer) || envelope.size() > constants::kMaxSecurityMessageBytes) {
+        // Like the gossip transport, nothing travels to this node's own
+        // identity: a self-addressed message must take the local path.
+        if (peer == self || !mesh.nodes.contains(peer) ||
+            envelope.size() > constants::kMaxSecurityMessageBytes) {
             return false;
         }
         mesh.queue.push_back({self, peer, {envelope.begin(), envelope.end()}});
@@ -925,6 +928,36 @@ TEST_F(RouterMesh, ActiveEpochActivationOfferIsCurrentMemberOnly) {
     EXPECT_EQ(candidate->producer.activation_calls, 1);
 }
 
+TEST_F(RouterMesh, SelfEnrollmentRepliesTakeTheLocalPath) {
+    // Production incident: a member's own final attestation under the SVSM
+    // profile first enrolls its own AK, so this node is observer and subject
+    // at once. The transport refuses its own identity; the activation answer
+    // must still reach this node's verifier, through the local path.
+    bootstrap_epoch_one();
+    Node* member = founders[0];
+    const auto offer = routed_activation_offer(network, member->id, member->id, 2);
+    member->producer.activation_answer = routed_activation_response(offer);
+    const auto message =
+        member->router->compose(SecurityMessageKind::SvsmAkActivationOffer, offer, 1);
+    EXPECT_TRUE(member->router->deliver_local(message, mesh.now_ms).delivered);
+    EXPECT_EQ(member->producer.activation_calls, 1);
+    // The response reached route_activation_response on this node. No live
+    // exchange stands behind this hand-made offer, so the service refuses it
+    // there; before the fix the response vanished in the transport instead.
+    EXPECT_EQ(member->router->drops(DropReason::ServiceRejected), 1u);
+    EXPECT_TRUE(mesh.queue.empty()) << "a self-addressed reply left through the transport";
+
+    // A remote non-member's offer for this node stays a membership drop.
+    const auto hostile = routed_activation_offer(network, outsider->id, member->id, 2);
+    EXPECT_EQ(member->deliver(outsider->id,
+                              encode_security_message(outsider->router->compose(
+                                  SecurityMessageKind::SvsmAkActivationOffer, hostile, 1)),
+                              mesh.now_ms)
+                  .dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(member->producer.activation_calls, 1);
+}
+
 TEST_F(RouterMesh, ActivationOfferWithoutProducerIsNoService) {
     bootstrap_epoch_one();
     Node* member = founders[0];
@@ -949,6 +982,56 @@ TEST_F(RouterMesh, ActivationOfferWithoutProducerIsNoService) {
     EXPECT_EQ(bare.receive(outsider->id, encode_security_message(hostile_message),
                            mesh.now_ms).dropped,
               DropReason::NotMember);
+}
+
+TEST_F(RouterMesh, NodeWithoutEpochStateAnswersItsVerifiedAuthority) {
+    // Production incident: a Tier 2 server holds no epoch state after Epoch 1,
+    // so the pre-epoch rule (anchor or founder) refused every challenge from
+    // the current Tier 1 as NotMember. Its verified authority names the
+    // committee; that, and nothing a peer claims, admits the challenger.
+    Node* tier2 = outsider;
+    ASSERT_EQ(tier2->runtime->epochs(), nullptr);
+    Node* member = founders[1];
+    Node* stranger = founders[2];
+    const auto challenge_from = [&](Node* sender) {
+        return encode_security_message(sender->router->compose(
+            SecurityMessageKind::AttestationChallenge,
+            gate_passing_challenge(network, tier2->id), 1));
+    };
+    const auto offer_from = [&](Node* sender) {
+        return encode_security_message(sender->router->compose(
+            SecurityMessageKind::SvsmAkActivationOffer,
+            routed_activation_offer(network, sender->id, tier2->id, 1), 1));
+    };
+
+    // Unset, the gate stays closed to everyone but the anchor.
+    EXPECT_EQ(tier2->deliver(member->id, challenge_from(member), mesh.now_ms).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(tier2->producer.calls, 0);
+
+    SecurityRouterConfig config;
+    config.network_id = network;
+    config.genesis_anchor_id = founders[0]->id;
+    config.authority_member = [&](const NodeId& node) { return node == member->id; };
+    SecurityRouter gated(config, *tier2->runtime, *tier2->transport, tier2->events,
+                         *tier2->sealer, &tier2->producer);
+
+    // A member of the verified authority reaches the producer (which answers
+    // nothing here, hence NoService), for a challenge and an activation offer.
+    EXPECT_EQ(gated.receive(member->id, challenge_from(member), mesh.now_ms).dropped,
+              DropReason::NoService);
+    EXPECT_EQ(tier2->producer.calls, 1);
+    EXPECT_EQ(gated.receive(member->id, offer_from(member), mesh.now_ms).dropped,
+              DropReason::NoService);
+    EXPECT_EQ(tier2->producer.activation_calls, 1);
+
+    // Anyone else stays a membership drop before any platform work.
+    EXPECT_EQ(gated.receive(stranger->id, challenge_from(stranger), mesh.now_ms).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(gated.receive(stranger->id, offer_from(stranger), mesh.now_ms).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(tier2->producer.calls, 1);
+    EXPECT_EQ(tier2->producer.activation_calls, 1);
 }
 
 TEST_F(RouterMesh, PreQuorumAnchorChallengeIsBoundedPerWindow) {

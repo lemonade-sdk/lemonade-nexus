@@ -184,14 +184,18 @@ void EpochManager::recompute_phase() {
 }
 
 Digest EpochManager::computed_attestation_root() const {
-    // Sorted by node identity so every verifier derives the same root.
-    CanonicalEncoder encoder("lemonade-nexus/attestation-root:v1");
+    // Sorted by node identity, and over the plan-bound attestation contexts,
+    // so every member derives the same root. The evidence digests differ per
+    // verifier (each challenge has its own nonce), and a root over them would
+    // make the handoff underivable by any other member. Its own domain: the
+    // Genesis root commits to the single verifier's evidence digests instead.
+    CanonicalEncoder encoder("lemonade-nexus/handoff-attestation-root:v1");
     encoder.add_u64(transition_->selected_members.size());
     std::vector<NodeId> sorted = transition_->selected_members;
     std::sort(sorted.begin(), sorted.end());
     for (const auto& node : sorted) {
         encoder.add_bytes(node.bytes);
-        encoder.add_bytes(final_verdicts_.at(node).evidence_digest);
+        encoder.add_bytes(final_verdicts_.at(node).context_digest);
     }
     return encoder.digest();
 }

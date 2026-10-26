@@ -98,9 +98,14 @@ Tier 2 server is not held to a tree log, even when an older release ran one. A
    servers first (those that report a configured attestation collector), then
    Tier 1, each group by SHA-256 of the release number and the node id.
 3. The first server in the order gets a Turn record; its gate says `go`.
-4. It restarts on the new release. Tier 1 witnesses challenge it with an
-   UpgradeHealth attestation. When a witness quorum saw it attested, healthy,
-   and measuring only the new release's hashes, an Upgraded record follows.
+4. It restarts on the new release. When its signed status names the new
+   release and the Healthy flag, Tier 1 witnesses challenge it with an
+   UpgradeHealth attestation. A witness does not challenge earlier: each
+   chain position has a small attempt budget, and the updater installs on its
+   own timer. A Tier 2 server admits these challenges from the Tier 1 members
+   of its verified epoch authority. When a witness quorum saw it attested,
+   healthy, and measuring only the new release's hashes, an Upgraded record
+   follows.
 5. The next server's Turn needs every other participant live. One server is
    down at a time at most.
 6. A `report` with `failed` from the server in its turn finalizes a Halt.

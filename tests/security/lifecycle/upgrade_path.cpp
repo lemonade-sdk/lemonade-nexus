@@ -411,6 +411,42 @@ TEST_F(UpgradePath, TurnsRunOneAtATimeTier2FirstAndOnlyAfterWitnesses) {
     }
 }
 
+// Production incident: the updater installs on its own timer, up to about 17
+// minutes after its turn opens, but the witnesses challenged the subject at
+// once and spent their whole per-position attempt budget (8 attempts, 10 s
+// apart) on the release it still ran. When it finally upgraded, no witness
+// could challenge it again and the turn never closed. A witness now waits
+// for the subject's signed status to name the release.
+TEST_F(UpgradePath, ATurnClosesWhenTheSubjectInstallsLongAfterItOpened) {
+    bootstrap();
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(run_until([&] {
+        return std::all_of(reserves.begin(), reserves.end(),
+                           [](Node* r) { return r->driver->verified_authority() != nullptr; });
+    }));
+    ASSERT_EQ(upgrade(founders.front()).offer_approval(
+                  release_approval_bundle_json(signer->approval(kN1, kN))),
+              ReleaseOfferResult::Adopted);
+    ASSERT_TRUE(run_until([&] { return finalized().release_number == kN1; }));
+    for (Node* node : servers()) upgrade(node).stage(kN1);
+    ASSERT_TRUE(run_until([&] { return finalized().in_turn.has_value(); }));
+    Node* subject = mesh.nodes.at(*finalized().in_turn);
+    ASSERT_FALSE(subject->driver->is_tier1_member()) << "Tier 2 goes first";
+
+    // The subject's turn is open, but its updater has not run yet.
+    const uint64_t budget_ms = (constants::kMaxUpgradeHealthAttemptsPerPosition + 2) *
+                               constants::kUpgradeWitnessIntervalMs;
+    const uint64_t installs_at = mesh.now_ms + budget_ms;
+    while (mesh.now_ms < installs_at) upgrade_step();
+    ASSERT_EQ(finalized().in_turn, subject->id);
+    EXPECT_FALSE(finalized().upgraded.contains(subject->id));
+
+    restart_with(*subject, kN1, kN);
+    upgrade(subject).stage(kN1);
+    EXPECT_TRUE(run_until([&] { return finalized().upgraded.contains(subject->id); }))
+        << "the turn never closed after a late install";
+}
+
 TEST_F(UpgradePath, AServerThatIsDownBlocksTheNextTurn) {
     bootstrap();
     ASSERT_FALSE(HasFatalFailure());
