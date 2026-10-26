@@ -1,0 +1,137 @@
+name: Deps OpenSSL (mobile)
+
+# Builds the static OpenSSL archives for the iOS and Android SDK builds with
+# scripts/build-openssl-mobile.sh and publishes them on the release
+# deps-openssl-<version>-mobile-r<revision> of this repository. Run it by hand
+# once per OpenSSL version, then copy the printed SHA-256 values into
+# LEMONADE_NEXUS_OPENSSL_PREBUILT_SHA256_{IOS,IOSSIMULATOR,ANDROID}_* and the
+# release into LEMONADE_NEXUS_OPENSSL_MOBILE_RELEASE in
+# cmake/libraries/openssl.cmake in a reviewed pull request. The desktop
+# archives (deps-openssl.yml) are a separate release, so their pins stay.
+#
+# The source is the official OpenSSL release tarball, accepted only when its
+# SHA-256 equals both the input and the .sha256 file that OpenSSL publishes.
+# An existing asset is never replaced: a new build would change the pin.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: OpenSSL version (must equal LEMONADE_NEXUS_OPENSSL_PREBUILT_VERSION)
+        required: true
+        default: 3.5.9
+      sha256:
+        description: SHA-256 of openssl-<version>.tar.gz as published by OpenSSL
+        required: true
+        default: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+      revision:
+        description: Archive build of this version; publishes deps-openssl-<version>-mobile-r<revision>
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.version }}
+  SOURCE_SHA256: ${{ inputs.sha256 }}
+  REVISION: ${{ inputs.revision }}
+  IOS_DEPLOYMENT_TARGET: "15.0"
+  ANDROID_API: "24"
+  ANDROID_NDK_VERSION: 27.0.12077973
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download and verify the source tarball
+        run: |
+          base="https://github.com/openssl/openssl/releases/download/openssl-${VERSION}"
+          curl -fsSLO "${base}/openssl-${VERSION}.tar.gz"
+          curl -fsSLO "${base}/openssl-${VERSION}.tar.gz.sha256"
+          actual=$(sha256sum "openssl-${VERSION}.tar.gz" | cut -d' ' -f1)
+          published=$(cut -d' ' -f1 "openssl-${VERSION}.tar.gz.sha256")
+          if [ "$actual" != "$SOURCE_SHA256" ] || [ "$actual" != "$published" ]; then
+            echo "::error::the OpenSSL tarball does not match the expected SHA-256"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openssl-source
+          path: openssl-${{ inputs.version }}.tar.gz
+          if-no-files-found: error
+
+  ios:
+    needs: source
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: openssl-source
+      - name: Build
+        run: |
+          echo "${SOURCE_SHA256}  openssl-${VERSION}.tar.gz" | shasum -a 256 -c -
+          for p in ios-arm64 iossimulator-arm64 iossimulator-x86_64; do
+            scripts/build-openssl-mobile.sh "$p" "openssl-${VERSION}.tar.gz" "out/$p"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openssl-mobile-ios
+          path: out/*.tar.gz
+          if-no-files-found: error
+
+  android:
+    needs: source
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: openssl-source
+      - name: Install the NDK
+        run: |
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_VERSION}" >/dev/null
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          echo "${SOURCE_SHA256}  openssl-${VERSION}.tar.gz" | shasum -a 256 -c -
+          for p in android-arm64-v8a android-armeabi-v7a android-x86_64; do
+            scripts/build-openssl-mobile.sh "$p" "openssl-${VERSION}.tar.gz" "out/$p"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openssl-mobile-android
+          path: out/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [ios, android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: openssl-mobile-*
+          path: out
+          merge-multiple: true
+      - name: Publish the archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="deps-openssl-${VERSION}-mobile-r${REVISION}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --latest=false --target "$GITHUB_SHA" --title "OpenSSL ${VERSION} static archives (iOS, Android)" \
+              --notes "Static OpenSSL ${VERSION} (archive build ${REVISION}; iOS ${IOS_DEPLOYMENT_TARGET}+, Android API ${ANDROID_API}+) for the mobile SDK builds. Built by deps-openssl-mobile.yml from openssl-${VERSION}.tar.gz (SHA-256 ${SOURCE_SHA256}). Not a Nexus release."
+          fi
+          # No --clobber: a pinned archive must never change.
+          gh release upload "$tag" out/*.tar.gz
+          echo "Pin these in cmake/libraries/openssl.cmake:"
+          echo "set(LEMONADE_NEXUS_OPENSSL_MOBILE_RELEASE \"deps-openssl-\${LEMONADE_NEXUS_OPENSSL_PREBUILT_VERSION}-mobile-r${REVISION}\")"
+          for f in out/*.tar.gz; do
+            plat=$(basename "$f" .tar.gz); plat=${plat#openssl-${VERSION}-}
+            var=$(echo "$plat" | tr '[:lower:]-' '[:upper:]_')
+            echo "set(LEMONADE_NEXUS_OPENSSL_PREBUILT_SHA256_${var} \"$(sha256sum "$f" | cut -d' ' -f1)\")"
+          done

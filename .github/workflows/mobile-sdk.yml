@@ -1,0 +1,128 @@
+name: Mobile SDK
+
+# Builds the client SDK for iOS (XCFramework: device arm64, simulator
+# arm64/x86_64) and Android (arm64-v8a, armeabi-v7a, x86_64) with
+# scripts/build-sdk-mobile.sh, checks that only the ln_* API is exported, and
+# analyzes and tests the Flutter plugin in packages/lemonade_nexus_sdk.
+#
+# With a release tag (manual run), uploads the plugin archives
+# lemonade_nexus_sdk-{ios,android}-<VERSION>.zip to that release and prints
+# their SHA-256 values for packages/lemonade_nexus_sdk/native/manifest.json.
+# The tag must match the manifest's base_url (mobile-sdk-v<VERSION>).
+#
+# OpenSSL comes from the pinned mobile archives (deps-openssl-mobile.yml);
+# the build fails with instructions until they are published and pinned.
+
+on:
+  pull_request:
+    paths:
+      - 'projects/LemonadeNexusSDK/**'
+      - 'projects/LemonadeNexus/src/Boringtun/**'
+      - 'packages/lemonade_nexus_sdk/**'
+      - 'crates/boringtun-ffi/**'
+      - 'crates/virtual-netstack/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - 'scripts/build-sdk-mobile.sh'
+      - 'scripts/build-openssl-mobile.sh'
+      - '.github/workflows/mobile-sdk.yml'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release to upload the plugin archives to, e.g. mobile-sdk-v0.9.8 (empty: build only)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  FLUTTER_VERSION: "3.44.4"
+  ANDROID_NDK_VERSION: 27.0.12077973
+
+jobs:
+  ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: |
+          brew install ninja
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+      - name: Build
+        run: scripts/build-sdk-mobile.sh ios-arm64 iossimulator-arm64 iossimulator-x86_64
+      - name: Verify exports
+        run: |
+          xc=build/mobile/dist/ios/lemonade_nexus_sdk.xcframework
+          for bin in "$xc"/*/lemonade_nexus_sdk.framework/lemonade_nexus_sdk; do
+            other=$(nm -gU "$bin" | grep -vc ' _ln_' || true)
+            if [ "$other" != "0" ]; then echo "::error::$bin exports $other non-ln_ symbols"; exit 1; fi
+            test "$(nm -gU "$bin" | grep -c ' _ln_')" -ge 60
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lemonade_nexus_sdk-ios
+          path: build/mobile/dist/lemonade_nexus_sdk-ios-*.zip
+          if-no-files-found: error
+
+  android:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: |
+          brew install ninja
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_VERSION}" >/dev/null
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+      - name: Build
+        run: scripts/build-sdk-mobile.sh android-arm64-v8a android-armeabi-v7a android-x86_64
+      - name: Verify exports and dependencies
+        run: |
+          bin="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/darwin-x86_64/bin"
+          for so in build/mobile/dist/android/jniLibs/*/liblemonade_nexus_sdk.so; do
+            test "$("$bin/llvm-nm" -D --defined-only "$so" | grep -c ' T ln_')" -ge 60
+            if "$bin/llvm-readelf" -d "$so" | grep NEEDED | grep -vE 'liblog|libdl|libm|libc\.so'; then
+              echo "::error::$so needs a library outside the platform"; exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lemonade_nexus_sdk-android
+          path: build/mobile/dist/lemonade_nexus_sdk-android-*.zip
+          if-no-files-found: error
+
+  plugin:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Analyze + test
+        working-directory: packages/lemonade_nexus_sdk
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+  publish:
+    if: inputs.release_tag != ''
+    needs: [ios, android, plugin]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lemonade_nexus_sdk-*
+          path: out
+          merge-multiple: true
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # No --clobber: the manifest pins these bytes.
+          gh release upload "$RELEASE_TAG" out/*.zip
+          echo "Set these in packages/lemonade_nexus_sdk/native/manifest.json:"
+          for f in out/*.zip; do echo "$(basename "$f") sha256 $(sha256sum "$f" | cut -d' ' -f1)"; done
