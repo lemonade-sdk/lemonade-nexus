@@ -207,4 +207,17 @@ bool SecurityRuntime::adopt_epoch_from_handoff(const EpochHandoff& handoff,
     return start_consensus(std::move(*own_vote_key), previous_checkpoint);
 }
 
+bool SecurityRuntime::leave_epoch() {
+    if (!epochs_.has_value()) {
+        return false;
+    }
+    // Consensus and the share end before the epoch state, as at activation:
+    // nothing of the finished epoch can act after this returns.
+    consensus_.reset();
+    authority_.abandon_dkg();
+    authority_.clear_epoch();
+    epochs_.reset();
+    return true;
+}
+
 }  // namespace nexus::security
