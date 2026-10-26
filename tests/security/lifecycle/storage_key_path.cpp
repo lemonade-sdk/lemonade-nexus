@@ -358,6 +358,48 @@ protected:
             SecurityMessageKind::StorageUnlockPartial, message, request.epoch));
     }
 
+    /// Rewrites the node's records.json the way a commit without a proof
+    /// leaves it: the record moves from "records" to "unproven".
+    void strip_proof(const Node& node, const Digest& record_digest) {
+        const auto file = node.dir / "storage" / "records.json";
+        auto document = nlohmann::json::parse(raw_file(file));
+        auto& records = document.at("records");
+        bool found = false;
+        for (auto it = records.begin(); it != records.end(); ++it) {
+            const auto decoded =
+                decode_security_message(nexus::crypto::from_base64(it->get<std::string>()));
+            const auto* message = std::get_if<SecurityMessage>(&decoded);
+            ASSERT_NE(message, nullptr);
+            const auto* proof = std::get_if<StoragePlanProofMsg>(&message->body);
+            ASSERT_NE(proof, nullptr);
+            const auto record = storage_record_from_payload(proof->payload);
+            ASSERT_TRUE(record.has_value());
+            if (storage_record_digest(*record) != record_digest) continue;
+            document["unproven"].push_back(
+                nexus::crypto::to_base64(encode_storage_record(*record)));
+            records.erase(it);
+            found = true;
+            break;
+        }
+        ASSERT_TRUE(found) << "the record is not in records.json";
+        write_file(file, document.dump());
+    }
+
+    /// Runs the next boundary over the founders, which refreshes the shares,
+    /// and returns the refreshed plan's digest once every founder holds it.
+    Digest refresh_at_next_boundary() {
+        const Digest before = storage(founders.front()).chain().current_digest;
+        members = rotate(members, founders, 2);
+        if (::testing::Test::HasFatalFailure()) return {};
+        EXPECT_TRUE(run_storage_until([&] {
+            const auto& chain = storage(founders.front()).chain();
+            return chain.current_digest != before && !chain.pending.has_value() &&
+                   all_current(founders, chain.current_digest);
+        }));
+        EXPECT_EQ(current_plan().operation, StorageOperation::Refresh);
+        return storage(founders.front()).chain().current_digest;
+    }
+
     /// Lets in-flight answers from earlier attempts settle, so a counter read
     /// afterwards measures only what follows.
     void settle() {
@@ -1218,6 +1260,166 @@ TEST_F(StorageKeyPath, AServerOutsideTier1AcceptsOnlyAProvedRecord) {
     deliver(proof);
     EXPECT_EQ(storage(fresh).chain().current_digest, current);
     EXPECT_TRUE(storage(fresh).current_verified());
+}
+
+// --- Records finalized without a commit proof -----------------------------------------
+
+// Production incident (release 2026102601): the epoch-2 refresh committed, but
+// the commit produced no proof on any member (as with the first-child defect
+// that HotStuffSafety.ACommitProofSkipsAChildThatNoCertificateExtends covers). A
+// member served only records with a proof, so a server that missed the
+// refresh never learned it. Its unlock requests named the plan before the
+// refresh, which no holder answers, and it stayed locked. The members still
+// held the refresh's blocks; the proof comes back from that certified chain,
+// and the server catches up and unlocks.
+TEST_F(StorageKeyPath, AServerThatMissedARecordFinalizedWithoutItsProofCatchesUpAndUnlocks) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    const Digest before = storage(founders.front()).chain().current_digest;
+    Node* behind = reserves[0];
+    const auto behind_key = data_key_bytes(behind);
+    ASSERT_EQ(behind_key.size(), 32u);
+
+    // The server follows the epochs but receives no storage record.
+    const NodeId behind_id = behind->id;
+    mesh.drop_if = [behind_id](const Queued& item, const SecurityMessage& message) {
+        return item.to == behind_id && message.kind == SecurityMessageKind::StoragePlanProof;
+    };
+    const Digest after = refresh_at_next_boundary();
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_EQ(storage(behind).chain().current_digest, before);
+
+    // Every member holds the refresh without its proof and restarts its
+    // storage side; its consensus still holds the finalizing blocks.
+    for (Node* member : founders) {
+        strip_proof(*member, after);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        build_storage(*member);
+        EXPECT_EQ(storage(member).chain().current_digest, after);
+        EXPECT_FALSE(storage(member).holds_proof(after));
+        EXPECT_TRUE(storage(member).holds_share(after));
+    }
+
+    // The server restarts: its data key is not in memory, and its records
+    // end at the plan before the refresh.
+    mesh.drop_if = {};
+    build_storage(*behind);
+    ASSERT_EQ(storage(behind).chain().current_digest, before);
+    ASSERT_TRUE(run_storage_until([&] {
+        return storage(behind).chain().current_digest == after &&
+               storage(behind).data_keys().state() == DataKeyState::Unlocked;
+    })) << "the server never caught up with the refresh and unlocked";
+    EXPECT_EQ(data_key_bytes(behind), behind_key);
+    EXPECT_TRUE(storage(behind).holds_proof(after));
+    EXPECT_TRUE(storage(behind).current_verified());
+    ASSERT_TRUE(run_storage_until([&] { return all_unlocked(founders); }));
+
+    // The rebuilt proof is on disk: a restarted member serves it at once.
+    build_storage(*founders[0]);
+    EXPECT_TRUE(storage(founders[0]).holds_proof(after));
+}
+
+// Release 2026102601 kept only records with a proof, so a member's records.json
+// still ended at the plan before the refresh. A restart then took that plan as
+// current and destroyed the share of the plan it could not see. The share must
+// survive until a verified record names its plan.
+TEST_F(StorageKeyPath, ARestartWithRecordsThatLackTheCurrentPlanKeepsItsShare) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    const Digest before = storage(founders.front()).chain().current_digest;
+    Node* holder = founders[2];
+    const auto records = holder->dir / "storage" / "records.json";
+    const std::string stale = raw_file(records);
+    const Digest after = refresh_at_next_boundary();
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_TRUE(share_of(holder, after).has_value());
+
+    // The holder restarts with the records from before the refresh, and no
+    // peer record reaches it for a while: it knows only its disk.
+    write_file(records, stale);
+    const NodeId held_back = holder->id;
+    mesh.drop_if = [held_back](const Queued& item, const SecurityMessage& message) {
+        return item.to == held_back && message.kind == SecurityMessageKind::StoragePlanProof;
+    };
+    build_storage(*holder);
+    for (int i = 0; i < 50; ++i) storage_step();
+    EXPECT_EQ(storage(holder).chain().current_digest, before);
+    EXPECT_TRUE(storage(holder).chain_bound());
+    EXPECT_TRUE(storage(holder).holds_share(after)) << "stale records destroyed a live share";
+    EXPECT_TRUE(share_of(holder, after).has_value());
+    EXPECT_NE(storage(holder).data_keys().state(), DataKeyState::Unlocked);
+
+    // The proved record arrives: the share is placed, kept, and used.
+    mesh.drop_if = {};
+    ASSERT_TRUE(run_storage_until([&] {
+        return storage(holder).chain().current_digest == after &&
+               storage(holder).data_keys().state() == DataKeyState::Unlocked;
+    }));
+    EXPECT_TRUE(storage(holder).holds_share(after));
+    EXPECT_TRUE(share_of(holder, after).has_value());
+}
+
+// A proof rebuilt from a peer's certified chain is candidate data: it is kept
+// only when it verifies under the epoch's vote keys and quorum and commits the
+// held record's exact bytes.
+TEST_F(StorageKeyPath, ARebuiltStorageProofIsKeptOnlyWhenItVerifies) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    const Digest after = refresh_at_next_boundary();
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    Node* member = founders[3];
+    Node* peer = founders[0];
+
+    // The page of the peer's certified chain that starts at the refresh's
+    // block.
+    const Digest wanted =
+        block_payload_digest(storage_record_payload(StorageRecord{current_plan()}));
+    const HotStuffService* consensus = peer->runtime->consensus();
+    ASSERT_NE(consensus, nullptr);
+    std::optional<SyncResponse> genuine;
+    for (uint64_t height = 0;
+         height < consensus->last_committed_height().underlying() && !genuine; ++height) {
+        const auto page = consensus->certified_page_after(Height{height});
+        if (!page || page->chain.size() < 3 ||
+            page->chain.front().first.transitions_digest != wanted) {
+            continue;
+        }
+        SyncResponse response;
+        response.high_qc = page->certifying;
+        for (const auto& [proposal, justify] : page->chain) {
+            response.chain.push_back(ProposalMessage{proposal, justify, std::nullopt});
+        }
+        genuine = std::move(response);
+    }
+    ASSERT_TRUE(genuine) << "no page starts at the refresh's block";
+
+    strip_proof(*member, after);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    build_storage(*member);
+    ASSERT_FALSE(storage(member).holds_proof(after));
+
+    {  // A certificate in the three-chain with a forged signature.
+        auto forged = *genuine;
+        forged.chain[1].justify.signers.front().signature[0] ^= 1;
+        storage(member).on_certified_chain(forged, peer->id);
+        EXPECT_FALSE(storage(member).holds_proof(after)) << "a forged certificate was kept";
+    }
+    {  // The child removed: the three blocks no longer link.
+        auto forged = *genuine;
+        forged.chain.erase(forged.chain.begin() + 1);
+        storage(member).on_certified_chain(forged, peer->id);
+        EXPECT_FALSE(storage(member).holds_proof(after)) << "a broken chain was kept";
+    }
+    {  // The closing certificate covers the child, not the grandchild.
+        auto forged = *genuine;
+        forged.chain.resize(3);
+        forged.high_qc = forged.chain[1].justify;
+        storage(member).on_certified_chain(forged, peer->id);
+        EXPECT_FALSE(storage(member).holds_proof(after)) << "an unclosed three-chain was kept";
+    }
+    storage(member).on_certified_chain(*genuine, peer->id);
+    EXPECT_TRUE(storage(member).holds_proof(after)) << "the genuine chain did not rebuild it";
+    EXPECT_TRUE(storage(member).current_verified());
 }
 
 // --- Files under the data key (Phase 7, B9, B10, B5a) --------------------------------

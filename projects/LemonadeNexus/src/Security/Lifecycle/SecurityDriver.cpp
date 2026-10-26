@@ -1888,6 +1888,9 @@ void SecurityDriver::on_certified_chain(const SyncResponse& response, const Node
     if (upgrade_chain_sink_) {
         upgrade_chain_sink_(response, from);
     }
+    if (storage_chain_sink_) {
+        storage_chain_sink_(response, from);
+    }
 }
 
 void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {

@@ -398,7 +398,12 @@ With the setting on:
 - **Records outside Tier 1.** Every server receives each finalized record
   with its commit proof (`StoragePlanProof`) and verifies it against the
   committing epoch's vote keys. A server asks a Tier 1 member for the live
-  records every 30 s (`StoragePlanRequest`).
+  records every 30 s (`StoragePlanRequest`). A record whose commit produced
+  no proof is kept on disk but served to nobody. A Tier 1 member rebuilds
+  its proof from the certified chain that the other members' consensus still
+  serves (`SyncRequest` pages of the current epoch), verifies it, and then
+  serves the record. A record finalized in an earlier epoch cannot be
+  rebuilt this way.
 - **Key sessions.** Holders run the key generation or refresh over the
   security transport (`StorageKeyPackage`). Secret packages are sealed to
   their recipient with the session bound inside the seal. A session without a
@@ -429,7 +434,10 @@ With the setting on:
   copy unseals to the same bytes. A sealed share that reports Missing,
   PolicyMismatch, or Corrupt is never replaced by the file copy.
 - **Files.** `data/security/storage/records.json` (the live records and their
-  proofs) and `data/security/storage/data-key.json` (the wrapped data key).
+  proofs; a live record without a proof is under `unproven`) and
+  `data/security/storage/data-key.json` (the wrapped data key). A share whose
+  plan `records.json` does not name is kept until a verified record names
+  that plan.
 - **nexus-attestd.** The daemon must know the `StorageUnlock` purpose (value
   4). An older daemon refuses the challenge, so the holder's attestation fails
   closed and the requester stays locked.

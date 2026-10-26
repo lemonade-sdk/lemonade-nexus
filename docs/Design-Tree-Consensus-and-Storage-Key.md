@@ -676,7 +676,11 @@ Always on, no setting (`Security/Storage/`):
   bytes, and for a final plan only when every check in
   `check_storage_final` passes. Servers outside Tier 1 receive each record
   with its commit proof (`StoragePlanProof`) and verify the proof against the
-  committing epoch's vote keys.
+  committing epoch's vote keys. A live record whose commit produced no proof
+  stays in `records.json` (under `unproven`) and is served to nobody. A
+  Tier 1 member rebuilds the proof from the peers' certified chain of the
+  current epoch (`SyncRequest` pages, `StorageKeyService::on_certified_chain`)
+  and keeps it only when `verify_commit_proof` passes.
 - **Selection.** At each epoch boundary the holders come from the finalized
   eligibility pool, ranked by `H(checkpoint_seed ‖ node_id)` with the
   finalized state root as the seed, at most 50. With no key and at least 5
@@ -716,7 +720,9 @@ Always on, no setting (`Security/Storage/`):
   finalized its records (the Genesis certificate digest). Records of another
   chain are refused; a file without the binding binds when each commit proof
   verifies under this chain. Shares are pruned only against a bound chain
-  with a current plan. When the files are encrypted, a missing
+  with a current plan, and a share whose plan the stored records do not name
+  is kept until a verified record names it. When the files are encrypted, a
+  missing
   `records.json` or `data-key.json`, a chain without a final plan, or a
   foreign chain stops startup with an error that names the files to restore.
 - **Share storage.** On a host that can seal, shares are kept by

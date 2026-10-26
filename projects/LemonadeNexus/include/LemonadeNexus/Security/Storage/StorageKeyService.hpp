@@ -13,7 +13,11 @@
 //    when it completes the pending selection with every holder's signature
 //    over the same plan bytes. Records reach servers outside Tier 1 as
 //    StoragePlanProof messages that carry the commit proof; each server
-//    verifies the proof against the committing epoch's vote keys.
+//    verifies the proof against the committing epoch's vote keys. A live
+//    record whose commit produced no proof is still kept on disk, so that a
+//    restart does not fall back to an older plan, but it is served to nobody.
+//    A member rebuilds its proof from the certified chain that the peers'
+//    consensus still serves, verifies it, and then serves the record.
 // 2. Key sessions (B5, B5a, Part C). Each selected holder runs the first key
 //    generation, a share refresh, or a rotation for the finalized selection
 //    over the security transport: round 1 broadcast, round 2 sealed to each
@@ -36,7 +40,10 @@
 // stays inert. When the files are encrypted under the data key, lost or
 // foreign storage state stops the server (halt_reason()) instead of starting
 // fresh: a fresh start would prune the holder's shares and create a new data
-// key, and the encrypted files would never open again.
+// key, and the encrypted files would never open again. For the same reason a
+// share that the stored records do not name (for example a share of a plan
+// whose record was never written) is kept until the chain names its plan:
+// stale records must not destroy a live share.
 //
 // The storage key is its own key role. Nothing here signs for the network,
 // votes, or grants Tier 1 authority; the identity key signs only the holder's
@@ -165,6 +172,12 @@ public:
     void on_message(const SecurityMessage& message);
     void on_verdict(const AttestationVerdict& verdict);
     void on_eligibility_finalized(const FinalizedEligibility& finalized, const Tier1Set& pool);
+    /// A checked sync reply (SecurityDriver::set_storage_chain_sink). A
+    /// three-chain in it over the block of a live record that this node holds
+    /// without its proof becomes that proof once it verifies under the vote
+    /// keys and quorum of its epoch. Also advances this node's own search for
+    /// such a proof. The reply is candidate data; nothing else in it counts.
+    void on_certified_chain(const SyncResponse& response, const NodeId& from);
 
     // --- Payload handling (through the two registered adapters) ---
     [[nodiscard]] std::optional<ProposedPayload> propose(const HotStuffService& consensus,
@@ -177,6 +190,11 @@ public:
     [[nodiscard]] const StorageChainState& chain() const { return chain_; }
     [[nodiscard]] DataKeyService& data_keys() { return *data_keys_; }
     [[nodiscard]] const DataKeyService& data_keys() const { return *data_keys_; }
+    /// True when this node holds the record `record_digest` with a commit
+    /// proof, which is what it serves to other servers.
+    [[nodiscard]] bool holds_proof(const Digest& record_digest) const {
+        return proofs_.contains(record_digest);
+    }
     /// True when this holder keeps a share for the final plan `plan_digest`.
     [[nodiscard]] bool holds_share(const Digest& plan_digest) const;
     /// True while the current plan's retiring plan still unwraps.
@@ -228,11 +246,44 @@ private:
         std::size_t quorum = 0;
         std::map<NodeId, crypto::Ed25519PublicKey> vote_keys;
     };
+    /// A search of a peer's certified chain for the block that finalized a
+    /// live record held without its proof.
+    struct ProofSearch {
+        Digest record{};
+        NodeId peer{};
+        /// Exclusive lower bound: the block of the nearest earlier record
+        /// proved in this epoch, or zero.
+        uint64_t lower = 0;
+        /// The height the outstanding page request names (SyncRequest).
+        uint64_t after = 0;
+        uint64_t sent_ms = 0;
+        /// The next page, sent on the next tick so that a search stays far
+        /// below the peer's message budget.
+        std::optional<uint64_t> next_after;
+    };
 
     // Records.
     void apply_record(const StorageRecord& record, std::optional<StoragePlanProofMsg> proof,
                       bool verified);
     void on_plan_proof(const StoragePlanProofMsg& proof);
+    /// True when the commit proof verifies for the record under the vote keys
+    /// and quorum of its committing epoch, and a final plan names that epoch.
+    [[nodiscard]] bool proof_verifies(const StorageRecord& record,
+                                      const StoragePlanProofMsg& message);
+    /// True while `digest` names a live record: the pending, current, or
+    /// retiring plan, or a batch that carries a latest claim.
+    [[nodiscard]] bool live_record(const Digest& digest, const StorageRecord& record) const;
+    /// Drops the proofs and the unproven records of records that are no
+    /// longer live.
+    void keep_live_records();
+    /// The lowest-sequence live record held without its proof.
+    [[nodiscard]] std::optional<std::pair<Digest, StorageRecord>> first_unproven() const;
+    /// The heights (exclusive) between which the block of the unproven
+    /// `record` lies in the current epoch; nullopt when it cannot lie in it.
+    [[nodiscard]] std::optional<std::pair<uint64_t, uint64_t>> search_bounds(
+        const StorageRecord& record) const;
+    void search_proof(const NodeId& peer);
+    void request_page(uint64_t after);
     void on_plan_request(const StoragePlanRequestMsg& request, const NodeId& from);
     void send_live_records(const NodeId& to, uint64_t after_sequence);
     void broadcast_proof(const Digest& record_digest);
@@ -320,6 +371,15 @@ private:
     /// A record applied past a gap in the sequence: the next record request
     /// asks for every live record again.
     bool record_gap_ = false;
+    /// Live records applied from a commit that produced no commit proof, by
+    /// record digest. Kept on disk; never served until a verified proof
+    /// replaces the entry.
+    std::map<Digest, StorageRecord> unproven_;
+    std::optional<ProofSearch> proof_search_;
+    /// Shares loaded at start for a plan that the stored records do not name.
+    /// Each stays until the chain names its plan; the normal pruning rules
+    /// apply from then on.
+    std::set<Digest> unplaced_shares_;
     mutable std::mutex halt_mutex_;
     std::string halt_reason_;
 
