@@ -22,8 +22,8 @@ implemented and always on, with no setting to turn it off; see
 [Configuration](Configuration#threshold-storage-key). The external review of
 the unaudited library paths in [B3](#b3-library) was not commissioned: that
 gate was waived on 2026-10-22, not satisfied. Phase 6 is implemented:
-`nexus-attestd` seals and unseals, and the gossip identity key moves to a
-sealed copy through a one-way migration (see [B6](#b6-sealing-the-boot-set)
+`nexus-attestd` seals and unseals, and the gossip identity key and the epoch
+vote keys move under the seal through one-way migrations (see [B6](#b6-sealing-the-boot-set)
 for the binding, the migration, the upgrade path, and the limits). Phase 7 is
 implemented and always on (see
 [B12](#b12-phase-7-implementation)); it had the same review gate, also
@@ -401,7 +401,7 @@ data only. See [Tree Merge Ceremony](Tree-Merge-Ceremony).
 | Storage secret `s` | Never assembled. Holder *i* keeps share `s_i`. | Threshold decryption only |
 | Storage public key `S = s·G` | Public, recorded in the holder plan | Wrapping data keys |
 | Server data key (DEK) | Wrapped on that server's disk; unwrapped in memory | Encrypts that server's files |
-| Boot set (gossip identity key, own share) | Sealed by the vTPM (B6) | Starting up and authenticating before unlock |
+| Boot set (gossip identity key, own share, vote-key wrapping key) | Sealed by the vTPM (B6) | Starting up and authenticating before unlock |
 
 The storage key is a separate key role with its own domain-separation tag
 (`LEMONADE-NEXUS-STORAGE-V1`). It never signs and never authorizes. FROST,
@@ -529,7 +529,8 @@ anything, so these two items cannot depend on the DEK:
   vTPM under a policy bound to the approved release's PCRs and returns the
   result to the server, which stores it. `nexus-attestd` still never reads the
   server's data directory.
-- The gossip identity key and the server's storage share are stored sealed.
+- The gossip identity key, the server's storage share, and the server's
+  vote-key wrapping key are stored sealed.
 
 **Implemented (Phase 6).**
 
@@ -539,8 +540,8 @@ anything, so these two items cannot depend on the DEK:
 | Seal parent | ECC P-256 storage primary in the owner hierarchy, unique field `LEMONADE-NEXUS-SEAL-PARENT-V1`. Recreated per call. No persistent handle, no NV index. Not the EK, not the quote AK. |
 | Sealed object | Keyed-hash object holding a random 32-byte key. No `USERWITHAUTH`; `ADMINWITHPOLICY`. Sessions are salted to the parent, so the key is encrypted to and from the TPM. |
 | Secret encryption | XChaCha20-Poly1305 in the server process, under the sealed key. Associated data: purpose `sealed-blob`, the sealing domain, the PCR digest, and the TPM public area. |
-| Domains | One per secret role: `gossip-identity` today; `storage-share` for Phase 5. |
-| Files | `data/sealed/<domain>.sealed` (running boot chain), `data/sealed/<domain>.next.sealed` (staged for an approved next boot chain), `data/sealed/gossip-identity.state.json` (migration state and the public key). |
+| Domains | One per secret role: `gossip-identity`, `storage-share` (Phase 5), and `vote-key-wrap` (the wrapping key of the epoch vote keys). |
+| Files | `data/sealed/<domain>.sealed` (running boot chain), `data/sealed/<domain>.next.sealed` (staged for an approved next boot chain), `data/sealed/gossip-identity.state.json` (migration state and the public key), `data/sealed/vote-key-wrap.state.json` (migration state and the key id). |
 
 The daemon creates and unseals only the 32-byte key. The server encrypts and
 decrypts the secret itself (`SealedBlobStore` with `attestd_seal_backend`), so
@@ -576,6 +577,42 @@ new identity in place of a sealed one:
 The same rules apply before step 3, except that `keypair.json` is used instead
 of stopping.
 
+Vote keys. Consensus votes while the DEK is locked (B8), so the vault cannot
+cover the epoch vote keys (B12). Each server seals one random 32-byte vote-key
+wrapping key under the domain `vote-key-wrap` and uses it only to encrypt its
+own vote keys (`EpochStore`, `Security/Epoch/EpochStore.hpp`). A seal or an
+unseal is a TPM operation and a new vote key is created every epoch, so the
+server seals the wrapping key once and unseals it once per start. The vote keys
+never reach the daemon.
+
+| Item | Value |
+|---|---|
+| Sealed copy | `data/security/vote-key-<epoch>.sealed.json`. `EncryptedBlob` version 1 (XChaCha20-Poly1305) under `HKDF(wrapping key, "LEMONADE-NEXUS-VOTE-KEY-WRAP-V1", "lemonade-nexus-vote-key-file-key-v1")`. Associated data: `aead_aad("vote-key-at-rest", {epoch, node id, vote public key})`. The file names the key id, a second HKDF output of the wrapping key. |
+| Machine-bound copy | `data/security/vote-key-<epoch>.json`, the format before sealing: `KeyWrappingService` with an empty passphrase, so the key comes from `wrap_local.key` and `/etc/machine-id`. |
+| State | `data/sealed/vote-key-wrap.state.json`: migration state, the boot id that sealed the key, and the key id. |
+
+The vote-key migration has the same three states and the same two-boot rule
+as the gossip identity:
+
+1. **Machine-bound.** A host that cannot seal keeps only the machine-bound
+   copies. This is the protection before this change, and its limit.
+2. **Sealed, pending.** The server seals a new wrapping key, unseals it, and
+   compares it. It then records the pending state and gives every existing vote
+   key a sealed copy. Each new vote key goes to both files, machine-bound copy
+   first.
+3. **Sealed.** When the wrapping key unseals in a later boot, the server gives
+   every machine-bound copy a sealed copy, reads it back, and compares it. Then
+   it records the sealed state, and only then overwrites and removes the
+   machine-bound copies. A crash between two steps leaves an extra copy, never
+   a missing key.
+
+While the migration is pending, the machine-bound copies hold every vote key.
+A wrapping key that does not unseal, or that is missing, is then replaced by a
+new one, and the sealed copies are written again. After step 3 the restart
+cases of the table above apply to the wrapping key and stop startup, and a
+machine-bound copy is never read again. A machine-bound file that appears after
+step 3 does not get a sealed copy.
+
 Upgrade path. PCR 8 records the GRUB commands and the kernel command line; PCR
 9 records the files GRUB reads (kernel, initramfs, GRUB configuration). The
 server binary is measured into PCR 10 by IMA, not into PCR 8 or 9. On the
@@ -601,8 +638,14 @@ Limits:
   remapping can keep old blocks.
 - On the root server the gossip identity is also the Genesis key, and it is
   sealed the same way.
-- The vote keys and `wrap_local.key` keep the machine-bound wrapping (B12).
-  With Phase 7 on, `keypair.enc` is also encrypted under the DEK.
+- The vote-key path is tested with a test double of the daemon, not with
+  swtpm. It uses the same `SealedBlobStore` and backend as the gossip identity.
+- On a host that cannot seal, the vote keys keep the machine-bound wrapping
+  (B12). `wrap_local.key` is in the same data directory, so a reader of the
+  whole directory can unwrap them. `wrap_local.key` stays plaintext at mode
+  600. With Phase 7 on, `keypair.enc` is also encrypted under the DEK.
+- Overwriting a machine-bound vote-key copy is best effort, like
+  `keypair.json`.
 
 ### B7. Unlock at startup
 
@@ -779,16 +822,17 @@ Always on, no setting (`Security/Storage/StorageVault.hpp`):
   - Everything under `security/`: the epoch and consensus state, the storage
     key records, the wrapped DEK (`data-key.json`, already wrapped to `S`), and
     `vault-state.json`.
-  - `security/vote-key-<epoch>.json`. `EpochStore::store_vote_key` writes the
-    vote private key wrapped by `KeyWrappingService` with an empty passphrase,
-    so the key is derived from `identity/wrap_local.key` and
-    `/etc/machine-id`. Consensus votes continue while the DEK is locked, so
-    the vault cannot cover it. The wrap key is in the same data directory, so
-    this wrapping binds the file to the machine; it does not protect the vote
-    key from a reader of the whole data directory. Sealing the vote keys like
-    the boot set (B6) is open work.
-  - `identity/wrap_local.key`. The file share store and the vote keys read it
-    before the unlock, so moving it under the DEK would stop a cold start.
+  - The vote keys. `EpochStore::store_vote_key` writes the vote private key,
+    and consensus votes while the DEK is locked, so the vault cannot cover it.
+    A host that can seal encrypts it under the sealed vote-key wrapping key
+    (B6, `vote-key-<epoch>.sealed.json`). A host that cannot seal keeps
+    `vote-key-<epoch>.json` under the machine-bound wrapping
+    (`identity/wrap_local.key` and `/etc/machine-id`), which a reader of the
+    whole data directory can unwrap.
+  - `identity/wrap_local.key`. The file share store and the machine-bound
+    vote-key copies read it before the unlock, so moving it under the DEK would
+    stop a cold start. On a host that seals, the vote keys stop depending on it
+    when their migration completes (B6).
   - `identity/peers.json` and `identity/ns_slots.json` (gossip starts before
     the unlock), and `ipam/allocations.json` (IPAM starts before the unlock).
     These hold mesh addresses that gossip also distributes.
@@ -856,7 +900,7 @@ This part does not change the trust model and can ship first.
 | 4 | `storage-threshold` crate: library review, key generation, re-share, share refresh, DLEQ, threshold ECIES. | — |
 | 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose, per-epoch share refresh, daily `StorageKeyRotation`. | 2, 4 |
 | 6 | `nexus-attestd` Seal and Unseal; boot set sealed. **Implemented** (B6). | — |
-| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented** (B12), including the TLS and ACME private keys and coverage generation 2 (committed op ids, admission records, account data store, user credentials). Files read before the unlock, such as the vote keys and `wrap_local.key`, stay under machine-bound wrapping; B12 lists every file that is not covered and the reason. | 5, 6 |
+| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented** (B12), including the TLS and ACME private keys and coverage generation 2 (committed op ids, admission records, account data store, user credentials, legacy link token files). Vote keys are read before the unlock and are sealed through the boot set instead (B6); B12 lists every file that is not covered and the reason. | 5, 6 |
 
 Phases 1, 4, and 6 can run in parallel.
 

@@ -148,13 +148,30 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
     file_share_store_ = std::make_unique<FileStorageShareStore>(
         storage_directory / "sealed", storage_crypto_.get(), wrapping,
         config.identity.public_key);
-    if (config.seal_backend.available() && !config.sealed_directory.empty()) {
-        // The share joins the gossip identity in the sealed boot set. A share
-        // kept in the file store before this host could seal moves across on
-        // first use.
+    if (!config.sealed_directory.empty()) {
+        // Also without a backend: the vote-key migration must see a sealed
+        // wrapping key that this build can no longer unseal.
         sealed_blobs_ =
             std::make_unique<SealedBlobStore>(config.sealed_directory, config.seal_backend);
         sealed_blobs_->set_next_boot_chain(config.next_boot_chain);
+    }
+    // The vote-key wrapping key joins the boot set before the driver starts
+    // and loads a vote key (EpochStore, design B6).
+    vote_key_protection_ = store_.open_vote_key_sealing(
+        VoteKeySealing{.sealed = sealed_blobs_.get(),
+                       .crypto = storage_crypto_.get(),
+                       .boot_id = config.boot_id},
+        vote_key_error_);
+    if (vote_key_protection_ == VoteKeyProtection::Refused) {
+        spdlog::error("[security] vote keys: {}", vote_key_error_);
+    } else {
+        spdlog::info("[security] vote keys at rest: {}",
+                     vote_key_protection_name(vote_key_protection_));
+    }
+    if (config.seal_backend.available() && sealed_blobs_ != nullptr) {
+        // The share joins the gossip identity in the sealed boot set. A share
+        // kept in the file store before this host could seal moves across on
+        // first use.
         share_store_ = std::make_unique<SealedStorageShareStore>(*sealed_blobs_,
                                                                  file_share_store_.get());
     } else {

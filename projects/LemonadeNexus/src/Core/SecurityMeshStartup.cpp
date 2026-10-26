@@ -62,11 +62,13 @@ std::optional<SecurityMeshStartup> start_security_mesh(
     mesh_config.platform_source = std::move(platform_source);
     mesh_config.activation_source = std::move(activation_source);
     mesh_config.on_epoch_established = std::move(on_epoch_established);
-    // The share is sealed beside the gossip identity, with the same backend,
-    // directory, and upgrade staging (B7 step 1).
+    // The share and the vote-key wrapping key are sealed beside the gossip
+    // identity, with the same backend, directory, upgrade staging, and
+    // two-boot rule (B6, B7 step 1).
     mesh_config.seal_backend = storage.seal_backend;
     mesh_config.sealed_directory =
         std::filesystem::path(config.data_root) / kSealedDirectory;
+    mesh_config.boot_id = read_kernel_boot_id;
     if (release) {
         mesh_config.next_boot_chain = security::boot_pcrs_from_approval(release->approval);
     }
@@ -75,6 +77,12 @@ std::optional<SecurityMeshStartup> start_security_mesh(
     startup->service =
         std::make_unique<security::SecurityMeshService>(io, mesh_config, gossip,
                                                         &key_wrapping);
+    // A sealed vote-key wrapping key that does not unseal after the migration
+    // completed stops startup, like the gossip identity (B6).
+    if (const auto& reason = startup->service->vote_key_halt_reason(); !reason.empty()) {
+        error = "vote keys: " + reason;
+        return std::nullopt;
+    }
     startup->service->start();
     if (auto* storage_key = startup->service->storage_key(); storage_key != nullptr) {
         // The files are encrypted and the storage state that opens them is

@@ -74,16 +74,23 @@ struct SecurityMeshConfig {
     /// Fires when this node first holds finalized epoch authority (entry into
     /// Active, or genesis certificate issuance). io-thread context.
     std::function<void()> on_epoch_established;
-    /// How the storage share is sealed (B6, B7 step 1): the boot set's backend
-    /// (attestd_seal_backend in production). Empty means this host cannot
-    /// seal; the share then stays in the machine-bound file store.
+    /// How the storage share and the vote-key wrapping key are sealed (B6, B7
+    /// step 1): the boot set's backend (attestd_seal_backend in production).
+    /// Empty means this host cannot seal; the share then stays in the
+    /// machine-bound file store, and the vote keys keep the machine-bound
+    /// wrapping (EpochStore).
     SealBackend seal_backend;
     /// The boot set's SealedBlobStore directory (Core/BootSet.hpp
-    /// kSealedDirectory under the data root).
+    /// kSealedDirectory under the data root). Empty disables both sealed
+    /// stores (tests).
     std::filesystem::path sealed_directory;
     /// Expected PCR 8/9 of the installed, verified release approval; staged
-    /// for the share like for the gossip identity. nullopt stages nothing.
+    /// for the share and the vote-key wrapping key like for the gossip
+    /// identity. nullopt stages nothing.
     std::optional<BootPcrValues> next_boot_chain;
+    /// Returns this kernel boot's id (Core/BootSet.hpp read_kernel_boot_id in
+    /// production). Unset or empty keeps the vote-key migration pending.
+    std::function<std::string()> boot_id;
     /// Files encrypted under the data key (Phase 7), or nullptr. Not owning;
     /// must outlive the service.
     StorageVault* vault = nullptr;
@@ -106,6 +113,13 @@ public:
     [[nodiscard]] static constexpr std::string_view name() { return "SecurityMeshService"; }
 
     [[nodiscard]] const SecurityDriver& driver() const { return driver_; }
+
+    /// How this node's own vote keys are protected at rest, decided at
+    /// construction (EpochStore::open_vote_key_sealing).
+    [[nodiscard]] VoteKeyProtection vote_key_protection() const { return vote_key_protection_; }
+    /// Non-empty when startup must stop because the sealed vote-key wrapping
+    /// key cannot be used (protection Refused). Says why and how to recover.
+    [[nodiscard]] const std::string& vote_key_halt_reason() const { return vote_key_error_; }
 
     /// True when `node` is in the current epoch's frozen Tier 1 set. The mesh
     /// decided that; consumers only read it.
@@ -339,6 +353,8 @@ private:
     // the router reaches it only through the address-captured challenge gate.
     std::unique_ptr<crypto::SodiumCryptoService> storage_crypto_;
     std::unique_ptr<SealedBlobStore> sealed_blobs_;
+    VoteKeyProtection vote_key_protection_ = VoteKeyProtection::MachineBound;
+    std::string vote_key_error_;
     std::unique_ptr<FileStorageShareStore> file_share_store_;
     std::unique_ptr<IStorageShareStore> share_store_;
     std::unique_ptr<StorageKeyService> storage_;

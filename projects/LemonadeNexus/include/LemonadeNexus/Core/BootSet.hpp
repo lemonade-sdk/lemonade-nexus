@@ -3,8 +3,11 @@
 // The boot set (design B6): secrets a server needs before it can unlock
 // anything else. Today that is the gossip identity key, which is also the
 // server's security-mesh NodeId key (and the Genesis key on the root server).
-// Phase 5 adds the server's storage share under its own sealing domain in the
-// same SealedBlobStore.
+// The same SealedBlobStore holds the server's storage share
+// (Security/Storage/StorageShareStore.hpp) and the vote-key wrapping key
+// (Security/Epoch/EpochStore.hpp), each under its own sealing domain. The
+// vote-key wrapping key follows the same migration states and rules as this
+// file.
 //
 // One-way migration from identity/keypair.json to a sealed copy:
 //
