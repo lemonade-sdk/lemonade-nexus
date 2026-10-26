@@ -18,7 +18,11 @@
 //      boot chain changes. For a reboot, have the server stage the sealed
 //      boot set for the new PCRs first.
 //   7. Stop the services, swap the files atomically (backups kept), install
-//      the exact package versions.
+//      the exact package versions. Before a package install, keep a copy of
+//      the running kernel's initramfs: PCR 9 measures it, and a package can
+//      rebuild it through a dpkg trigger. Without a boot-chain change the
+//      approval keeps PCR 8/9, so the measured image is put back after the
+//      install. A rollback puts it back in every case.
 //   8. Without a reboot: start the services and run the health gate. With a
 //      reboot: reboot; the next cycle after boot runs the health gate.
 //   9. Healthy: record the release as installed and report "upgraded".
@@ -125,6 +129,13 @@ private:
     CycleResult run_health_gate(State& state);
     CycleResult roll_back(State& state, const std::string& reason, bool restart_services);
     CycleResult commit(State& state, const std::string& detail);
+
+    /// Copy the running kernel's initramfs to the backup of this release and
+    /// record it in `state`. A host with no image at that path records none.
+    bool back_up_measured_initrd(State& state, std::string& error);
+    /// Put the recorded initramfs back when its bytes changed. Fails when the
+    /// backup is missing or the restored file does not match it.
+    bool restore_measured_initrd(const State& state, std::string& error);
 
     std::optional<Release> fetch_and_verify(const State& state, std::string& error);
     std::optional<std::string> fetch_asset(const std::string& tag, const std::string& name,

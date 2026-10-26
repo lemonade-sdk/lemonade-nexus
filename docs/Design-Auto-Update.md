@@ -43,6 +43,11 @@ hardware-qualified, release workflow not run.** See
 4. The updater installs the packages, then reboots inside its upgrade turn.
    The health gate (Phase 4 step 7) runs after the reboot. On failure the
    updater boots the previous GRUB entry and halts the rollout.
+   Before the install it copies the running kernel's initramfs, which PCR 9
+   measures. A package can rebuild that image through a dpkg trigger. A
+   release without a boot-chain change keeps PCR 8/9, so the updater puts the
+   measured image back after the install; a rollback puts it back in every
+   case.
 5. A release that does not change the boot chain restarts only the services,
    with no reboot.
 
