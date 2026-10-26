@@ -27,10 +27,12 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <random>
 #include <set>
+#include <stdexcept>
 
 namespace {
 
@@ -833,6 +835,15 @@ struct Host {
     std::chrono::steady_clock::time_point clock{};
     std::vector<std::string> reports;
     std::vector<std::string> ops;
+    /// A package install rebuilds the running kernel's initramfs, as a dpkg
+    /// trigger of initramfs-tools or dracut does.
+    bool apt_rebuilds_initrd = false;
+    int initrd_rebuilds = 0;
+    /// Runs after each fake package install.
+    std::function<void()> after_apt_install;
+
+    static constexpr std::string_view kInitrd = "/boot/initrd.img-6.8.0-45-generic";
+    static constexpr std::string_view kMeasuredInitrd = "initrd measured at boot";
 
     fs::path host(std::string_view p) const { return dir.path / fs::path(p).relative_path(); }
 
@@ -844,6 +855,7 @@ struct Host {
         write_text(host("/proc/sys/kernel/random/boot_id"), boot_id + "\n");
         write_text(host("/etc/default/grub"), "GRUB_DEFAULT=saved\n");
         write_text(host("/boot/grub/grub.cfg"), kGrubCfg);
+        write_text(host(kInitrd), std::string(kMeasuredInitrd));
         set_next(make_release(keys, "v2026.10.24", "nexus-new", "attestd-new", kEmptyLock,
                               {sha256_hex("nexus-old")}, {sha256_hex("attestd-old")}));
     }
@@ -977,6 +989,10 @@ struct Host {
                         packages[argv[i].substr(0, eq)] = argv[i].substr(eq + 1);
                     }
                 }
+                if (apt_rebuilds_initrd) {
+                    write_text(host(kInitrd), "initrd rebuilt " + std::to_string(++initrd_rebuilds));
+                }
+                if (after_apt_install) after_apt_install();
                 return {0, ""};
             }
             if (argv[0] == "systemctl" && argv[1] == "stop") running = false;
@@ -1252,6 +1268,122 @@ TEST(UpdaterCycle, ResumesASwapInterruptedByACrash) {
     EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-new");
     EXPECT_EQ(read_text(h.host("/usr/bin/nexus-attestd")), "attestd-new");
     EXPECT_EQ(read_text(h.host(security::kReleaseApprovalPath)), h.next.approval);
+}
+
+// ---------------------------------------------------------------------------
+// The measured initramfs
+// ---------------------------------------------------------------------------
+
+constexpr std::string_view kLibcUpdateLock = "format 1\npackage libc6 2.39-0ubuntu8.5 library\n";
+constexpr std::string_view kGrubUpdateLock =
+    "format 1\npackage grub-efi-amd64-signed 1.202+2.12-1ubuntu8 boot\n";
+
+TEST(UpdaterInitrd, KeepsTheMeasuredInitrdWhenAPackageRebuildsItWithoutABootChainChange) {
+    Host h;
+    h.apt_rebuilds_initrd = true;
+    h.set_next(make_release(h.keys, "v2026.10.24", "nexus-new", "attestd-new",
+                            std::string(kLibcUpdateLock), {sha256_hex("nexus-old")},
+                            {sha256_hex("attestd-old")}));
+    auto u = h.updater();
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_EQ(h.initrd_rebuilds, 1);
+    EXPECT_EQ(h.packages["libc6"], "2.39-0ubuntu8.5");
+    // PCR 9 at the next boot measures the same image as at this boot.
+    EXPECT_EQ(read_text(h.host(Host::kInitrd)), Host::kMeasuredInitrd);
+    EXPECT_EQ(read_text(u.state_dir() / "previous" / "v2026.10.24" / "boot" /
+                        "initrd.img-6.8.0-45-generic"),
+              Host::kMeasuredInitrd);
+    EXPECT_FALSE(h.ran({"systemctl", "reboot"}));
+}
+
+TEST(UpdaterInitrd, ARollbackRestoresTheMeasuredInitrdAfterThePreviousPackagesReinstall) {
+    Host h;
+    h.apt_rebuilds_initrd = true;
+    h.new_binary_is_broken = true;
+    h.set_next(make_release(h.keys, "v2026.10.24", "nexus-new", "attestd-new",
+                            std::string(kLibcUpdateLock), {sha256_hex("nexus-old")},
+                            {sha256_hex("attestd-old")}));
+    auto u = h.updater();
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Failed) << r.detail;
+    // The forward install and the reinstall of the previous version both rebuilt it.
+    EXPECT_EQ(h.initrd_rebuilds, 2);
+    EXPECT_EQ(h.packages["libc6"], "2.39-0ubuntu8.4");
+    EXPECT_EQ(read_text(h.host(Host::kInitrd)), Host::kMeasuredInitrd);
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
+}
+
+TEST(UpdaterInitrd, RollsBackWhenTheMeasuredInitrdBackupIsMissing) {
+    Host h;
+    h.apt_rebuilds_initrd = true;
+    h.set_next(make_release(h.keys, "v2026.10.24", "nexus-new", "attestd-new",
+                            std::string(kLibcUpdateLock), {sha256_hex("nexus-old")},
+                            {sha256_hex("attestd-old")}));
+    auto u = h.updater();
+    const auto backup =
+        u.state_dir() / "previous" / "v2026.10.24" / "boot" / "initrd.img-6.8.0-45-generic";
+    h.after_apt_install = [&] {
+        std::error_code ec;
+        fs::remove(backup, ec);
+    };
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Failed) << r.detail;
+    EXPECT_NE(r.detail.find("backup of the measured"), std::string::npos) << r.detail;
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
+    EXPECT_EQ(h.reports, std::vector<std::string>{"failed"});
+}
+
+TEST(UpdaterInitrd, AHostWithoutAnInitrdUpgrades) {
+    Host h;
+    std::error_code ec;
+    fs::remove(h.host(Host::kInitrd), ec);
+    h.set_next(make_release(h.keys, "v2026.10.24", "nexus-new", "attestd-new",
+                            std::string(kLibcUpdateLock), {sha256_hex("nexus-old")},
+                            {sha256_hex("attestd-old")}));
+    auto u = h.updater();
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_FALSE(fs::exists(h.host(Host::kInitrd)));
+}
+
+TEST(UpdaterInitrd, ABootChainChangeKeepsTheNewInitrdAndItsRollbackRestoresTheMeasuredOne) {
+    Host h;
+    h.apt_rebuilds_initrd = true;
+    h.new_binary_is_broken = true;
+    h.set_next(make_release(h.keys, "v2026.10.24", "nexus-new", "attestd-new",
+                            std::string(kGrubUpdateLock), {sha256_hex("nexus-old")},
+                            {sha256_hex("attestd-old")}, 'a'));
+    auto u = h.updater();
+    ASSERT_EQ(u.run_once().outcome, CycleOutcome::Rebooting);
+    // The approval's new PCR 8/9 cover the boot chain that the packages produced.
+    EXPECT_EQ(read_text(h.host(Host::kInitrd)), "initrd rebuilt 1");
+    h.reboot();
+    ASSERT_EQ(u.run_once().outcome, CycleOutcome::Rebooting);
+    // Back in the previous boot chain: its packages and its measured image.
+    h.reboot();
+    const auto r = u.run_once();
+    EXPECT_EQ(r.outcome, CycleOutcome::Failed) << r.detail;
+    EXPECT_EQ(h.packages["grub-efi-amd64-signed"], "1.202+2.12-1ubuntu7");
+    EXPECT_EQ(read_text(h.host(Host::kInitrd)), Host::kMeasuredInitrd);
+}
+
+TEST(UpdaterInitrd, AResumedInstallRestoresTheInitrdFromTheFirstBackup) {
+    Host h;
+    h.set_next(make_release(h.keys, "v2026.10.24", "nexus-new", "attestd-new",
+                            std::string(kLibcUpdateLock), {sha256_hex("nexus-old")},
+                            {sha256_hex("attestd-old")}));
+    auto u = h.updater();
+    // The first attempt stops inside apt-get after the trigger rebuilt the image.
+    h.after_apt_install = [&] {
+        write_text(h.host(Host::kInitrd), "initrd rebuilt before the crash");
+        throw std::runtime_error("crash inside apt-get");
+    };
+    ASSERT_EQ(u.run_once().outcome, CycleOutcome::Refused);
+    h.after_apt_install = nullptr;
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_EQ(read_text(h.host(Host::kInitrd)), Host::kMeasuredInitrd);
 }
 
 }  // namespace

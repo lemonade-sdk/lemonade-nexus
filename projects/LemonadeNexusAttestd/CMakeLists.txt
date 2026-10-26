@@ -60,6 +60,10 @@ if(UNIX AND NOT APPLE)
             DESTINATION lib/lemonade-nexus COMPONENT Runtime)
     install(FILES "${CMAKE_SOURCE_DIR}/packaging/apparmor/nexus-tier1-authority-probe"
             DESTINATION /etc/apparmor.d COMPONENT Runtime)
+    # The blob, hooks, and loader below go into the PCR 9-measured initramfs.
+    # packaging/debian/preinst and postinst list each of them (EARLY_BOOT_INPUTS)
+    # and rebuild the initramfs only when one changes. Add a new early-boot
+    # file to both lists.
     install(FILES "${CMAKE_SOURCE_DIR}/packaging/apparmor/nexus-tier1-authority-probe.bin"
             DESTINATION lib/lemonade-nexus/apparmor COMPONENT Runtime)
     install(PROGRAMS "${CMAKE_SOURCE_DIR}/packaging/initramfs-tools/hooks/nexus-tier1-apparmor"

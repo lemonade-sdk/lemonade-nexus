@@ -1,0 +1,32 @@
+#!/bin/bash
+set -e
+
+# The files this package puts into the initramfs. postinst lists the same
+# files in the same order.
+EARLY_BOOT_INPUTS=(
+    /usr/lib/lemonade-nexus/apparmor/nexus-tier1-authority-probe.bin
+    /usr/share/initramfs-tools/hooks/nexus-tier1-apparmor
+    /usr/share/initramfs-tools/scripts/init-premount/nexus-tier1-apparmor
+    /usr/lib/dracut/modules.d/76nexus-tier1-apparmor/module-setup.sh
+    /usr/lib/dracut/modules.d/76nexus-tier1-apparmor/nexus-tier1-apparmor.sh
+)
+EARLY_BOOT_DIGEST=/var/lib/lemonade-nexus/.initramfs-inputs.sha256
+
+# Record the digest of the early-boot files that are installed now, before
+# the new files are unpacked. postinst compares it with the new files and
+# rebuilds the initramfs only when they differ. Without a complete set of
+# installed files, no digest is recorded, and postinst rebuilds.
+record_early_boot_digest() {
+    local file digest
+    rm -f "$EARLY_BOOT_DIGEST"
+    for file in "${EARLY_BOOT_INPUTS[@]}"; do
+        [ -f "$file" ] || return 0
+    done
+    digest=$(sha256sum -- "${EARLY_BOOT_INPUTS[@]}") || return 0
+    printf '%s\n' "$digest" > "$EARLY_BOOT_DIGEST"
+}
+
+# The directory is root-owned (postinst). Do not follow a symlink in its place.
+if [ -d /var/lib/lemonade-nexus ] && [ ! -L /var/lib/lemonade-nexus ]; then
+    record_early_boot_digest
+fi

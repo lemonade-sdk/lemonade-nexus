@@ -26,6 +26,8 @@ constexpr std::string_view kGrubDefault = "/etc/default/grub";
 constexpr std::string_view kGrubCfg = "/boot/grub/grub.cfg";
 constexpr std::string_view kGrubEnv = "/boot/grub/grubenv";
 constexpr std::string_view kBootId = "/proc/sys/kernel/random/boot_id";
+/// GRUB reads this image for the kernel and measures it into PCR 9.
+constexpr std::string_view kInitrdPrefix = "/boot/initrd.img-";
 
 std::optional<std::string> read_file(const fs::path& path, std::size_t max_bytes) {
     std::error_code ec;
@@ -48,6 +50,12 @@ json packages_json(const std::vector<OsPackage>& packages) {
         out.push_back({p.name, p.version, static_cast<int>(p.role)});
     }
     return out;
+}
+
+/// Where the updater keeps the measured initramfs before a package install.
+fs::path initrd_backup_path(const fs::path& state_dir, const std::string& tag,
+                            const std::string& initrd) {
+    return state_dir / "previous" / tag / "boot" / fs::path(initrd).filename();
 }
 
 std::vector<OsPackage> packages_from(const json& j) {
@@ -89,6 +97,9 @@ struct Updater::State {
     std::string previous_grub_entry;
     std::string boot_id;
     std::vector<std::string> staged_seal_names;
+    /// The initramfs kept before the package install (kInitrdPrefix + kernel
+    /// release); empty when no package install or no image.
+    std::string measured_initrd;
     std::string last_result;
 };
 
@@ -131,6 +142,8 @@ std::optional<Updater::State> Updater::load_state() {
         s.previous_grub_entry = j.at("previous_grub_entry").get<std::string>();
         s.boot_id = j.at("boot_id").get<std::string>();
         s.staged_seal_names = j.at("staged_seal_names").get<std::vector<std::string>>();
+        // Absent in a state file written before this field existed.
+        s.measured_initrd = j.value("measured_initrd", std::string());
         s.last_result = j.at("last_result").get<std::string>();
         return s;
     } catch (const std::exception&) {
@@ -152,6 +165,7 @@ bool Updater::save_state(const State& s) {
         {"previous_grub_entry", s.previous_grub_entry},
         {"boot_id", s.boot_id},
         {"staged_seal_names", s.staged_seal_names},
+        {"measured_initrd", s.measured_initrd},
         {"last_result", s.last_result},
     };
     std::error_code ec;
@@ -427,6 +441,10 @@ CycleResult Updater::start_update(State& state, const Release& release) {
     next.reboot = decision_reboot.reboot;
     next.staged_seal_names.clear();
     next.previous_grub_entry.clear();
+    next.measured_initrd.clear();
+    if (!next.packages_install.empty() && !back_up_measured_initrd(next, error)) {
+        return {CycleOutcome::Refused, error};
+    }
 
     if (next.reboot) {
         const auto grub_default = read_file(host_path(kGrubDefault), kMaxMetadataBytes);
@@ -517,6 +535,12 @@ CycleResult Updater::resume(State& state) {
             if (r.exit_code != 0) {
                 return roll_back(state, "apt-get install failed: " + trim(r.output), true);
             }
+            // The approval keeps PCR 8/9 unless the boot chain changes, so the
+            // initramfs must stay the measured image. With a boot-chain
+            // change, the new PCRs cover what the packages produce.
+            if (!state.reboot && !restore_measured_initrd(state, error)) {
+                return roll_back(state, error, true);
+            }
             if (!check_library_hashes(error)) return roll_back(state, error, true);
         }
         if (!state.reboot) return finish_without_reboot(state);
@@ -549,6 +573,7 @@ CycleResult Updater::resume(State& state) {
         if (!restore.empty() && env_.run(apt_install_argv(restore)).exit_code != 0) {
             notes = "; restoring the previous packages failed";
         }
+        if (!restore_measured_initrd(state, error)) notes += "; " + error;
         const std::string detail = state.last_result + notes;
         report(state, false, detail);
         state.halted_release_number = state.number;
@@ -559,6 +584,51 @@ CycleResult Updater::resume(State& state) {
         return {CycleOutcome::Failed, detail};
     }
     return {CycleOutcome::Refused, "unknown updater phase " + state.phase};
+}
+
+bool Updater::back_up_measured_initrd(State& state, std::string& error) {
+    state.measured_initrd.clear();
+    const auto kernel = trim(env_.kernel_release());
+    if (kernel.empty() || kernel.find('/') != std::string::npos || kernel == "." ||
+        kernel == "..") {
+        error = "cannot name the initramfs of the running kernel";
+        return false;
+    }
+    const std::string initrd = std::string(kInitrdPrefix) + kernel;
+    const auto target = host_path(initrd);
+    std::error_code ec;
+    if (!fs::exists(target, ec)) return true;
+    const auto backup = initrd_backup_path(state_dir(), state.tag, initrd);
+    fs::create_directories(backup.parent_path(), ec);
+    fs::permissions(backup.parent_path(), fs::perms::owner_all, fs::perm_options::replace, ec);
+    if (!install_file_atomic(target, backup, fs::status(target, ec).permissions(), error)) {
+        return false;
+    }
+    state.measured_initrd = initrd;
+    return true;
+}
+
+bool Updater::restore_measured_initrd(const State& state, std::string& error) {
+    if (state.measured_initrd.empty()) return true;
+    const auto target = host_path(state.measured_initrd);
+    const auto backup = initrd_backup_path(state_dir(), state.tag, state.measured_initrd);
+    const auto kept = sha256_file_hex(backup.string());
+    if (!kept) {
+        error = "the backup of the measured " + state.measured_initrd + " is missing";
+        return false;
+    }
+    if (sha256_file_hex(target.string()) == kept) return true;
+    spdlog::warn("[updater] the package install changed {}; restoring the measured image",
+                 state.measured_initrd);
+    std::error_code ec;
+    if (!install_file_atomic(backup, target, fs::status(backup, ec).permissions(), error)) {
+        return false;
+    }
+    if (sha256_file_hex(target.string()) != kept) {
+        error = "the restored " + state.measured_initrd + " does not match its backup";
+        return false;
+    }
+    return true;
 }
 
 bool Updater::check_library_hashes(std::string& error) {
@@ -645,6 +715,8 @@ CycleResult Updater::roll_back(State& state, const std::string& reason, bool res
         if (!restore.empty() && env_.run(apt_install_argv(restore)).exit_code != 0) {
             notes += "; restoring the previous packages failed";
         }
+        // The previous boot chain needs its measured initramfs back.
+        if (!restore_measured_initrd(state, error)) notes += "; " + error;
     }
     if (restart_services &&
         !systemctl({"start", std::string(kAttestdUnit), std::string(kServerUnit)}, error)) {

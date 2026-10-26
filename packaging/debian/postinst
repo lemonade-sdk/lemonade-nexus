@@ -57,6 +57,28 @@ rebuild_supported_initramfs() {
     fi
 }
 
+# The files this package puts into the initramfs. preinst lists the same
+# files in the same order.
+EARLY_BOOT_INPUTS=(
+    /usr/lib/lemonade-nexus/apparmor/nexus-tier1-authority-probe.bin
+    /usr/share/initramfs-tools/hooks/nexus-tier1-apparmor
+    /usr/share/initramfs-tools/scripts/init-premount/nexus-tier1-apparmor
+    /usr/lib/dracut/modules.d/76nexus-tier1-apparmor/module-setup.sh
+    /usr/lib/dracut/modules.d/76nexus-tier1-apparmor/nexus-tier1-apparmor.sh
+)
+EARLY_BOOT_DIGEST=/var/lib/lemonade-nexus/.initramfs-inputs.sha256
+
+# True unless preinst recorded a digest of the previously installed
+# early-boot files and the new files have the same digest. A fresh install,
+# a reinstall after removal, and an RPM install record no digest.
+early_boot_inputs_changed() {
+    local recorded current
+    [ -f "$EARLY_BOOT_DIGEST" ] && [ ! -L "$EARLY_BOOT_DIGEST" ] || return 0
+    recorded=$(cat -- "$EARLY_BOOT_DIGEST") || return 0
+    current=$(sha256sum -- "${EARLY_BOOT_INPUTS[@]}" 2>/dev/null) || return 0
+    [ "$recorded" != "$current" ]
+}
+
 # Create lemonade-nexus system user if it doesn't exist
 if ! id -u lemonade-nexus >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin \
@@ -144,11 +166,23 @@ fi
 chown root:lemonade-nexus /etc/lemonade-nexus/lemonade-nexus.env
 chmod 0640 /etc/lemonade-nexus/lemonade-nexus.env
 
+# PCR 9 measures the initramfs. The sealed boot set (storage share, gossip
+# identity) and the release approval are bound to PCR 8/9, so a rebuilt image
+# stops unsealing and attestation at the next boot unless an approval for the
+# new values is staged. Rebuild only when this package's early-boot files
+# changed; an upgrade or reinstall with the same files keeps the measured
+# image.
+#
 # Rebuild only through the backend selected by installed package state. The
 # dependency guarantees a supported backend; dracut wins when both are present,
 # and refusing zero prevents an image that silently omits the Tier-1 early
 # profile.
-rebuild_supported_initramfs
+if early_boot_inputs_changed; then
+    rebuild_supported_initramfs
+else
+    echo "lemonade-nexus: the early-boot files are unchanged; the measured initramfs is kept"
+fi
+rm -f "$EARLY_BOOT_DIGEST"
 
 # Enable the unit without starting it. A fresh install has no config until
 # nexus-bootstrap runs; starting now would fail validation and trigger the

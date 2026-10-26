@@ -293,6 +293,117 @@ class BootstrapTest(unittest.TestCase):
         self.assertNotIn("-/var/lib/nexus", " ".join(lines).replace("-/var/lib/lemonade-nexus", ""))
 
 
+class InitramfsRebuildTest(unittest.TestCase):
+    # PCR 9 measures the initramfs, and the sealed boot set and the release
+    # approval are bound to PCR 8/9. The package must keep the measured image
+    # when its early-boot files do not change, and rebuild it when they do.
+    PREINST = REPO / "packaging/debian/preinst"
+    POSTINST = REPO / "packaging/debian/postinst"
+
+    @staticmethod
+    def block(text, start):
+        match = re.search(rf"^{re.escape(start)}.*?^[)}}]\n", text, re.MULTILINE | re.DOTALL)
+        assert match, start
+        return match.group(0)
+
+    @staticmethod
+    def inputs(text):
+        block = InitramfsRebuildTest.block(text, "EARLY_BOOT_INPUTS=(")
+        return [line.strip() for line in block.splitlines()[1:-1]]
+
+    def test_both_scripts_list_every_installed_early_boot_file(self):
+        preinst = self.PREINST.read_text()
+        postinst = self.POSTINST.read_text()
+        self.assertEqual(self.inputs(preinst), self.inputs(postinst))
+        for script in (preinst, postinst):
+            self.assertIn("EARLY_BOOT_DIGEST=/var/lib/lemonade-nexus/.initramfs-inputs.sha256\n", script)
+        # Every file installed from the initramfs sources, at its packaged
+        # path (CPack installs under /usr).
+        cmake = (REPO / "projects/LemonadeNexusAttestd/CMakeLists.txt").read_text()
+        installed = set()
+        for rule in re.findall(r"install\((?:PROGRAMS|FILES)(.*?)\)", cmake, re.DOTALL):
+            source = re.search(r'"\$\{CMAKE_SOURCE_DIR\}/packaging/([^"]+)"', rule)
+            if not source or not re.match(r"(initramfs-tools|dracut)/|apparmor/.*\.bin$", source.group(1)):
+                continue
+            destination = re.search(r"DESTINATION\s+(\S+)", rule).group(1)
+            rename = re.search(r"RENAME\s+(\S+)", rule)
+            name = rename.group(1) if rename else Path(source.group(1)).name
+            installed.add(f"/usr/{destination}/{name}")
+        self.assertEqual(len(installed), 5)
+        self.assertEqual(installed, set(self.inputs(postinst)))
+        extra = (REPO / "cmake/packaging.cmake").read_text()
+        self.assertIn("${CMAKE_SOURCE_DIR}/packaging/debian/preinst;", extra)
+
+    def test_postinst_rebuilds_only_when_the_early_boot_files_changed(self):
+        postinst = self.POSTINST.read_text()
+        self.assertIn("if early_boot_inputs_changed; then\n    rebuild_supported_initramfs\n", postinst)
+        self.assertEqual(len(re.findall(r"^\s*rebuild_supported_initramfs$", postinst, re.MULTILINE)), 1)
+        self.assertIn('\nrm -f "$EARLY_BOOT_DIGEST"\n', postinst)
+
+    def run_scripts(self, directory, before, after):
+        """Run preinst's record and postinst's check on files in directory.
+
+        before() runs ahead of preinst (the installed files), after() between
+        preinst and postinst (the unpack). Returns True when postinst would
+        rebuild."""
+        if not shutil.which("sha256sum") or not Path("/bin/bash").exists():
+            self.skipTest("needs bash and sha256sum")
+        files = [directory / f"input{i}" for i in range(5)]
+        digest = directory / "digest"
+        functions = (self.block(self.PREINST.read_text(), "record_early_boot_digest() {") +
+                     self.block(self.POSTINST.read_text(), "early_boot_inputs_changed() {"))
+        program = (
+            "set -e\n" + functions +
+            "EARLY_BOOT_INPUTS=(" + " ".join(f"'{f}'" for f in files) + ")\n"
+            f"EARLY_BOOT_DIGEST='{digest}'\n"
+            '"$1"\n'
+        )
+        def run(step):
+            return subprocess.run(["/bin/bash", "-c", program, "test", step], capture_output=True, text=True)
+        before(files, digest)
+        self.assertEqual(run("record_early_boot_digest").returncode, 0)
+        after(files, digest)
+        return run("early_boot_inputs_changed").returncode == 0
+
+    @staticmethod
+    def write_all(files, digest):
+        for i, f in enumerate(files):
+            f.write_text(f"content {i}\n")
+
+    def test_an_upgrade_with_the_same_early_boot_files_keeps_the_image(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(self.run_scripts(Path(d), self.write_all, lambda files, digest: None))
+
+    def test_an_upgrade_that_changes_an_early_boot_file_rebuilds(self):
+        def change(files, digest):
+            files[2].write_text("new loader\n")
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self.run_scripts(Path(d), self.write_all, change))
+
+    def test_a_fresh_install_rebuilds(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self.run_scripts(Path(d), lambda files, digest: None, self.write_all))
+
+    def test_an_incomplete_previous_install_rebuilds(self):
+        def partial(files, digest):
+            self.write_all(files, digest)
+            files[0].unlink()
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self.run_scripts(Path(d), partial, self.write_all))
+
+    def test_a_stale_digest_without_installed_files_rebuilds(self):
+        def stale(files, digest):
+            digest.write_text("stale\n")
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self.run_scripts(Path(d), stale, self.write_all))
+
+    def test_a_missing_early_boot_file_after_unpack_rebuilds(self):
+        def remove(files, digest):
+            files[4].unlink()
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self.run_scripts(Path(d), self.write_all, remove))
+
+
 class ImaKernelReferenceTest(unittest.TestCase):
     # MeasurementIma.hpp parses the kernel's ascii runtime measurements ABI;
     # the header must carry the authoritative kernel documentation reference so
