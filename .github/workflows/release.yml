@@ -212,7 +212,8 @@ jobs:
       # halted: after a halt, servers run the halted release or the release
       # before it, and the new approval must list both (checked again after
       # the approval is built). The servers are not trusted for the proof.
-      # See docs/Releasing.md.
+      # The bootstrap release and releases listed in release/hand-installed
+      # are recorded complete by a reviewed commit. See docs/Releasing.md.
       - name: Check the previous rollout
         id: rollout
         env:
@@ -232,6 +233,13 @@ jobs:
               exit 1
             fi
             echo "::notice::The bootstrap release $PREVIOUS_TAG is recorded as complete"
+            echo "state=complete" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A release installed by hand on every server has no complete rollout
+          # records. A reviewed commit that lists its tag records its completion.
+          if grep -qxF "$PREVIOUS_TAG" <(tr -d '[:blank:]\r' < release/hand-installed 2>/dev/null); then
+            echo "::notice::$PREVIOUS_TAG is recorded in release/hand-installed as installed on every server"
             echo "state=complete" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -297,7 +305,7 @@ jobs:
       - name: Check the approval against the previous rollout
         run: |
           if [ ! -f rollout/rollout-proof.json ]; then
-            echo "::notice::No rollout proof (bootstrap release, or the release after it)"
+            echo "::notice::No rollout proof (bootstrap release, or a previous release recorded complete by a reviewed commit)"
             exit 0
           fi
           network=$(python3 -c 'import json; print(json.load(open("release/fleet-profile.json"))["network_id"])')
