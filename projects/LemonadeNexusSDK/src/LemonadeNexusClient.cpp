@@ -865,7 +865,14 @@ LemonadeNexusClient::LemonadeNexusClient(const ServerConfig& config)
 {
 }
 
-LemonadeNexusClient::~LemonadeNexusClient() = default;
+LemonadeNexusClient::~LemonadeNexusClient() {
+    // The orchestrator's thread calls back into this client (certificate
+    // renewal, peer refresh) until it stops. unique_ptr clears impl_ before
+    // ~Impl runs, so stopping it there leaves that thread reading a null
+    // impl_: stop it here while impl_ is still set. A moved-from client has
+    // no impl_.
+    if (impl_) disable_mesh();
+}
 
 LemonadeNexusClient::LemonadeNexusClient(LemonadeNexusClient&&) noexcept = default;
 LemonadeNexusClient& LemonadeNexusClient::operator=(LemonadeNexusClient&&) noexcept = default;
