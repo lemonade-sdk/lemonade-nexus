@@ -2652,30 +2652,18 @@ TEST_F(DeltaTransferTest, UnknownOperationIsFinalAndAdvancesTheCursor) {
 // (8) Mesh state: production writes race production reads
 // ---------------------------------------------------------------------------
 
-// The tunnel-IP and NS-slot fields are written on the io thread by the
-// production handlers (ServerHello tunnel assignment, NS slot claims) and
-// read from other threads through the production getters. This test runs
-// the io context on its own thread so the writes are REAL cross-thread
-// production writes, while a reader thread exercises the same fields
-// concurrently. Under -fsanitize=thread an unlocked access on either side
-// is reported.
+// The NS-slot fields are written on the io thread by the production handler
+// (NS slot claims) and read from other threads through the production
+// getters. This test runs the io context on its own thread so the writes are
+// REAL cross-thread production writes, while a reader thread exercises the
+// same fields concurrently. Under -fsanitize=thread an unlocked access on
+// either side is reported.
 TEST_F(DeltaTransferTest, MeshStateProductionWritesRaceProductionReads) {
     auto root_kp = kc->ed25519_keygen();
     auto& a = make_node("a");
     auto& b = make_node("b");
     make_certified_pair(a, b, root_kp);
 
-    // The production tunnel-IP assignment: a cert-verified ServerHello
-    // response carrying assigned_tunnel_ip.
-    auto send_tunnel_ip = [&] {
-        auto cert = issue_cert(b.pubkey_b64(), "srv-b", root_kp);
-        json h = json::parse(cert);
-        h["is_response"] = true;
-        h["assigned_tunnel_ip"] = "10.64.0.5";
-        inject(build_packet(b.keypair(), gossip::GossipMsgType::ServerHello,
-                            bytes_of(h.dump())),
-               a);
-    };
     // A production NS slot claim: signed by the claimant (b), who is
     // cert-verified on a. A fresh timestamp makes each claim win the LWW
     // rule, so every one is a real write to the slot table.
@@ -2696,11 +2684,9 @@ TEST_F(DeltaTransferTest, MeshStateProductionWritesRaceProductionReads) {
                a);
     };
 
-    // Prime both fields through the production path.
-    send_tunnel_ip();
+    // Prime the slot table through the production path.
     send_ns_claim(3);
     pump_for(std::chrono::milliseconds(300));
-    ASSERT_EQ(a.gossip->our_tunnel_ip(), "10.64.0.5");
     ASSERT_EQ(a.gossip->our_ns_slot().value_or(0), 0u);  // b claimed, not a
     auto slots = a.gossip->get_ns_slots();
     ASSERT_FALSE(slots.empty());
@@ -2713,7 +2699,6 @@ TEST_F(DeltaTransferTest, MeshStateProductionWritesRaceProductionReads) {
     std::atomic<uint64_t> reads{0};
     std::thread reader([&] {
         while (!stop_reader) {
-            (void)a.gossip->our_tunnel_ip();
             (void)a.gossip->our_ns_slot();
             (void)a.gossip->get_ns_slots();
             ++reads;
@@ -2738,7 +2723,6 @@ TEST_F(DeltaTransferTest, MeshStateProductionWritesRaceProductionReads) {
     for (const auto& s : final_slots) {
         EXPECT_EQ(s.server_pubkey, b.pubkey_b64());
     }
-    EXPECT_EQ(a.gossip->our_tunnel_ip(), "10.64.0.5");
 }
 
 }  // namespace

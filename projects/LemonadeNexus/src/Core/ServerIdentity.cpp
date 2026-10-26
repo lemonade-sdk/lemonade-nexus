@@ -572,43 +572,29 @@ std::string build_server_fqdn(
 
 std::string resolve_tunnel_ip(
     const std::string& server_node_id,
-    const ServerConfig& config,
-    ipam::IPAMService& ipam,
-    gossip::GossipService& gossip)
+    const std::string& gossip_pubkey_b64,
+    ipam::IPAMService& ipam)
 {
-    if (server_node_id.empty()) return {};
+    if (server_node_id.empty() || gossip_pubkey_b64.empty()) return {};
 
-    std::string tunnel_bind_ip;
-
-    if (config.seed_peers.empty()) {
-        // Genesis/root server: always use .1 as the gateway address.
-        auto server_alloc = ipam.allocate_tunnel_ip(server_node_id);
-        (void)server_alloc;
-        tunnel_bind_ip = "10.64.0.1";
-        spdlog::info("Genesis server -- gateway tunnel IP: {}", tunnel_bind_ip);
-    } else {
-        // Joining server: check existing allocation or wait for gossip assignment
-        auto existing = ipam.get_allocation(server_node_id);
-        if (existing && existing->tunnel) {
-            tunnel_bind_ip = existing->tunnel->base_network;
-        } else {
-            spdlog::info("Waiting for tunnel IP assignment from network peers...");
-            for (int i = 0; i < 15 && gossip.our_tunnel_ip().empty(); ++i) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-            tunnel_bind_ip = gossip.our_tunnel_ip();
-            if (tunnel_bind_ip.empty()) {
-                spdlog::warn("No tunnel IP received from peers -- self-allocating");
-                auto alloc = ipam.allocate_tunnel_ip(server_node_id);
-                tunnel_bind_ip = alloc.base_network;
-            }
-        }
+    // Every server's IPAM file is local, so a sequential allocation (by this
+    // server or by a peer) starts at the same offset on each server and gives
+    // every server the same address. The backbone allocation is keyed on the
+    // server identity and replicated with conflict resolution, so the address
+    // derived from it is unique and stays the same across restarts.
+    const auto backbone = ipam.allocate_backbone_ip(server_node_id, gossip_pubkey_b64);
+    const auto alloc = ipam.assign_server_tunnel_ip(server_node_id);
+    if (alloc.base_network.empty()) {
+        spdlog::error("No tunnel IP: backbone allocation '{}' has no server tunnel address",
+                      backbone.base_network);
+        return {};
     }
 
-    // Strip CIDR suffix (e.g. "10.64.0.1/32" -> "10.64.0.1")
+    std::string tunnel_bind_ip = alloc.base_network;
     if (auto slash = tunnel_bind_ip.find('/'); slash != std::string::npos) {
         tunnel_bind_ip = tunnel_bind_ip.substr(0, slash);
     }
+    spdlog::info("Server tunnel IP {} (backbone {})", tunnel_bind_ip, backbone.base_network);
     return tunnel_bind_ip;
 }
 

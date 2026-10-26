@@ -27,8 +27,8 @@ title: Network Architecture
         [Server A]         [Server B]         [Server C]
         us-west            eu-west            ap-south
         pub: <ip-a>        pub: <ip-b>        pub: <ip-c>
-        tun: 10.64.0.1     tun: 10.64.0.1     tun: 10.64.0.1
-        bb:  172.16.0.x    bb:  172.16.0.x    bb:  172.16.0.x
+        tun: 10.64.252.a   tun: 10.64.253.b   tun: 10.64.254.c
+        bb:  172.16.0.a    bb:  172.16.1.b    bb:  172.16.2.c
              |                  |                  |
              └──── Server backbone (172.16.0.0/22) ────┘
              |                  |                  |
@@ -39,6 +39,10 @@ title: Network Architecture
 Both the client plane and the server backbone are **virtual addresses that
 exist only inside each daemon** (userspace netstack). There is no kernel
 WireGuard interface and no TUN device on the server.
+
+Each server has its own tunnel address. It is `10.64.252.0` plus the offset
+of the server's backbone address, so the two addresses of a server end in the
+same offset (see [IP Ranges](IP-Ranges#server-tunnel-ips)).
 
 ## Traffic Planes
 
@@ -96,7 +100,7 @@ sessions plus an in-process smoltcp netstack. Consequences:
    POST /api/join           -> node creation, tunnel IP, mesh config, session JWT
 
 3. Mesh tunnel (UDP 51940)
-   BoringTun handshake -> client 10.64.0.x <-> server 10.64.0.1
+   BoringTun handshake -> client 10.65.x.x <-> server 10.64.252.0/22 address
 
 4. Private API (TCP 9101, via the mesh)
    Tree, mesh, IPAM, routing, relay, certs

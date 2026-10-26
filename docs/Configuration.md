@@ -252,8 +252,9 @@ runs the merge once, after every server runs a release with tree operations.
 - **Tunnel addresses.** The join operation's apply step derives the endpoint
   address from the tree: the first free `/32` at or after a start offset
   derived from the node id, inside `10.65.0.0`–`10.127.255.254`. A deleted
-  node's address is free again at once. IPAM keeps `10.64.0.0/16` for server
-  addresses.
+  node's address is free again at once. IPAM keeps `10.64.0.0/16`: each
+  server takes its own address in `10.64.252.0/22` from its backbone address
+  (see [IP Ranges](IP-Ranges#server-tunnel-ips)).
 - **Server-assigned fields.** For every writer that is not an admin of the
   root node, `tunnel_ip` and `private_subnet` are server-assigned and `type`
   is fixed: a create cannot set the addresses or make a Relay node, and an

@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <tuple>
@@ -37,6 +38,20 @@ constexpr uint32_t kTreeTunnelFirst = kTunnelBase + tree::kTreeTunnelFirstOffset
 bool is_tree_tunnel_ip(uint32_t ip) {
     return ip >= kTreeTunnelFirst && ip < kTunnelBase + kTunnelSize;
 }
+
+/// True for a tunnel record in the server tunnel range.
+bool is_server_tunnel_ip(uint32_t ip) {
+    return ip >= kServerTunnelBase && ip < kServerTunnelBase + kServerTunnelSize;
+}
+
+/// The first backbone offset a server can hold (.0 to .9 are reserved).
+constexpr uint32_t kBackboneUsableStart = 10;
+
+static_assert(kServerTunnelSize == kBackboneSize,
+              "each backbone offset maps to one server tunnel address");
+static_assert(kServerTunnelBase >= kTunnelBase &&
+                  kServerTunnelBase + kServerTunnelSize <= kTreeTunnelFirst,
+              "server tunnel addresses stay below the tree range");
 
 /// Return the current Unix timestamp.
 uint64_t now_unix() {
@@ -365,9 +380,10 @@ void IPAMService::load_allocations() {
     }
 
     // Rebuild cursor positions by scanning existing allocations. Tree-range
-    // records belong to the tree and never move the sequential cursor.
+    // and server-range records never move the sequential cursor.
     for (const auto& [node_id, aset] : allocations_) {
-        if (aset.tunnel && !is_tree_tunnel_ip(parse_cidr(aset.tunnel->base_network).first)) {
+        if (aset.tunnel && !is_tree_tunnel_ip(parse_cidr(aset.tunnel->base_network).first) &&
+            !is_server_tunnel_ip(parse_cidr(aset.tunnel->base_network).first)) {
             auto [ip, prefix] = parse_cidr(aset.tunnel->base_network);
             uint32_t offset = ip - kTunnelBase + 1;
             // Never go below 10 — .0-.9 reserved for system use
@@ -529,7 +545,8 @@ uint32_t IPAMService::sweep_expired_tunnel_leases() {
 
     for (const auto& [nid, aset] : allocations_) {
         if (!aset.tunnel) continue;
-        if (is_tree_tunnel_ip(parse_cidr(aset.tunnel->base_network).first)) continue;
+        const uint32_t ip = parse_cidr(aset.tunnel->base_network).first;
+        if (is_tree_tunnel_ip(ip) || is_server_tunnel_ip(ip)) continue;
         if (aset.tunnel->last_seen > 0 &&
             (now - aset.tunnel->last_seen) > timeout) {
             to_release.push_back(nid);
@@ -600,6 +617,53 @@ std::size_t IPAMService::sync_tree_tunnel_addresses(
     }
     if (changed > 0) save_allocations();
     return changed;
+}
+
+std::optional<std::string> IPAMService::server_tunnel_for_backbone(
+    std::string_view backbone_cidr) {
+    const auto address = backbone_cidr.substr(0, backbone_cidr.find('/'));
+    if (address.size() != backbone_cidr.size() && backbone_cidr.substr(address.size()) != "/32") {
+        return std::nullopt;
+    }
+    // ip_to_u32 trusts its input: give it at most four short digit groups and
+    // then require that the result prints back as the same text.
+    if (address.size() > 15 || std::count(address.begin(), address.end(), '.') != 3 ||
+        !std::all_of(address.begin(), address.end(),
+                     [](char c) { return c == '.' || (c >= '0' && c <= '9'); })) {
+        return std::nullopt;
+    }
+    const uint32_t ip = ip_to_u32(address);
+    if (u32_to_ip(ip) != address) return std::nullopt;
+    if ((ip & kBackboneMask) != kBackboneBase) return std::nullopt;
+    const uint32_t offset = ip - kBackboneBase;
+    if (offset < kBackboneUsableStart) return std::nullopt;
+    return format_cidr(kServerTunnelBase + offset, 32);
+}
+
+Allocation IPAMService::assign_server_tunnel_ip(std::string_view server_node_id) {
+    std::lock_guard lock(mutex_);
+    auto it = allocations_.find(std::string(server_node_id));
+    if (it == allocations_.end() || !it->second.backbone) return {};
+    const auto cidr = server_tunnel_for_backbone(it->second.backbone->base_network);
+    if (!cidr) return {};
+
+    auto& tunnel = it->second.tunnel;
+    if (tunnel && tunnel->base_network == *cidr) return *tunnel;
+    if (tunnel) {
+        spdlog::info("[{}] server '{}' tunnel {} replaced by {}", name(), server_node_id,
+                     tunnel->base_network, *cidr);
+    }
+    Allocation alloc;
+    alloc.block_type       = BlockType::Tunnel;
+    alloc.base_network     = *cidr;
+    alloc.customer_node_id = std::string(server_node_id);
+    alloc.allocated_at     = now_unix();
+    alloc.last_seen        = 0;
+    tunnel = alloc;
+    save_allocations();
+    spdlog::info("[{}] server '{}' tunnel {} (from backbone {})", name(), server_node_id, *cidr,
+                 it->second.backbone->base_network);
+    return alloc;
 }
 
 void IPAMService::update_tunnel_last_seen(std::string_view node_id) {

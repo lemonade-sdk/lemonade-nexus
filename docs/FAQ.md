@@ -79,10 +79,12 @@ TDX, or Secure Enclave provider in this repository. See the
 
 ## How are IP addresses allocated?
 
-- **Clients:** sequential from `10.64.0.0/10`, starting at `.10` (first ten
-  reserved).
-- **Servers:** deterministic from the server's identity key, in
-  `172.16.0.0/22`, with pubkey-based conflict resolution.
+- **Clients:** the committed join operation assigns each endpoint an address
+  from the tree, in `10.65.0.0`–`10.127.255.254`.
+- **Servers:** a backbone address that is deterministic from the server's
+  identity key, in `172.16.0.0/22`, with pubkey-based conflict resolution.
+  The server's tunnel address, where clients reach its private API, has the
+  same offset in `10.64.252.0/22`.
 
 Details in [IP Ranges](IP-Ranges). Note that automatic reclamation of
 departed servers' backbone IPs is not yet wired.

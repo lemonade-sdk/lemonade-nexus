@@ -158,3 +158,31 @@ TEST(BoringtunPeerRoutes, ATunnelAddressThatIsNotThePeersOwnGetsNoRoute) {
     for (std::size_t i = 0; i < 5; ++i) EXPECT_TRUE(routes[i].empty()) << i << ": " << routes[i];
     EXPECT_EQ(routes[5], "10.64.0.10/32");
 }
+
+// The session server's private API answers on the server's tunnel address,
+// which the server peer's plane route carries. A peer route on that address is
+// a longer match and would send the private API traffic to the peer instead.
+// Before servers had unique addresses, every server and the first endpoint
+// that a server allocated held 10.64.0.10.
+TEST(BoringtunPeerRoutes, APeerNeverGetsTheSessionServersAddress) {
+    const std::string server = "10.64.252.37";
+    const auto routes = BoringtunMesh::peer_allowed_ips(
+        {mesh_peer("bare", server), mesh_peer("prefixed", server + "/32"),
+         mesh_peer("other-server", "10.64.252.38/32"), mesh_peer("endpoint", "10.65.0.9/32")},
+        kPlane, kOwn, server);
+    ASSERT_EQ(routes.size(), 4u);
+    EXPECT_TRUE(routes[0].empty()) << routes[0];
+    EXPECT_TRUE(routes[1].empty()) << routes[1];
+    EXPECT_EQ(routes[2], "10.64.252.38/32");
+    EXPECT_EQ(routes[3], "10.65.0.9/32");
+
+    // The server address is also reserved when it arrives with a prefix.
+    const auto prefixed = BoringtunMesh::peer_allowed_ips({mesh_peer("p", server)}, kPlane,
+                                                          kOwn, server + "/32");
+    EXPECT_TRUE(prefixed[0].empty()) << prefixed[0];
+
+    // Without a known server address only the own address is reserved.
+    const auto unknown =
+        BoringtunMesh::peer_allowed_ips({mesh_peer("p", server)}, kPlane, kOwn);
+    EXPECT_EQ(unknown[0], server + "/32");
+}

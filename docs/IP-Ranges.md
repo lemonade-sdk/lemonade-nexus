@@ -9,6 +9,7 @@ title: IP Ranges and IPAM
 - [Address Ranges](#address-ranges)
 - [Reserved Addresses](#reserved-addresses)
 - [Client Tunnel IPs](#client-tunnel-ips)
+- [Server Tunnel IPs](#server-tunnel-ips)
 - [Private and Shared Blocks](#private-and-shared-blocks)
 - [Backbone Allocation](#backbone-allocation)
 - [Multi-Server Coordination](#multi-server-coordination)
@@ -35,18 +36,44 @@ reserved for system use:
 | Address | Purpose |
 |---------|---------|
 | `.0` | Network address |
-| `.1` | Server gateway (tunnel plane) |
-| `.2`–`.9` | Reserved for system services |
-| `.10`+ | Allocated endpoints |
+| `.1`–`.9` | Reserved for system services |
+| `.10`+ | Allocated addresses |
 
 ## Client Tunnel IPs (10.64.0.0/10)
 
-- Sequential allocation starting at offset 10.
-- Each client gets a `/32`; tunnel allocations cannot be expanded.
-- Allocated during `/api/join` and persisted to `data/ipam/`.
-- Allocations are DHCP-style leases: the lease timeout scales with how full
-  the pool is (168 hours at half-full or less, shrinking linearly to zero at
-  full).
+The client plane holds three kinds of address:
+
+| Range | Holder | Assigned by |
+|-------|--------|-------------|
+| `10.65.0.0`–`10.127.255.254` | Endpoints | The committed join operation, from the tree (see [Configuration](Configuration)) |
+| `10.64.252.0/22` | Servers | Each server, from its backbone address (see [Server Tunnel IPs](#server-tunnel-ips)) |
+| `10.64.0.10` and up | Endpoints from before tree operations | The sequential IPAM allocator of one server |
+
+- Each address is a `/32`; tunnel allocations cannot be expanded.
+- `POST /api/ipam/allocate` does not give tunnel addresses. A client joins
+  to receive one.
+
+## Server Tunnel IPs
+
+A server answers its private API (TCP `9101`) on its tunnel address. The join
+response gives this address to the client as `server_tunnel_ip`, and the
+`private.<id>.<region>.seip.<domain>` record points to it.
+
+The address is `10.64.252.0` plus the offset of the server's backbone address
+in `172.16.0.0/22`. For example, backbone `172.16.1.7` gives tunnel
+`10.64.253.7`. Each server holds its own backbone address (see
+[Backbone Allocation](#backbone-allocation)), so each server holds its own
+tunnel address, and the address is the same after a restart. If two servers
+claim the same backbone address, the conflict rule moves the losing server
+at its next start, and its tunnel address moves with it. A server computes
+its own address and records it in its IPAM file. Servers do not ask peers for
+an address.
+
+Before this rule, each server took the first sequential address from an IPAM
+file that only it (or the peer that answered it) held, so every server bound
+`10.64.0.10`. An updated server moves to its derived address at its first
+start; a server that still runs an older release keeps its old address until
+it updates.
 
 ## Private and Shared Blocks
 

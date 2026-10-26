@@ -40,7 +40,7 @@ Base domain: `dns_base_domain` (default `lemonade-nexus.io`).
 ```text
 <id>.<region>.seip.<domain>              A   -> public IP
 _config.<id>.<region>.seip.<domain>      TXT -> ports + region + load [+ host]
-private.<id>.<region>.seip.<domain>      A   -> tunnel IP (10.64.0.x)
+private.<id>.<region>.seip.<domain>      A   -> tunnel IP (10.64.252.0/22)
 backend.<id>.<region>.seip.<domain>      A   -> backbone IP (172.16.0.x)
 ```
 
@@ -51,7 +51,7 @@ identifies the server's backbone address.
 ## EP — Client Endpoints
 
 ```text
-private.<node_id>.ep.<domain>    A -> client tunnel IP (10.64.0.x)
+private.<node_id>.ep.<domain>    A -> client tunnel IP (10.65.x.x)
 ```
 
 Registered by the server when a client joins via `/api/join`.

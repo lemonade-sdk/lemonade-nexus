@@ -329,7 +329,6 @@ void GossipService::on_start() {
 }
 
 void GossipService::send_startup_server_hello() {
-    // If we need a tunnel IP, include the request flag so a peer allocates one for us.
     std::vector<std::string> endpoints;
     bool have_cert = false;
     {
@@ -345,24 +344,8 @@ void GossipService::send_startup_server_hello() {
     }
     if (have_cert) {
         json hello = *our_certificate_;
-        bool need_tunnel_ip = false;
         {
             std::lock_guard lock(mesh_state_mutex_);
-            need_tunnel_ip = ipam_ && our_tunnel_ip_.empty();
-            // Check if IPAM already has our allocation
-            if (need_tunnel_ip) {
-                auto existing = ipam_->get_allocation(our_certificate_->server_id);
-                if (existing && existing->tunnel) {
-                    auto ip = existing->tunnel->base_network;
-                    if (auto slash = ip.find('/'); slash != std::string::npos)
-                        ip = ip.substr(0, slash);
-                    our_tunnel_ip_ = ip;
-                    need_tunnel_ip = false;
-                }
-            }
-            if (need_tunnel_ip) {
-                hello["request_tunnel_ip"] = true;
-            }
             if (!our_region_.empty()) {
                 hello["region"] = our_region_;
             }
@@ -379,8 +362,7 @@ void GossipService::send_startup_server_hello() {
                 send_packet(*target, GossipMsgType::ServerHello, payload_bytes);
             }
         }
-        spdlog::info("[{}] sent ServerHello to {} peers (request_tunnel_ip: {})",
-                      name(), endpoints.size(), need_tunnel_ip);
+        spdlog::info("[{}] sent ServerHello to {} peers", name(), endpoints.size());
     }
 }
 
@@ -1836,7 +1818,6 @@ void GossipService::on_gossip_tick() {
             json hello = *our_certificate_;
             {
                 std::lock_guard lock(mesh_state_mutex_);
-                if (ipam_ && our_tunnel_ip_.empty()) hello["request_tunnel_ip"] = true;
                 if (!our_region_.empty()) hello["region"] = our_region_;
                 if (!our_advertised_endpoint_.empty())
                     hello["advertised_endpoint"] = our_advertised_endpoint_;
@@ -2726,33 +2707,8 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
             }
         }
 
-        // If peer requested a tunnel IP and we have IPAM, allocate one
-        if (j.value("request_tunnel_ip", false) && ipam_ && !cert.server_id.empty()) {
-            auto alloc = ipam_->allocate_tunnel_ip(cert.server_id);
-            if (!alloc.base_network.empty()) {
-                // Strip /32 suffix for the IP
-                auto assigned_ip = alloc.base_network;
-                if (auto slash = assigned_ip.find('/'); slash != std::string::npos) {
-                    assigned_ip = assigned_ip.substr(0, slash);
-                }
-                spdlog::info("[{}] allocated tunnel IP {} for joining server '{}'",
-                              name(), assigned_ip, cert.server_id);
-
-                // Send assignment in our response
-                if (our_certificate_ && !j.value("is_response", false)) {
-                    json response = *our_certificate_;
-                    response["is_response"] = true;
-                    response["assigned_tunnel_ip"] = assigned_ip;
-                    if (!our_advertised_endpoint_.empty())
-                        response["advertised_endpoint"] = our_advertised_endpoint_;
-                    auto payload_str = response.dump();
-                    std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
-                    send_packet(sender, GossipMsgType::ServerHello, payload_bytes);
-                }
-            }
-        }
-        // Respond with our own certificate (no IP request)
-        else if (our_certificate_ && !j.value("is_response", false)) {
+        // Respond with our own certificate.
+        if (our_certificate_ && !j.value("is_response", false)) {
             json response = *our_certificate_;
             response["is_response"] = true;
             if (!our_advertised_endpoint_.empty())
@@ -2760,20 +2716,6 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
             auto payload_str = response.dump();
             std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
             send_packet(sender, GossipMsgType::ServerHello, payload_bytes);
-        }
-
-        // If this is a response containing our assigned tunnel IP, store it
-        if (j.value("is_response", false) && j.contains("assigned_tunnel_ip")) {
-            {
-                std::lock_guard lock(mesh_state_mutex_);
-                our_tunnel_ip_ = j["assigned_tunnel_ip"].get<std::string>();
-            }
-            std::string ip;
-            {
-                std::lock_guard lock(mesh_state_mutex_);
-                ip = our_tunnel_ip_;
-            }
-            spdlog::info("[{}] received tunnel IP assignment: {}", name(), ip);
         }
 
         // The certificate verified and the packet signer proved possession of
@@ -2808,11 +2750,6 @@ void GossipService::set_ipam(ipam::IPAMService* ipam) {
 
 void GossipService::set_boringtun(boringtun::BoringtunService* dataplane) {
     boringtun_ = dataplane;
-}
-
-std::string GossipService::our_tunnel_ip() const {
-    std::lock_guard lock(mesh_state_mutex_);
-    return our_tunnel_ip_;
 }
 
 void GossipService::try_add_backbone_mesh_peer(const GossipPeer& peer) {

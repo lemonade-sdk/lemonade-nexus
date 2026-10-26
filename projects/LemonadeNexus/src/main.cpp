@@ -725,8 +725,10 @@ int main(int argc, char* argv[]) {
     // Tunnel IP + TLS resolution
     // ========================================================================
     auto server_node_id = nexus::core::resolve_server_node_id(storage);
+    // The tunnel address follows the backbone allocation, which is keyed on
+    // the gossip identity (see the backbone section below).
     std::string tunnel_bind_ip = nexus::core::resolve_tunnel_ip(
-        server_node_id, config, ipam, gossip);
+        server_node_id, nexus::crypto::to_base64(gossip.keypair().public_key), ipam);
 
     // Resolve server FQDN and register DNS records
     std::string server_hostname = config.server_hostname;
