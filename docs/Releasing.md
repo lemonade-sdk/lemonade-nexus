@@ -411,7 +411,7 @@ cat /var/lib/nexus-updater/state.json
 |---|---|
 | `/var/lib/nexus-updater/state.json` | Installed and halted release numbers, the update phase, the last result |
 | `/var/lib/nexus-updater/staged/<tag>/` | Verified files waiting for the upgrade turn |
-| `/var/lib/nexus-updater/previous/<tag>/` | The files from before `<tag>` was installed |
+| `/var/lib/nexus-updater/previous/<tag>/` | The files from before `<tag>` was installed. When `<tag>` installs OS packages, `boot/` holds the running kernel's measured initramfs |
 | `/run/lemonade-nexus/upgrade.sock` | The server's upgrade control socket, root peers only ([Upgrade Control](Upgrade-Control)) |
 
 A failed release halts on that server until a newer release appears. To retry
@@ -420,6 +420,21 @@ the same release after a fix on the host, an operator sets
 
 The package also disables `unattended-upgrades` and `apt-daily-upgrade.timer`:
 every OS change comes through a release.
+
+PCR 9 measures the initramfs, so a rebuilt image stops unsealing and
+attestation at the next boot. Two rules keep the measured image:
+
+- Before an OS package install, the updater copies
+  `/boot/initrd.img-$(uname -r)` to `previous/<tag>/boot/`. A package can
+  rebuild the image through a dpkg trigger. A release without a boot-chain
+  change keeps PCR 8/9, so the updater puts the copy back after the install.
+  A rollback puts it back in every case. A missing copy fails the update and
+  rolls it back.
+- The server package (`apt install ./lemonade-nexus-*.deb`) rebuilds the
+  initramfs only when its own early-boot files change: a fresh install, or an
+  upgrade that changes the AppArmor blob, the initramfs-tools hook and loader,
+  or the dracut module. `preinst` records the digest of the installed files,
+  and `postinst` compares it with the new files.
 
 ## Limits
 
@@ -436,7 +451,10 @@ every OS change comes through a release.
   job only compares them. The workflow never computes PCR values.
 - **OS package lock.** `release/os-packages.lock` was captured on the
   reference VM. A lock change that touches a `boot` package needs new PCR 8/9
-  in `release/fleet-profile.json`, measured on the reference VM.
+  in `release/fleet-profile.json`, measured on the reference VM. When those
+  packages build a new initramfs on each server, the measured PCR 9 is correct
+  only if every server builds the same bytes as the reference VM. That is not
+  verified.
 - **Embedded libraries.** Fleet OS updates of OpenSSL do not reach Nexus. An
   OpenSSL fix reaches the fleet only when a release moves `UBUNTU_SNAPSHOT`;
   track the Ubuntu security notices for `openssl` in Ubuntu 24.04. A local
