@@ -13,6 +13,7 @@ mesh yet.
 
 ## Table of Contents
 - [Purpose](#purpose)
+- [Empty start: no tree data kept](#empty-start-no-tree-data-kept)
 - [What the merge trusts](#what-the-merge-trusts)
 - [How a server behaves until the merge](#how-a-server-behaves-until-the-merge)
 - [Before you start](#before-you-start)
@@ -37,6 +38,33 @@ The owner runs one script, `nexus-tree-migrate`, on the root server: once as a
 dry run, and once to sign and deliver. Everything else is the normal signed
 release and the rolling update.
 
+## Empty start: no tree data kept
+
+When no tree data needs to survive, skip the merge. The install moves each
+Tier 1 server's `data/tree` (with any tree log) aside. A Tier 1 server with no
+tree log and an empty tree does not await a merge: it opens a log on the empty
+base and asks Tier 1 for the `EstablishRoot` operation of its configured
+`root_pubkey`. Tier 1 commits it as height 1, which holds only the application
+root, owned by the root management key. No command is needed.
+
+The authority is unchanged: a replica accepts `EstablishRoot` only when it
+names the replica's own configured `root_pubkey` and no root exists, only from
+a submitter in the block epoch's Tier 1 set, and only through consensus. It
+is one-shot: a second root is refused (`AlreadyExists`).
+
+To check from the root server (ns1), run the one command:
+
+```bash
+sudo nexus-tree-migrate
+```
+
+It reports that no Tier 1 member awaits a merge and exits. Then
+`GET /api/tree/sync` on each Tier 1 server shows `"mode": "ops"`,
+`"height": 1` (or more after the first writes), and the same `"state_root"`.
+
+Move the trees aside on every Tier 1 server or on none: a server that keeps an
+old tree awaits a merge and withholds its vote, and the script refuses a mix.
+
 ## What the merge trusts
 
 - The merged tree is authorized only by the **root management key** signature
@@ -53,8 +81,10 @@ release and the rolling update.
   at most 10 minutes from its clock, a nonce it has not served). It signs its
   export with its own gossip identity (`lemonade-nexus/tree-export-signature:v1`).
 - The root server merges only when the exports are signed by exactly the
-  current Tier 1 members by finalized membership, each once, plus its own
-  backup export. Only the root server's export counts as the root server's.
+  current Tier 1 members by finalized membership, each once, plus at most its
+  own backup export. Only the root server's export counts as the root
+  server's. Without a backup, the merged root is the application root of the
+  root management key (as `EstablishRoot` creates it).
 - The root management key and the data key never leave the running servers.
   The script holds no key. On the root server's control socket (root peers
   only, [Upgrade Control](Upgrade-Control)) the key signs only an export
@@ -94,11 +124,12 @@ server holds no tree.
 
 - You know which server holds the root management key (the root server). Its
   identity public key is `root_pubkey`. On the production mesh this is ns1.
-- The root server's own tree: a Tier 2 server deleted its tree at startup. Use
-  the backup taken before that release ran (on ns1:
-  `/var/lib/lemonade-nexus-backup-20261025-boot/state.tar`). The script
-  accepts a tar file or a directory and finds the data directory in it (the
-  directory that holds `tree/nodes`).
+- The root server's own tree (optional, `--backup`): a Tier 2 server deleted
+  its tree at startup. To keep it, use the backup taken before that release
+  ran (on ns1: `/var/lib/lemonade-nexus-backup-20261025-boot/state.tar`). The
+  script accepts a tar file or a directory and finds the data directory in it
+  (the directory that holds `tree/nodes`). Without `--backup`, the root server
+  contributes no tree.
 - The backup's files open only with the data key the root server holds now.
   Run the merge before the root server's next monthly data key rotation.
 - Every Tier 1 member must be reachable from the root server on its public
@@ -196,7 +227,7 @@ Then, on the selected nodes:
 
 The result depends only on the exports: their order, and the order of nodes
 in them, does not change it. The merge refuses to produce a commit only for
-malformed input (repeated server labels, not exactly one root server export,
+malformed input (repeated server labels, more than one root server export,
 a bad resolution, no root in any export).
 
 ## Recovery

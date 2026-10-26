@@ -923,7 +923,6 @@ protected:
             : crypto_svc->ed25519_keygen().public_key;
         config.root_pubkey = crypto::to_hex(
             std::span<const uint8_t>(anchor.data(), anchor.size()));
-        config.onboard_enabled = true;
 
         gossip_svc = std::make_unique<gossip::GossipService>(io, 0, *storage_svc, *crypto_svc);
         gossip_svc->set_network_id(kTestNetworkHex);
@@ -1645,7 +1644,6 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     core::ServerConfig config;
     config.root_pubkey = crypto::to_hex(
         std::span<const uint8_t>(root.public_key.data(), root.public_key.size()));
-    config.onboard_enabled = true;
     core::ServerAdmissionService admission{config, c, kw, s, gossip};
     admission.set_network_id(kTestNetworkHex);
     admission.start();
@@ -1736,7 +1734,6 @@ TEST(OnboardingAdmission, ReservedSelfServerIdRefused) {
     core::ServerConfig config;
     config.root_pubkey = crypto::to_hex(
         std::span<const uint8_t>(root.public_key.data(), root.public_key.size()));
-    config.onboard_enabled = true;
     core::ServerAdmissionService admission{config, c, kw, s, gossip};
     admission.set_network_id(kTestNetworkHex);
     admission.start();
@@ -2059,7 +2056,6 @@ TEST(OnboardingAdmission, SupersedeRevokesTheOldCertificate) {
     core::ServerConfig config;
     config.root_pubkey = crypto::to_hex(
         std::span<const uint8_t>(root.public_key.data(), root.public_key.size()));
-    config.onboard_enabled = true;
     core::ServerAdmissionService admission{config, c, kw, s, gossip};
     admission.set_network_id(kTestNetworkHex);
     admission.start();

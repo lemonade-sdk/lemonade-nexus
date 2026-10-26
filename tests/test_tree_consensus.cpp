@@ -716,6 +716,38 @@ protected:
     std::vector<TestBlock> blocks;
 };
 
+// The empty start: a Tier 1 server with no tree log and an empty tree (its
+// data/tree moved aside) does not await a merge. It asks for the EstablishRoot
+// op of the configured root key, and the first committed tree block, height 1,
+// holds just the application root owned by that key.
+TEST_F(TreeConsensusCommitTest, AnEmptyServerReachesHeightOneWithTheRootAlone) {
+    EXPECT_FALSE(tc->awaiting_merge());
+    EXPECT_TRUE(tc->healthy());
+    EXPECT_EQ(tc->log().height(), 0u);
+    bool requested = false;
+    tc->set_root_request([&requested] { requested = true; });
+    tc->maintain();
+    EXPECT_TRUE(requested);
+
+    mirror = base_state();
+    root = seal(root_op());
+    blocks.push_back(tree_block(nullptr, 1, TreeBatch{{root}}, now_ms, mirror));
+    blocks.push_back(block(&blocks[0], 2));
+    blocks.push_back(block(&blocks[1], 3));
+    blocks.push_back(block(&blocks[2], 4));
+    for (const auto& b : blocks) ASSERT_FALSE(deliver(b).rejected.has_value());
+    EXPECT_EQ(tc->log().height(), 1u);
+    const auto nodes = tree_svc->nodes_snapshot();
+    ASSERT_EQ(nodes.size(), 1u);
+    EXPECT_EQ(tree::canonical_principal(nodes.at("root").mgmt_pubkey),
+              tree::canonical_principal(root_key));
+    // The root exists now: no second request.
+    requested = false;
+    now_ms += 60'000;
+    tc->maintain();
+    EXPECT_FALSE(requested);
+}
+
 TEST_F(TreeConsensusCommitTest, CommittedBlocksAreLoggedThenApplied) {
     commit_two_blocks();
     EXPECT_TRUE(tc->healthy()) << tc->halt_reason();

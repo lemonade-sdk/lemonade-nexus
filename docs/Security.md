@@ -118,8 +118,13 @@ log height 1, once. Its security rules:
   10 minutes, with a nonce it has not served. It signs the export with its
   gossip identity under `lemonade-nexus/tree-export-signature:v1`, bound to
   the network. The root server merges only when the signers are exactly the
-  current Tier 1 members by finalized membership, each once, plus its own
-  backup export, which only it may mark as the root server's.
+  current Tier 1 members by finalized membership, each once, plus at most its
+  own backup export, which only it may mark as the root server's. Without a
+  backup the merged root is the root management key's application root.
+- **Empty start.** A Tier 1 server with no tree log and an empty tree awaits
+  no merge. Tier 1 commits the `EstablishRoot` operation for the configured
+  `root_pubkey` as height 1; replicas accept it only for their own configured
+  key, only while no root exists, and only through consensus.
 - **Deterministic merge.** The merge rule (`tree::merge_tree_exports`,
   TreeMerge.hpp) depends only on the exports. It always decides, and it
   reports every tie-break and every dropped node.

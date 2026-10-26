@@ -7,6 +7,7 @@ title: Configuration Reference
 
 ## Table of Contents
 - [Configuration Sources and Precedence](#configuration-sources-and-precedence)
+- [Removed Settings](#removed-settings)
 - [Trust Anchors (Required for a Normal Start)](#trust-anchors-required-for-a-normal-start)
 - [Network](#network)
 - [Identity and Auth](#identity-and-auth)
@@ -45,12 +46,27 @@ Note: an environment variable overrides a CLI value for *every other* setting
 (for example `SP_HTTP_PORT` overrides `--http-port`). Keep the packaged
 environment file for deliberate operator overrides only.
 
-**Boolean environment variables** (`SP_CLOSED_REGISTRATION`,
-`SP_DNS_SEED_DISCOVERY`, `SP_DDNS_ENABLED`)
-take `1`, `true`, `yes`, or `on` for true and `0`, `false`, `no`, or `off`
-for false, in any letter case. The server logs any other value at error level
-and turns the setting off. Two exceptions: `SP_DNS_SEED_DISCOVERY` then keeps
-its current value, and `SP_CLOSED_REGISTRATION` then closes registration.
+**Boolean environment variables** (`SP_DDNS_ENABLED`) take `1`, `true`,
+`yes`, or `on` for true and `0`, `false`, `no`, or `off` for false, in any
+letter case. The server logs any other value at error level and turns the
+setting off.
+
+## Removed Settings
+
+Nexus has no optional features. These settings switched features that now
+always run. A configuration file, command line, or environment that still
+names one starts normally: the server logs a warning that the setting no
+longer exists and ignores its value.
+
+| Removed setting (JSON key, CLI, env) | Now |
+|---|---|
+| `tree_ops_enabled`, `--tree-ops`, `SP_TREE_OPS` | Tree operations always run ([Tree Operations](#tree-operations)) |
+| `tree_log_enabled`, `--tree-log`, `SP_TREE_LOG` | The tree log always runs on Tier 1 |
+| `open_registration`, `--closed-registration`, `SP_CLOSED_REGISTRATION` | Registration is open: a new identity joins into a group of its own; a link token places a device in the inviter's group |
+| `onboard_enabled`, `--no-onboard` | A server that holds the root key accepts onboarding requests |
+| `dns_seed_discovery`, `--no-dns-seed-discovery`, `SP_DNS_SEED_DISCOVERY` | Seed peers are also discovered from tier/region DNS records at startup |
+
+`ddns_enabled` stays a setting (default off).
 
 ## Trust Anchors (Required for a Normal Start)
 
@@ -108,7 +124,6 @@ by firewall/NAT mapping, not by the server binding it.
 | `--rp-id <domain>` | `SP_RP_ID` | `rp_id` | `lemonade-nexus.local` | WebAuthn relying party ID |
 | `--seed-peer <host:port>` | `SP_SEED_PEERS` | `seed_peers` | | Gossip seed peers (repeatable / comma-separated; env appends) |
 | `--server-hostname <name>` | `SP_SERVER_HOSTNAME` | `server_hostname` | (auto) | Server hostname for the TLS certificate |
-| `--closed-registration` | `SP_CLOSED_REGISTRATION=1` | `open_registration` | open | New identities need a device link token to join |
 
 ## DNS
 
@@ -117,7 +132,6 @@ by firewall/NAT mapping, not by the server binding it.
 | `--dns-base-domain <dom>` | `SP_DNS_BASE_DOMAIN` | `dns_base_domain` | `lemonade-nexus.io` | Discovery zone suffix |
 | `--dns-ns-hostname <fqdn>` | `SP_DNS_NS_HOSTNAME` | `dns_ns_hostname` | (auto) | This server's NS hostname (pins its NS slot) |
 | `--dns-provider <name>` | `SP_DNS_PROVIDER` | `dns_provider` | `local` | `local` (self-hosted authoritative) or `cloudflare` |
-| `--no-dns-seed-discovery` | `SP_DNS_SEED_DISCOVERY=0` | `dns_seed_discovery` | on | Do not auto-discover seed peers from tier/region DNS records |
 
 ## TLS / ACME
 
@@ -145,11 +159,10 @@ checks for signed manifests of other versions.
 
 ## Onboarding
 
-Server-side (a server that holds the root key accepts onboarding by default):
+Server-side (a server that holds the root key always accepts onboarding):
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| `--no-onboard` | | `onboard_enabled` | on | Refuse onboarding requests |
 | `--mint-admission-token` | | `mint_admission_token` | | Mint a single-use enrollment token and exit (root holder only) |
 | `--token-candidate <b64>` | | `mint_token_candidate` | | Candidate gossip pubkey the token binds to (required with mint) |
 | `--token-ttl <sec>` | | `mint_token_ttl_sec` | `600` | Minted-token lifetime (60–3600) |
@@ -171,11 +184,8 @@ orders every tree write, and every Tier 1 server applies the committed tree
 log. There is no other tree write path. They implement Phases 1 to 3 of
 [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key).
 
-**Removed settings.** Earlier releases had `tree_ops_enabled` (`--tree-ops`,
-`SP_TREE_OPS`) and `tree_log_enabled` (`--tree-log`, `SP_TREE_LOG`). A
-configuration file, command line, or environment that still names them does
-not stop a server from starting: the server logs a warning that the setting no
-longer exists and ignores its value.
+**Removed settings.** `tree_ops_enabled` and `tree_log_enabled` no longer
+exist (see [Removed Settings](#removed-settings)).
 
 **The one-time merge.** A server whose tree was written before tree
 operations awaits the [Tree Merge Ceremony](Tree-Merge-Ceremony) commit. It
@@ -200,7 +210,9 @@ runs the merge once, after every server runs a release with tree operations.
   with `409`, because the join operation assigns tunnel addresses; `private`
   and `shared` blocks do not change.
 - **Start.** A server that has no tree log starts a new log on the empty base.
-  With an empty tree it runs normally. With a populated tree it awaits the
+  With an empty tree it runs normally and requests the `EstablishRoot`
+  operation for `root_pubkey`, so Tier 1 reaches height 1 with the
+  application root alone. With a populated tree it awaits the
   merge commit (see above): a log based on the local tree would differ from
   every other server's log and would foreclose the merge commit, which is
   valid only as height 1 on the empty base.
@@ -513,6 +525,10 @@ The following settings no longer do anything and are not recognized:
 These inert settings are listed so that older runbooks and environment files
 can be read correctly; remove them from your configuration when you touch
 it.
+
+Settings of features that now always run (tree operations, open
+registration, onboarding, DNS seed discovery) are accepted with a warning; see
+[Removed Settings](#removed-settings).
 
 ### Files under the data key (Phase 7)
 

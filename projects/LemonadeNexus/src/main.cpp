@@ -261,7 +261,7 @@ int main(int argc, char* argv[]) {
     // hang until our own DNS service is up. Run it detached; discovered peers are
     // added once they resolve and get a ServerHello on the next gossip tick. Self
     // entries are dropped by the gossip identity guard.
-    if (config.dns_seed_discovery) {
+    {
         std::thread([&gossip,
                      base   = config.dns_base_domain,
                      region = config.region,

@@ -34,8 +34,8 @@
 //   8. Every node that does not reach the root through its parents (a missing
 //      parent, a dropped parent, or a cycle) is dropped.
 // Rules 1 to 8 always decide. The merge refuses to produce a commit only for
-// malformed input: repeated server labels, not exactly one root server
-// export, a bad resolution, or no root in any export. Every tie-break and
+// malformed input: repeated server labels, more than one root server export,
+// a bad resolution, or no root in any export. Every tie-break and
 // every drop is reported, so the operator reviews them before signing.
 //
 // The merge commit is the only height-1 entry that does not come from
@@ -291,9 +291,11 @@ struct SignedMergeBuild {
 
 /// Check and merge signed exports (sign_tree_export) for the supported
 /// migration: every export verifies for the network; the signers are exactly
-/// the members plus the root signer, each once, so no current Tier 1 tree is
-/// left out; the export marked root_server is the root signer's, and only it.
-/// Then merge_tree_exports without resolutions, and build the entry when no
+/// the members, each once, so no current Tier 1 tree is left out, plus at most
+/// one export by the root signer; the export marked root_server is the root
+/// signer's, and only it. Without an export by the root signer (no backup),
+/// the root server's copy of the root is make_root_node(root_key). Then
+/// merge_tree_exports without resolutions, and build the entry when no
 /// conflict remains.
 [[nodiscard]] SignedMergeBuild build_signed_merge(crypto::SodiumCryptoService& crypto,
                                                   const std::vector<nlohmann::json>& docs,

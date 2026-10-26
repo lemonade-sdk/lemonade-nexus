@@ -341,26 +341,19 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
                               const std::string& norm_pubkey,
                               const std::optional<auth::LinkTokenRecord>& link,
                               const std::string& cpu_id, const std::string& net_mac,
-                              const std::string& node_region, bool is_inference,
-                              bool is_root_owner) {
+                              const std::string& node_region, bool is_inference) {
     JoinOpResult result;
     auto* submitter = tree_op_submitter(ctx, res);
     if (!submitter) return result;
 
     const auto existing = ctx.tree.get_node(node_id);
-    if (!existing) {
-        if (link) {
-            if (!ctx.tree.get_node(link->group_node_id)) {
-                error_response(res, "link token group no longer exists", 409);
-                return result;
-            }
-            if (!link_owner_may_place(ctx.tree, *link)) {
-                error_response(res, "the invite is no longer valid", 403);
-                return result;
-            }
-        } else if (!ctx.config.open_registration && !is_root_owner &&
-                   !ctx.tree.get_node("customer-" + node_id)) {
-            error_response(res, "registration closed — link token required", 403);
+    if (!existing && link) {
+        if (!ctx.tree.get_node(link->group_node_id)) {
+            error_response(res, "link token group no longer exists", 409);
+            return result;
+        }
+        if (!link_owner_may_place(ctx.tree, *link)) {
+            error_response(res, "the invite is no longer valid", 403);
             return result;
         }
     }
@@ -632,8 +625,8 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
-        // public_key drives mgmt_pubkey, every ACL principal, and the
-        // is_root_owner check — it MUST be the Ed25519-authenticated identity,
+        // public_key drives mgmt_pubkey and every ACL principal — it MUST be
+        // the Ed25519-authenticated identity,
         // not an unverified body field. Bind it to body.pubkey (already verified
         // against the challenge signature by ctx_.auth.authenticate above).
         {
@@ -703,18 +696,14 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
 
         // Root initialization is deferred: no public caller may create the
         // application root, and this endpoint never modifies an existing
-        // root's data or assignments. Ownership below is pure validation of
-        // the stored root record for the closed-registration exemption.
-        const auto existing_root = ctx_.tree.get_node("root");
-        if (!existing_root) {
+        // root's data or assignments. Registration is open: a new identity
+        // joins into a group of its own.
+        if (!ctx_.tree.get_node("root")) {
             error_response(res,
                 "application root not established — root initialization is unavailable",
                 409);
             return;
         }
-        const bool is_root_owner = !existing_root->mgmt_pubkey.empty() &&
-            tree::canonical_principal(existing_root->mgmt_pubkey) ==
-            tree::canonical_principal(norm_pubkey);
 
         // A device that already joined does not move: its link token is an
         // invite to become a member of the token's group. The join below then
@@ -733,7 +722,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         }
 
         auto joined = join_via_tree_op(ctx_, res, body, node_id, norm_pubkey, link, cpu_id,
-                                       net_mac, node_region, is_inference, is_root_owner);
+                                       net_mac, node_region, is_inference);
         if (joined.used_link) {
             if (joined.state == JoinOpResult::State::Pending) {
                 link_claim->settle_with(joined.submission);

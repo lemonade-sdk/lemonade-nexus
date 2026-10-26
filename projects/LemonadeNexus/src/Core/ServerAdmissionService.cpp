@@ -37,7 +37,6 @@ ServerAdmissionService::ServerAdmissionService(
     : config_(config), crypto_(crypto), key_wrapping_(key_wrapping),
       storage_(storage), gossip_(gossip),
       tokens_(storage, crypto) {
-    cfg_.enabled         = config.onboard_enabled;
     cfg_.request_ttl_sec = config.onboard_request_ttl_sec;
     cfg_.max_pending     = config.onboard_max_pending;
 }
@@ -75,7 +74,7 @@ bool ServerAdmissionService::accepts_onboarding() const {
     // No fail-open: onboarding is advertised/accepted only by the server whose
     // local identity actually holds the root key — not merely one that has a
     // root_pubkey configured (every enrolled server does).
-    return cfg_.enabled && !config_.root_pubkey.empty() && is_root_key_holder_;
+    return !config_.root_pubkey.empty() && is_root_key_holder_;
 }
 
 bool ServerAdmissionService::verify_sig(const std::string& pubkey_b64,

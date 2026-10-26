@@ -1,5 +1,5 @@
 // Closed public root-claim surface: no public caller (authentication,
-// registration, open_registration) may create the global permission root,
+// registration, which is always open) may create the global permission root,
 // assign its ownership, or create or restore root-level grants. Fresh root
 // initialization is unavailable pending the deferred authority work. Covers
 // both HTTP entry points (/api/auth and /api/join), preservation of existing
@@ -194,7 +194,6 @@ protected:
         stranger_kp = crypto->ed25519_keygen();
         // Mesh trust anchor only; the test starts with NO application root.
         config.root_pubkey = hex_of(mesh_kp);
-        config.open_registration = true;
 
         crypto::Ed25519Keypair server_kp = crypto->ed25519_keygen();
         relay = std::make_unique<relay::RelayService>(io, 0, *crypto);
@@ -400,7 +399,7 @@ TEST_F(RootClaimHttpTest, FirstCallerCannotClaimRootViaJoin) {
     EXPECT_FALSE(tree->get_node("root").has_value());
 }
 
-// open_registration cannot be used to acquire root permissions: a joiner gets
+// Open registration cannot be used to acquire root permissions: a joiner gets
 // its own Customer/Endpoint nodes, while the pre-existing root record stays
 // exactly as seeded — same owner, same single assignment.
 TEST_F(RootClaimHttpTest, OpenRegistrationCannotGrantRootPermissions) {
@@ -546,23 +545,6 @@ TEST_F(RootClaimHttpTest, GroupOwnerAdministersTheirGroup) {
     // The upgrade is scoped to the caller's own group.
     EXPECT_FALSE(tree->check_permission(prefixed_b64(stranger_kp), "root",
                                         acl::Permission::Admin));
-}
-
-// The closed-registration link-token exemption recognizes the owner of the
-// EXISTING root (pure validation of stored data) and no one else.
-TEST_F(RootClaimHttpTest, ClosedRegistrationExemptionUsesExistingOwnershipOnly) {
-    seed_root(owner_kp);
-    config.open_registration = false;
-
-    auto res = join(owner_kp);
-    ASSERT_TRUE(static_cast<bool>(res));
-    ASSERT_EQ(res->status, 200) << res->body;
-
-    res = join(stranger_kp);
-    ASSERT_TRUE(static_cast<bool>(res));
-    ASSERT_EQ(res->status, 403) << res->body;
-    EXPECT_NE(res->body.find("registration closed"), std::string::npos);
-    EXPECT_FALSE(find_customer(stranger_kp).has_value());
 }
 
 // --- Post-epoch establishment (the deferred root-initialization authority) ---

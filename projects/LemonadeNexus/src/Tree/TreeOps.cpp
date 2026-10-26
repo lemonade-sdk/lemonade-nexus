@@ -1106,8 +1106,9 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             break;
         case TreeOpKind::Join:
             // A join is authorized by the verified device statement and the
-            // submitter's admission policy (open registration or a link
-            // token), not by a tree permission. plan_op checks placement.
+            // submitter (registration is open; a link token places the
+            // device in the inviter's group), not by a tree permission.
+            // plan_op checks placement.
             break;
         case TreeOpKind::EstablishRoot: {
             // Only the configured root management key, never a key the

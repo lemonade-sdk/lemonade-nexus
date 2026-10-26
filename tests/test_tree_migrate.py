@@ -114,6 +114,34 @@ class TreeMigrateTest(unittest.TestCase):
         self.assertEqual(reply, {"ok": True, "echo": "tree_merge_context"})
         self.assertEqual(seen["op"], "tree_merge_context")
 
+    def _collect(self, answers, backup=None):
+        ctx = {"members": [{"signer": s, "address": f"10.0.0.{i}:9102", "http_port": 9100}
+                           for i, s in enumerate(answers)]}
+        args = type("Args", (), {"servers": {}, "socket": "unused", "insecure_tls": False,
+                                 "backup": backup})()
+        status_for = {f"https://10.0.0.{i}:9100": answers[s] for i, s in enumerate(answers)}
+        old_control, old_post = migrate.control, migrate.post
+        migrate.control = lambda request, path: {"ok": True, "body": {"request": "r"}}
+        migrate.post = lambda url, body, insecure: status_for[url.rsplit("/api", 1)[0]]
+        try:
+            return migrate.collect(args, ctx, self.dir)
+        finally:
+            migrate.control, migrate.post = old_control, old_post
+
+    def test_nothing_to_merge_when_no_member_awaits_a_merge(self):
+        not_awaiting = (409, {"error": "this server is not awaiting the tree merge commit"})
+        self.assertIsNone(self._collect({"ed25519:A": not_awaiting, "ed25519:B": not_awaiting}))
+
+    def test_a_mix_of_awaiting_and_empty_members_is_refused(self):
+        not_awaiting = (409, {"error": "this server is not awaiting the tree merge commit"})
+        export = (200, {"signer": "ed25519:B", "server": "b", "nodes": []})
+        with self.assertRaises(SystemExit):
+            self._collect({"ed25519:A": not_awaiting, "ed25519:B": export})
+
+    def test_members_that_await_give_their_exports_without_a_backup(self):
+        exports = self._collect({"ed25519:A": (200, {"signer": "ed25519:A", "nodes": [1]})})
+        self.assertEqual(exports, [{"signer": "ed25519:A", "nodes": [1]}])
+
 
 if __name__ == "__main__":
     unittest.main()

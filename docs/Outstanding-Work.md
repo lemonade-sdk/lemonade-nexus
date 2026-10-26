@@ -206,10 +206,14 @@ section 2.
 
 The rollout steps are in `Releasing.md` ("The tree operations release"). What remains:
 
-- **Owner step, once.** After the rolling update reaches all six servers, run
-  `nexus-tree-migrate` on ns1 (10.10.12.40): a dry run with
-  `--backup /var/lib/lemonade-nexus-backup-20261025-boot/state.tar`, review, then `--commit
-  --expect-tree-digest <digest>`. Until then tree writes answer `503` on every Tier 1 server.
+- **Empty start (owner decision, 2026-10-25).** The network is effectively empty: the live fleet
+  is installed directly with each Tier 1 server's `data/tree` moved aside. Tier 1 then commits the
+  application root for `root_pubkey` as height 1 by itself; `sudo nexus-tree-migrate` on ns1
+  only confirms that nothing awaits a merge.
+- **Keeping trees instead.** After the rolling update reaches all six servers, run
+  `nexus-tree-migrate` on ns1 (10.10.12.40): a dry run (with `--backup` to keep ns1's tree),
+  review, then `--commit --expect-tree-digest <digest>`. Until then tree writes answer `503`
+  on every Tier 1 server that kept a tree.
 - **Backup under the current data key.** ns1 reads its backup with the data key it holds now. A
   monthly data key rotation after the backup was taken makes the backup unreadable; run the merge
   before ns1's next rotation, or restore the tree files with the key of that time.

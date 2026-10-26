@@ -342,6 +342,15 @@ again.
 
 ## The tree operations release (one time)
 
+**Empty start (no tree data kept).** When the fleet is installed directly
+with each Tier 1 server's `data/tree` moved aside, no merge is needed: Tier 1
+commits the application root for `root_pubkey` as tree log height 1 by itself
+(see [Tree Merge Ceremony](Tree-Merge-Ceremony#empty-start-no-tree-data-kept)).
+`sudo nexus-tree-migrate` on ns1 only confirms that no server awaits a merge.
+
+**Keeping existing trees.** The rest of this section applies when the trees
+must survive.
+
 The first release in which tree operations always run (no
 `tree_ops_enabled` setting) needs one owner step after its rollout: the
 [Tree Merge Ceremony](Tree-Merge-Ceremony). The rollout itself is a normal

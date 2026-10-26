@@ -62,7 +62,6 @@ struct ServerConfig {
     // DNS resolution
     std::string dns_base_domain{"lemonade-nexus.io"};
     std::string dns_ns_hostname;            // this server's NS hostname (e.g. "ns1.lemonade-nexus.io")
-    bool        dns_seed_discovery{true};   // auto-discover seed peers from tier/region DNS records on startup
 
     // Deprecated, parse-only: release authority is the Genesis-delegated key
     // in the packaged approval; never consulted as a trust input.
@@ -117,15 +116,11 @@ struct ServerConfig {
     std::string onboard_token;               // single-use enrollment token (runtime-only, never persisted)
 
     // Onboarding — mesh side
-    bool        onboard_enabled{true};             // accept onboarding requests when we hold the root key
     bool        mint_admission_token{false};       // CLI mode: mint an enrollment token and exit (runtime-only)
     std::string mint_token_candidate;              // optional base64 candidate key to bind (runtime-only)
     uint32_t    mint_token_ttl_sec{600};           // minted-token TTL (runtime-only)
     uint32_t    onboard_request_ttl_sec{3600};     // pending admission lifetime
     uint32_t    onboard_max_pending{8};            // cap on concurrent pending admissions
-
-    // User/device registration policy
-    bool        open_registration{true};     // false: new identities need a device link token to join
 
     // Private API (dual-server mode — auto-enabled once tunnel IP is allocated)
     uint16_t    private_http_port{9101};     // Private API port (VPN-only)
@@ -141,8 +136,8 @@ struct ServerConfig {
 /// Load config: CLI args > env vars > config file > defaults.
 /// A boolean SP_* variable takes a value that parse_bool_flag accepts. Any
 /// other value is logged at error level and turns the setting off, except
-/// that SP_DNS_SEED_DISCOVERY keeps its current value and
-/// SP_CLOSED_REGISTRATION closes registration (the safer setting).
+/// that SP_DDNS_ENABLED then stays off. Settings of removed features are
+/// accepted and ignored with a warning.
 [[nodiscard]] ServerConfig load_config(int argc, char* argv[]);
 
 /// Parse a boolean flag value, ignoring ASCII case: "1", "true", "yes", and

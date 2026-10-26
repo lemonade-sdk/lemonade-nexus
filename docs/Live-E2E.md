@@ -157,15 +157,13 @@ the member entered through an invite from the owner (or every invite group,
 when `NEXUS_E2E_OWNER_PUBKEY` is not set), and removes every member entry
 from the CI group except the owner's.
 
-### Closed registration
+### Invited accounts
 
-A new account gets its own top-level group only when the network has open
-registration (the server default). With closed registration, `/api/join`
-refuses a new identity without an invite, and an invite places the identity
-as a device inside the inviter's group, with only `read` on that group. Such
-an account cannot administer a CI group, so it cannot be the owner. In that
-case the owner setup fails with "registration closed — link token required".
-The member account can still be created from an invite code with
+Registration is always open: a new account without an invite gets its own
+top-level group. An invite places the identity as a device inside the
+inviter's group, with only `read` on that group. Such an account cannot
+administer a CI group, so it cannot be the owner. The member account can be
+created from an invite code with
 `scripts/live-e2e-setup --member-invite`; the script asks for the code
 without echo.
 

@@ -690,10 +690,6 @@ TEST_F(TreeMigrationTest, ForgedMissingOrExtraExportsAreRefused) {
     docs = signed_exports();
     docs.erase(docs.begin() + 1);
     EXPECT_TRUE(refused(docs));
-    // The backup is missing.
-    docs = signed_exports();
-    docs.pop_back();
-    EXPECT_TRUE(refused(docs));
     // A server that is not a member signed an export.
     docs = signed_exports();
     tree::TreeExport stray;
@@ -967,4 +963,45 @@ TEST_F(TreeMigrationTest, AMemberExportsItsTreeOnlyForAFreshRootSignedRequest) {
     EXPECT_EQ(endpoint.answer(request(root_kp, std::string(32, '2'))).first, 409);  // replay
     awaiting = false;
     EXPECT_EQ(endpoint.answer(request(root_kp, std::string(32, '3'))).first, 409);
+}
+
+// Without a backup the root server contributes no tree: the root is the
+// application root of the root management key, and every member's tree is
+// still required.
+TEST_F(TreeMigrationTest, WithoutABackupTheRootComesFromTheRootKey) {
+    auto docs = signed_exports();
+    docs.pop_back();  // no backup
+    // Every member's root differs from the key's root.
+    for (auto& doc : docs) {
+        auto parsed = *tree::tree_export_from_json(doc);
+        for (auto& n : parsed.nodes) {
+            if (n.id == "root") n.hostname = "local-" + parsed.server;
+        }
+        const auto signer = doc["signer"].get<std::string>();
+        const auto index = static_cast<std::size_t>(
+            std::find_if(tier1.begin(), tier1.end(),
+                         [&](const auto& kp) { return principal_of(kp) == signer; }) -
+            tier1.begin());
+        doc = tree::sign_tree_export(crypto_svc, tree::tree_export_to_json(parsed), network,
+                                     tier1[index]);
+    }
+    const auto build = tree::build_signed_merge(crypto_svc, docs, input());
+    ASSERT_TRUE(build.refusal.empty()) << build.refusal;
+    ASSERT_TRUE(build.entry.has_value()) << build.report.dump();
+    EXPECT_EQ(tree::encode_tree_node(build.result.nodes.at("root")),
+              tree::encode_tree_node(tree::make_root_node(root_key)));
+    EXPECT_FALSE(build.result.nodes.contains("d9"));  // the backup's device
+    EXPECT_TRUE(build.result.nodes.contains("d1"));
+    // A member is still required.
+    docs.erase(docs.begin());
+    EXPECT_FALSE(tree::build_signed_merge(crypto_svc, docs, input()).refusal.empty());
+}
+
+// No root server export at all: the merge takes the root by the other rules.
+TEST_F(TreeMergeTest, NoRootServerExportIsAllowed) {
+    auto exports = two_servers();
+    exports[0].root_server = false;
+    const auto result = tree::merge_tree_exports(exports, {});
+    EXPECT_TRUE(result.conflicts.empty()) << tree::merge_conflicts_to_json(result.conflicts).dump();
+    EXPECT_TRUE(result.nodes.contains("root"));
 }

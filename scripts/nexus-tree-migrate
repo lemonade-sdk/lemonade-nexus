@@ -2,9 +2,15 @@
 """Run the one-time tree merge from the root server (docs/Tree-Merge-Ceremony.md).
 
 Run it as root on the server that holds the root management key, after every
-server runs a release with tree operations. Each Tier 1 server then holds the
-tree it wrote before tree operations and refuses tree writes until the merge
-commit arrives.
+server runs a release with tree operations. A Tier 1 server that holds a tree
+it wrote before tree operations refuses tree writes until the merge commit
+arrives. A Tier 1 server with an empty tree needs no merge: Tier 1 commits the
+application root for root_pubkey by itself (an EstablishRoot op), and this
+script reports that there is nothing to merge.
+
+    sudo nexus-tree-migrate
+        Without --backup: the root server contributes no tree of its own, and
+        the merged root is the application root of the root management key.
 
     sudo nexus-tree-migrate --backup /var/lib/lemonade-nexus-backup-20261025-boot/state.tar
         Dry run. Collects a signed export from every current Tier 1 member and
@@ -206,9 +212,14 @@ def post(url, body, insecure, timeout=60):
         return 0, {"error": str(e)}
 
 
+NOT_AWAITING = "not awaiting the tree merge commit"
+
+
 def collect(args, ctx, work):
+    """The signed exports, or None when no Tier 1 member awaits a merge."""
     print("Collecting signed exports:")
-    exports = [backup_export(args, work)] if args.backup else []
+    exports = []
+    not_awaiting = []
     urls = member_urls(ctx, args.servers)
     for signer, url in urls.items():
         request = require(control({"op": "tree_merge_request", "target": signer}, args.socket),
@@ -217,12 +228,23 @@ def collect(args, ctx, work):
         if status == 404:
             fail(f"{url} has no tree merge route: it runs an older release. Wait until the "
                  "rollout reaches every server.")
+        if status == 409 and NOT_AWAITING in str(body.get("error", "")):
+            print(f"  {url}: does not await a merge (empty tree, or a tree log already)")
+            not_awaiting.append(url)
+            continue
         if status != 200:
             fail(f"{url} refused the export request ({status}): {body.get('error', body)}")
         if body.get("signer") != signer:
             fail(f"{url} answered with an export signed by {body.get('signer')}, not {signer}")
         print(f"  {body.get('server')} ({url}): {len(body.get('nodes', []))} nodes")
         exports.append(body)
+    if not_awaiting and not exports:
+        return None
+    if not_awaiting:
+        fail("some Tier 1 members await a merge and others do not: " + ", ".join(not_awaiting) +
+             " do not. Give every Tier 1 server either its old tree or an empty one.")
+    if args.backup:
+        exports.insert(0, backup_export(args, work))
     path = work / "exports.json"
     with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         json.dump(exports, f, indent=2)
@@ -298,12 +320,19 @@ def main():
     print(f"Network {ctx['network_id']}; root key {ctx['root_key']}; "
           f"{len(ctx['members'])} Tier 1 members")
     if not args.backup:
-        print("No --backup: the root server contributes no tree of its own. The merge refuses "
-              "this unless the root server is a Tier 1 member.")
+        print("No --backup: the root server contributes no tree of its own; the merged root "
+              "is the application root of the root management key.")
 
     work = Path(args.work_dir)
     work.mkdir(mode=0o700, parents=True, exist_ok=True)
     exports = collect(args, ctx, work)
+    if exports is None:
+        print()
+        print("No Tier 1 member awaits a merge, so there is nothing to merge. Tier 1 servers "
+              "with an empty tree commit the application root for root_pubkey by themselves "
+              "(EstablishRoot). Check GET /api/tree/sync on each Tier 1 server: mode \"ops\", "
+              "height 1 or more, and the same state_root.")
+        return
     block_time_ms = int(time.time() * 1000)
 
     if not args.commit:

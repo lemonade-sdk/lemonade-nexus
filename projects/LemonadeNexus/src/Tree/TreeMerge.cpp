@@ -477,9 +477,9 @@ MergeResult merge_tree_exports(const std::vector<TreeExport>& exports,
             ++root_servers;
         }
     }
-    if (root_servers != 1) {
+    if (root_servers > 1) {
         add_conflict(out, "root", "bad_exports",
-                     "exactly one export must be marked as the root server; found " +
+                     "at most one export may be marked as the root server; found " +
                          std::to_string(root_servers),
                      {});
         root_server = nullptr;
@@ -729,11 +729,13 @@ SignedMergeBuild build_signed_merge(crypto::SodiumCryptoService& crypto,
     if (!root_signer) return refuse("the root signer is not an Ed25519 key");
     // Compare principals by key bytes: spellings of one key differ.
     std::map<std::string, bool> required;  // canonical principal -> seen
+    std::set<std::string> members;         // canonical principals
     required.emplace(principal_of(*root_signer), false);
     for (const auto& member : input.members) {
         const auto key = principal_key(member);
         if (!key) return refuse("a Tier 1 member is not an Ed25519 key");
         required.emplace(principal_of(*key), false);
+        members.insert(principal_of(*key));
     }
     json signers = json::object();
     for (const auto& doc : docs) {
@@ -760,10 +762,24 @@ SignedMergeBuild build_signed_merge(crypto::SodiumCryptoService& crypto,
         out.exports.push_back(std::move(*parsed));
     }
     for (const auto& [signer, seen] : required) {
-        if (!seen) {
-            return refuse("no export from " + signer +
-                          "; every Tier 1 member and the root server must contribute one");
+        if (seen) continue;
+        if (signer == principal_of(*root_signer) && !members.contains(signer)) {
+            // The root server has no tree of its own to give (no backup).
+            // The root then is the application root of the root management
+            // key, as an EstablishRoot op creates it.
+            TreeExport key_root;
+            key_root.server = "root-management-key";
+            key_root.root_server = true;
+            key_root.nodes = {make_root_node(input.root_key)};
+            if (signers.contains(key_root.server)) {
+                return refuse("server label " + key_root.server + " repeats");
+            }
+            signers[key_root.server] = "";
+            out.exports.push_back(std::move(key_root));
+            continue;
         }
+        return refuse("no export from " + signer +
+                      "; every Tier 1 member must contribute one");
     }
 
     out.result = merge_tree_exports(out.exports, {});

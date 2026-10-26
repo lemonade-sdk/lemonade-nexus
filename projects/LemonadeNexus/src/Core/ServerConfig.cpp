@@ -3,6 +3,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -37,15 +38,27 @@ void read_env_bool(const char* name, bool& target, bool on_invalid) {
     target = on_invalid;
 }
 
-// Settings of removed features. Tree operations always run, so the switches
-// that once turned them on are accepted and ignored: a configuration that
-// still names them must not stop a server from starting.
-constexpr std::array<const char*, 2> kRetiredConfigKeys = {"tree_ops_enabled", "tree_log_enabled"};
-constexpr std::array<const char*, 2> kRetiredEnvironment = {"SP_TREE_OPS", "SP_TREE_LOG"};
+// Settings of removed features. Nexus has no optional features: tree
+// operations, open registration, server onboarding, and DNS seed discovery
+// always run. A configuration, command line, or environment that still names
+// one of the old switches starts normally; the value is ignored.
+constexpr std::array<const char*, 5> kRetiredConfigKeys = {
+    "tree_ops_enabled", "tree_log_enabled", "open_registration", "onboard_enabled",
+    "dns_seed_discovery"};
+constexpr std::array<const char*, 4> kRetiredEnvironment = {
+    "SP_TREE_OPS", "SP_TREE_LOG", "SP_CLOSED_REGISTRATION", "SP_DNS_SEED_DISCOVERY"};
+constexpr std::array<const char*, 5> kRetiredOptions = {
+    "--tree-ops", "--tree-log", "--closed-registration", "--no-onboard",
+    "--no-dns-seed-discovery"};
+
+bool is_retired_option(std::string_view arg) {
+    return std::find(kRetiredOptions.begin(), kRetiredOptions.end(), arg) !=
+           kRetiredOptions.end();
+}
 
 void warn_retired_setting(std::string_view name) {
-    spdlog::warn("Config: '{}' no longer exists and is ignored; tree operations through "
-                 "Tier 1 consensus always run",
+    spdlog::warn("Config: '{}' no longer exists and is ignored; the feature it switched "
+                 "always runs",
                  name);
 }
 }
@@ -129,7 +142,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("region"))              j.at("region").get_to(c.region);
     if (j.contains("server_hostname"))     j.at("server_hostname").get_to(c.server_hostname);
     if (j.contains("dns_base_domain"))     j.at("dns_base_domain").get_to(c.dns_base_domain);
-    if (j.contains("dns_seed_discovery"))  j.at("dns_seed_discovery").get_to(c.dns_seed_discovery);
     if (j.contains("dns_ns_hostname"))     j.at("dns_ns_hostname").get_to(c.dns_ns_hostname);
     if (j.contains("release_signing_pubkey"))     j.at("release_signing_pubkey").get_to(c.release_signing_pubkey);
     if (j.contains("github_releases_url"))        j.at("github_releases_url").get_to(c.github_releases_url);
@@ -139,9 +151,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("ddns_password"))              j.at("ddns_password").get_to(c.ddns_password);
     if (j.contains("ddns_update_interval_sec"))   j.at("ddns_update_interval_sec").get_to(c.ddns_update_interval_sec);
     if (j.contains("ddns_enabled"))               j.at("ddns_enabled").get_to(c.ddns_enabled);
-    if (j.contains("open_registration"))          j.at("open_registration").get_to(c.open_registration);
     if (j.contains("private_http_port"))          j.at("private_http_port").get_to(c.private_http_port);
-    if (j.contains("onboard_enabled"))           j.at("onboard_enabled").get_to(c.onboard_enabled);
     if (j.contains("onboard_request_ttl_sec"))   j.at("onboard_request_ttl_sec").get_to(c.onboard_request_ttl_sec);
     if (j.contains("onboard_max_pending"))       j.at("onboard_max_pending").get_to(c.onboard_max_pending);
 }
@@ -177,7 +187,6 @@ void print_usage(const char* prog) {
     spdlog::info("  --mint-admission-token     Mint a server-admission enrollment token and exit (root holder only)");
     spdlog::info("  --token-candidate <b64>    Required with --mint-admission-token: joining server's gossip pubkey (base64) the token is bound to");
     spdlog::info("  --token-ttl <sec>          Minted-token lifetime, 60-3600s (default: 600)");
-    spdlog::info("  --no-onboard               Refuse to accept onboarding requests from new servers");
     spdlog::info("  --enroll-server <b64> <id> Enroll a server: sign cert for its base64 gossip pubkey; <id> is a unique DNS label");
     spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's platform binding key (base64 DER SPKI) in the cert");
     spdlog::info("  --enroll-tpm-ek-cert <path> Attach the server's TPM EK cert (PEM) for audit/validation");
@@ -197,14 +206,12 @@ void print_usage(const char* prog) {
     spdlog::info("  --dns-port <N>             Internal DNS listen port (default: 5335, NAT-mapped from public)");
     spdlog::info("  --public-dns-port <N>      DNS port advertised to clients (default: 53)");
     spdlog::info("  --dns-base-domain <dom>    DNS zone suffix (default: lemonade-nexus.io)");
-    spdlog::info("  --no-dns-seed-discovery    Disable auto-discovery of seed peers from tier/region DNS");
     spdlog::info("  --dns-provider <name>      DNS provider: 'local' (default) or 'cloudflare'");
     spdlog::info("  --dns-ns-hostname <fqdn>   This server's NS hostname (e.g. ns1.example.com)");
     spdlog::info("  --server-hostname <name>   Server hostname for TLS cert (auto-generated from region if omitted)");
     spdlog::info("  --acme-provider <name>     ACME CA provider: letsencrypt (default), letsencrypt_staging, zerossl");
     spdlog::info("  --acme-eab-kid <kid>       ZeroSSL EAB Key ID");
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
-    spdlog::info("  --closed-registration      New identities must present a device link token to join");
     spdlog::info("  --sign-tree-merge <preimage> <out>  Root holder: sign a tree merge preimage and exit");
     spdlog::info("  --install-tree-merge <commit.json>  Verify a signed tree merge commit and write it as tree log height 1, then exit");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
@@ -359,16 +366,12 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.mint_token_candidate = argv[++i];
         } else if (std::strcmp(argv[i], "--token-ttl") == 0 && i + 1 < argc) {
             config.mint_token_ttl_sec = static_cast<uint32_t>(std::atoi(argv[++i]));
-        } else if (std::strcmp(argv[i], "--no-onboard") == 0) {
-            config.onboard_enabled = false;
         } else if (std::strcmp(argv[i], "--dns-port") == 0 && i + 1 < argc) {
             config.dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--public-dns-port") == 0 && i + 1 < argc) {
             config.public_dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--dns-base-domain") == 0 && i + 1 < argc) {
             config.dns_base_domain = argv[++i];
-        } else if (std::strcmp(argv[i], "--no-dns-seed-discovery") == 0) {
-            config.dns_seed_discovery = false;
         } else if (std::strcmp(argv[i], "--dns-provider") == 0 && i + 1 < argc) {
             config.dns_provider = argv[++i];
         } else if (std::strcmp(argv[i], "--dns-ns-hostname") == 0 && i + 1 < argc) {
@@ -381,10 +384,7 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.acme_eab_kid = argv[++i];
         } else if (std::strcmp(argv[i], "--acme-eab-hmac-key") == 0 && i + 1 < argc) {
             config.acme_eab_hmac_key = argv[++i];
-        } else if (std::strcmp(argv[i], "--closed-registration") == 0) {
-            config.open_registration = false;
-        } else if (std::strcmp(argv[i], "--tree-ops") == 0 ||
-                   std::strcmp(argv[i], "--tree-log") == 0) {
+        } else if (is_retired_option(argv[i])) {
             warn_retired_setting(argv[i]);
         } else if (std::strcmp(argv[i], "--sign-tree-merge") == 0 && i + 2 < argc) {
             config.sign_tree_merge_preimage = argv[++i];
@@ -447,7 +447,6 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_DNS_PORT"))         config.dns_port        = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_PUBLIC_DNS_PORT"))  config.public_dns_port = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_DNS_BASE_DOMAIN"))  config.dns_base_domain = v;
-    read_env_bool("SP_DNS_SEED_DISCOVERY", config.dns_seed_discovery, config.dns_seed_discovery);
     if (const char* v = std::getenv("SP_DNS_NS_HOSTNAME")) config.dns_ns_hostname = v;
     if (const char* v = std::getenv("SP_DDNS_DOMAIN"))    config.ddns_domain   = v;
     if (const char* v = std::getenv("SP_DDNS_PASSWORD"))  config.ddns_password = v;
@@ -460,12 +459,6 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_SERVER_HOSTNAME"))    config.server_hostname       = v;
     if (const char* v = std::getenv("SP_ACME_EAB_KID"))       config.acme_eab_kid          = v;
     if (const char* v = std::getenv("SP_ACME_EAB_HMAC_KEY"))  config.acme_eab_hmac_key     = v;
-    {
-        // An unreadable value closes registration: the safer reading.
-        bool closed = !config.open_registration;
-        read_env_bool("SP_CLOSED_REGISTRATION", closed, true);
-        config.open_registration = !closed;
-    }
     for (const char* name : kRetiredEnvironment) {
         if (std::getenv(name) != nullptr) warn_retired_setting(name);
     }
