@@ -411,9 +411,11 @@ RouteResult SecurityRouter::deliver_local(SecurityMessage message, uint64_t now_
     if (message.sender != runtime_.self()) {
         return drop(DropReason::SenderMismatch);
     }
-    // No wall clock has advanced for a local message; the flood-window
-    // reference is the current steady value the transport would have stamped.
-    return dispatch(message, 0);
+    // The caller's steady clock drives the windows, as the transport's does
+    // for inbound traffic. A fixed value would never roll this node's own
+    // challenge-production window: after the first full budget, every own
+    // final attestation would be dropped for the rest of the process.
+    return dispatch(message, now_ms);
 }
 
 RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) {

@@ -1034,6 +1034,40 @@ TEST_F(RouterMesh, NodeWithoutEpochStateAnswersItsVerifiedAuthority) {
     EXPECT_EQ(tier2->producer.activation_calls, 1);
 }
 
+TEST_F(RouterMesh, OwnChallengesRollTheProductionWindowOnTheCallersClock) {
+    // Production incident (release 2026102601): the local path dispatched at
+    // time zero, so this node's own production window never rolled. After
+    // four own challenges in the process lifetime, every Tier 1 member
+    // dropped its own final challenge as BudgetExceeded, no member held a
+    // verdict for itself, readiness never formed, and each boundary attempt
+    // ran out its final-attestation budget.
+    bootstrap_epoch_one();
+    Node* a = founders[0];
+    const auto own_challenge = [&] {
+        return a->router->compose(SecurityMessageKind::AttestationChallenge,
+                                  gate_passing_challenge(network, a->id), 1);
+    };
+
+    // Each window takes exactly one full budget of own challenges.
+    for (uint64_t window = 0; window < 3; ++window) {
+        const uint64_t now = mesh.now_ms + window * constants::kChallengeProductionWindowMs;
+        for (uint32_t i = 0; i < constants::kChallengeProductionsPerWindow; ++i) {
+            EXPECT_NE(a->router->deliver_local(own_challenge(), now).dropped,
+                      DropReason::BudgetExceeded)
+                << "window " << window << " challenge " << i;
+        }
+        EXPECT_EQ(a->producer.calls,
+                  static_cast<int>((window + 1) * constants::kChallengeProductionsPerWindow));
+    }
+
+    // The budget still binds this node: one more inside the same window is
+    // dropped before production.
+    const uint64_t last = mesh.now_ms + 2 * constants::kChallengeProductionWindowMs;
+    EXPECT_EQ(a->router->deliver_local(own_challenge(), last).dropped,
+              DropReason::BudgetExceeded);
+    EXPECT_EQ(a->producer.calls, static_cast<int>(3 * constants::kChallengeProductionsPerWindow));
+}
+
 TEST_F(RouterMesh, PreQuorumAnchorChallengeIsBoundedPerWindow) {
     Node* anchor = founders[0];
     Node* b = founders[1];

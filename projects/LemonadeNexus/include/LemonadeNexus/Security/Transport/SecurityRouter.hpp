@@ -188,8 +188,10 @@ public:
                                           EpochId epoch) const;
 
     /// Applies an own message through the same dispatch as inbound traffic.
-    /// The gates do not run: the message never crossed the wire. Pass
-    /// `now_ms` for the flood and challenge-production windows.
+    /// The gates do not run: the message never crossed the wire. The
+    /// challenge-production budget still applies to this node's own
+    /// challenges. `now_ms` is the caller's steady clock in milliseconds; it
+    /// rolls that window and stamps evidence-transfer deadlines.
     RouteResult deliver_local(SecurityMessage message, uint64_t now_ms);
 
     [[nodiscard]] bool send(const NodeId& to, const SecurityMessage& message);
