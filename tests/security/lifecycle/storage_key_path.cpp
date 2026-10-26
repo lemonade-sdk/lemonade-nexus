@@ -1359,6 +1359,70 @@ TEST_F(StorageKeyPath, ARestartWithRecordsThatLackTheCurrentPlanKeepsItsShare) {
     EXPECT_TRUE(share_of(holder, after).has_value());
 }
 
+// The live fleet after release 2026102601: the current plan committed without
+// a proof, no member wrote it to disk, and no server can serve it. A rolling
+// restart of every member then loses the plan record itself; the saved
+// consensus chain keeps block headers only. The restarts must keep every
+// share and must fail closed: no member unlocks under a plan it cannot prove,
+// and no member destroys the share of the plan it lost.
+TEST_F(StorageKeyPath, ARollingRestartThatLostTheCurrentPlanKeepsEveryShareAndStaysLocked) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    const Digest before = storage(founders.front()).chain().current_digest;
+    std::map<NodeId, std::string> stale;
+    for (Node* member : founders) {
+        stale[member->id] = raw_file(member->dir / "storage" / "records.json");
+    }
+    Node* behind = reserves[0];
+    const NodeId behind_id = behind->id;
+    mesh.drop_if = [behind_id](const Queued& item, const SecurityMessage& message) {
+        return item.to == behind_id && message.kind == SecurityMessageKind::StoragePlanProof;
+    };
+    const Digest after = refresh_at_next_boundary();
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+
+    // No server can serve the plan with a proof, as on the fleet.
+    mesh.drop_if = [after](const Queued&, const SecurityMessage& message) {
+        const auto* proof = std::get_if<StoragePlanProofMsg>(&message.body);
+        if (proof == nullptr) return false;
+        const auto record = storage_record_from_payload(proof->payload);
+        return record.has_value() && storage_record_digest(*record) == after;
+    };
+    const auto shares_left = [&] {
+        return std::count_if(founders.begin(), founders.end(),
+                             [&](Node* m) { return share_of(m, after).has_value(); });
+    };
+    ASSERT_EQ(shares_left(), 5);
+
+    // One member at a time restarts with the records the old release wrote.
+    for (std::size_t i = 0; i < founders.size(); ++i) {
+        Node* member = founders[i];
+        write_file(member->dir / "storage" / "records.json", stale.at(member->id));
+        build_storage(*member);
+        for (int step = 0; step < 200; ++step) {
+            storage_step();
+            ASSERT_GE(shares_left(), 4) << "below t after restart " << i + 1;
+        }
+        EXPECT_EQ(shares_left(), 5) << "a share was destroyed after restart " << i + 1;
+        EXPECT_NE(storage(member).chain().current_digest, after);
+        EXPECT_NE(storage(member).data_keys().state(), DataKeyState::Unlocked);
+    }
+
+    // Every member restarted: the plan record exists nowhere. The shares are
+    // all kept, and nothing unlocks without the proved plan.
+    for (int step = 0; step < 300; ++step) storage_step();
+    EXPECT_EQ(shares_left(), 5);
+    build_storage(*behind);
+    for (int step = 0; step < 300; ++step) storage_step();
+    std::vector<Node*> restarted(founders.begin(), founders.end());
+    restarted.push_back(behind);
+    for (Node* node : restarted) {
+        EXPECT_NE(storage(node).chain().current_digest, after);
+        EXPECT_NE(storage(node).data_keys().state(), DataKeyState::Unlocked);
+    }
+    EXPECT_EQ(storage(behind).chain().current_digest, before);
+}
+
 // A proof rebuilt from a peer's certified chain is candidate data: it is kept
 // only when it verifies under the epoch's vote keys and quorum and commits the
 // held record's exact bytes.
