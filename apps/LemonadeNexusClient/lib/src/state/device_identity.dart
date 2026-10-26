@@ -6,7 +6,7 @@
 /// falls back to a plaintext copy.
 library;
 
-import '../sdk/sdk.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import 'cluster_keyring.dart' show canonicalPrincipal;
 
 /// Where a legacy identity copy lives.

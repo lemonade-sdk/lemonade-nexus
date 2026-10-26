@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:nexus_client/src/sdk/models.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import 'package:nexus_client/src/state/cluster_keyring.dart';
 
 void main() {

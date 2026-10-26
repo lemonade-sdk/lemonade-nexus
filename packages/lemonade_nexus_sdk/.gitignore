@@ -1,0 +1,10 @@
+# Native binaries: installed by scripts/build-sdk-mobile.sh or downloaded at
+# build time (native/manifest.json). Never committed.
+ios/Frameworks/
+android/src/main/jniLibs/
+
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec.lock

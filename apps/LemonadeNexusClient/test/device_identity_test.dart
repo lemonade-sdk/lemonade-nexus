@@ -3,7 +3,7 @@
 // of these tests needs the native SDK library.
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:nexus_client/src/sdk/sdk.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import 'package:nexus_client/src/state/device_identity.dart';
 
 const _keyA = 'ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';

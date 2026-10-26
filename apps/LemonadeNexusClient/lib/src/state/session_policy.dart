@@ -3,7 +3,7 @@
 /// plain values so unit tests cover them without the native SDK.
 library;
 
-import '../sdk/sdk.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 
 /// True only when the network refused the credentials. The SDK maps HTTP 401
 /// and 403 to [LnError.auth]; every other outcome keeps the account and the

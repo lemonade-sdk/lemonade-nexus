@@ -3,7 +3,7 @@
 ///
 /// Usage:
 /// ```dart
-/// import 'package:nexus_client/src/sdk/sdk.dart';
+/// import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 ///
 /// final sdk = LemonadeNexusSdk();
 /// ```

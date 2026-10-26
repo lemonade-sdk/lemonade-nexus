@@ -12,7 +12,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
-import '../sdk/models.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
 

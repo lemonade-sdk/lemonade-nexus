@@ -5,7 +5,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:nexus_client/src/sdk/mesh_port.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import 'package:nexus_client/src/views/mesh_port_view.dart';
 
 MeshPortStatus _status({String? selection, String tls = 'active', String error = ''}) {

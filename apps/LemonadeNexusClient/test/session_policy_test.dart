@@ -8,7 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:nexus_client/src/platform/settings_store.dart';
-import 'package:nexus_client/src/sdk/sdk.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import 'package:nexus_client/src/state/app_state.dart';
 import 'package:nexus_client/src/state/session_policy.dart';
 

@@ -12,7 +12,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
-import '../sdk/models.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import '../views/admin_console/server_admin_provider.dart';
 import '../views/admin_console/admin_console_widget.dart';
 import '../../theme/app_theme.dart';

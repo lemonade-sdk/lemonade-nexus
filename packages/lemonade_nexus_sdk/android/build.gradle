@@ -1,0 +1,72 @@
+group = 'io.lemonadenexus.sdk'
+version = '0.9.8'
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.9.2'
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace = 'io.lemonadenexus.sdk'
+    compileSdk = 35
+
+    defaultConfig {
+        minSdkVersion 24
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    // jniLibs/<abi>/liblemonade_nexus_sdk.so from scripts/build-sdk-mobile.sh,
+    // or the release archive pinned in ../native/manifest.json.
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}
+
+def jniDir = file('src/main/jniLibs')
+
+tasks.register('fetchLemonadeNexusSdk') {
+    onlyIf { !new File(jniDir, 'arm64-v8a/liblemonade_nexus_sdk.so').exists() }
+    doLast {
+        def manifest = new groovy.json.JsonSlurper().parse(file('../native/manifest.json'))
+        def entry = manifest.android
+        if (!entry.sha256) {
+            throw new GradleException("lemonade_nexus_sdk: no Android archive is published for " +
+                "${manifest.version}. Build it with scripts/build-sdk-mobile.sh in lemonade-nexus.")
+        }
+        def zip = new File(temporaryDir, entry.file)
+        new URL("${manifest.base_url}/${entry.file}").withInputStream { input ->
+            zip.withOutputStream { it << input }
+        }
+        def actual = java.security.MessageDigest.getInstance('SHA-256').digest(zip.bytes).encodeHex().toString()
+        if (actual != entry.sha256) {
+            throw new GradleException("lemonade_nexus_sdk: ${entry.file} has SHA-256 ${actual}, expected ${entry.sha256}")
+        }
+        project.copy {
+            from zipTree(zip)
+            into jniDir
+        }
+    }
+}
+
+preBuild.dependsOn('fetchLemonadeNexusSdk')

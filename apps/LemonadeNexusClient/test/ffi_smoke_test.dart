@@ -7,7 +7,7 @@ import 'dart:ffi' as ffi;
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:nexus_client/src/sdk/ffi_bindings.dart';
+import 'package:lemonade_nexus_sdk/ffi_bindings.dart';
 
 String _libLeaf() {
   if (Platform.isWindows) return 'lemonade_nexus_sdk.dll';

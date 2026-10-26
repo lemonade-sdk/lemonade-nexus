@@ -36,7 +36,7 @@ no kernel module, no TUN device, no elevated privileges, on every platform.
 |----------|-----------|--------|
 | C++ | `lnsdk::LemonadeNexusClient` class | `LemonadeNexusSDK/LemonadeNexusClient.hpp` |
 | C | `ln_*` FFI functions | `LemonadeNexusSDK/lemonade_nexus.h` |
-| Dart/Flutter | Generated FFI wrapper (`lib/src/sdk/`) | Consumes the C ABI |
+| Dart/Flutter | `packages/lemonade_nexus_sdk` (FFI wrapper, `NexusWorker`, DNS discovery; ships the iOS/Android library) | Consumes the C ABI |
 
 The shared library exports only the `ln_*` C API (hidden visibility); the C++
 class and the Dart wrapper both sit on top of it.
@@ -247,5 +247,13 @@ netstack are embedded.
   static OpenSSL archive, so the dylib loads no Homebrew or system OpenSSL.
 - **Windows:** build definitions exist; CI is currently disabled, so validate
   locally.
+- **iOS and Android:** `scripts/build-sdk-mobile.sh` builds the SDK alone
+  (`LEMONADE_NEXUS_SDK_ONLY`) as an XCFramework (device arm64, simulator
+  arm64/x86_64, iOS 15+) and as `liblemonade_nexus_sdk.so` for arm64-v8a,
+  armeabi-v7a and x86_64 (API 24+, static C++ runtime, 16 KB pages). Both
+  export only the `ln_*` API. The Flutter plugin `packages/lemonade_nexus_sdk`
+  ships them; see its `native/README.md`. The mesh runs in userspace, so no
+  VPN or Network Extension entitlement is needed; the mesh port listens on
+  loopback only while the app runs.
 - The SDK ships as a native dynamic library (`.so` / `.dylib` / `.dll`);
   there is no per-platform VPN backend to manage.
