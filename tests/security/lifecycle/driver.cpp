@@ -367,6 +367,48 @@ TEST_F(DriverMesh, TimedHandoffRotatesToEpochTwo) {
     run_until_committed(before + 1);
 }
 
+// Production incident: readiness and the handoff were derived from each
+// member's own evidence digests. Every member verifies different evidence
+// (its own challenge nonce), so no replica ever arrived at the leader's
+// readiness digest, nothing committed, and every boundary was abandoned.
+TEST_F(DriverMesh, HandoffCommitsWhenEveryMemberVerifiedDifferentEvidence) {
+    bootstrap();
+    run_until_committed(1);
+    prepare_handoff();
+    for (Node* founder : founders) {
+        ASSERT_NE(founder->runtime->epochs()->transition(), nullptr);
+    }
+    for (Node* member : founders) {
+        const auto vote_key = member->driver->vote_key_for_epoch(2);
+        ASSERT_TRUE(vote_key.has_value());
+        for (Node* founder : founders) {
+            const auto verdict = seen_by(final_verdict(latest_plan(), member->id), founder->id);
+            founder->driver->on_attestation_verdict(verdict, evidence_for(member->id, *vote_key));
+        }
+    }
+    mesh.pump();
+    for (int i = 0; i < 600; ++i) {
+        step(1);
+        if (std::all_of(founders.begin(), founders.end(),
+                        [](Node* f) { return f->driver->current_epoch() == 2u; })) {
+            break;
+        }
+    }
+    for (Node* founder : founders) {
+        EXPECT_EQ(founder->driver->current_epoch(), 2u);
+    }
+    // Every member holds the same finalized authority, whose attestation root
+    // no single verifier's evidence could have produced.
+    const auto* first = founders[0]->driver->verified_authority();
+    ASSERT_NE(first, nullptr);
+    for (Node* founder : founders) {
+        const auto* authority = founder->driver->verified_authority();
+        ASSERT_NE(authority, nullptr);
+        EXPECT_EQ(authority->epoch, 2u);
+        EXPECT_EQ(authority->attestation_root, first->attestation_root);
+    }
+}
+
 // The announcement is a hint, not authority — but the hint must not be wrong:
 // its authority record carries the announced epoch's real DKG transcript digest,
 // not an all-zero placeholder, so a verifier comparing canonical digests over
@@ -494,6 +536,48 @@ TEST_F(DriverMesh, SequentialRestartsKeepEveryMemberCommitting) {
         ASSERT_FALSE(HasFatalFailure()) << "member " << i << " stalled after its restart";
         EXPECT_GT(victim->runtime->consensus()->state().last_voted_view, floor)
             << "member " << i << " stopped voting after its restart";
+    }
+}
+
+// The recovery install: every server gets the fixed binary and keeps its Epoch 1
+// state (epoch record, authority chain, consensus and eligibility stores). The
+// Tier 1 members restart one at a time, each rejoining before the next goes
+// down, because the consensus store keeps the safety state but not the blocks
+// a certificate names: a committee restarted all at once holds no parent to
+// extend. Afterwards the next boundary hands off to Epoch 2, with each member
+// holding different evidence for every node, as production verifiers do.
+TEST_F(DriverMesh, ACommitteeRestartedOneAtATimeOnItsStateHandsOffToEpochTwo) {
+    bootstrap();
+    run_until_committed(2);
+    ASSERT_FALSE(HasFatalFailure());
+
+    for (Node* member : founders) {
+        Height highest = 0;
+        for (Node* founder : founders) {
+            highest = std::max(highest, founder->driver->last_committed_height());
+        }
+        restart_node(*member);
+        member->driver->start(mesh.now_ms);
+        ASSERT_EQ(member->driver->current_epoch(), 1u) << "the kept epoch record";
+        run_until_committed(highest + 3, 200);
+        ASSERT_FALSE(HasFatalFailure());
+        ASSERT_EQ(member->driver->phase(), DriverPhase::Active);
+    }
+
+    prepare_handoff();
+    for (Node* founder : founders) {
+        ASSERT_NE(founder->runtime->epochs()->transition(), nullptr);
+    }
+    final_attest_subjects(0x70, founders, founders);
+    for (int i = 0; i < 600; ++i) {
+        step(1);
+        if (std::all_of(founders.begin(), founders.end(),
+                        [](Node* f) { return f->driver->current_epoch() == 2u; })) {
+            break;
+        }
+    }
+    for (Node* founder : founders) {
+        EXPECT_EQ(founder->driver->current_epoch(), 2u);
     }
 }
 

@@ -362,6 +362,15 @@ inline AttestationVerdict final_verdict(const NextEpochPlan& plan, const NodeId&
     return verdict;
 }
 
+// The same verdict as one particular verifier records it. Each verifier sends
+// its own challenge with its own nonce, and the evidence binds the challenge,
+// so two verifiers of one node never hold the same evidence digest.
+inline AttestationVerdict seen_by(AttestationVerdict verdict, const NodeId& verifier) {
+    verdict.evidence_digest[3] = verifier.bytes[0];
+    verdict.evidence_digest[4] = verifier.bytes[1];
+    return verdict;
+}
+
 inline AttestationEvidence evidence_for(const NodeId& id, const nexus::crypto::Ed25519PublicKey& vote_key) {
     AttestationEvidence evidence;
     evidence.node_id = id;
@@ -688,7 +697,7 @@ struct DriverMeshBase : ::testing::Test {
                     continue;
                 }
                 observer->driver->on_attestation_verdict(
-                    final_verdict(plan, subject->id, round),
+                    seen_by(final_verdict(plan, subject->id, round), observer->id),
                     evidence_for(subject->id, *vote_key));
             }
         }
@@ -808,7 +817,7 @@ struct DriverMeshBase : ::testing::Test {
             verdict.purpose = challenge.purpose;
             verdict.context_digest = challenge.context_digest;
             mesh.nodes.at(challenger)->driver->on_attestation_verdict(
-                verdict, evidence_for(challenge.node_id, *vote_key));
+                seen_by(verdict, challenger), evidence_for(challenge.node_id, *vote_key));
             asked.insert(challenger);
         }
         for (const auto& challenger : asked) {
@@ -825,8 +834,9 @@ struct DriverMeshBase : ::testing::Test {
             if (!vote_key.has_value()) {
                 continue;
             }
-            node->driver->on_attestation_verdict(final_verdict(plan, challenger, final_round_),
-                                                 evidence_for(challenger, *vote_key));
+            node->driver->on_attestation_verdict(
+                seen_by(final_verdict(plan, challenger, final_round_), challenger),
+                evidence_for(challenger, *vote_key));
         }
         ++final_round_;
         mesh.pump();

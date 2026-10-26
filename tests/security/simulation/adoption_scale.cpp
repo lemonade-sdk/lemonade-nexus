@@ -146,7 +146,7 @@ Row measure(std::size_t size) {
         ReadinessEntry entry;
         entry.node = node;
         entry.incarnation = 1;
-        entry.evidence_digest.fill(0xED);
+        entry.attestation_context.fill(0xED);
         entry.vote_key = committee.pubs.at(node);
         readiness.entries.push_back(entry);
     }
