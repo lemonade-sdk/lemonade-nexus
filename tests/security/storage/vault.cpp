@@ -12,8 +12,10 @@
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 
 #include <asio.hpp>
+#include <nlohmann/json.hpp>
 #include <gtest/gtest.h>
 #include <sodium.h>
 
@@ -111,6 +113,21 @@ void write_raw(const fs::path& path, std::string_view text) {
 
 bool encrypted(std::string_view raw) { return raw.starts_with("LNXVAULT"); }
 
+/// The coverage of the first Phase 7 release: generation 1 only.
+std::vector<VaultCoverage> first_generation_coverage() {
+    auto coverage = StorageVault::default_coverage();
+    std::erase_if(coverage, [](const VaultCoverage& c) { return c.since > 1; });
+    return coverage;
+}
+
+/// Files of groups that coverage generation 2 added.
+const std::vector<std::string> kGenerationTwo = {
+    "tree/committed-ops.json",
+    "onboarding/admissions.json",
+    "chat-aa11/c1.json",
+    "keyenv-bb22/p1.json",
+};
+
 class StorageVaultTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -131,6 +148,10 @@ protected:
             {"tree/deltas/000001.json", "{\"sequence\":1}"},
             {"tree/log/1.json", "{\"height\":1}"},
             {"tree/log/snapshot-0.json", "{\"height\":0}"},
+            {"tree/committed-ops.json", "{\"format\":1,\"ids\":[]}"},
+            {"onboarding/admissions.json", "{\"data\":{\"admissions\":[]}}"},
+            {"chat-aa11/c1.json", "{\"data\":\"chat blob\"}"},
+            {"keyenv-bb22/p1.json", "{\"data\":\"key envelope\"}"},
         };
         for (const auto& [rel, text] : originals) write_raw(data / rel, text);
         write_raw(data / "identity/keypair.pub", "public");
@@ -143,13 +164,14 @@ protected:
         crypto.stop();
     }
 
-    void build(std::size_t batch = 1) {
+    void build(std::size_t batch = 1,
+               std::vector<VaultCoverage> coverage = StorageVault::default_coverage()) {
         vault.reset();
         StorageVaultOptions options;
         options.batch = batch;
         options.rotation_interval_ms = kMonth;
         vault = std::make_unique<StorageVault>(data, data / "security" / "storage", crypto,
-                                               StorageVault::default_coverage(), options);
+                                               std::move(coverage), options);
         vault->load();
         vault->attach(&keys);
     }
@@ -193,6 +215,25 @@ protected:
         ASSERT_TRUE(run_to_done());
         expect_encrypted_contents();
     }
+
+    /// A server that migrated under the first Phase 7 release: its vault is
+    /// "encrypted", the generation-2 files are plaintext, and its state file
+    /// has no coverage generation.
+    void migrate_first_generation() {
+        keys.unlock();
+        build(1, first_generation_coverage());
+        ASSERT_TRUE(run_to_done());
+        for (const auto& rel : kGenerationTwo) {
+            ASSERT_EQ(read_raw(data / rel), originals.at(rel)) << rel;
+        }
+        EXPECT_TRUE(encrypted(read_raw(data / "tree/nodes/alpha.json")));
+        vault.reset();
+        auto state = nlohmann::json::parse(read_raw(state_path()));
+        state.erase("coverage");
+        write_raw(state_path(), state.dump());
+    }
+
+    fs::path state_path() const { return data / "security/storage/vault-state.json"; }
 
     static constexpr uint64_t kMonth = 30ULL * 24 * 3600 * 1000;
     nexus::crypto::SodiumCryptoService crypto;
@@ -637,6 +678,341 @@ TEST_F(StorageVaultTest, ACopyViewOfAPlaintextBackupReadsItsPlaintext) {
     const auto read = view->read(backup / "tree/nodes/alpha.json");
     ASSERT_EQ(read.status, VaultReadStatus::Ok);
     EXPECT_EQ(read.bytes, "{\"id\":\"alpha\"}");
+}
+
+// --- Coverage generation 2 --------------------------------------------------------
+
+TEST_F(StorageVaultTest, CoverageGenerationTwoCoversTreeAdmissionAndAccountData) {
+    build();
+    EXPECT_TRUE(vault->covers(data / "tree" / "committed-ops.json"));
+    EXPECT_TRUE(vault->covers(data / "onboarding" / "admissions.json"));
+    EXPECT_TRUE(vault->covers(data / ("chat-" + std::string(64, 'a')) / "0123.json"));
+    EXPECT_TRUE(vault->covers(data / ("keyenv-" + std::string(64, 'b')) / "4567.json"));
+    // A prefix group covers files directly inside a top-level directory only.
+    EXPECT_FALSE(vault->covers(data / "chat-" / "0123.json"));
+    EXPECT_FALSE(vault->covers(data / "chat-aa" / "sub" / "0123.json"));
+    EXPECT_FALSE(vault->covers(data / "account" / "chat-aa" / "0123.json"));
+    EXPECT_FALSE(vault->covers(data / "keyenv-bb" / "4567.json.tmp"));
+    // The tree's transfer pool and other files stay as they were.
+    EXPECT_FALSE(vault->covers(data / "tree" / "retained_deltas" / (std::string(64, 'c') + ".json")));
+    EXPECT_FALSE(vault->covers(data / "onboarding" / "other.json"));
+
+    // A symlink with a covered prefix makes the scan incomplete.
+    fs::create_directories(root / "elsewhere");
+    fs::create_directory_symlink(root / "elsewhere", data / "keyenv-cc33");
+    EXPECT_TRUE(vault->test_enumerate_relative().empty());
+    fs::remove(data / "keyenv-cc33");
+    EXPECT_FALSE(vault->test_enumerate_relative().empty());
+}
+
+// A fresh migration encrypts the generation-2 groups with every other group
+// and records the generation, so nothing waits for adoption.
+TEST_F(StorageVaultTest, FreshMigrationRecordsTheCurrentCoverageGeneration) {
+    migrate();
+    EXPECT_FALSE(vault->adoption_pending());
+    EXPECT_TRUE(vault->files_ready());
+    EXPECT_EQ(nlohmann::json::parse(read_raw(state_path())).value("coverage", 0), 2);
+}
+
+// The in-place update: a server already "encrypted" under generation 1 adopts
+// the new groups with no manual step, and loses nothing.
+TEST_F(StorageVaultTest, AddedCoverageIsAdoptedOnAnEncryptedVault) {
+    migrate_first_generation();
+    build();
+    EXPECT_EQ(vault->mode(), VaultMode::Encrypted);
+    EXPECT_TRUE(vault->adoption_pending());
+    // The DEK is in memory, but the services that read covered files wait.
+    EXPECT_FALSE(vault->files_ready());
+    // Until the adoption commits, the plaintext of the new groups is
+    // authoritative, and the earlier groups stay encrypted.
+    for (const auto& rel : kGenerationTwo) {
+        const auto read = vault->read(data / rel);
+        ASSERT_EQ(read.status, VaultReadStatus::Ok) << rel;
+        EXPECT_EQ(read.bytes, originals.at(rel)) << rel;
+    }
+    EXPECT_EQ(vault->read(data / "tree/nodes/alpha.json").bytes,
+              originals.at("tree/nodes/alpha.json"));
+
+    tick();
+    EXPECT_FALSE(vault->adoption_pending());
+    EXPECT_TRUE(vault->files_ready());
+    expect_encrypted_contents();
+    EXPECT_EQ(nlohmann::json::parse(read_raw(state_path())).value("coverage", 0), 2);
+
+    // A restart unlocks and reads the adopted files without a new adoption.
+    crash_and_restart();
+    EXPECT_FALSE(vault->adoption_pending());
+    EXPECT_TRUE(vault->files_ready());
+    expect_encrypted_contents();
+    // A rotation re-encrypts the adopted files too.
+    const Key before = keys.persisted;
+    ASSERT_TRUE(vault->request_rotation());
+    ASSERT_TRUE(run_to_done());
+    EXPECT_NE(keys.persisted, before);
+    expect_encrypted_contents();
+}
+
+TEST_F(StorageVaultTest, AdoptionWaitsForTheDataKeyAndAVerifiedUnlock) {
+    migrate_first_generation();
+    keys.restart();
+    build();
+    tick(3);
+    EXPECT_TRUE(vault->adoption_pending());
+    EXPECT_FALSE(vault->files_ready());
+    for (const auto& rel : kGenerationTwo) EXPECT_EQ(read_raw(data / rel), originals.at(rel));
+    keys.dek = keys.persisted;  // in memory, but no round trip proved it yet
+    tick(3);
+    EXPECT_TRUE(vault->adoption_pending());
+    for (const auto& rel : kGenerationTwo) EXPECT_EQ(read_raw(data / rel), originals.at(rel));
+    keys.unlock();
+    tick();
+    EXPECT_FALSE(vault->adoption_pending());
+    expect_encrypted_contents();
+}
+
+// After the adoption the new groups fail closed like every other group.
+TEST_F(StorageVaultTest, AdoptedFilesRefusePlaintextAndMovedObjectsAfterRestart) {
+    migrate_first_generation();
+    build();
+    tick();
+    ASSERT_FALSE(vault->adoption_pending());
+    const auto ops = data / "tree/committed-ops.json";
+    const auto admissions = data / "onboarding/admissions.json";
+    const auto ops_object = read_raw(ops);
+
+    write_raw(ops, "{\"format\":1,\"ids\":[]}");
+    EXPECT_EQ(vault->read(ops).status, VaultReadStatus::Rejected);
+    crash_and_restart();
+    EXPECT_FALSE(vault->adoption_pending());
+    EXPECT_TRUE(vault->files_ready());
+    EXPECT_EQ(vault->read(ops).status, VaultReadStatus::Rejected);
+    tick();
+    // The plaintext is not adopted after a restart either.
+    EXPECT_FALSE(encrypted(read_raw(ops)));
+
+    // Another path's valid object: the AAD binds the domain and the path.
+    write_raw(ops, read_raw(admissions));
+    EXPECT_EQ(vault->read(ops).status, VaultReadStatus::Rejected);
+    write_raw(data / "keyenv-bb22/p2.json", read_raw(data / "keyenv-bb22/p1.json"));
+    EXPECT_EQ(vault->read(data / "keyenv-bb22/p2.json").status, VaultReadStatus::Rejected);
+    // Tampered ciphertext.
+    auto tampered = ops_object;
+    tampered.back() = static_cast<char>(tampered.back() ^ 0x01);
+    write_raw(ops, tampered);
+    EXPECT_EQ(vault->read(ops).status, VaultReadStatus::Rejected);
+    // The original object still opens.
+    write_raw(ops, ops_object);
+    EXPECT_EQ(vault->read(ops).bytes, originals.at("tree/committed-ops.json"));
+}
+
+// The adoption applies to the new groups only: plaintext planted in a group
+// of an earlier generation stays refused and is never encrypted.
+TEST_F(StorageVaultTest, AdoptionNeverAcceptsPlaintextInAnEarlierGroup) {
+    migrate_first_generation();
+    write_raw(data / "tree/nodes/planted.json", "{\"id\":\"planted\"}");
+    write_raw(data / "identity/jwt_secret.hex", "planted-secret");
+    build();
+    EXPECT_EQ(vault->read(data / "tree/nodes/planted.json").status, VaultReadStatus::Rejected);
+    EXPECT_EQ(vault->read(data / "identity/jwt_secret.hex").status, VaultReadStatus::Rejected);
+    tick();
+    EXPECT_FALSE(vault->adoption_pending());
+    EXPECT_EQ(read_raw(data / "tree/nodes/planted.json"), "{\"id\":\"planted\"}");
+    EXPECT_EQ(read_raw(data / "identity/jwt_secret.hex"), "planted-secret");
+    EXPECT_EQ(vault->read(data / "tree/nodes/planted.json").status, VaultReadStatus::Rejected);
+    EXPECT_EQ(vault->read(data / "identity/jwt_secret.hex").status, VaultReadStatus::Rejected);
+}
+
+// A file in a new group that holds the header but does not open under the
+// current DEK is neither adopted nor dropped: the files stay locked.
+TEST_F(StorageVaultTest, AdoptionStopsAtAnEncryptedFileThatDoesNotOpen) {
+    migrate_first_generation();
+    const auto foreign = data / "keyenv-bb22/foreign.json";
+    {
+        StorageVault other(data, root / "other-state", crypto);
+        const auto object = other.seal_for(foreign, random_key(), "{\"data\":\"x\"}");
+        ASSERT_TRUE(object.has_value());
+        write_raw(foreign, *object);
+    }
+    build();
+    tick(3);
+    EXPECT_TRUE(vault->adoption_pending());
+    EXPECT_FALSE(vault->files_ready());
+    for (const auto& rel : kGenerationTwo) EXPECT_EQ(read_raw(data / rel), originals.at(rel));
+    // Removing the foreign file lets the adoption finish.
+    fs::remove(foreign);
+    tick();
+    EXPECT_FALSE(vault->adoption_pending());
+    expect_encrypted_contents();
+}
+
+// A crash after the adoption record and before every replacement: load()
+// finishes the replacements without the DEK, and nothing is lost, even when
+// a plaintext was already overwritten.
+TEST_F(StorageVaultTest, CrashAfterTheAdoptionRecordFinishesTheReplacements) {
+    migrate_first_generation();
+    {
+        StorageVault sealer(data, root / "unused-state", crypto);
+        for (const auto& rel : kGenerationTwo) {
+            const auto object = sealer.seal_for(data / rel, *keys.dek, originals.at(rel));
+            ASSERT_TRUE(object.has_value()) << rel;
+            write_raw(data / (rel + ".vault-new"), *object);
+        }
+    }
+    auto state = nlohmann::json::parse(read_raw(state_path()));
+    state["coverage"] = 2;
+    state["phase"] = "promoting";
+    write_raw(state_path(), state.dump());
+    write_raw(data / "tree/committed-ops.json", std::string(20, '\0'));
+
+    keys.restart();  // load() needs no key
+    build();
+    EXPECT_FALSE(vault->adoption_pending());
+    EXPECT_EQ(vault->phase(), VaultPhase::Idle);
+    keys.unlock();
+    expect_encrypted_contents();
+}
+
+// A crash before the record leaves staged copies beside the plaintext; the
+// plaintext stays authoritative and the next adoption replaces them.
+TEST_F(StorageVaultTest, CrashBeforeTheAdoptionRecordKeepsThePlaintext) {
+    migrate_first_generation();
+    write_raw(data / "tree/committed-ops.json.vault-new", "LNXVAULT-stale");
+    write_raw(data / "chat-aa11/gone.json.vault-new", "LNXVAULT-orphan");
+    build();
+    EXPECT_EQ(vault->read(data / "tree/committed-ops.json").bytes,
+              originals.at("tree/committed-ops.json"));
+    tick();
+    EXPECT_FALSE(vault->adoption_pending());
+    expect_encrypted_contents();
+    EXPECT_FALSE(fs::exists(data / "chat-aa11/gone.json.vault-new"));
+    EXPECT_FALSE(fs::exists(data / "chat-aa11/gone.json"));
+}
+
+// A rotation that a generation-1 server began before the update: before its
+// commit it is discarded, the adoption runs, and the rotation runs again.
+TEST_F(StorageVaultTest, RotationInterruptedByTheUpdateIsDiscardedAndRunsAgain) {
+    for (const bool restart : {false, true}) {
+        SCOPED_TRACE(restart ? "process restart" : "same process");
+        vault.reset();
+        SetUp();
+        keys = FakeKeys{};
+        keys.unlock();
+        build(1, first_generation_coverage());
+        ASSERT_TRUE(run_to_done());
+        const Key before = keys.persisted;
+        ASSERT_TRUE(vault->request_rotation());
+        tick(2);
+        ASSERT_EQ(vault->phase(), VaultPhase::RotateStaging);
+        if (restart) {
+            crash_and_restart();
+        } else {
+            build();
+        }
+        ASSERT_TRUE(vault->adoption_pending());
+        ASSERT_TRUE(run_to_done());
+        EXPECT_FALSE(vault->adoption_pending());
+        expect_encrypted_contents();
+        EXPECT_NE(keys.persisted, before);
+        if (::testing::Test::HasFailure()) return;
+    }
+}
+
+TEST_F(StorageVaultTest, ACopyViewOfAFirstGenerationBackupReadsItsNewGroupsAsPlaintext) {
+    migrate_first_generation();
+    const auto backup = root / "backup" / "data";
+    fs::create_directories(backup.parent_path());
+    fs::copy(data, backup, fs::copy_options::recursive);
+    build();
+    tick();
+    ASSERT_FALSE(vault->adoption_pending());
+
+    const auto view = vault->copy_view(backup);
+    for (const auto& [rel, text] : originals) {
+        const auto read = view->read(backup / rel);
+        ASSERT_EQ(read.status, VaultReadStatus::Ok) << rel;
+        EXPECT_EQ(read.bytes, text) << rel;
+    }
+    EXPECT_EQ(read_raw(backup / "tree/committed-ops.json"),
+              originals.at("tree/committed-ops.json"));
+}
+
+// --- Services on the generation-2 groups ---------------------------------------------
+
+TEST_F(StorageVaultTest, TreeCommittedOpsAreSealedAndAPlantedPlaintextIsRefused) {
+    migrate();
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    files.set_vault(vault.get());
+    const std::string id(64, 'a');
+    const auto refusal = [](const nexus::tree::PermissionTreeService& tree) {
+        return tree.validate_local_op(nexus::tree::TreeOp{}, nexus::tree::TreeOpPolicy{}, 0)
+            .refusal;
+    };
+    {
+        nexus::tree::PermissionTreeService tree{files, crypto};
+        tree.start();
+        nexus::tree::CommittedOpIds ids;
+        ids.insert(id, 1'800'000'000);
+        ASSERT_TRUE(tree.replace_all(tree.nodes_snapshot(), ids));
+        tree.stop();
+    }
+    const auto path = data / "tree/committed-ops.json";
+    EXPECT_TRUE(encrypted(read_raw(path)));
+    {
+        nexus::tree::PermissionTreeService tree{files, crypto};
+        tree.start();
+        EXPECT_TRUE(tree.committed_ids().contains(id));
+        EXPECT_NE(refusal(tree), nexus::tree::TreeOpRefusal::StorageError);
+        tree.stop();
+    }
+    // A plaintext record is refused, and the tree refuses operations rather
+    // than forget the committed ids.
+    write_raw(path, "{\"format\":1,\"ids\":[]}");
+    {
+        nexus::tree::PermissionTreeService tree{files, crypto};
+        tree.start();
+        EXPECT_FALSE(tree.committed_ids().contains(id));
+        EXPECT_EQ(refusal(tree), nexus::tree::TreeOpRefusal::StorageError);
+        tree.stop();
+    }
+    // Locked: the ids are unknown, not empty.
+    crash_and_restart(/*holders_up=*/false);
+    files.set_vault(vault.get());
+    {
+        nexus::tree::PermissionTreeService tree{files, crypto};
+        tree.start();
+        EXPECT_EQ(refusal(tree), nexus::tree::TreeOpRefusal::StorageError);
+        tree.stop();
+    }
+    files.stop();
+}
+
+TEST_F(StorageVaultTest, AdmissionsAndAccountDataAreWrittenThroughTheVault) {
+    migrate();
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    files.set_vault(vault.get());
+    nexus::storage::SignedEnvelope envelope;
+    envelope.type = "admissions";
+    envelope.data = "{\"admissions\":[]}";
+    ASSERT_TRUE(files.write_file("onboarding", "admissions.json", envelope));
+    EXPECT_TRUE(encrypted(read_raw(data / "onboarding/admissions.json")));
+    const auto admissions = files.read_file("onboarding", "admissions.json");
+    ASSERT_TRUE(admissions.has_value());
+    EXPECT_EQ(admissions->data, envelope.data);
+
+    const std::string category = "keyenv-" + std::string(64, 'd');
+    envelope.type = "key_envelope";
+    envelope.data = "{\"wrapped\":\"opaque\"}";
+    ASSERT_TRUE(files.write_file(category, "p9.json", envelope));
+    EXPECT_TRUE(encrypted(read_raw(data / category / "p9.json")));
+    EXPECT_EQ(files.list_files(category), std::vector<std::string>{"p9"});
+    const auto key_envelope = files.read_file(category, "p9.json");
+    ASSERT_TRUE(key_envelope.has_value());
+    EXPECT_EQ(key_envelope->data, envelope.data);
+    EXPECT_TRUE(files.delete_file(category, "p9.json"));
+    EXPECT_TRUE(files.list_files(category).empty());
+    files.stop();
 }
 
 }  // namespace

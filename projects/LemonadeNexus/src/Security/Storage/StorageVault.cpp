@@ -99,6 +99,8 @@ StorageVault::StorageVault(fs::path data_root, fs::path state_directory,
       coverage_(std::move(coverage)),
       options_(options) {
     if (options_.batch == 0) options_.batch = 1;
+    for (const auto& c : coverage_) current_generation_ = std::max(current_generation_, c.since);
+    coverage_generation_ = current_generation_;
 }
 
 std::vector<VaultCoverage> StorageVault::default_coverage() {
@@ -121,6 +123,17 @@ std::vector<VaultCoverage> StorageVault::default_coverage() {
         // and the TLS listener still opens the cert by path.
         {"tls-key", "certs", "privkey.pem", ""},
         {"acme-account-key", "certs", "account.key", ""},
+        // Generation 2. The tree's committed operation ids are tree state
+        // beside the tree log; the tree reads them only after the unlock.
+        {"tree-committed-ops", "tree", "committed-ops.json", "", 2},
+        // Server admission records: candidate keys, platform evidence, source
+        // addresses, and decisions.
+        {"server-admissions", "onboarding", "admissions.json", "", 2},
+        // The account data store (AccountDataStore): one directory per account
+        // group. The blobs are client-encrypted; the vault also hides who
+        // stores what.
+        {"account-chat", "chat-*", "", ".json", 2},
+        {"account-key-envelope", "keyenv-*", "", ".json", 2},
     };
 }
 
@@ -137,13 +150,20 @@ std::optional<StorageVault::Covered> StorageVault::classify(const fs::path& path
     for (const auto& c : coverage_) {
         // The file sits in `c.directory` or in any subdirectory beneath it
         // (recursive coverage). Nested FQDN cert directories (certs/<fqdn>/)
-        // hold privkey.pem one level below the declared `certs` directory.
-        const bool in_dir = directory == c.directory ||
-            (c.directory.empty()
-                 ? false
-                 : (directory.size() > c.directory.size() &&
-                    directory.starts_with(c.directory) &&
-                    directory[c.directory.size()] == '/'));
+        // hold privkey.pem one level below the declared `certs` directory. A
+        // prefix group ("chat-*") covers only files directly inside one
+        // top-level directory.
+        bool in_dir = false;
+        if (c.directory.ends_with('*')) {
+            const std::string_view prefix(c.directory.data(), c.directory.size() - 1);
+            in_dir = directory.size() > prefix.size() && directory.starts_with(prefix) &&
+                     directory.find('/') == std::string::npos;
+        } else {
+            in_dir = directory == c.directory ||
+                     (!c.directory.empty() && directory.size() > c.directory.size() &&
+                      directory.starts_with(c.directory) &&
+                      directory[c.directory.size()] == '/');
+        }
         if (!in_dir) continue;
         const bool match = !c.name.empty() ? name == c.name
                                            : (!c.suffix.empty() && name.size() > c.suffix.size() &&
@@ -234,12 +254,47 @@ std::vector<StorageVault::Covered> StorageVault::enumerate() const {
     };
 
     for (const auto& c : coverage_) {
-        const auto dir = data_root_ / c.directory;
-        std::error_code ec;
-        if (!fs::is_directory(dir, ec)) continue;
-        if (!walk(dir)) {
-            last_scan_ok_ = false;
-            return {};
+        std::vector<fs::path> dirs;
+        if (c.directory.ends_with('*')) {
+            // Every top-level directory with the prefix. A symlink with such a
+            // name fails the scan like a symlink inside a covered directory.
+            const std::string prefix = c.directory.substr(0, c.directory.size() - 1);
+            std::error_code ec;
+            auto it = fs::directory_iterator(data_root_, ec);
+            if (ec) {
+                spdlog::error("[storage-vault] cannot scan {}", data_root_.string());
+                last_scan_ok_ = false;
+                return {};
+            }
+            for (; it != fs::directory_iterator(); it.increment(ec)) {
+                const std::string name = it->path().filename().string();
+                if (name.size() <= prefix.size() || !name.starts_with(prefix)) continue;
+                const auto status = it->symlink_status(ec);
+                if (ec || fs::is_symlink(status)) {
+                    spdlog::error("[storage-vault] cannot use covered directory {}",
+                                  it->path().string());
+                    last_scan_ok_ = false;
+                    return {};
+                }
+                if (fs::is_directory(status)) dirs.push_back(it->path());
+            }
+            if (ec) {
+                spdlog::error("[storage-vault] scan of {} failed: {}", data_root_.string(),
+                              ec.message());
+                last_scan_ok_ = false;
+                return {};
+            }
+        } else {
+            std::error_code ec;
+            if (fs::is_directory(data_root_ / c.directory, ec)) {
+                dirs.push_back(data_root_ / c.directory);
+            }
+        }
+        for (const auto& dir : dirs) {
+            if (!walk(dir)) {
+                last_scan_ok_ = false;
+                return {};
+            }
         }
     }
     std::vector<Covered> out;
@@ -374,6 +429,7 @@ bool StorageVault::save_state() {
     j["mode"] = vault_mode_name(mode_);
     j["phase"] = vault_phase_name(phase_);
     j["key_id"] = crypto::to_hex(std::span<const uint8_t>(target_key_id_));
+    j["coverage"] = coverage_generation_;
     j["last_rotation_ms"] = last_rotation_ms_;
     j["rotation_requested"] = rotation_requested_;
     std::error_code ec;
@@ -403,12 +459,22 @@ void StorageVault::load() {
             phase = parse_phase(j["phase"].get<std::string>());
             id = crypto::from_hex(j["key_id"].get<std::string>());
         }
-        if (mode && phase && id.size() == target_key_id_.size()) {
+        // A state file from before coverage generations records generation 1.
+        std::optional<uint32_t> generation = 1;
+        if (j.is_object() && j.contains("coverage")) {
+            const auto& c = j["coverage"];
+            generation = c.is_number_unsigned() && c.get<uint64_t>() >= 1 &&
+                                 c.get<uint64_t>() <= UINT32_MAX
+                             ? std::optional<uint32_t>(c.get<uint32_t>())
+                             : std::nullopt;
+        }
+        if (mode && phase && generation && id.size() == target_key_id_.size()) {
             mode_ = *mode;
             phase_ = *phase;
             std::copy(id.begin(), id.end(), target_key_id_.begin());
             last_rotation_ms_ = j.value("last_rotation_ms", uint64_t{0});
             rotation_requested_ = j.value("rotation_requested", false);
+            coverage_generation_ = *generation;
         } else {
             damaged = true;
         }
@@ -418,6 +484,8 @@ void StorageVault::load() {
         // accepted plaintext.
         mode_ = VaultMode::Plaintext;
         phase_ = VaultPhase::Idle;
+        // A migration encrypts every group, so nothing waits for adoption.
+        coverage_generation_ = current_generation_;
         for (const auto& file : enumerate()) {
             const auto bytes = read_whole(file.path);
             if (bytes && has_header(*bytes)) {
@@ -432,6 +500,8 @@ void StorageVault::load() {
                       state_path_.string());
         mode_ = VaultMode::Encrypted;
         phase_ = VaultPhase::Idle;
+        // Fail closed: no group accepts plaintext.
+        coverage_generation_ = current_generation_;
         return;
     }
     if (mode_ == VaultMode::Encrypted && phase_ == VaultPhase::Promoting && !read_only_) {
@@ -440,7 +510,9 @@ void StorageVault::load() {
         phase_ = VaultPhase::Idle;
         (void)save_state();
     }
-    spdlog::info("[storage-vault] mode {}, phase {}", vault_mode_name(mode_), vault_phase_name(phase_));
+    spdlog::info("[storage-vault] mode {}, phase {}, coverage generation {} of {}",
+                 vault_mode_name(mode_), vault_phase_name(phase_), coverage_generation_,
+                 current_generation_);
 }
 
 void StorageVault::attach(DataKeySource* source) {
@@ -471,7 +543,24 @@ bool StorageVault::rotation_requested() const {
 bool StorageVault::files_ready() const {
     std::lock_guard lock(mutex_);
     if (mode_ != VaultMode::Encrypted) return true;
-    return source_ != nullptr && source_->data_key().has_value();
+    return !adoption_pending_locked() && source_ != nullptr && source_->data_key().has_value();
+}
+
+bool StorageVault::adoption_pending() const {
+    std::lock_guard lock(mutex_);
+    return adoption_pending_locked();
+}
+
+bool StorageVault::adoption_pending_locked() const {
+    return mode_ == VaultMode::Encrypted && coverage_generation_ < current_generation_;
+}
+
+bool StorageVault::adopted(const Covered& file) const {
+    return file.coverage->since <= coverage_generation_;
+}
+
+bool StorageVault::sealed_at_rest(const Covered& file) const {
+    return mode_ == VaultMode::Encrypted && adopted(file);
 }
 
 bool StorageVault::request_rotation() {
@@ -496,8 +585,9 @@ VaultRead StorageVault::read_locked(const Covered& file) const {
     const auto staged = staged_path(file.path);
     const bool have_file = fs::exists(file.path, ec);
     const bool have_staged = fs::exists(staged, ec);
-    if (mode_ != VaultMode::Encrypted) {
-        // Before the migration commits, the plaintext is authoritative.
+    if (!sealed_at_rest(file)) {
+        // Before the migration commits, or the adoption of the file's group,
+        // the plaintext is authoritative.
         if (!have_file) return {VaultReadStatus::Missing, {}};
         auto bytes = read_whole(file.path);
         if (!bytes) return {VaultReadStatus::Rejected, {}};
@@ -543,7 +633,7 @@ bool StorageVault::write_locked(const Covered& file, std::string_view bytes) {
     std::error_code ec;
     fs::create_directories(file.path.parent_path(), ec);
     const auto staged = staged_path(file.path);
-    if (mode_ != VaultMode::Encrypted) {
+    if (!sealed_at_rest(file)) {
         if (!write_durable(file.path, bytes)) return false;
         // A stale staged copy is re-staged before the migration commits.
         fs::remove(staged, ec);
@@ -707,7 +797,9 @@ void StorageVault::discard_staged() {
 void StorageVault::tick(uint64_t wall_ms) {
     std::lock_guard lock(mutex_);
     if (source_ == nullptr || read_only_) return;
-    if (mode_ == VaultMode::Encrypted) {
+    if (adoption_pending_locked()) {
+        tick_adoption(wall_ms);
+    } else if (mode_ == VaultMode::Encrypted) {
         tick_rotation(wall_ms);
     } else {
         tick_migration(wall_ms);
@@ -722,6 +814,93 @@ void StorageVault::finish(uint64_t wall_ms) {
     pending_loaded_ = false;
     staged_originals_.clear();
     (void)save_state();
+}
+
+void StorageVault::tick_adoption(uint64_t wall_ms) {
+    if (phase_ != VaultPhase::Idle) {
+        // A rotation that began before this release. Before its commit it is
+        // discarded, and it restarts after the adoption because it is still
+        // due. After its commit, and in "promoting", it finishes first.
+        // Neither touches a file of a group that is not adopted.
+        const bool uncommitted =
+            (phase_ == VaultPhase::RotateStaging || phase_ == VaultPhase::RotateVerifying) &&
+            source_->replacement_key().has_value();
+        if (uncommitted) {
+            abort_rotation();
+        } else {
+            tick_rotation(wall_ms);
+        }
+        return;
+    }
+    // The DEK in memory came through t holders, and the adopted files open
+    // under it.
+    const auto dek = source_->data_key();
+    if (!dek || !source_->unlock_verified()) return;
+    const auto files = enumerate();
+    if (!last_scan_ok_) {
+        spdlog::warn("[storage-vault] scan failed; adoption retries");
+        return;
+    }
+    std::size_t staged_count = 0;
+    for (const auto& file : files) {
+        if (adopted(file)) continue;
+        std::error_code ec;
+        const auto staged = staged_path(file.path);
+        if (!fs::exists(file.path, ec)) {
+            // Only a staged copy is left. The plaintext was authoritative and
+            // is gone, so the staged copy goes too.
+            fs::remove(staged, ec);
+            continue;
+        }
+        const auto bytes = read_whole(file.path);
+        if (!bytes) {
+            spdlog::warn("[storage-vault] cannot read {}; adoption retries", file.relative);
+            return;
+        }
+        if (has_header(*bytes)) {
+            // Kept only when it opens under the DEK.
+            auto opened = open(file, dek->span(), *bytes);
+            if (!opened) {
+                spdlog::error("[storage-vault] {} is neither plaintext nor encrypted under the "
+                              "current data key; the files stay locked until it is restored or "
+                              "removed",
+                              file.relative);
+                return;
+            }
+            wipe(*opened);
+            fs::remove(staged, ec);
+            continue;
+        }
+        // stage_one reads the staged copy back and compares it with the
+        // plaintext.
+        if (!stage_one(file, {}, dek->span())) {
+            spdlog::warn("[storage-vault] staging {} for adoption failed; adoption retries",
+                         file.relative);
+            return;
+        }
+        ++staged_count;
+    }
+    // The record of the new generation is the switch point, as "encrypted" is
+    // for the migration: before it the plaintext stands; after it load() or
+    // this function finishes the replacements.
+    const KeyId current = key_id(dek->span());
+    const KeyId previous_target = target_key_id_;
+    const uint32_t previous_generation = coverage_generation_;
+    coverage_generation_ = current_generation_;
+    phase_ = VaultPhase::Promoting;
+    target_key_id_ = current;
+    if (!save_state()) {
+        coverage_generation_ = previous_generation;
+        phase_ = VaultPhase::Idle;
+        target_key_id_ = previous_target;
+        return;
+    }
+    promote_all(current);
+    phase_ = VaultPhase::Idle;
+    (void)save_state();
+    spdlog::info("[storage-vault] coverage generation {} adopted: {} file(s) encrypted and "
+                 "their plaintext removed",
+                 coverage_generation_, staged_count);
 }
 
 void StorageVault::tick_migration(uint64_t wall_ms) {
@@ -789,11 +968,16 @@ void StorageVault::tick_migration(uint64_t wall_ms) {
         spdlog::warn("[storage-vault] migration verification failed; retrying");
         return;
     }
+    // The migration staged and verified every group, so it records the
+    // current coverage generation.
+    const uint32_t previous_generation = coverage_generation_;
     mode_ = VaultMode::Encrypted;
     phase_ = VaultPhase::Promoting;
+    coverage_generation_ = current_generation_;
     if (!save_state()) {
         mode_ = VaultMode::Migrating;
         phase_ = VaultPhase::Verifying;
+        coverage_generation_ = previous_generation;
         return;
     }
     promote_all(current);

@@ -284,12 +284,15 @@ private:
     // so a tree used without start() keeps its existing behavior.
     bool holds_files_ = true;
 
-    /// Write committed_ops_ to tree/committed-ops.json. Caller holds mutex_.
+    /// Write committed_ops_ to tree/committed-ops.json, through the storage
+    /// vault when one covers the path. Caller holds mutex_.
     bool persist_committed_ops_locked() const;
     /// persist_committed_ops_locked when `verdict` is ok; logs a failure.
     /// Caller holds mutex_.
     void persist_committed_ops_after(const TreeOpVerdict& verdict);
-    /// Load tree/committed-ops.json into committed_ops_. Caller holds mutex_.
+    /// Load tree/committed-ops.json into committed_ops_. A record that exists
+    /// but does not parse, or that the vault refuses or cannot open while the
+    /// data key is locked, sets committed_ops_unreadable_. Caller holds mutex_.
     void load_committed_ops_locked();
 };
 
