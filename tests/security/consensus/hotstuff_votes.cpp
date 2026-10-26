@@ -175,8 +175,10 @@ TEST_F(HotStuffVotes, TimeoutCertificateCarriesEachSignersOwnHighQc) {
     const auto t3 = harness.make_timeout(3, 3, filled_digest(0x63));
 
     EXPECT_TRUE(std::holds_alternative<std::monostate>(service->receive_timeout(t0)));
-    EXPECT_TRUE(std::holds_alternative<std::monostate>(service->receive_timeout(t2)));
     EXPECT_EQ(service->current_view(), 1u);
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(service->receive_timeout(t2)));
+    // f + 1 = 2 members time out above view 1: this node enters their view.
+    EXPECT_EQ(service->current_view(), 3u);
 
     const auto formed = service->receive_timeout(t3);
     ASSERT_TRUE(std::holds_alternative<TimeoutCertificate>(formed));
@@ -202,9 +204,10 @@ TEST_F(HotStuffVotes, SecondTimeoutFromOneNodeDoesNotCount) {
     // A refreshed claim from the same node: not counted, not evidence.
     EXPECT_TRUE(std::holds_alternative<std::monostate>(
         service->receive_timeout(harness.make_timeout(0, 3, filled_digest(0x61)))));
+    EXPECT_EQ(service->current_view(), 1u) << "one member counted once is one witness";
     EXPECT_TRUE(std::holds_alternative<std::monostate>(
         service->receive_timeout(harness.make_timeout(2, 3, filled_digest(0x62)))));
-    EXPECT_EQ(service->current_view(), 1u);
+    EXPECT_EQ(service->current_view(), 3u);
 
     const auto formed = service->receive_timeout(harness.make_timeout(3, 3, filled_digest(0x63)));
     ASSERT_TRUE(std::holds_alternative<TimeoutCertificate>(formed));
@@ -239,6 +242,77 @@ TEST_F(HotStuffVotes, OwnTimeoutVoteRoundTrips) {
     EXPECT_EQ(tc.signers[1].node_id, harness.members[1]);
     EXPECT_EQ(tc.signers[1].high_qc_digest, own.high_qc_digest);
     EXPECT_EQ(service->current_view(), own.view + 1);
+}
+
+// Four members, f = 1: timeouts from f + 1 = 2 distinct members above this
+// node's view move it to the lower of their two views. One member alone does
+// not, and no vote is cast by entering a view.
+TEST_F(HotStuffVotes, TimeoutsFromFPlusOneMembersAboveMoveThisNodesView) {
+    ASSERT_EQ(service->current_view(), 1u);
+    const Digest qc = nexus::security::qc_digest(harness.genesis_qc());
+
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(
+        service->receive_timeout(harness.make_timeout(0, 6, qc))));
+    EXPECT_EQ(service->current_view(), 1u) << "one member above is not an honest witness";
+
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(
+        service->receive_timeout(harness.make_timeout(2, 9, qc))));
+    EXPECT_EQ(service->current_view(), 6u) << "the lower of the two highest views";
+    EXPECT_EQ(service->make_timeout_vote().view, 6u);
+    EXPECT_EQ(service->state().last_voted_view, 0u) << "entering a view is not a vote";
+
+    // Above view 6 only member 2 remains; member 3 at 9 makes two witnesses.
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(
+        service->receive_timeout(harness.make_timeout(3, 9, qc))));
+    EXPECT_EQ(service->current_view(), 9u);
+
+    // This node's own timeout for view 9 completes the certificate: the
+    // committee that could not meet before now leaves view 9 together.
+    const auto formed = service->receive_timeout(service->make_timeout_vote());
+    ASSERT_TRUE(std::holds_alternative<TimeoutCertificate>(formed));
+    EXPECT_EQ(std::get<TimeoutCertificate>(formed).view, 9u);
+    EXPECT_EQ(service->current_view(), 10u);
+    EXPECT_EQ(service->state().last_voted_view, 0u);
+
+    // A proposal for a view this node left is stale; safety is untouched.
+    const Block old = harness.make_block(1, 5, test_genesis(), harness.genesis_qc(), 0x30);
+    EXPECT_EQ(service->receive_proposal(old.proposal, old.justify).rejected,
+              ConsensusFailure::StaleView);
+}
+
+// The whole committee restarted: this member resumes from the view its own
+// safety state names, the others from theirs. The sync floor is the shared
+// high certificate, below every one of them, so it does not bring the
+// members together; their timeouts do.
+TEST(HotStuffViewSync, MemberRestartedBehindJoinsTheViewItsPeersTimeOutIn) {
+    Harness harness{4};
+    RecordingStore store;
+    HotStuffState stored;
+    stored.epoch = kEpoch;
+    stored.consensus_ruleset = constants::kConsensusRulesetVersion;
+    stored.last_voted_view = 3;
+    stored.high_qc = harness.genesis_qc();
+    stored.locked_qc = harness.genesis_qc();
+    store.seed_state = stored;
+
+    HotStuffService member(harness.config_for(1), clone_key(harness.keys[1]), store);
+    ASSERT_FALSE(member.synced());
+    member.sync_to_certified(0);
+    ASSERT_TRUE(member.synced());
+    EXPECT_EQ(member.current_view(), 4u);
+
+    // Before the floor below their views can help, the peers at view 7 and
+    // view 8 time out. Two of them above this member's view is f + 1.
+    const Digest qc = nexus::security::qc_digest(harness.genesis_qc());
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(
+        member.receive_timeout(harness.make_timeout(0, 7, qc))));
+    EXPECT_EQ(member.current_view(), 4u);
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(
+        member.receive_timeout(harness.make_timeout(2, 8, qc))));
+    EXPECT_EQ(member.current_view(), 7u);
+    EXPECT_EQ(member.make_timeout_vote().view, 7u);
+    EXPECT_EQ(member.state().last_voted_view, 3u);
+    EXPECT_TRUE(store.calls.empty()) << "no safety write for a view change";
 }
 
 }  // namespace
