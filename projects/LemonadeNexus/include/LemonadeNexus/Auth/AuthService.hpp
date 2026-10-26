@@ -74,6 +74,10 @@ public:
                     const std::string& group_node_id, std::chrono::seconds ttl,
                     std::vector<std::string> permissions = {});
 
+    /// Look up a link token without consuming it. nullopt when it is unknown,
+    /// expired, or spent.
+    [[nodiscard]] std::optional<LinkTokenRecord> verify_link_token(std::string_view token);
+
     /// Verify and burn a device-link token (single use).
     [[nodiscard]] std::optional<LinkTokenRecord> consume_link_token(std::string_view token);
 
@@ -81,6 +85,20 @@ public:
     /// TokenLinkAuthProvider::refund). False when nothing was restored.
     bool refund_link_token(std::string_view token, const LinkTokenRecord& record);
 
+    /// Wire link token replication between Tier 1 servers (see
+    /// TokenLinkAuthProvider::set_replication). Call before serving requests.
+    void set_link_token_replication(TokenLinkAuthProvider::EventSigner signer,
+                                    TokenLinkAuthProvider::EventPublisher publisher);
+
+    /// Add a link token event another Tier 1 server made (see
+    /// TokenLinkAuthProvider::apply_replicated).
+    [[nodiscard]] bool apply_replicated_link_token(const LinkTokenEvent& event);
+
+    /// Forget every link token (this server left Tier 1).
+    void purge_link_tokens();
+
+    /// Test seam: the link token clock (TokenLinkAuthProvider).
+    void set_link_token_clock_for_testing(std::function<uint64_t()> now_sec);
     /// Verify the fresh proof that deletes the account of `pubkey_b64` (raw
     /// base64 key): a signature over auth::account_delete_proof_message for a
     /// challenge issued by issue_ed25519_challenge. Consumes the challenge.

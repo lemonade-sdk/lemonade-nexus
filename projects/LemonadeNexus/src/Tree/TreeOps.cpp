@@ -84,6 +84,29 @@ void add_join(security::CanonicalEncoder& enc, const JoinStatement& j) {
     enc.add_string(j.link_owner_pubkey);
 }
 
+void add_link_event(security::CanonicalEncoder& enc, const auth::LinkTokenEvent& e) {
+    enc.add_u16(static_cast<uint16_t>(e.kind));
+    enc.add_string(e.token_hash);
+    enc.add_u32(e.generation);
+    enc.add_string(e.network_id);
+    enc.add_u64(e.expires_at);
+    enc.add_string(e.group_node_id);
+    add_strings(enc, e.permissions);
+    enc.add_string(e.owner_user_id);
+    enc.add_string(e.owner_pubkey);
+    enc.add_u64(e.created_at);
+    enc.add_u64(e.timestamp);
+    enc.add_string(e.origin_pubkey);
+    enc.add_u64(e.origin_seq);
+    enc.add_string(e.signature);
+}
+
+/// The op kinds and sources that may carry the link extension.
+bool link_extension_allowed(const TreeOp& op) {
+    return (op.kind == TreeOpKind::Join && op.body.source == TreeOpSource::Device) ||
+           (op.kind == TreeOpKind::AcceptInvite && op.body.source == TreeOpSource::Session);
+}
+
 /// The kind/source pairs an op may use.
 bool source_allowed(TreeOpKind kind, TreeOpSource source) {
     switch (kind) {
@@ -479,6 +502,20 @@ TreeOpVerdict plan_join(const TreeOp& op, Overlay& overlay) {
                 const TreeNode* sibling = overlay.find(sibling_id);
                 if (sibling->type != NodeType::Endpoint) continue;
                 const std::string sibling_mgmt = sibling->mgmt_pubkey;
+                if (op.body.link_extension) {
+                    // The sibling's key may already hold an entry on the new
+                    // device (the group owner's always does); complete it.
+                    if (!sibling_mgmt.empty()) {
+                        (void)rules::grant_link_peer_access(overlay.edit(node_id),
+                                                            sibling_mgmt);
+                    }
+                    if (rules::link_peer_access_missing(*sibling, norm)) {
+                        (void)rules::grant_link_peer_access(overlay.edit(sibling_id), norm);
+                    }
+                    continue;
+                }
+                // Ops from an earlier release: a key that already holds an
+                // entry gains nothing.
                 if (!sibling_mgmt.empty()) {
                     grant_once(overlay.edit(node_id),
                                {.management_pubkey = sibling_mgmt,
@@ -506,8 +543,8 @@ TreeOpVerdict plan_join(const TreeOp& op, Overlay& overlay) {
     }
 
     // Returning device: it keeps its tunnel address (a node stored without one
-    // gets a derived address) and records a rotated mesh key. Best effort,
-    // like the direct path: a mesh key another node holds leaves the key
+    // gets a derived address) and records a rotated mesh key. Best effort: a
+    // mesh key another node holds leaves the key
     // unchanged (the API layer refuses such claims first).
     std::string new_ip = existing->tunnel_ip;
     if (new_ip.empty()) {
@@ -677,6 +714,13 @@ security::CanonicalEncoder op_encoder(const TreeOp& op) {
             }
             break;
     }
+    // Appended only when set, so an op without it keeps the encoding (and op
+    // id) an earlier release computes.
+    if (op.body.link_extension) {
+        enc.add_string(kTreeOpLinkExtensionTag);
+        add_bool(enc, op.body.invite_grant.has_value());
+        if (op.body.invite_grant) add_link_event(enc, *op.body.invite_grant);
+    }
     return enc;
 }
 
@@ -685,6 +729,20 @@ security::CanonicalEncoder op_encoder(const TreeOp& op) {
 void record_committed(CommittedOpIds& committed, const TreeOp& op) {
     committed.insert(op_id_hex(op), op.signed_at);
     if (const auto statement = statement_id_hex(op)) committed.insert(*statement, op.signed_at);
+    // Kept until the invite expires: an id is pruned once its time is older
+    // than the freshness window, and no block time past the expiry accepts
+    // the grant.
+    if (const auto redemption = redemption_id_hex(op)) {
+        committed.insert(*redemption, op.body.invite_grant->expires_at);
+    }
+}
+
+std::optional<std::string> redemption_id_hex(const TreeOp& op) {
+    if (!op.body.invite_grant) return std::nullopt;
+    security::CanonicalEncoder enc(kTreeOpRedemptionDomain);
+    enc.add_string(op.body.invite_grant->token_hash);
+    const auto d = enc.digest();
+    return crypto::to_hex(std::span<const uint8_t>(d.data(), d.size()));
 }
 
 std::vector<uint8_t> encode_tree_op(const TreeOp& op) {
@@ -750,6 +808,54 @@ std::string derive_join_node_id(crypto::SodiumCryptoService& crypto,
 
 // --- Validation -------------------------------------------------------------
 
+namespace {
+
+/// The invite grant an op carries: a mint signed by a trusted submitter for
+/// this network, unexpired at the block time, and bound to the op's target,
+/// inviter, and permissions.
+TreeOpVerdict invite_grant_verdict(crypto::SodiumCryptoService& crypto, const TreeOp& op,
+                                   const auth::LinkTokenEvent& grant, const TreeState& state,
+                                   uint64_t block_time_sec) {
+    using R = TreeOpRefusal;
+    if (grant.kind != auth::LinkTokenEventKind::Mint || auth::link_token_event_shape_error(grant)) {
+        return refuse(R::BadStatement, "invite grant is malformed");
+    }
+    // Identity is not authority: the grant only shows that a Tier 1 server
+    // issued the invite. The inviter's current tree authority still decides
+    // (plan_join placement and rules::invite_acceptance_refusal).
+    const auto origin = canonical_principal(std::string(kEd25519Prefix) + grant.origin_pubkey);
+    const auto& trusted = state.policy().trusted_submitters;
+    if (origin.empty() || std::none_of(trusted.begin(), trusted.end(), [&](const std::string& t) {
+            return canonical_principal(t) == origin;
+        })) {
+        return refuse(R::BadStatement, "invite grant origin is not a trusted submitter");
+    }
+    if (!auth::link_token_event_signature_valid(crypto, grant)) {
+        return refuse(R::BadStatement, "invite grant signature does not verify");
+    }
+    if (grant.network_id !=
+        crypto::to_hex(std::span<const uint8_t>(op.network_id.data(), op.network_id.size()))) {
+        return refuse(R::WrongNetwork, "invite grant is bound to another network");
+    }
+    if (block_time_sec >= grant.expires_at) return refuse(R::Stale, "invite expired");
+    if (grant.created_at > block_time_sec + kTreeOpMaxFutureSec) {
+        return refuse(R::Stale, "invite issued after the block time");
+    }
+    if (op.kind == TreeOpKind::Join) {
+        const auto& js = op.body.join;
+        if (js.link_group_id != grant.group_node_id ||
+            js.link_owner_pubkey != grant.owner_pubkey) {
+            return refuse(R::BadStatement, "join differs from the invite grant");
+        }
+    } else if (op.target != grant.group_node_id || op.body.inviter != grant.owner_pubkey ||
+               op.body.invite_permissions != grant.permissions) {
+        return refuse(R::BadStatement, "invite acceptance differs from the invite grant");
+    }
+    return {};
+}
+
+}  // namespace
+
 TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
                           const TreeState& state, uint64_t block_time_sec,
                           const CommittedOpIds& committed) {
@@ -763,6 +869,12 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
     }
     if (op.target.empty()) return refuse(R::Malformed, "op target is empty");
     if (op.principal.empty()) return refuse(R::Malformed, "op principal is empty");
+    if (op.body.link_extension && !link_extension_allowed(op)) {
+        return refuse(R::Malformed, "only a join or an invite acceptance has a link extension");
+    }
+    if (op.body.invite_grant && !op.body.link_extension) {
+        return refuse(R::Malformed, "an invite grant needs the link extension");
+    }
 
     // 2. Network binding.
     if (op.network_id != state.policy().network_id) {
@@ -809,6 +921,10 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
     const auto statement = statement_id_hex(op);
     if (statement && committed.contains(*statement)) {
         return refuse(R::Replayed, "wrapped statement already committed");
+    }
+    if (const auto redemption = redemption_id_hex(op);
+        redemption && committed.contains(*redemption)) {
+        return refuse(R::Replayed, "invite already redeemed");
     }
 
     // 7. The wrapped statement, and the op fields it fixes.
@@ -875,6 +991,13 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             break;
     }
 
+    if (body.invite_grant) {
+        if (auto v = invite_grant_verdict(crypto, op, *body.invite_grant, state, block_time_sec);
+            !v.ok()) {
+            return v;
+        }
+    }
+
     // 8. Target existence and base_version.
     const TreeNode* target = state.find(op.target);
     if (op.kind == TreeOpKind::CreateNode || op.kind == TreeOpKind::EstablishRoot) {
@@ -935,8 +1058,8 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             break;
         }
         case TreeOpKind::DeleteNode: {
-            // A group admin removes the group's devices through the API, as
-            // with tree operations off. A signed delta keeps the stricter
+            // A group admin removes the group's devices through the API. A
+            // signed delta keeps the stricter
             // delta rule: delete_node on the node itself.
             const bool admin_removal = body.source != TreeOpSource::Delta &&
                                        rules::admin_anchor(nodes, op.target, op.principal);
@@ -983,8 +1106,9 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             break;
         case TreeOpKind::Join:
             // A join is authorized by the verified device statement and the
-            // submitter's admission policy (open registration or a link
-            // token), not by a tree permission. plan_op checks placement.
+            // submitter (registration is open; a link token places the
+            // device in the inviter's group), not by a tree permission.
+            // plan_op checks placement.
             break;
         case TreeOpKind::EstablishRoot: {
             // Only the configured root management key, never a key the
@@ -1276,6 +1400,20 @@ bool read_delta(CanonicalReader& r, TreeDelta& d) {
            r.string(d.signer_pubkey) && r.string(d.signature) && r.uint(d.timestamp);
 }
 
+bool read_link_event(CanonicalReader& r, auth::LinkTokenEvent& e) {
+    uint16_t kind = 0;
+    if (!(r.uint(kind) && r.string(e.token_hash) && r.uint(e.generation) &&
+          r.string(e.network_id) && r.uint(e.expires_at) && r.string(e.group_node_id) &&
+          r.strings(e.permissions) && r.string(e.owner_user_id) && r.string(e.owner_pubkey) &&
+          r.uint(e.created_at) && r.uint(e.timestamp) && r.string(e.origin_pubkey) &&
+          r.uint(e.origin_seq) && r.string(e.signature))) {
+        return false;
+    }
+    if (kind > 0xFF) return false;
+    e.kind = static_cast<auth::LinkTokenEventKind>(kind);
+    return true;
+}
+
 bool read_join(CanonicalReader& r, JoinStatement& j) {
     return r.string(j.device_pubkey) && r.string(j.challenge) &&
            r.string(j.challenge_signature) && r.boolean(j.hostname_present) &&
@@ -1325,6 +1463,16 @@ std::optional<TreeOp> decode_tree_op(std::span<const uint8_t> encoding,
                 ok = r.string(op.body.new_parent_id);
             }
             break;
+    }
+    if (ok && !r.done() && link_extension_allowed(op)) {
+        bool has_grant = false;
+        ok = r.expect(kTreeOpLinkExtensionTag) && r.boolean(has_grant);
+        op.body.link_extension = ok;
+        if (ok && has_grant) {
+            auth::LinkTokenEvent grant;
+            ok = read_link_event(r, grant);
+            if (ok) op.body.invite_grant = std::move(grant);
+        }
     }
     if (!ok || !r.done()) return std::nullopt;
     // The layout above mirrors op_encoder; the exact re-encoding check makes

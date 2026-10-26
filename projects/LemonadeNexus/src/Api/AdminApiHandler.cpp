@@ -118,6 +118,13 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         json_response(res, ctx_.gossip.account_sync_status());
     }));
 
+    // GET /api/link/sync — link token (invite) replication state between Tier
+    // 1 servers, in the same shape as /api/dns/sync
+    priv.Get("/api/link/sync", require_auth(ctx_.auth,
+        [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
+        json_response(res, ctx_.gossip.link_sync_status());
+    }));
+
     // GET /api/tree/sync — tree log state (mode, height, state root, halt
     // reason, last refused entry) and its replication status per peer
     priv.Get("/api/tree/sync", require_auth(ctx_.auth,

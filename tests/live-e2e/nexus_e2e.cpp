@@ -1102,8 +1102,8 @@ int cmd_setup_account(const Options& o) {
     }
     report.add("identity", Outcome::Pass, "wrote " + o.identity_out + " (mode 0600)");
 
-    // An optional invite code for a network with closed registration. It is
-    // read from the environment so that it is not in the process arguments.
+    // An optional invite code: the account then joins the inviter's group. It
+    // is read from the environment so that it is not in the process arguments.
     std::string code;
     if (const char* env = std::getenv("NEXUS_E2E_INVITE_CODE")) code = trim(env);
 

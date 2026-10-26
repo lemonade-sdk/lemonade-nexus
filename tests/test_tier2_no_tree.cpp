@@ -51,6 +51,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "support/tree_seed.hpp"
 #ifdef _WIN32
 #  include <process.h>
 #  define getpid _getpid
@@ -256,13 +257,13 @@ protected:
     /// Every kind of tree file a server can hold: nodes, the delta log, the
     /// transfer pool, the committed op ids, and the tree log.
     void hold_a_full_tree() {
-        ASSERT_TRUE(tree_svc->bootstrap_root(tree::make_root_node(root_key)));
+        ASSERT_TRUE(test_support::put_node(*tree_svc, tree::make_root_node(root_key)));
         tree::TreeNode child;
         child.id = "customer-a";
         child.parent_id = "root";
         child.type = tree::NodeType::Customer;
         child.mgmt_pubkey = root_key;
-        ASSERT_TRUE(tree_svc->insert_join_node(child));
+        ASSERT_TRUE(test_support::put_node(*tree_svc, child));
         storage::SignedDelta delta;
         delta.operation = "create_node";
         delta.target_node_id = "customer-a";
@@ -310,12 +311,12 @@ TEST_F(Tier2TreeFilesTest, AClosedTreeWritesNoFile) {
     role.update(MembershipView::NonMember, true);
     ASSERT_FALSE(tree_svc->is_open());
     // A request that raced the gate cannot recreate tree files.
-    EXPECT_FALSE(tree_svc->bootstrap_root(tree::make_root_node(root_key)));
+    EXPECT_FALSE(test_support::put_node(*tree_svc, tree::make_root_node(root_key)));
     tree::TreeNode child;
     child.id = "late";
     child.parent_id = "root";
     child.type = tree::NodeType::Customer;
-    EXPECT_FALSE(tree_svc->insert_join_node(child));
+    EXPECT_FALSE(test_support::put_node(*tree_svc, child));
     EXPECT_FALSE(fs::exists(tree_dir() / "nodes" / "root.json"));
     EXPECT_FALSE(fs::exists(tree_dir() / "nodes" / "late.json"));
 }
@@ -355,7 +356,7 @@ TEST_F(Tier2TreeFilesTest, AFormerTier2ServerStartsAnEmptyTreeOnTier1Entry) {
     ASSERT_TRUE(role.holds_tree());
     EXPECT_TRUE(tree_svc->nodes_snapshot().empty());
     // The tree writes again once it is held.
-    EXPECT_TRUE(tree_svc->bootstrap_root(tree::make_root_node(root_key)));
+    EXPECT_TRUE(test_support::put_node(*tree_svc, tree::make_root_node(root_key)));
     EXPECT_TRUE(fs::exists(tree_dir() / "nodes" / "root.json"));
 }
 

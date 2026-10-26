@@ -237,6 +237,16 @@ TEST_F(StorageVaultTest, CoverageCoversAcmeKeysNotPublicCerts) {
     EXPECT_FALSE(vault->covers(data / "certs" / "server-abc.eu-west.seip.lemonade-nexus.io" / "meta.json"));
 }
 
+// Link token (invite) state is encrypted at rest: the provider's ledger and
+// the gossip replica file. A plaintext token file from an earlier release is
+// not covered, so the provider still reads it during the upgrade window.
+TEST_F(StorageVaultTest, CoverageCoversLinkTokenState) {
+    build();
+    EXPECT_TRUE(vault->covers(data / "link_tokens" / "ledger.json"));
+    EXPECT_TRUE(vault->covers(data / "link_replica" / "replica.json"));
+    EXPECT_FALSE(vault->covers(data / "link_tokens" / (std::string(64, 'a') + ".json")));
+}
+
 // A symlink anywhere in a covered directory makes the scan incomplete, and an
 // incomplete scan must not be treated as a complete empty one. A symlinked
 // privkey.pem must not be staged, promoted, or reported as migrated: the
@@ -576,6 +586,57 @@ TEST_F(StorageVaultTest, AcmeCertificateKeyIsReadThroughTheVault) {
     crash_and_restart(/*holders_up=*/false);
     acme.set_vault(vault.get());
     EXPECT_FALSE(acme.get_certificate(fqdn).has_value());
+}
+
+// The tree merge reads a backup of this server's data directory with the data
+// key the running server holds (StorageVault::copy_view). Only a genuine copy
+// under the current DEK opens, at the same relative path; the copy is never
+// written.
+TEST_F(StorageVaultTest, ACopyViewReadsABackupWithTheCurrentDataKeyAndWritesNothing) {
+    migrate();
+    const auto backup = root / "backup" / "data";
+    fs::create_directories(backup.parent_path());
+    fs::copy(data, backup, fs::copy_options::recursive);
+
+    const auto view = vault->copy_view(backup);
+    EXPECT_EQ(view->mode(), VaultMode::Encrypted);
+    for (const auto& [rel, text] : originals) {
+        const auto read = view->read(backup / rel);
+        ASSERT_EQ(read.status, VaultReadStatus::Ok) << rel;
+        EXPECT_EQ(read.bytes, text) << rel;
+    }
+    // Nothing is written, removed, or rotated through the view.
+    const auto alpha = backup / "tree/nodes/alpha.json";
+    const auto raw = read_raw(alpha);
+    EXPECT_FALSE(view->write(alpha, "{\"id\":\"forged\"}"));
+    EXPECT_FALSE(view->remove(alpha));
+    EXPECT_FALSE(view->request_rotation());
+    view->tick(now_ms + kMonth * 2);
+    EXPECT_EQ(read_raw(alpha), raw);
+
+    // A file moved to another path does not open, and neither does the copy
+    // once the DEK in memory is another one.
+    write_raw(backup / "tree/nodes/beta.json", raw);
+    EXPECT_EQ(view->read(backup / "tree/nodes/beta.json").status, VaultReadStatus::Rejected);
+    keys.dek = random_key();
+    EXPECT_EQ(view->read(alpha).status, VaultReadStatus::Rejected);
+}
+
+// A backup taken before the files were encrypted reads as plaintext: its own
+// state file says so.
+TEST_F(StorageVaultTest, ACopyViewOfAPlaintextBackupReadsItsPlaintext) {
+    keys.unlock();
+    build();
+    const auto backup = root / "backup" / "data";
+    fs::create_directories(backup.parent_path());
+    fs::copy(data, backup, fs::copy_options::recursive);
+    ASSERT_TRUE(run_to_done());  // the live files are encrypted now
+
+    const auto view = vault->copy_view(backup);
+    EXPECT_EQ(view->mode(), VaultMode::Plaintext);
+    const auto read = view->read(backup / "tree/nodes/alpha.json");
+    ASSERT_EQ(read.status, VaultReadStatus::Ok);
+    EXPECT_EQ(read.bytes, "{\"id\":\"alpha\"}");
 }
 
 }  // namespace

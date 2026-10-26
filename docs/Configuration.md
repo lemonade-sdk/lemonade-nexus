@@ -7,6 +7,7 @@ title: Configuration Reference
 
 ## Table of Contents
 - [Configuration Sources and Precedence](#configuration-sources-and-precedence)
+- [Removed Settings](#removed-settings)
 - [Trust Anchors (Required for a Normal Start)](#trust-anchors-required-for-a-normal-start)
 - [Network](#network)
 - [Identity and Auth](#identity-and-auth)
@@ -14,7 +15,7 @@ title: Configuration Reference
 - [TLS / ACME](#tls--acme)
 - [DDNS](#ddns)
 - [Onboarding](#onboarding)
-- [Experimental: Tree Operations](#experimental-tree-operations)
+- [Tree Operations](#tree-operations)
 - [Experimental: Threshold Storage Key](#experimental-threshold-storage-key)
 - [JSON Config Example](#json-config-example)
 - [Retired and Inert Settings](#retired-and-inert-settings)
@@ -45,12 +46,27 @@ Note: an environment variable overrides a CLI value for *every other* setting
 (for example `SP_HTTP_PORT` overrides `--http-port`). Keep the packaged
 environment file for deliberate operator overrides only.
 
-**Boolean environment variables** (`SP_CLOSED_REGISTRATION`,
-`SP_DNS_SEED_DISCOVERY`, `SP_DDNS_ENABLED`, `SP_TREE_OPS`, `SP_TREE_LOG`)
-take `1`, `true`, `yes`, or `on` for true and `0`, `false`, `no`, or `off`
-for false, in any letter case. The server logs any other value at error level
-and turns the setting off. Two exceptions: `SP_DNS_SEED_DISCOVERY` then keeps
-its current value, and `SP_CLOSED_REGISTRATION` then closes registration.
+**Boolean environment variables** (`SP_DDNS_ENABLED`) take `1`, `true`,
+`yes`, or `on` for true and `0`, `false`, `no`, or `off` for false, in any
+letter case. The server logs any other value at error level and turns the
+setting off.
+
+## Removed Settings
+
+Nexus has no optional features. These settings switched features that now
+always run. A configuration file, command line, or environment that still
+names one starts normally: the server logs a warning that the setting no
+longer exists and ignores its value.
+
+| Removed setting (JSON key, CLI, env) | Now |
+|---|---|
+| `tree_ops_enabled`, `--tree-ops`, `SP_TREE_OPS` | Tree operations always run ([Tree Operations](#tree-operations)) |
+| `tree_log_enabled`, `--tree-log`, `SP_TREE_LOG` | The tree log always runs on Tier 1 |
+| `open_registration`, `--closed-registration`, `SP_CLOSED_REGISTRATION` | Registration is open: a new identity joins into a group of its own; a link token places a device in the inviter's group |
+| `onboard_enabled`, `--no-onboard` | A server that holds the root key accepts onboarding requests |
+| `dns_seed_discovery`, `--no-dns-seed-discovery`, `SP_DNS_SEED_DISCOVERY` | Seed peers are also discovered from tier/region DNS records at startup |
+
+`ddns_enabled` stays a setting (default off).
 
 ## Trust Anchors (Required for a Normal Start)
 
@@ -108,7 +124,6 @@ by firewall/NAT mapping, not by the server binding it.
 | `--rp-id <domain>` | `SP_RP_ID` | `rp_id` | `lemonade-nexus.local` | WebAuthn relying party ID |
 | `--seed-peer <host:port>` | `SP_SEED_PEERS` | `seed_peers` | | Gossip seed peers (repeatable / comma-separated; env appends) |
 | `--server-hostname <name>` | `SP_SERVER_HOSTNAME` | `server_hostname` | (auto) | Server hostname for the TLS certificate |
-| `--closed-registration` | `SP_CLOSED_REGISTRATION=1` | `open_registration` | open | New identities need a device link token to join |
 
 ## DNS
 
@@ -117,7 +132,6 @@ by firewall/NAT mapping, not by the server binding it.
 | `--dns-base-domain <dom>` | `SP_DNS_BASE_DOMAIN` | `dns_base_domain` | `lemonade-nexus.io` | Discovery zone suffix |
 | `--dns-ns-hostname <fqdn>` | `SP_DNS_NS_HOSTNAME` | `dns_ns_hostname` | (auto) | This server's NS hostname (pins its NS slot) |
 | `--dns-provider <name>` | `SP_DNS_PROVIDER` | `dns_provider` | `local` | `local` (self-hosted authoritative) or `cloudflare` |
-| `--no-dns-seed-discovery` | `SP_DNS_SEED_DISCOVERY=0` | `dns_seed_discovery` | on | Do not auto-discover seed peers from tier/region DNS records |
 
 ## TLS / ACME
 
@@ -145,11 +159,10 @@ checks for signed manifests of other versions.
 
 ## Onboarding
 
-Server-side (a server that holds the root key accepts onboarding by default):
+Server-side (a server that holds the root key always accepts onboarding):
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| `--no-onboard` | | `onboard_enabled` | on | Refuse onboarding requests |
 | `--mint-admission-token` | | `mint_admission_token` | | Mint a single-use enrollment token and exit (root holder only) |
 | `--token-candidate <b64>` | | `mint_token_candidate` | | Candidate gossip pubkey the token binds to (required with mint) |
 | `--token-ttl <sec>` | | `mint_token_ttl_sec` | `600` | Minted-token lifetime (60–3600) |
@@ -164,23 +177,21 @@ Candidate-side:
 | `--onboard-timeout <sec>` | | Give up waiting for admission after this (default 900) |
 | `--onboard-token <tok>` | `SP_ONBOARD_TOKEN` | Single-use enrollment token for immediate admission |
 
-## Experimental: Tree Operations
+## Tree Operations
 
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--tree-ops` | `SP_TREE_OPS=1` | `tree_ops_enabled` | off | Ops mode: order tree writes through Tier 1 consensus, apply them after commit, and replicate the tree log |
-| `--tree-log` | `SP_TREE_LOG=1` | `tree_log_enabled` | off | Read-only mode: build and replicate the tree log; tree writes keep the direct paths. Ignored when `tree_ops_enabled` is set |
-
-These settings are experimental. They implement Phases 1 to 3 of
+Tree operations always run. There is no setting for them: Tier 1 consensus
+orders every tree write, and every Tier 1 server applies the committed tree
+log. There is no other tree write path. They implement Phases 1 to 3 of
 [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key).
-Keep them off in production. With both off (the default), no tree operation
-is built, proposed, applied, or replicated, the tree write paths are
-unchanged, and the gossip record transfer pool runs as before. Read-only mode
-is the first release of the migration; the
-[Tree Merge Ceremony](Tree-Merge-Ceremony) runbook moves a mesh from
-read-only mode to ops mode.
 
-With ops mode on:
+**Removed settings.** `tree_ops_enabled` and `tree_log_enabled` no longer
+exist (see [Removed Settings](#removed-settings)).
+
+**The one-time merge.** A server whose tree was written before tree
+operations awaits the [Tree Merge Ceremony](Tree-Merge-Ceremony) commit. It
+keeps serving that tree for reads, answers every tree write with `503` and a
+`Retry-After` header, and votes for no tree block. The root server's operator
+runs the merge once, after every server runs a release with tree operations.
 
 - Every tree write builds one signed tree operation (`TreeOp`). The routes are
   `POST /api/join`, `/api/tree/delta`, `/api/tree/node`,
@@ -190,22 +201,21 @@ With ops mode on:
   `POST /api/join` when an existing device presents a link token),
   `/api/account/delete` (a `DeleteAccount` operation), and
   `/api/mesh/heartbeat` (a `SetEndpoint`
-  operation, sent only when the endpoint changed). `AcceptInvite`,
-  `MoveNode`, and `DeleteAccount` are new operation kinds, and a member
-  leaving its own entry is a new `SetAssignment` allowance: a Tier 1 server
-  without them refuses such blocks, so upgrade every Tier 1 server before
-  ops-mode clients use invites into other groups, moves, or account
-  deletion. The application root is an
-  `EstablishRoot` operation that names the configured `root_pubkey`.
+  operation, sent only when the endpoint changed). A `Join` with a link token
+  and an `AcceptInvite` carry a link extension (the invite's signed grant,
+  which makes the redemption single use on every replica). The application
+  root is an `EstablishRoot` operation that names the configured
+  `root_pubkey`, or it comes with the merge commit.
   `POST /api/ipam/allocate` writes no tree node. It refuses a `tunnel` block
   with `409`, because the join operation assigns tunnel addresses; `private`
   and `shared` blocks do not change.
-- **Start.** A server in ops mode that has no tree log starts a new log only
-  when its persistent tree is empty. With a populated tree and no log, it
-  halts tree operations and logs the reason: a log based on the local tree
-  would differ from every other server's log and would foreclose the
-  [Tree Merge Ceremony](Tree-Merge-Ceremony). Install the ceremony's commit,
-  or start from an empty tree.
+- **Start.** A server that has no tree log starts a new log on the empty base.
+  With an empty tree it runs normally and requests the `EstablishRoot`
+  operation for `root_pubkey`, so Tier 1 reaches height 1 with the
+  application root alone. With a populated tree it awaits the
+  merge commit (see above): a log based on the local tree would differ from
+  every other server's log and would foreclose the merge commit, which is
+  valid only as height 1 on the empty base.
 - The server signs each operation with its gossip identity key, with the
   domain tag `lemonade-nexus/tree-op-signature:v1`. Replicas trust a signature
   only from a member of the block epoch's frozen Tier 1 set. The signature
@@ -214,8 +224,9 @@ With ops mode on:
 - **Submission.** A Tier 1 server checks the operation against its committed
   tree, adds it to its pending pool (at most 1,024 operations, 512 per
   submitting server, 32 per principal), and forwards it to the other Tier 1
-  members with the `TreeOpSubmit` security message. A server outside Tier 1
-  answers tree writes with 503.
+  members with the `TreeOpSubmit` security message. A server outside Tier 1,
+  and a server that awaits the merge, answers tree writes with `503` and
+  `Retry-After: 30`. The write was not applied, so a retry is safe.
 - **Ordering.** When a Tier 1 server leads a view and no epoch-boundary stage
   is pending, it proposes a batch from its pool: at most 128 operations and
   48,000 bytes of operation encodings. The batch travels with the proposal;
@@ -233,8 +244,7 @@ With ops mode on:
   changes. The log height continues across epochs. A snapshot is written
   every 1,000 heights. At startup the server verifies the log, and restores the
   tree from the log when an apply was interrupted.
-- **Wait, then pending.** A write route waits up to 10 s for the commit. A
-  committed write answers with the status code and body of the direct path.
+- **Wait, then pending.** A write route waits up to 10 s for the commit.
   After 10 s the route answers `202` with `{"status": "pending", "op_id":
   ...}`; the client polls `GET /api/tree/op/{op_id}` (`pending`, `committed`,
   or `refused` with a reason). A pending join answers `202` without a tunnel
@@ -248,8 +258,7 @@ With ops mode on:
   root node, `tunnel_ip` and `private_subnet` are server-assigned and `type`
   is fixed: a create cannot set the addresses or make a Relay node, and an
   update cannot change the addresses or the type. A group admin is not a root
-  admin: tunnel addresses and relays act on the whole plane. The direct write
-  paths apply the same rule.
+  admin: tunnel addresses and relays act on the whole plane.
 - **Forwarding.** The server forwards between two tunnel addresses only for
   nodes that the dataplane binds to them: the peer the server installed for
   the address at join must have the node's mesh key. A Relay node is open to
@@ -260,7 +269,7 @@ With ops mode on:
   removes the dataplane peer, and removes the private DNS record.
 - Each node that an operation writes gets `version` = previous version + 1
   (1 for a new node). Node JSON includes `version` only when it is not 0, so
-  records written with the setting off keep their exact bytes.
+  records written before tree operations keep their exact bytes.
   `canonical_node_json` and the tree hash never include `version`.
 - Committed operation ids are persisted (`data/tree/committed-ops.json`, and
   the tree log under consensus), so replay stays refused after a restart.
@@ -286,63 +295,56 @@ With ops mode on:
   handoff), so it follows the chain across epochs. An entry from an epoch the
   server has not verified yet is held (at most 64 entries) until the chain
   reaches it. An entry that does not verify or does not chain is refused and
-  logged, and nothing after it applies.
-- **Tier 2 servers** hold no tree in any mode: they run no tree log, take
-  no replicated entry, and keep no tree file. A server that joins Tier 1
-  starts its log on its first Tier 1 tick and catches up from Tier 1; a server
-  that leaves Tier 1 stops its log and deletes it with the rest of
-  `data/tree/`. See [Architecture](Architecture#the-tree-on-tier-1-only).
+  logged, and nothing after it applies. The merge commit verifies under the
+  configured root management key instead.
+- **Tier 2 servers** hold no tree: they run no tree log, take no replicated
+  entry, and keep no tree file. A server that joins Tier 1 starts its log on
+  its first Tier 1 tick and catches up from Tier 1; a server that leaves
+  Tier 1 stops its log and deletes it with the rest of `data/tree/`. See
+  [Architecture](Architecture#the-tree-on-tier-1-only).
 - **Lagging servers.** A Tier 1 server that missed a tree block does not
   halt. It applies nothing out of order, catches up through replication, and
   resumes with the next committed block.
-- **Transfer pool.** In ops mode the gossip record transfer pool no longer
-  carries tree records (`Digest`, `DeltaRequest`, and `DeltaResponse` are
-  dropped), because the committed log does.
+- **Transfer pool.** The gossip record transfer pool carries no tree records
+  (`Digest`, `DeltaRequest`, and `DeltaResponse` are dropped), because the
+  committed log does.
 - **IPAM records.** Each committed block updates the tunnel records in
   `data/ipam/allocations.json` for tree-derived addresses (`10.65.0.0` and
   above). These records never expire through the lease sweep and never move
   IPAM's sequential cursor.
 - **Status.** `GET /api/tree/sync` (private API, authenticated) reports the
-  mode, log height, state root, health and halt reason, whether the server is
-  behind, held entries, the last refused entry, and per-peer sync status.
+  mode (`ops`, or `awaiting-merge` with `pre_merge_nodes`), log height, state
+  root, health and halt reason, whether the server is behind, held entries,
+  the last refused entry, and per-peer sync status.
 - **Fail closed.** A server whose log does not verify, whose tree changed
-  outside the log, whose populated tree has no log, or whose state disagrees
-  with a certified entry that chains to its log halts tree operations: it applies, votes for, proposes, and
-  accepts no tree operation, and keeps serving its last committed tree.
-
-With read-only mode on, a Tier 1 server builds the tree log from the empty tree,
-runs the `"tree"` stream, verifies and appends replicated entries (the merge
-commit, then committed blocks), and never changes the live tree. It proposes,
-votes for, and accepts no tree operation. Tree writes use the direct paths,
-and the record transfer pool keeps running.
-- Status codes and response bodies are otherwise those of the direct write
-  paths, with these differences:
+  outside the log, or whose state disagrees with a certified entry that
+  chains to its log halts tree operations: it applies, votes for, proposes,
+  and accepts no tree operation, and keeps serving its last committed tree.
+- Other rules of the write routes:
   - A join, and any other write that changes several nodes, is all or
     nothing.
   - A delete through `/api/tree/delta` also removes the link grants that
-    named the deleted key, as the direct delete route does.
+    named the deleted key.
   - No route deletes the root node.
-  - A create or update through `/api/tree/delta` also enforces one endpoint
-    identifier and one mesh key per node, as the direct routes do.
+  - A create or update through `/api/tree/delta` enforces one endpoint
+    identifier and one mesh key per node.
   - An operation larger than 48,000 bytes is refused.
   - A join without the Ed25519 challenge (`method` other than `ed25519`)
-    answers 403, as with the setting off.
-  - Without a configured submitter the write routes answer 500. They never
-    fall back to the direct paths.
+    answers 403.
+  - Without a configured submitter the write routes answer 500.
 
 Limits:
 
 - **Tree on Tier 1 only.** A Tier 2 server answers every tree route, reads
-  and writes alike, with `421` and no data, in every mode. It cannot forward a
-  write: replicas trust operation signatures from the frozen Tier 1 set only,
-  and no finalized list of admitted submitters exists. A root-signed
-  admission certificate is identity, not authority.
+  and writes alike, with `421` and no data. It cannot forward a write:
+  replicas trust operation signatures from the frozen Tier 1 set only, and no
+  finalized list of admitted submitters exists. A root-signed admission
+  certificate is identity, not authority.
 - **Same starting tree.** Servers agree on state roots only if every server
-  started from the same tree: an empty one, or the merge commit. A new
-  ops-mode tree log therefore starts only from an empty tree (see **Start**).
-  A server whose log base differs, for example a log an earlier build started
-  from a populated tree, refuses every replicated entry (the status names it).
-  Existing, divergent trees need the [Tree Merge Ceremony](Tree-Merge-Ceremony).
+  started from the same tree: an empty one, or the merge commit. A new tree
+  log therefore always starts on the empty base (see **Start**). A server
+  whose log base differs, for example a log an earlier build started from a
+  populated tree, refuses every replicated entry (the status names it).
 - **Unproved commits.** A block that committed while the three blocks behind
   its commit were no longer held is logged without a commit proof. Peers
   refuse that copy and take the entry from another Tier 1 server.
@@ -351,13 +353,10 @@ Limits:
   renumbered entry is refused, not applied.
 - **Replication index.** The sync stream indexes at most 1,048,576 heights;
   later heights are not offered.
-- **Tree changed outside the log.** Turning the setting off, writing the tree,
-  and turning it on again halts tree operations at startup. The server does
-  not overwrite either side.
 - **Server-filled base version.** Current clients send no base version, so
   the server reads it from the committed tree. When a concurrent write makes
   an operation stale, the server rebuilds it from the new state, at most three
-  times. This keeps today's last-writer-wins behavior.
+  times. This keeps last-writer-wins behavior.
 - **Asserted principals.** Session routes (`/api/tree/node*`, the heartbeat)
   carry no signature by the principal; the submitting Tier 1 server asserts
   the principal. The join device signature covers only the server challenge.
@@ -366,9 +365,6 @@ Limits:
 - **Root key from configuration.** Replicas accept an `EstablishRoot`
   operation only for their own configured `root_pubkey`. Tier 1 servers with
   different configured keys establish no root.
-- **Versions while on only.** The direct paths do not maintain `version`.
-  After the setting is turned off, a delta update replaces the stored record,
-  including its version.
 
 ## Threshold Storage Key
 
@@ -529,6 +525,10 @@ The following settings no longer do anything and are not recognized:
 These inert settings are listed so that older runbooks and environment files
 can be read correctly; remove them from your configuration when you touch
 it.
+
+Settings of features that now always run (tree operations, open
+registration, onboarding, DNS seed discovery) are accepted with a warning; see
+[Removed Settings](#removed-settings).
 
 ### Files under the data key (Phase 7)
 

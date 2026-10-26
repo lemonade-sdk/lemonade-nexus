@@ -1,6 +1,7 @@
 #pragma once
 
 #include <LemonadeNexus/ACL/ACLService.hpp>
+#include <LemonadeNexus/Auth/LinkTokenLedger.hpp>
 #include <LemonadeNexus/Core/IService.hpp>
 #include <LemonadeNexus/Gossip/IGossipProvider.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
@@ -146,8 +147,9 @@ public:
     /// over the encrypted backbone: permission tree sync (Digest,
     /// DeltaRequest, DeltaResponse; retired in tree ops mode) while this
     /// server holds the tree (set_tree_role), catch-up sync (SyncDigest,
-    /// SyncRequest, catch-up DnsRecordSync, TreeLogSync) and
-    /// AccountEnvelopeSync. Without a backbone path to a peer, no tree
+    /// SyncRequest, catch-up DnsRecordSync, TreeLogSync),
+    /// AccountEnvelopeSync, and LinkTokenSync (Tier 1 to Tier 1 only).
+    /// Without a backbone path to a peer, no tree
     /// records move to or from it. Tier 1 servers serve catch-up to every
     /// certified server; Tier 2 servers catch up from Tier 1 and never feed
     /// records back, and take no tree record or tree log entry. The netstack
@@ -166,6 +168,9 @@ public:
 
     /// Tree log replication state, in the same shape as dns_sync_status().
     [[nodiscard]] nlohmann::json tree_sync_status() const;
+
+    /// Link token replication state, in the same shape as dns_sync_status().
+    [[nodiscard]] nlohmann::json link_sync_status() const;
 
     /// Set the "ip:port" this server is reachable at, carried in ServerHello so
     /// peers share it instead of the UDP source they happen to observe. Call
@@ -498,6 +503,20 @@ private:
     void save_account_replica();
     void load_account_replica();
 
+    // Link token replication (backbone only, Tier 1 to Tier 1)
+    void handle_link_token_sync(const asio::ip::udp::endpoint& sender,
+                                const std::string& sender_pubkey, const uint8_t* payload,
+                                std::size_t payload_len, Via via);
+    /// Network, origin signature, and origin certification of an event, or a
+    /// reason it fails. Shared by network ingress and restore from disk.
+    [[nodiscard]] std::optional<std::string> link_token_origin_error(
+        const auth::LinkTokenEvent& event) const;
+    /// Hand an origin-verified event to the link token sink and the replica.
+    /// Returns true when the sink holds it.
+    bool apply_link_token_event(const auth::LinkTokenEvent& event);
+    void save_link_replica();
+    void load_link_replica();
+
     /// Sign and persist a replica snapshot as <category>/replica.json.
     bool save_replica_file(const sync::OriginReplica& replica, const std::string& category,
                            const std::string& type);
@@ -807,6 +826,11 @@ private:
     uint64_t                              account_replica_saved_version_{0};
     bool                                  account_replica_loaded_{false};
     std::function<bool(const AccountEnvelopeRecord&)> account_envelope_sink_;
+    // Link token replica (Tier 1 only) and the store it feeds.
+    std::unique_ptr<sync::OriginReplica>  link_replica_;
+    uint64_t                              link_replica_saved_version_{0};
+    bool                                  link_replica_loaded_{false};
+    std::function<bool(const auth::LinkTokenEvent&)> link_token_sink_;
     std::chrono::steady_clock::time_point last_tombstone_prune_{};
     // Last SyncRequest served per "<stream>|<peer>", for rate limiting (io
     // thread only).
@@ -924,6 +948,28 @@ public:
     /// the io thread.
     void broadcast_account_envelope(AccountEnvelopeRecord record);
 
+    /// Set the store that receives replicated link token events. The sink
+    /// returns true when it holds the event (new or already held). It runs
+    /// on the io thread. Restores the persisted replica once start() has also
+    /// run.
+    void set_link_token_sink(std::function<bool(const auth::LinkTokenEvent&)> sink);
+
+    /// Sign a link token event this server made: sets network_id (this
+    /// network), origin_pubkey (this gossip identity), origin_seq, and the
+    /// signature over link_token_event_signing_bytes. False before start()
+    /// or while no network id is set. Thread-safe.
+    [[nodiscard]] bool sign_link_token_event(auth::LinkTokenEvent& event);
+
+    /// Replicate a signed link token event this server made to every Tier 1
+    /// peer over the backbone. Only a Tier 1 server replicates, and only to
+    /// Tier 1: a Tier 2 server holds no link tokens. Returns the number of
+    /// peers the event is sent to (0 when this server is not Tier 1).
+    /// Thread-safe: the send runs on the io thread.
+    std::size_t broadcast_link_token_event(const auth::LinkTokenEvent& event);
+
+    /// Forget every replicated link token event and delete the replica file
+    /// (this server left Tier 1). Thread-safe.
+    void purge_link_tokens();
     /// Drop the replicated envelopes of a deleted account: every envelope of a
     /// group in `group_ids`, and every envelope addressed to a canonical key
     /// in `recipients`. No tombstone is sent. Each Tier 1 server that applies

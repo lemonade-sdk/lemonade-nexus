@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include "support/tree_seed.hpp"
 #ifdef _WIN32
 #  include <process.h>
 #  define getpid _getpid
@@ -338,7 +339,7 @@ TEST_F(TreeOpsTest, DeleteNodeFromDeltaApplies) {
 }
 
 // A group admin removes a device it holds no entry on through the API (a
-// session op), as with tree operations off. A signed delta keeps the stricter
+// session op). A signed delta keeps the stricter
 // rule: delete_node on the node itself.
 TEST_F(TreeOpsTest, GroupAdminRemovesDevicesThroughTheApiOnly) {
     auto owner = crypto_svc->ed25519_keygen();
@@ -772,18 +773,6 @@ TEST_F(TreeOpsTest, VersionsPersistAcrossRestart) {
     EXPECT_EQ(version_of("root"), 0u);
 }
 
-TEST_F(TreeOpsTest, DirectPathsDoNotAdvanceVersions) {
-    // The flag-off write paths keep their behavior: no version bookkeeping.
-    ASSERT_TRUE(tree_svc->insert_join_node(customer("acme", root_pk)));
-    ASSERT_TRUE(tree_svc->grant_assignment("acme", {principal_of(stranger_kp), {"read"}}));
-    auto node = *tree_svc->get_node("acme");
-    node.hostname = "direct";
-    ASSERT_TRUE(tree_svc->update_node_direct("acme", node));
-    EXPECT_EQ(version_of("acme"), 0u);
-    nlohmann::json j = *tree_svc->get_node("acme");
-    EXPECT_FALSE(j.contains("version"));
-}
-
 // =========================================================================
 // Server-assigned addresses and the relay type
 // =========================================================================
@@ -1175,7 +1164,7 @@ TEST_F(TreeMembershipTest, DeleteRightAloneDoesNotTakeOverASubgroup) {
     ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"add_child", "read"}))).ok());
     auto sub = *tree_svc->get_node("alpha-sub1");
     sub.assignments.push_back({pb, {"delete_node"}});
-    ASSERT_TRUE(tree_svc->update_node_direct("alpha-sub1", sub));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, sub));
     EXPECT_EQ(run(next(move_op("alpha-sub1", "beta", pb))).refusal, TreeOpRefusal::Forbidden);
     // B may move its own device into alpha, where it holds add_child. The
     // device gains no reach to alpha's devices by that.
@@ -1204,34 +1193,6 @@ TEST_F(TreeMembershipTest, NewOpKindsRoundTripAndApplyIdentically) {
     both(next(move_op("alpha-dev2", "alpha-sub1", pa)));
     both(next(move_op("alpha-sub1", "alpha-sub2", pa)));
     EXPECT_EQ(tree_svc->tree_digest(), tree_b.tree_digest());
-    tree_b.stop();
-    storage_b->stop();
-}
-
-TEST_F(TreeMembershipTest, DirectPathsApplyTheSamePlanAsTreeOps) {
-    auto storage_b = make_storage("b3");
-    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
-    tree_b.start();
-    build(tree_b);
-
-    ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"connect_private", "read"}))).ok());
-    ASSERT_TRUE(run(next(move_op("alpha-dev2", "alpha-sub1", pa))).ok());
-    std::string reason;
-    using Change = tree::PermissionTreeService::AssignmentChange;
-    EXPECT_EQ(tree_b.accept_invite("alpha", pb, pa, {"connect_private", "read"}, reason),
-              Change::Applied)
-        << reason;
-    EXPECT_EQ(tree_b.move_node("alpha-dev2", "alpha-sub1", pa, reason), Change::Applied) << reason;
-    for (const auto* id : {"alpha", "alpha-dev", "alpha-dev2", "alpha-sub1"}) {
-        auto a = *tree_svc->get_node(id);
-        auto b = *tree_b.get_node(id);
-        a.version = 0;
-        b.version = 0;
-        EXPECT_EQ(nlohmann::json(a).dump(), nlohmann::json(b).dump()) << id;
-    }
-    // The direct paths refuse what the ops refuse.
-    EXPECT_EQ(tree_b.accept_invite("alpha", pb2, pa, {"admin", "read"}, reason), Change::Invalid);
-    EXPECT_EQ(tree_b.move_node("beta", "alpha", root_pk, reason), Change::Forbidden);
     tree_b.stop();
     storage_b->stop();
 }
@@ -1404,46 +1365,6 @@ TEST_F(TreeAccountDeletionTest, ReplicasApplyTheSameDeletion) {
     storage_b->stop();
 }
 
-TEST_F(TreeAccountDeletionTest, TheDirectPathMatchesTheOperation) {
-    auto storage_b = make_storage("acct-direct");
-    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
-    tree_b.start();
-    build(tree_b);
-    ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"connect_private", "read"}))).ok());
-    std::string reason;
-    using Change = tree::PermissionTreeService::AssignmentChange;
-    ASSERT_EQ(tree_b.accept_invite("alpha", pb, pa, {"connect_private", "read"}, reason),
-              Change::Applied);
-
-    std::vector<std::string> hooked;
-    tree_b.set_removed_nodes_hook([&](const std::vector<tree::TreeNode>& removed) {
-        for (const auto& n : removed) hooked.push_back(n.id);
-    });
-    ASSERT_TRUE(run(next(account_op(pb))).ok());
-    tree::AccountDeletion out;
-    ASSERT_TRUE(tree_b.delete_account(pb, out, reason)) << reason;
-    tree_b.set_removed_nodes_hook({});
-
-    std::sort(hooked.begin(), hooked.end());
-    EXPECT_EQ(hooked, (std::vector<std::string>{"beta", "beta-dev", "beta-dev2"}));
-    EXPECT_EQ(out.removed.size(), 3u);
-    auto a_nodes = tree_svc->nodes_snapshot();
-    auto b_nodes = tree_b.nodes_snapshot();
-    ASSERT_EQ(a_nodes.size(), b_nodes.size());
-    for (auto& [id, n] : a_nodes) {
-        ASSERT_TRUE(b_nodes.contains(id)) << id;
-        n.version = 0;
-        b_nodes[id].version = 0;
-        EXPECT_EQ(nlohmann::json(n).dump(), nlohmann::json(b_nodes[id]).dump()) << id;
-    }
-    // The direct path is idempotent as well.
-    ASSERT_TRUE(tree_b.delete_account(pb, out, reason)) << reason;
-    EXPECT_TRUE(out.removed.empty());
-    EXPECT_FALSE(tree_b.delete_account("not-a-key", out, reason));
-    tree_b.stop();
-    storage_b->stop();
-}
-
 TEST_F(TreeAccountDeletionTest, TheDeletionSurvivesARestart) {
     const auto op = next(account_op(pb));
     ASSERT_TRUE(run(op).ok());
@@ -1454,4 +1375,232 @@ TEST_F(TreeAccountDeletionTest, TheDeletionSurvivesARestart) {
     EXPECT_FALSE(tree_svc->get_node("beta-dev").has_value());
     EXPECT_TRUE(tree_svc->get_node("alpha").has_value());
     EXPECT_EQ(run(op).refusal, TreeOpRefusal::Replayed) << "replay stays refused after a restart";
+}
+
+// =========================================================================
+// Invite redemption across Tier 1 servers (link extension, invite grant)
+// =========================================================================
+
+/// Server A (server_kp) and server B (server_b_kp) are both trusted
+/// submitters. An invite is minted on one and redeemed through the other.
+class TreeInviteRedemptionTest : public TreeMembershipTest {
+protected:
+    crypto::Ed25519Keypair server_b_kp;
+
+    void SetUp() override {
+        TreeMembershipTest::SetUp();
+        server_b_kp = crypto_svc->ed25519_keygen();
+        policy.trusted_submitters.push_back(principal_of(server_b_kp));
+    }
+
+    /// The signed mint a Tier 1 server makes for an invite to `group`.
+    auth::LinkTokenEvent grant(const crypto::Ed25519Keypair& minter, const std::string& group,
+                               const std::string& owner, std::vector<std::string> perms,
+                               const std::string& token = "lnk_invite", uint64_t ttl = 600) {
+        auth::LinkTokenEvent g;
+        g.kind = auth::LinkTokenEventKind::Mint;
+        g.token_hash = auth::link_token_hash_hex(token);
+        g.network_id = crypto::to_hex(std::span<const uint8_t>(network.data(), network.size()));
+        g.expires_at = kBlock + ttl;
+        g.group_node_id = group;
+        g.permissions = std::move(perms);
+        g.owner_user_id = "owner";
+        g.owner_pubkey = owner;
+        g.created_at = kBlock;
+        g.timestamp = kBlock;
+        g.origin_pubkey = b64(minter.public_key);
+        g.origin_seq = 1;
+        resign(g, minter);
+        return g;
+    }
+
+    void resign(auth::LinkTokenEvent& g, const crypto::Ed25519Keypair& minter) {
+        const auto bytes = auth::link_token_event_signing_bytes(g);
+        g.signature = crypto::to_base64(
+            crypto_svc->ed25519_sign(minter.private_key, std::span<const uint8_t>(bytes)));
+    }
+
+    /// A linked join op that carries the link extension and `g`.
+    TreeOp linked_join(const crypto::Ed25519Keypair& device, const auth::LinkTokenEvent& g) {
+        auto op = join_op(device, g.group_node_id, g.owner_pubkey);
+        op.body.link_extension = true;
+        op.body.invite_grant = g;
+        return op;
+    }
+
+    TreeOp accept_with(const std::string& invitee, const auth::LinkTokenEvent& g) {
+        auto op = accept_op(g.group_node_id, invitee, g.owner_pubkey, g.permissions);
+        op.body.link_extension = true;
+        op.body.invite_grant = g;
+        return op;
+    }
+
+    TreeOp seal_by(TreeOp op, const crypto::Ed25519Keypair& submitter) {
+        return seal(std::move(op), ++clock, &submitter);
+    }
+};
+
+TEST_F(TreeInviteRedemptionTest, AnInviteMintedOnOneServerIsRedeemedThroughAnother) {
+    const auto g = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    const auto device = crypto_svc->ed25519_keygen();
+    auto v = run(seal_by(linked_join(device, g), server_b_kp));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    const auto id = tree::derive_join_node_id(*crypto_svc, principal_of(device));
+    EXPECT_EQ(tree_svc->get_node(id)->parent_id, "alpha");
+
+    // An invite for an existing identity redeems through either server too.
+    const auto g2 = grant(server_b_kp, "alpha", pa, {"read", "connect_private"}, "lnk_member");
+    auto accepted = run(seal_by(accept_with(pb, g2), server_kp));
+    ASSERT_TRUE(accepted.ok()) << accepted.reason;
+}
+
+// Two servers submit ops that redeem the same invite. Whatever order
+// consensus fixes, every replica applies the first and refuses the second.
+TEST_F(TreeInviteRedemptionTest, ASecondRedemptionIsRefusedOnEveryReplica) {
+    auto storage_b = make_storage("redeem-b");
+    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
+    tree_b.start();
+    build(tree_b);
+
+    const auto g = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    const auto d1 = crypto_svc->ed25519_keygen();
+    const auto d2 = crypto_svc->ed25519_keygen();
+    const auto first = seal_by(linked_join(d1, g), server_kp);
+    const auto second = seal_by(linked_join(d2, g), server_b_kp);
+    const auto as_member = seal_by(accept_with(pb, g), server_b_kp);
+
+    for (auto* svc : {tree_svc.get(), &tree_b}) {
+        ASSERT_TRUE(run(first, svc).ok());
+        const auto again = run(second, svc);
+        EXPECT_EQ(again.refusal, TreeOpRefusal::Replayed) << again.reason;
+        const auto member = run(as_member, svc);
+        EXPECT_EQ(member.refusal, TreeOpRefusal::Replayed) << member.reason;
+    }
+    EXPECT_EQ(tree_svc->tree_digest(), tree_b.tree_digest());
+    EXPECT_FALSE(tree_svc->get_node(tree::derive_join_node_id(*crypto_svc, principal_of(d2))));
+
+    // The redemption id outlives the freshness window until the invite expires.
+    tree::CommittedOpIds committed;
+    tree::record_committed(committed, first);
+    committed.prune_signed_before(tree::committed_id_cutoff(g.expires_at));
+    EXPECT_TRUE(committed.contains(*tree::redemption_id_hex(first)));
+    committed.prune_signed_before(g.expires_at + 1);
+    EXPECT_FALSE(committed.contains(*tree::redemption_id_hex(first)));
+    tree_b.stop();
+    storage_b->stop();
+}
+
+TEST_F(TreeInviteRedemptionTest, AForgedExpiredOrMismatchedGrantIsRefused) {
+    const auto device = crypto_svc->ed25519_keygen();
+    const auto refusal_of = [&](const auth::LinkTokenEvent& g) {
+        auto op = seal_by(linked_join(device, g), server_b_kp);
+        return submit(op, clock).refusal;
+    };
+
+    auto tampered = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    tampered.permissions.push_back("add_child");
+    EXPECT_EQ(refusal_of(tampered), TreeOpRefusal::BadStatement);
+
+    const auto untrusted = grant(stranger_kp, "alpha", pa, {"read"});
+    EXPECT_EQ(refusal_of(untrusted), TreeOpRefusal::BadStatement);
+
+    auto other_network = grant(server_kp, "alpha", pa, {"read"});
+    other_network.network_id = std::string(64, 'f');
+    resign(other_network, server_kp);
+    EXPECT_EQ(refusal_of(other_network), TreeOpRefusal::WrongNetwork);
+
+    const auto short_lived = grant(server_kp, "alpha", pa, {"read"}, "lnk_short", 60);
+    clock = kBlock + 60;
+    EXPECT_EQ(refusal_of(short_lived), TreeOpRefusal::Stale) << "expired by the block time";
+
+    clock = kBlock;
+    auto spend = grant(server_kp, "alpha", pa, {});
+    spend.kind = auth::LinkTokenEventKind::Spend;
+    resign(spend, server_kp);
+    EXPECT_EQ(refusal_of(spend), TreeOpRefusal::BadStatement);
+
+    // The op must match the grant: another group, or other permissions.
+    const auto g = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    auto wrong_group = linked_join(device, g);
+    wrong_group.body.join.link_group_id = "beta";
+    EXPECT_EQ(submit(seal_by(wrong_group, server_b_kp), clock).refusal,
+              TreeOpRefusal::BadStatement);
+    auto wrong_perms = accept_with(pb, g);
+    wrong_perms.body.invite_permissions = {"read", "connect_private", "add_child"};
+    EXPECT_EQ(submit(seal_by(wrong_perms, server_b_kp), clock).refusal,
+              TreeOpRefusal::BadStatement);
+
+    // A grant needs the extension, and only a join or an acceptance has one.
+    auto no_extension = linked_join(device, g);
+    no_extension.body.link_extension = false;
+    EXPECT_EQ(submit(seal_by(no_extension, server_b_kp), clock).refusal,
+              TreeOpRefusal::Malformed);
+    auto on_move = move_op("alpha-dev2", "alpha-sub1", pa);
+    on_move.body.link_extension = true;
+    EXPECT_EQ(submit(seal_by(on_move, server_b_kp), clock).refusal, TreeOpRefusal::Malformed);
+    EXPECT_FALSE(tree_svc->get_node(tree::derive_join_node_id(*crypto_svc, principal_of(device))));
+}
+
+// The extension is appended only when set: an op without it encodes (and
+// gets the op id) exactly as an earlier release computes, and one with it
+// round-trips through the wire form.
+TEST_F(TreeInviteRedemptionTest, TheLinkExtensionRoundTripsAndOldOpsKeepTheirEncoding) {
+    const auto device = crypto_svc->ed25519_keygen();
+    const auto g = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    auto plain = join_op(device, "alpha", pa);
+    auto extended = plain;
+    extended.body.link_extension = true;
+    auto with_grant = extended;
+    with_grant.body.invite_grant = g;
+
+    const auto plain_bytes = tree::encode_tree_op(plain);
+    const auto extended_bytes = tree::encode_tree_op(extended);
+    ASSERT_GT(extended_bytes.size(), plain_bytes.size());
+    EXPECT_TRUE(std::equal(plain_bytes.begin(), plain_bytes.end(), extended_bytes.begin()))
+        << "the extension only appends";
+
+    for (auto op : {plain, extended, with_grant}) {
+        op = seal_by(op, server_kp);
+        const auto decoded =
+            tree::decode_tree_op(tree::encode_tree_op(op), *tree::tree_op_signature_bytes(op));
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(decoded->body.link_extension, op.body.link_extension);
+        EXPECT_EQ(decoded->body.invite_grant, op.body.invite_grant);
+        EXPECT_EQ(tree::op_id_hex(*decoded), tree::op_id_hex(op));
+    }
+
+    // An extension on another op kind does not decode.
+    auto move = seal_by(move_op("alpha-dev2", "alpha-sub1", pa), server_kp);
+    auto bytes = tree::encode_tree_op(move);
+    bytes.insert(bytes.end(),
+                 extended_bytes.begin() + static_cast<std::ptrdiff_t>(plain_bytes.size()),
+                 extended_bytes.end());
+    EXPECT_FALSE(tree::decode_tree_op(bytes, *tree::tree_op_signature_bytes(move)).has_value());
+}
+
+// The group owner's key already holds an entry on a linked device. With the
+// extension, the join completes that entry, so the owner's first device and
+// the new device reach each other. An op from an earlier release (no
+// extension) keeps that release's result on every replica.
+TEST_F(TreeInviteRedemptionTest, ALinkedJoinGivesTheOwnersDeviceAccessToTheNewDevice) {
+    const auto with_ext = crypto_svc->ed25519_keygen();
+    auto op = join_op(with_ext, "alpha", pa);
+    op.body.link_extension = true;
+    ASSERT_TRUE(run(seal_by(op, server_kp)).ok());
+    const auto id = tree::derive_join_node_id(*crypto_svc, principal_of(with_ext));
+    EXPECT_TRUE(connects(pa, "alpha-dev", id)) << "the owner's device misses the new device";
+    EXPECT_TRUE(connects(principal_of(with_ext), id, "alpha-dev"));
+    EXPECT_TRUE(connects(pa2, "alpha-dev2", id));
+    EXPECT_TRUE(connects(principal_of(with_ext), id, "alpha-dev2"));
+    EXPECT_FALSE(connects(pb, "beta-dev", id));
+    // The owner keeps control of the device and gains nothing else.
+    const auto node = *tree_svc->get_node(id);
+    EXPECT_TRUE(tree::rules::signer_has_permission(node, pa, acl::Permission::DeleteNode));
+    EXPECT_FALSE(tree::rules::signer_has_permission(node, pa, acl::Permission::Admin));
+
+    const auto without_ext = crypto_svc->ed25519_keygen();
+    ASSERT_TRUE(run(seal_by(join_op(without_ext, "alpha", pa), server_kp)).ok());
+    const auto old_id = tree::derive_join_node_id(*crypto_svc, principal_of(without_ext));
+    EXPECT_FALSE(connects(pa, "alpha-dev", old_id)) << "an earlier release's op keeps its result";
+    EXPECT_TRUE(connects(pa2, "alpha-dev2", old_id));
 }

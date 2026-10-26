@@ -19,6 +19,10 @@ constexpr uint64_t kMaintainIntervalMs = 5'000;
 /// A missing root is requested at most this often.
 constexpr uint64_t kRootRequestIntervalMs = 30'000;
 
+constexpr std::string_view kAwaitingMergeRefusal =
+    "tree writes are paused until the one-time tree merge commit is installed "
+    "(docs/Tree-Merge-Ceremony.md); retry later";
+
 std::string short_hex(const security::Digest& digest) {
     return crypto::to_hex(std::span<const uint8_t>(digest.data(), 8));
 }
@@ -40,50 +44,49 @@ bool TreeConsensus::start() {
     // A start after deactivate() begins with nothing held from before.
     held_.clear();
     behind_ = false;
-    if (config_.mode == TreeLogMode::ReadOnly) {
-        // Release N of the migration (design A9): the log starts from the
-        // empty tree, so the merge commit can become height 1, and the
-        // persistent tree keeps its local writes.
-        if (log_.open(rules::NodeMap{}) != TreeLog::OpenResult::Ok) {
-            halt("the tree log is corrupt");
-            return false;
-        }
+    {
+        std::lock_guard lock(mutex_);
+        awaiting_merge_ = false;
+        pre_merge_nodes_ = 0;
+    }
+    const auto current = tree_.nodes_snapshot();
+    // A new log always starts on the empty base. A populated live tree is
+    // never taken as the base: servers whose trees differ would then hold
+    // logs with different bases and refuse every vote, and a populated base
+    // forecloses the merge commit, which is valid only as height 1 on the
+    // empty base.
+    if (log_.open(rules::NodeMap{}) != TreeLog::OpenResult::Ok) {
+        halt("the tree log is corrupt");
+        return false;
+    }
+    if (log_.height() == 0 && log_.state().root == empty_base_root() && !current.empty()) {
+        // The tree was written before tree operations. Keep serving it, and
+        // take nothing but the merge commit until it arrives.
         {
             std::lock_guard lock(mutex_);
             halted_ = false;
             halt_reason_.clear();
+            awaiting_merge_ = true;
+            pre_merge_nodes_ = current.size();
         }
         refresh_status();
+        spdlog::warn("[TreeConsensus] this server holds a tree of {} nodes written before tree "
+                     "operations. Tree writes are refused until the one-time tree merge commit "
+                     "is installed (docs/Tree-Merge-Ceremony.md); the tree stays readable.",
+                     current.size());
         return true;
-    }
-    const auto current = tree_.nodes_snapshot();
-    // A new log takes the live tree as its base. Servers whose trees differ
-    // would then hold logs with different bases and refuse every vote, and a
-    // populated base forecloses the merge ceremony, whose commit is valid only
-    // as height 1 on the empty base. Start a new log only from an empty tree;
-    // a populated tree needs the ceremony's log first.
-    if (!log_.exists() && !current.empty()) {
-        halt("ops mode found no tree log and a populated tree (" +
-             std::to_string(current.size()) +
-             " nodes). Run the tree merge ceremony and install its commit "
-             "(docs/Tree-Merge-Ceremony.md), or start from an empty tree");
-        return false;
-    }
-    if (log_.open(current) != TreeLog::OpenResult::Ok) {
-        halt("the tree log is corrupt");
-        return false;
     }
     const auto log_digest = compute_tree_digest(log_.state().nodes);
     if (compute_tree_digest(current) != log_digest) {
         if (log_.applied_height() >= log_.height()) {
             // Every logged block was applied, yet the tree differs: something
-            // wrote the tree outside the log (for example with tree
-            // operations off). Neither side is overwritten.
+            // wrote the tree outside the log. Neither side is overwritten.
             halt("the persistent tree differs from the committed tree log");
             return false;
         }
-        // The log is ahead of the tree: a block was logged but its apply did
-        // not finish. The log is the committed state; restore the tree to it.
+        // The log is ahead of the tree: a block (or the merge commit) was
+        // logged but its apply did not finish. The log is the committed state;
+        // restore the tree to it.
         if (!tree_.replace_all(log_.state().nodes, log_.state().committed) ||
             tree_.tree_digest() != log_digest) {
             halt("the persistent tree cannot be restored from the tree log");
@@ -110,6 +113,8 @@ void TreeConsensus::deactivate(const std::string& reason) {
         std::lock_guard lock(mutex_);
         halted_ = true;
         halt_reason_ = reason;
+        awaiting_merge_ = false;
+        pre_merge_nodes_ = 0;
         status_.healthy = false;
         status_.halt_reason = reason;
         behind_ = false;
@@ -129,6 +134,11 @@ void TreeConsensus::deactivate(const std::string& reason) {
 bool TreeConsensus::healthy() const {
     std::lock_guard lock(mutex_);
     return !halted_;
+}
+
+bool TreeConsensus::awaiting_merge() const {
+    std::lock_guard lock(mutex_);
+    return awaiting_merge_;
 }
 
 std::string TreeConsensus::halt_reason() const {
@@ -181,12 +191,11 @@ TreeOpAdmission TreeConsensus::submit(TreeOp sealed) {
             out.verdict = {TreeOpRefusal::Unavailable, "tree log halted: " + halt_reason_};
             return out;
         }
+        if (awaiting_merge_) {
+            out.verdict = {TreeOpRefusal::Unavailable, std::string(kAwaitingMergeRefusal)};
+            return out;
+        }
         members = members_;
-    }
-    if (config_.mode == TreeLogMode::ReadOnly) {
-        out.verdict = {TreeOpRefusal::Unavailable,
-                       "the tree log is read-only; tree writes use the direct paths"};
-        return out;
     }
     if (std::find(members.begin(), members.end(), config_.self) == members.end()) {
         out.verdict = {TreeOpRefusal::Unavailable,
@@ -223,7 +232,7 @@ TreeOpAdmission TreeConsensus::submit(TreeOp sealed) {
 
 void TreeConsensus::receive_forwarded(const security::TreeOpSubmitMsg& message,
                                       const security::NodeId& from) {
-    if (!healthy() || config_.mode == TreeLogMode::ReadOnly) return;
+    if (!healthy() || awaiting_merge()) return;
     auto op = decode_tree_op(message.encoded_op, message.signature);
     if (!op) {
         spdlog::debug("[TreeConsensus] dropped a malformed forwarded op from {}",
@@ -286,7 +295,7 @@ std::optional<security::ProposedPayload> TreeConsensus::propose(
     const security::HotStuffService& consensus) {
     // A server behind the committed chain would build on a stale state, which
     // no replica accepts.
-    if (!healthy() || config_.mode == TreeLogMode::ReadOnly || behind_ || pool_.size() == 0) {
+    if (!healthy() || awaiting_merge() || behind_ || pool_.size() == 0) {
         return std::nullopt;
     }
     // The block extends the high certificate's block, as make_proposal does.
@@ -322,8 +331,11 @@ std::optional<security::ProposedPayload> TreeConsensus::propose(
 bool TreeConsensus::validate(const security::HotStuffService& consensus,
                              const security::Proposal& proposal,
                              const security::BlockPayload& payload) {
-    if (!healthy() || config_.mode == TreeLogMode::ReadOnly ||
-        payload.kind != security::BlockPayloadKind::TreeBatch) {
+    if (!healthy() || payload.kind != security::BlockPayloadKind::TreeBatch) return false;
+    if (awaiting_merge()) {
+        // Height 1 belongs to the merge commit. A tree block now would take
+        // it, and the pre-merge tree would be lost.
+        spdlog::info("[TreeConsensus] vote withheld: this server awaits the tree merge commit");
         return false;
     }
     const auto batch = decode_tree_batch(payload.body);
@@ -368,8 +380,13 @@ bool TreeConsensus::validate(const security::HotStuffService& consensus,
 }
 
 void TreeConsensus::on_committed(const security::CommittedPayload& committed) {
-    if (!healthy() || config_.mode == TreeLogMode::ReadOnly || committed.payload == nullptr ||
+    if (!healthy() || committed.payload == nullptr ||
         committed.payload->kind != security::BlockPayloadKind::TreeBatch) {
+        return;
+    }
+    if (awaiting_merge()) {
+        note_refusal("a tree block committed while this server awaits the tree merge commit; "
+                     "it is not applied over the pre-merge tree");
         return;
     }
     const security::Proposal& proposal = committed.proposal;
@@ -444,7 +461,7 @@ bool TreeConsensus::commit_entry(const TreeLogEntry& entry, TreeChainState next,
     }
     std::optional<TreeBatch> batch;
     if (entry.kind == TreeLogEntryKind::Batch) batch = decode_tree_batch(entry.batch);
-    if (config_.mode == TreeLogMode::Ops) {
+    {
         bool followed = false;
         if (batch) {
             const auto applied = tree_.apply_committed_ops(batch->ops, entry.block_time_ms / 1000);
@@ -476,10 +493,21 @@ bool TreeConsensus::commit_entry(const TreeLogEntry& entry, TreeChainState next,
             pool_.settle(op_id_hex(op), TreeOpOutcome{TreeOpStatus::Committed, {}, entry.height});
         }
     }
-    if (config_.mode == TreeLogMode::Ops) {
-        revalidate_pool();
-        if (applied_hook_) applied_hook_();
+    if (entry.kind == TreeLogEntryKind::Merge) {
+        bool was_awaiting = false;
+        {
+            std::lock_guard lock(mutex_);
+            was_awaiting = awaiting_merge_;
+            awaiting_merge_ = false;
+            pre_merge_nodes_ = 0;
+        }
+        spdlog::warn("[TreeConsensus] the tree merge commit is installed ({} nodes){}; tree "
+                     "writes are tree operations from now on",
+                     log_.state().nodes.size(),
+                     was_awaiting ? ", replacing the pre-merge tree" : "");
     }
+    revalidate_pool();
+    if (applied_hook_) applied_hook_();
     refresh_status();
     if (appended_hook_) appended_hook_(entry.height);
     return true;
@@ -522,6 +550,12 @@ ReplicaResult TreeConsensus::apply_next(const TreeLogEntry& entry) {
             return ReplicaResult::Refused;
         }
     } else {
+        if (awaiting_merge()) {
+            note_refusal("tree entry " + std::to_string(entry.height) +
+                         " is a consensus block, but this server holds a pre-merge tree and "
+                         "takes only the merge commit at height 1");
+            return ReplicaResult::Refused;
+        }
         const auto evidence = verify_certified_entry(entry, config_.network_id, authority_);
         if (evidence.result == EntryEvidence::UnknownEpoch) {
             hold(entry);
@@ -616,8 +650,9 @@ TreeLogStatus TreeConsensus::status_summary() const {
 
 void TreeConsensus::refresh_status() {
     std::lock_guard lock(mutex_);
-    status_.mode = config_.mode;
     status_.healthy = !halted_;
+    status_.awaiting_merge = awaiting_merge_;
+    status_.pre_merge_nodes = pre_merge_nodes_;
     status_.halt_reason = halt_reason_;
     status_.height = log_.height();
     status_.applied_height = log_.applied_height();
@@ -658,7 +693,9 @@ void TreeConsensus::maintain() {
     if (!healthy()) return;
     // A held entry whose epoch authority was unknown may verify now.
     if (held_.contains(log_.height() + 1)) drain_held();
-    if (config_.mode == TreeLogMode::ReadOnly) return;
+    // The log of a server awaiting the merge has no root, but the root comes
+    // with the merge commit: an EstablishRoot op would take height 1.
+    if (awaiting_merge()) return;
     revalidate_pool();
     if (!root_request_ || config_.root_key.empty() || log_.state().nodes.contains("root") ||
         !is_member(config_.self) || now - last_root_request_ms_ < kRootRequestIntervalMs) {

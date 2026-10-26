@@ -24,28 +24,6 @@ function(add_nexus_test TEST_NAME)
     gtest_discover_tests(${TEST_NAME} DISCOVERY_TIMEOUT 120)
 endfunction()
 
-# Flag-on build of an existing suite: the same source compiled with
-# NEXUS_TEST_TREE_OPS, so every case runs with ServerConfig::tree_ops_enabled.
-# CTest names get a ".TreeOps" suffix so both builds can be listed together.
-function(add_nexus_tree_ops_test TEST_NAME)
-    add_executable(${TEST_NAME} ${ARGN})
-    target_link_libraries(${TEST_NAME} PRIVATE
-        LemonadeNexus
-        GTest::gtest_main
-        GTest::gmock
-    )
-    target_compile_definitions(${TEST_NAME} PRIVATE
-        ASIO_STANDALONE
-        ASIO_NO_DEPRECATED
-        NEXUS_TEST_TREE_OPS=1
-    )
-    target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    if(WIN32)
-        target_link_libraries(${TEST_NAME} PRIVATE ws2_32 mswsock iphlpapi)
-    endif()
-    gtest_discover_tests(${TEST_NAME} DISCOVERY_TIMEOUT 120 TEST_SUFFIX ".TreeOps")
-endfunction()
-
 # --- Unit tests ---
 add_nexus_test(test_version            test_version.cpp)
 add_nexus_test(test_acl_store          test_acl_store.cpp)
@@ -66,11 +44,11 @@ add_nexus_test(test_relay_service     test_relay_service.cpp)
 add_nexus_test(test_rate_limiter       test_rate_limiter.cpp)
 add_nexus_test(test_ipam              test_ipam.cpp)
 add_nexus_test(test_auth              test_auth.cpp)
+add_nexus_test(test_link_token_ledger test_link_token_ledger.cpp)
 add_nexus_test(test_credential_unrevoke test_credential_unrevoke.cpp)
 add_nexus_test(test_passkey_challenge test_passkey_challenge.cpp)
 add_nexus_test(test_passkey_challenge_http test_passkey_challenge_http.cpp)
 add_nexus_test(test_root_bootstrap test_root_bootstrap.cpp)
-add_nexus_tree_ops_test(test_root_bootstrap_tree_ops test_root_bootstrap.cpp)
 add_nexus_test(test_api_authz_f34e test_api_authz_f34e.cpp)
 add_nexus_test(test_device_certs test_device_certs.cpp)
 add_nexus_test(test_sdk_passkey_challenge test_sdk_passkey_challenge.cpp)
@@ -373,7 +351,6 @@ add_sdk_test(test_sdk_mesh_port      test_sdk_mesh_port.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)
-add_nexus_tree_ops_test(test_http_endpoints_tree_ops test_http_endpoints.cpp)
 add_nexus_test(test_virtual_e2e        test_virtual_e2e.cpp)
 
 if(UNIX)
@@ -381,6 +358,8 @@ if(UNIX)
     add_test(NAME BootstrapPackaging
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_bootstrap.py
                 $<TARGET_FILE:LemonadeNexusApp>)
+    add_test(NAME TreeMigrateScript
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_tree_migrate.py)
 endif()
 
 # Live end-to-end client for the production fleet (docs/Live-E2E.md). POSIX

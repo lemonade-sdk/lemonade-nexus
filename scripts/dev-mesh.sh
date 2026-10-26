@@ -94,8 +94,7 @@ provision() {
   "genesis_pubkey": "${GOSSIP[0]}",
   "release_signing_pubkey": "$RELEASE_B64",
   "seed_peers": [$seeds],
-  "ddns_enabled": false,
-  "onboard_enabled": false
+  "ddns_enabled": false
 }
 EOF
     done

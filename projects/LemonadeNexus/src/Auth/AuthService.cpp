@@ -57,12 +57,33 @@ AuthService::mint_link_token(const std::string& owner_user_id,
                                      std::move(permissions));
 }
 
+std::optional<LinkTokenRecord> AuthService::verify_link_token(std::string_view token) {
+    return token_link_provider_.verify(token);
+}
+
 std::optional<LinkTokenRecord> AuthService::consume_link_token(std::string_view token) {
     return token_link_provider_.consume(token);
 }
 
 bool AuthService::refund_link_token(std::string_view token, const LinkTokenRecord& record) {
     return token_link_provider_.refund(token, record);
+}
+
+void AuthService::set_link_token_replication(TokenLinkAuthProvider::EventSigner signer,
+                                             TokenLinkAuthProvider::EventPublisher publisher) {
+    token_link_provider_.set_replication(std::move(signer), std::move(publisher));
+}
+
+bool AuthService::apply_replicated_link_token(const LinkTokenEvent& event) {
+    return token_link_provider_.apply_replicated(event);
+}
+
+void AuthService::purge_link_tokens() {
+    token_link_provider_.purge();
+}
+
+void AuthService::set_link_token_clock_for_testing(std::function<uint64_t()> now_sec) {
+    token_link_provider_.set_clock_for_testing(std::move(now_sec));
 }
 
 bool AuthService::revoke_ed25519(const std::string& pubkey_b64) {

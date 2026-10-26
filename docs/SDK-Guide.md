@@ -244,8 +244,14 @@ auto sub = client.create_link_token(600, "group-id",            // chosen group
 | `leave_membership(group)` | `ln_membership_leave(client, group, &json)` | Leave a group joined by invite |
 | `move_node(node, parent)` | `ln_move_node(client, node, parent, &json)` | Move a device or subgroup |
 
+- A code works on any Tier 1 server, not only on the server that created
+  it, so the client can redeem it through whichever server it reaches. A code
+  used in the first second after it was created can still be refused by a
+  server that has not received it yet; try again.
 - A **new device** uses the code with `set_link_token(code)` before
-  `join_network`; it is placed under the invite's group.
+  `join_network`; it is placed under the invite's group. The new device and
+  the devices already in that group, the owner's first device included, list
+  each other as mesh peers.
 - An **existing account** uses `accept_invite(code)`. It keeps its own network
   and becomes a member of the invite's group. Its device can then reach that
   group's devices, and they can reach it, as the invite's permissions allow.

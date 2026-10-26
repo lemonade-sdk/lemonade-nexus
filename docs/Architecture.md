@@ -99,7 +99,7 @@ from the membership snapshot on every security tick:
 
 | Membership | Tree | Files |
 |---|---|---|
-| Member | Loaded and served. Tree replication, the record transfer pool (direct-write mode), the tree log (tree-log and ops modes), and endpoint forwarding run. | Kept |
+| Member | Loaded and served. The tree log, its replication, and endpoint forwarding run. | Kept |
 | Not a member | Closed. Every tree route answers `421` with only `{"error":"this server does not serve the tree"}`: no redirect and no data. The dataplane forwards no packet between peers. | Deleted: each file under `data/tree/` is overwritten with zeros, flushed, and removed (best effort) |
 | Not known (before Epoch 1, or before the persisted state verifies) | Closed and not served | Kept |
 
@@ -111,10 +111,8 @@ The gated routes are `/api/join`, `/api/auth*`, `/api/link/*`, `/api/tree/*`,
 tree permission (`Api/TreeRouteGate.hpp`).
 
 A server that enters Tier 1 starts from its files, which are empty on a
-server that was Tier 2. In ops mode it catches up through Tier 1 tree log
-replication. In the default direct-write mode no tree replication exists, so a
-new member starts with an empty tree and creates the application root from
-`root_pubkey`, as every Tier 1 server does. A server that leaves Tier 1 closes
+server that was Tier 2, and catches up through Tier 1 tree log replication.
+A server that leaves Tier 1 closes
 the tree, stops the tree services, and deletes the files in the same tick
 that its last epoch ends.
 

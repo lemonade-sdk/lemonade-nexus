@@ -16,8 +16,7 @@
 
 namespace nexus::tree {
 
-/// One applied account deletion (TreeOpKind::DeleteAccount, or its direct
-/// form PermissionTreeService::delete_account).
+/// One applied account deletion (TreeOpKind::DeleteAccount).
 struct AccountDeletion {
     std::string              principal;   ///< the deleted account's key ("ed25519:<base64>")
     std::string              account_id;  ///< derive_join_node_id(principal)
@@ -48,99 +47,17 @@ public:
     /// Thread-safe.
     [[nodiscard]] bool is_open() const;
 
-    /// Bootstrap the root node if none exists.  Called during join when
-    /// the tree is empty — the first authenticated user becomes root.
-    /// Returns true if created, false if root already exists.
-    bool bootstrap_root(const TreeNode& root_node);
-
-    /// Insert a node directly during the join flow.
-    /// Bypasses the strict delta permission/signature checks because
-    /// the join handler has already authenticated the caller.
-    /// Returns true on success.
-    bool insert_join_node(const TreeNode& node);
-
-    /// Update a node directly, bypassing delta signing.
-    /// The caller (HTTP handler) is responsible for permission checks.
-    bool update_node_direct(const std::string& node_id, const TreeNode& updated);
-
-    /// Atomically update only the listen_endpoint field of a node.
-    /// Reads the current node, sets listen_endpoint, and persists — all under
-    /// a single lock.  This avoids the TOCTOU race of read → modify → write.
-    bool update_node_endpoint(const std::string& node_id,
-                               const std::string& new_endpoint);
-
-    /// Delete a node directly, bypassing delta signing.
-    /// The caller (HTTP handler) is responsible for permission checks.
-    bool delete_node_direct(const std::string& node_id);
-
     /// True if any surviving node has this management pubkey as its owner
     /// (node.mgmt_pubkey). Used by the delete path to avoid blocklisting an
     /// owner's key when they delete one of their own (self-owned) devices — the
     /// owner key still owns their group and sibling endpoints.
     [[nodiscard]] bool is_mgmt_pubkey_in_use(const std::string& mgmt_pubkey) const;
 
-    /// Grant an assignment (pubkey + permissions) on a node.
-    /// Idempotent: no-op if the pubkey already has an assignment.
-    /// Used after Ed25519 key registration to give new keys add_child on root.
-    bool grant_assignment(const std::string& node_id, const Assignment& assignment);
-
     /// True when `signer` holds `admin` on `node_id` or on one of its
     /// ancestors: an admin of a group administers the group's devices (reads
     /// their full assignment lists, removes them). Permissions are otherwise
     /// not inherited.
     [[nodiscard]] bool administers(std::string_view signer, std::string_view node_id) const;
-
-    /// Outcome of an administrative assignment change, an invite acceptance,
-    /// or a move.
-    enum class AssignmentChange { Applied, NotFound, Forbidden, Invalid, Conflict, StorageError };
-
-    /// Set exactly the permissions `principal` holds on `node_id`, replacing
-    /// any entries it had (an empty list removes it). The same rules as an
-    /// assignment delta apply: `signer` must hold `admin` on the node or an
-    /// ancestor, and a principal given any permission must have joined inside
-    /// that admin's subtree. A signer cannot change its own entry on the node
-    /// that grants its admin, so no admin locks itself out. Unknown
-    /// permission names are Invalid. A member may remove its own entry from a
-    /// group it entered through an invite (see rules::assignment_change_refusal).
-    /// `reason` receives the refusal text.
-    [[nodiscard]] AssignmentChange set_assignment(const std::string& node_id,
-                                                  std::string_view signer,
-                                                  std::string_view principal,
-                                                  const std::vector<std::string>& permissions,
-                                                  std::string& reason);
-
-    /// Direct-write form of the AcceptInvite tree operation: make `invitee` a
-    /// member of `target_id` with exactly `permissions`, as invited by
-    /// `inviter`. The caller has consumed the link token; this checks
-    /// rules::invite_acceptance_refusal against the current tree and then
-    /// applies the same plan as the tree operation. No other node changes.
-    /// `reason` receives the refusal text. Thread-safe.
-    [[nodiscard]] AssignmentChange accept_invite(const std::string& target_id,
-                                                 std::string_view invitee,
-                                                 std::string_view inviter,
-                                                 const std::vector<std::string>& permissions,
-                                                 std::string& reason);
-
-    /// Direct-write form of the MoveNode tree operation: move `node_id` under
-    /// `new_parent_id` for `signer`, after rules::move_refusal, with the same
-    /// plan as the tree operation (the node keeps its id, addresses, and own
-    /// assignments; see plan_op). `reason` receives the refusal text.
-    /// Thread-safe.
-    [[nodiscard]] AssignmentChange move_node(const std::string& node_id,
-                                             const std::string& new_parent_id,
-                                             std::string_view signer, std::string& reason);
-
-    /// Direct-write form of the DeleteAccount tree operation: remove the
-    /// account scope of `principal` (rules::account_scope) and the
-    /// assignments that name its swept keys, with the same plan as the tree
-    /// operation. The root node is never removed or changed. Idempotent: an
-    /// account with nothing left changes nothing and still succeeds. After the
-    /// tree lock is released, calls the removed-nodes hook with the removed
-    /// nodes and then the account-deleted hook, so the direct path runs the
-    /// same cleanup as an applied operation. False, with `reason` set, when the
-    /// principal is not an "ed25519:" key or a node write fails. Thread-safe.
-    [[nodiscard]] bool delete_account(std::string_view principal, AccountDeletion& out,
-                                      std::string& reason);
 
     /// The connect rule (rules::endpoint_may_connect) for endpoint
     /// `from_node_id`, acting as `principal`, to `to_node_id`. False when
@@ -160,8 +77,8 @@ public:
     /// Validate `op` as validate_local_op does and, when it is accepted, apply
     /// it through apply_op, both under one lock so no other write intervenes.
     /// Local application without consensus: single-process tests and tools
-    /// only. The server never calls it; with tree operations on it applies ops
-    /// from committed blocks only (TreeConsensus). Thread-safe.
+    /// only. The server never calls it; it applies ops from committed blocks
+    /// only (TreeConsensus). Thread-safe.
     [[nodiscard]] TreeOpVerdict submit_local_op(const TreeOp& op, const TreeOpPolicy& policy,
                                                 uint64_t block_time_sec);
 
@@ -184,8 +101,8 @@ public:
     [[nodiscard]] TreeOpVerdict apply_committed_ops(const std::vector<TreeOp>& ops,
                                                     uint64_t block_time_sec);
 
-    /// Set the function called after apply_op, apply_committed_ops,
-    /// submit_local_op, or delete_account removed nodes. It receives each removed node as it was
+    /// Set the function called after apply_op, apply_committed_ops, or
+    /// submit_local_op removed nodes. It receives each removed node as it was
     /// before the op, runs on the thread that applied the op, and runs after
     /// the tree lock is released, so it may read the tree. Every server that
     /// applies a committed block calls it, so per-server cleanup of a deleted
@@ -195,14 +112,18 @@ public:
 
     /// Set the function called after an account deletion is applied: by
     /// apply_op, apply_committed_ops, or submit_local_op for a DeleteAccount
-    /// operation (on every server that applies the committed block), and by
-    /// delete_account. It runs after the removed-nodes hook, on the same
-    /// thread, without the tree lock. An empty function clears it.
+    /// operation (on every server that applies the committed block). It runs
+    /// after the removed-nodes hook, on the same thread, without the tree
+    /// lock. An empty function clears it.
     /// Thread-safe.
     void set_account_deleted_hook(std::function<void(const AccountDeletion&)> hook);
 
     /// A copy of every node, keyed by id. Thread-safe.
     [[nodiscard]] rules::NodeMap nodes_snapshot() const;
+
+    /// A copy of the committed op ids, so a caller that rebuilds the tree
+    /// with replace_all keeps them. Thread-safe.
+    [[nodiscard]] CommittedOpIds committed_ids() const;
 
     /// compute_tree_digest of the current tree. Thread-safe.
     [[nodiscard]] security::Digest tree_digest() const;
@@ -303,16 +224,6 @@ private:
     /// Remove a tree node from storage.
     bool remove_node(std::string_view node_id);
 
-    /// The AssignmentChange for a refused rule.
-    [[nodiscard]] static AssignmentChange change_for(rules::AssignmentRefusal refusal);
-
-    /// Plan `op` with plan_op and persist its writes without consensus,
-    /// keeping each node's version (the direct paths do not maintain it).
-    /// The caller holds mutex_ and has already checked the op's rules. Only
-    /// for ops whose plan writes nodes and removes none.
-    [[nodiscard]] AssignmentChange apply_planned_direct_locked(const TreeOp& op,
-                                                               std::string& reason);
-
     /// apply_op with mutex_ held. Appends each node the op removes, as it was
     /// before the op, to `removed`, and each applied account deletion to
     /// `accounts`.
@@ -321,10 +232,8 @@ private:
 
     /// Write `effect` into the tree with mutex_ held: persist writes, then
     /// removals, keeping the identifier index in sync. Appends removed nodes
-    /// to `removed`. `keep_versions` keeps each written node's stored version
-    /// (the direct paths do not maintain versions). False when a write fails;
-    /// nothing is removed then.
-    [[nodiscard]] bool write_effect_locked(const TreeOpEffect& effect, bool keep_versions,
+    /// to `removed`. False when a write fails; nothing is removed then.
+    [[nodiscard]] bool write_effect_locked(const TreeOpEffect& effect,
                                            std::vector<TreeNode>& removed);
 
     /// Call the removed-nodes hook with `removed`, unless it is empty. Caller
@@ -355,9 +264,8 @@ private:
     std::unordered_map<std::string, TreeNode> nodes_;
 
     // Reverse index: endpoint_identifier -> node_id. Kept in sync with nodes_ in
-    // on_start / insert_join_node / update_node_direct / delete_node_direct /
-    // apply_op / replace_all so resolve_by_identifier is O(1) and new colliding registrations
-    // are rejected.
+    // on_start / apply_op / replace_all so resolve_by_identifier is O(1) and new
+    // colliding registrations are rejected.
     std::unordered_map<std::string, std::string> identifier_index_;
 
     // Replay protection: SHA-256 hash of canonical delta → timestamp of receipt

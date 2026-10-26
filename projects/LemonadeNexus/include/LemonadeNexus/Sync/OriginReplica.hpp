@@ -166,6 +166,10 @@ public:
     /// Returns the number removed.
     std::size_t prune_tombstones(uint64_t cutoff_timestamp);
 
+    /// Drop every entry, tombstone or not, whose timestamp is older than
+    /// `cutoff_timestamp`. For a stream whose entries carry their expiry as
+    /// the timestamp (link tokens). Returns the number removed.
+    std::size_t prune_expired(uint64_t cutoff_timestamp);
     /// Drop every entry whose key matches `match`, without a tombstone. For
     /// entries that no server may hold any longer, where every receiver
     /// refuses the entry on its own (an account deletion, see

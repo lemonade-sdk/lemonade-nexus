@@ -133,7 +133,7 @@ tier2.<region>.seip.<domain>    TXT -> ...
 ```
 
 The `A` record aggregates the public IPs of the servers currently serving
-that tier; startup seed discovery (`dns_seed_discovery`) uses it to find
+that tier; startup seed discovery (always on) uses it to find
 gossip peers automatically. The `TXT` record lists each member's SEIP FQDN
 (`<id>.<region>.seip.<domain>`). A tier with no members returns NXDOMAIN for
 both types.

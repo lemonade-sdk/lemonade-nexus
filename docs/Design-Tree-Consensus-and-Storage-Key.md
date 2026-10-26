@@ -5,14 +5,13 @@ title: "Design: Tree Consensus and Threshold Storage Key"
 
 # Design: Tree Consensus and Threshold Storage Key
 
-Status: **approved**. Phases 1 to 3 are implemented behind experimental
-settings: with `tree_ops_enabled`, Tier 1 servers order tree operations
-through consensus and apply them only after commit, and a Tier 1 member that
-joins or lags applies the replicated log; with `tree_log_enabled`, Tier 1
-members build and replicate the log in read-only mode for the merge ceremony.
-Tier 2 servers hold no tree in any mode (decided 2026-10-24; see
-[A7](#a7-tier-2-and-lagging-servers)). See
-[Configuration](Configuration#experimental-tree-operations) for the behavior
+Status: **approved**. Phases 1 to 3 are implemented and always run (no
+setting turns them off): Tier 1 servers order tree operations through
+consensus and apply them only after commit, and a Tier 1 member that joins or
+lags applies the replicated log. A server that holds a tree from before tree
+operations awaits the one-time merge commit. Tier 2 servers hold no tree
+(decided 2026-10-24; see [A7](#a7-tier-2-and-lagging-servers)). See
+[Configuration](Configuration#tree-operations) for the behavior
 and limits, and [Tree Merge Ceremony](Tree-Merge-Ceremony) for the
 migration runbook. Phase 4, the `storage-threshold` library
 (`crates/storage-threshold`), is implemented and tested. Phase 5 (holder
@@ -172,6 +171,19 @@ TreeOp {
   subgroup under another group (`rules::move_refusal`). Both are appended
   values; no existing kind is renumbered. See [Security](Security) for the
   rules.
+- A `join` with a link token and an `accept_invite` carry a link extension,
+  appended to the canonical encoding only when present (tag
+  `lemonade-nexus/tree-op-link-extension:v1`), so an op without it keeps the
+  encoding and op id of earlier releases. The extension holds the invite's
+  signed mint (`invite_grant`). Every replica verifies the grant (a trusted
+  submitter of the block's epoch signed it, for this network, unexpired at
+  the block time, bound to the op) and records its redemption id in the
+  committed id set until the invite expires, so a second redemption on any
+  server is refused as `Replayed`. A linked `join` with the extension gives
+  same-group sibling devices `read` and `connect_private` on the new device
+  even when the sibling's key already holds an entry there
+  (`rules::grant_link_peer_access`); a `join` without it keeps the earlier
+  result. See [Security](Security#invite-replication).
 - `delete_account` (kind 10) deletes the principal's own account in one
   atomic step. Its target is the account id that the principal's key
   derives, and its base version is 0. Every replica computes the same scope
@@ -183,7 +195,8 @@ TreeOp {
   applies the op. See [Security](Security#account-deletion).
 - Every write path in `TreeApiHandler` produces an op. The local-only methods
   (`insert_join_node`, `update_node_direct`, `grant_assignment`,
-  `delete_node_direct`) stop being called from request handlers.
+  `set_assignment`, `delete_node_direct`, and the direct forms of invite,
+  move, and account deletion) are removed.
 
 ### A2. Submission
 
@@ -335,7 +348,7 @@ Phase 3 implementation:
 - A Tier 1 server that sees a committed block that does not follow its log is
   "behind": it applies nothing out of order, catches up through replication,
   and resumes with the next committed block that chains.
-- In ops mode the gossip record transfer pool no longer carries tree records.
+- The gossip record transfer pool carries no tree records.
 
 ### A8. Effect on clients
 
@@ -349,31 +362,35 @@ Phase 3 implementation:
 
 Today each server's tree differs.
 
-1. Release N adds the tree log in read-only mode: Tier 1 servers build and
-   replicate it but keep applying changes locally.
-2. A one-time ceremony exports every server's tree. A merge tool unions them.
-   Export a Tier 2 server's tree before it runs a release that holds no tree
-   on Tier 2: that release deletes it at startup.
-   the root from the root server, each group from its creator's record, each
-   device from the server it joined. Conflicts are listed for an admin to
-   resolve.
+1. One release switches every write path to tree operations. A server that
+   holds a tree from before awaits the merge: it serves that tree for reads,
+   refuses tree writes (retryable `503`), and votes for no tree block, so no
+   block can take height 1 first.
+2. After the rolling update reaches every server, the root server's
+   operator runs one script. It collects a signed export of every current
+   Tier 1 member's tree, plus the root server's own tree from its backup (a
+   Tier 2 server deleted its tree at startup). The root server merges them by
+   a fixed rule: the root from the root server, each device from the server it
+   joined, each group from its creator's record, then a documented tie-break.
+   Nodes that share an identifier and nodes that do not reach the root are
+   dropped and reported.
 3. The merged tree is committed as **height 1**, signed by the root
-   management key offline, and verified by every Tier 1 server.
-4. Release N+1 switches every write path to ops. Local-only writes end.
+   management key inside the root server's process, and verified by every
+   Tier 1 server.
 
-Phase 3 implementation: release N is `tree_log_enabled` (read-only mode: the
-log starts from the empty tree and never changes the live tree); release N+1
-is `tree_ops_enabled`. Both default to off, so deploying the build changes
-nothing until an operator runs the ceremony. The merge commit is a tree log
-entry of kind `merge` at height 1: its body is the canonical encoding of the
-merged nodes, its root chains to the empty base, and the root management key
-signs a canonical JSON preimage that names the network, height, block time,
-roots, and node count. A log accepts it only on top of the empty base, so it
-is one-shot. `nexus-tree-merge` exports, merges (listing conflicts), and
-finalizes; `lemonade-nexus --sign-tree-merge` signs on the root server and
-`--install-tree-merge` installs the commit on a stopped server. At the switch
-to ops mode, a server's live tree is behind the committed log and is replaced
-by it. See [Tree Merge Ceremony](Tree-Merge-Ceremony).
+Implementation: the merge commit is a tree log entry of kind `merge` at
+height 1: its body is the canonical encoding of the merged nodes, its root
+chains to the empty base, and the root management key signs a canonical JSON
+preimage that names the network, height, block time, roots, and node count. A
+log accepts it only on top of the empty base, so it is one-shot. The root
+management key and the data key exist only inside the running servers, so
+the exports, the backup read, the merge, and the signature run there:
+`scripts/nexus-tree-migrate` only carries bytes between the root server's
+control socket and the Tier 1 members' `POST /api/tree/merge/export` and
+`POST /api/tree/merge/commit` routes. When the commit applies, a server's
+pre-merge tree is replaced by the merged tree. `nexus-tree-merge`,
+`--sign-tree-merge`, and `--install-tree-merge` remain for plaintext test
+data only. See [Tree Merge Ceremony](Tree-Merge-Ceremony).
 
 ## Part B: Threshold Storage Key
 
@@ -718,7 +735,8 @@ Always on, no setting (`Security/Storage/StorageVault.hpp`):
   The associated data is `aead_aad("storage-file-at-rest", {domain, relative
   path, key id})`. The key id is a second HKDF output of the DEK.
 - **Covered.** `identity/keypair.enc`, `identity/jwt_secret.hex`,
-  `identity/ddns_credentials.enc`, `account/replica.json`, `tree/nodes`,
+  `identity/ddns_credentials.enc`, `account/replica.json`,
+  `link_tokens/ledger.json`, `link_replica/replica.json`, `tree/nodes`,
   `tree/deltas`, `tree/log`, and the TLS and ACME private keys
   (`certs/<fqdn>/privkey.pem` and `certs/account.key`;
   `StorageVault::default_coverage()`). `FileStorageService`,

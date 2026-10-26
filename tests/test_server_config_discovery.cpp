@@ -10,6 +10,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -92,10 +93,43 @@ TEST(ServerConfigJson, StaleStorageFlagJsonKeysAreIgnored) {
     nexus::core::from_json(
         nlohmann::json{{"storage_key_enabled", true}, {"storage_files_enabled", true}},
         config);
-    EXPECT_FALSE(config.tree_ops_enabled);
-    EXPECT_FALSE(config.tree_log_enabled);
     EXPECT_FALSE(config.ddns_enabled);
 }
+
+// Tree operations, open registration, onboarding, and DNS seed discovery
+// always run. A config file that still names one of the removed keys, with any
+// value, loads like one without it.
+TEST_F(ConfigDiscovery, RemovedSwitchesInTheConfigFileAreIgnored) {
+    fs::current_path(dir);
+    {
+        std::ofstream out(dir / "lemonade-nexus.json");
+        out << R"({"tree_ops_enabled": false, "tree_log_enabled": "yes",
+                   "open_registration": false, "onboard_enabled": false,
+                   "dns_seed_discovery": 0, "http_port": 9200})";
+    }
+    const auto config = load_from_cwd();
+    EXPECT_EQ(config.http_port, 9200);
+    EXPECT_FALSE(config.data_root.empty());
+}
+
+#ifndef _WIN32
+// The removed variables and command-line switches are accepted and ignored.
+TEST_F(ConfigDiscovery, RemovedSwitchesInTheEnvironmentAndCommandLineAreIgnored) {
+    fs::current_path(dir);
+    const char* variables[] = {"SP_TREE_OPS", "SP_TREE_LOG", "SP_CLOSED_REGISTRATION",
+                               "SP_DNS_SEED_DISCOVERY"};
+    for (const char* name : variables) ::setenv(name, "maybe", 1);
+    std::vector<std::string> args = {"lemonade-nexus",        "--tree-ops",
+                                     "--tree-log",            "--closed-registration",
+                                     "--no-onboard",          "--no-dns-seed-discovery",
+                                     "--http-port",           "9300"};
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    const auto config = nexus::core::load_config(static_cast<int>(argv.size()), argv.data());
+    EXPECT_EQ(config.http_port, 9300);
+    for (const char* name : variables) ::unsetenv(name);
+}
+#endif
 
 TEST(ServerConfigEnv, ParseBoolFlagAcceptsOnlyBooleanWords) {
     using nexus::core::parse_bool_flag;
@@ -111,42 +145,16 @@ TEST(ServerConfigEnv, ParseBoolFlagAcceptsOnlyBooleanWords) {
 }
 
 #ifndef _WIN32
-// SP_TREE_OPS=0 once turned ops mode on, because any value counted as set.
-// Every boolean SP_* variable now reads its value.
+// A boolean SP_* variable reads its value: "0" is off, not "set".
 TEST_F(ConfigDiscovery, BooleanEnvironmentVariablesReadTheirValue) {
     fs::current_path(dir);
-    const char* names[] = {"SP_TREE_OPS", "SP_TREE_LOG", "SP_DDNS_ENABLED",
-                           "SP_CLOSED_REGISTRATION", "SP_DNS_SEED_DISCOVERY"};
-    auto set_all = [&](const char* value) {
-        for (const char* name : names) ::setenv(name, value, 1);
-    };
-
-    set_all("0");
-    auto off = load_from_cwd();
-    EXPECT_FALSE(off.tree_ops_enabled);
-    EXPECT_FALSE(off.tree_log_enabled);
-    EXPECT_FALSE(off.ddns_enabled);
-    EXPECT_TRUE(off.open_registration);
-    EXPECT_FALSE(off.dns_seed_discovery);
-
-    set_all("1");
-    auto on = load_from_cwd();
-    EXPECT_TRUE(on.tree_ops_enabled);
-    EXPECT_TRUE(on.tree_log_enabled);
-    EXPECT_TRUE(on.ddns_enabled);
-    EXPECT_FALSE(on.open_registration);
-    EXPECT_TRUE(on.dns_seed_discovery);
-
-    // An unreadable value turns a feature off, closes registration, and
-    // keeps seed discovery at its current value.
-    set_all("maybe");
-    auto bad = load_from_cwd();
-    EXPECT_FALSE(bad.tree_ops_enabled);
-    EXPECT_FALSE(bad.tree_log_enabled);
-    EXPECT_FALSE(bad.ddns_enabled);
-    EXPECT_FALSE(bad.open_registration);
-    EXPECT_TRUE(bad.dns_seed_discovery);
-
-    for (const char* name : names) ::unsetenv(name);
+    ::setenv("SP_DDNS_ENABLED", "0", 1);
+    EXPECT_FALSE(load_from_cwd().ddns_enabled);
+    ::setenv("SP_DDNS_ENABLED", "1", 1);
+    EXPECT_TRUE(load_from_cwd().ddns_enabled);
+    // An unreadable value turns the feature off.
+    ::setenv("SP_DDNS_ENABLED", "maybe", 1);
+    EXPECT_FALSE(load_from_cwd().ddns_enabled);
+    ::unsetenv("SP_DDNS_ENABLED");
 }
 #endif

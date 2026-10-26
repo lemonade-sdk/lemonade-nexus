@@ -1,5 +1,5 @@
 # Sidecar mesh integration test: nexus server + owner sidecar + linked sidecar.
-# Verifies closed-registration join gating, device link-token mint/join, the
+# Verifies device link-token mint/join, the
 # token-gated control API (incl. no/wrong-bearer 401), and private-API
 # reachability over the userspace mesh.
 #
@@ -134,7 +134,7 @@ Add-Content $HOSTS "127.0.0.1 $PRIVFQDN # nexus-mesh-test" -Encoding ascii
 # 4. start the server: no cert flags exist — it picks up the seeded ACME cache.
 $procs += Start-Process $srv -PassThru -WindowStyle Hidden `
     -ArgumentList @("--data-root","$root\server","--public-ip","127.0.0.1","--region",$REGION,
-                    "--closed-registration","--private-http-port",$PRIV,
+                    "--private-http-port",$PRIV,
                     "--root-pubkey",$pubhex,"--genesis-pubkey",$GENESIS,
                     "--release-signing-pubkey",$RELPUB) `
     -RedirectStandardOutput "$root\server.log" -RedirectStandardError "$root\server.err"
@@ -178,15 +178,6 @@ Check ($badauth -eq "401") "control API rejects a wrong bearer (401)"
 $linkResp = (curl.exe -s -X POST -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" --data "@$root\mint.json" http://127.0.0.1:9110/link-token) | ConvertFrom-Json
 Write-Host "LINK TOKEN group=$($linkResp.group_node_id) token=$($linkResp.link_token.Substring(0,16))..."
 
-# 8. an un-tokened identity must be rejected under closed registration
-$procs += Start-Process $sc -PassThru -WindowStyle Hidden `
-    -ArgumentList (@("--data-root","$root\intruder","--control-port","9112","--control-token",$TOK) + $tls) `
-    -RedirectStandardOutput "$root\intruder.log" -RedirectStandardError "$root\intruder.err"
-Start-Sleep 6
-$intr = CtlGet 9112 "/status"
-Write-Host "INTRUDER status=$($intr.status) join_failures=$($intr.join_failures) (expect degraded, failures>0)"
-Check ([int]$intr.join_failures -gt 0) "un-tokened intruder rejected under closed registration"
-
 # 9. linked sidecar WITH the token joins the owner's account/group
 $procs += Start-Process $sc -PassThru -WindowStyle Hidden `
     -ArgumentList (@("--data-root","$root\phone","--control-port","9111","--control-token",$TOK,"--link-token",$linkResp.link_token) + $tls) `
@@ -210,7 +201,7 @@ if (-not $eg.loopback_port) {
 }
 
 Write-Host "`n--- server join log ---"
-Select-String -Path "$root\server.log" -Pattern "Join\]|linked device|registration closed" -EA SilentlyContinue |
+Select-String -Path "$root\server.log" -Pattern "Join\]|linked device" -EA SilentlyContinue |
     Select-Object -Last 6 | ForEach-Object { $_.Line }
 
 # On failure the CI temp dir is discarded with the runner, so print enough to

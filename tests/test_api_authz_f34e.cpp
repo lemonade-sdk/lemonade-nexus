@@ -51,6 +51,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include "support/tree_seed.hpp"
 #ifdef _WIN32
 #  include <process.h>
 #  define getpid _getpid
@@ -365,7 +366,7 @@ protected:
         root.mgmt_pubkey = canonical;
         root.assignments = {{.management_pubkey = canonical,
                              .permissions = perms}};
-        EXPECT_TRUE(tree->bootstrap_root(root));
+        EXPECT_TRUE(test_support::put_node(*tree, root));
     }
 
     bool relay_file_exists(const std::string& relay_id) const {

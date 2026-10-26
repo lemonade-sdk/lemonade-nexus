@@ -47,6 +47,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include "support/tree_seed.hpp"
 #ifdef _WIN32
 #  include <process.h>
 #  define getpid _getpid
@@ -276,7 +277,7 @@ protected:
         node.tunnel_ip   = tunnel_ip;
         node.assignments = {{.management_pubkey = pubkey_of(owner),
                              .permissions = {"read", "write", "edit_node"}}};
-        ASSERT_TRUE(tree->insert_join_node(node)) << id;
+        ASSERT_TRUE(test_support::put_node(*tree, node)) << id;
     }
 
     void seed_tree() {
@@ -286,7 +287,7 @@ protected:
         root.hostname    = "root";
         root.mgmt_pubkey = pubkey_of(root_kp);
         root.assignments = {{.management_pubkey = pubkey_of(root_kp), .permissions = {"admin"}}};
-        ASSERT_TRUE(tree->bootstrap_root(root));
+        ASSERT_TRUE(test_support::put_node(*tree, root));
 
         alice = crypto->ed25519_keygen();
         bob   = crypto->ed25519_keygen();
@@ -412,7 +413,7 @@ TEST_F(DeviceCertTest, GroupWildcardRefusedForAnotherKeyOrADeviceNotJoined) {
     auto node = tree->get_node(bob_id);
     ASSERT_TRUE(node);
     node->tunnel_ip.clear();
-    ASSERT_TRUE(tree->update_node_direct(bob_id, *node));
+    ASSERT_TRUE(test_support::put_node(*tree, *node));
     res = issue(token, {{"scope", "group_loopback"}, {"client_pubkey", pubkey_of(bob)}});
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 403);
@@ -501,7 +502,7 @@ TEST_F(DeviceCertTest, DeleteCleanupRemovesTheStoredCertificates) {
     // Bob's device leaves: its device certificate goes, the group's stays.
     auto bob_node = tree->get_node(bob_id);
     ASSERT_TRUE(bob_node);
-    ASSERT_TRUE(tree->delete_node_direct(bob_id));
+    ASSERT_TRUE(test_support::remove_node(*tree, bob_id));
     tree_handler->cleanup_removed_nodes({*bob_node});
     EXPECT_FALSE(fs::exists(cert_dir(desk)));
     EXPECT_TRUE(fs::exists(cert_dir(group_a) / "privkey.pem"));
@@ -510,8 +511,8 @@ TEST_F(DeviceCertTest, DeleteCleanupRemovesTheStoredCertificates) {
     auto alice_node = tree->get_node(alice_id);
     auto group_node = tree->get_node("customer-" + alice_id);
     ASSERT_TRUE(alice_node && group_node);
-    ASSERT_TRUE(tree->delete_node_direct(alice_id));
-    ASSERT_TRUE(tree->delete_node_direct("customer-" + alice_id));
+    ASSERT_TRUE(test_support::remove_node(*tree, alice_id));
+    ASSERT_TRUE(test_support::remove_node(*tree, "customer-" + alice_id));
     tree_handler->cleanup_removed_nodes({*alice_node, *group_node});
     EXPECT_FALSE(fs::exists(cert_dir(laptop)));
     EXPECT_FALSE(fs::exists(cert_dir(group_a)));

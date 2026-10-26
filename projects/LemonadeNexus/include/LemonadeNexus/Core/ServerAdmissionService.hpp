@@ -37,7 +37,6 @@ public:
     void set_network_id(const std::string& network_hex) { network_id_hex_ = network_hex; }
 
     struct Config {
-        bool     enabled{true};
         uint32_t request_ttl_sec{3600};
         uint32_t max_pending{8};
         uint32_t nonce_ttl_sec{300};
@@ -55,7 +54,7 @@ public:
     void on_stop();
     [[nodiscard]] std::string_view name() const { return "ServerAdmissionService"; }
 
-    /// True when this server holds the root key and onboarding is enabled.
+    /// True when this server holds the root key.
     [[nodiscard]] bool accepts_onboarding() const;
 
     /// Issue a single-use challenge nonce (base64) for a candidate pubkey.

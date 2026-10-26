@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include "support/tree_seed.hpp"
 #ifdef _WIN32
 #  include <process.h>
 #  define getpid _getpid
@@ -622,7 +623,7 @@ TEST(DnsGroupLoopback, LabelIsStableDnsSafeAndDerivedFromTheGroupId) {
 }
 
 TEST_F(DnsResolveTest, GroupLoopbackAnswersLoopbackForAnyDeviceNameInTheGroup) {
-    ASSERT_TRUE(tree_svc->insert_join_node(loopback_group("customer-abc", root_pubkey_str)));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, loopback_group("customer-abc", root_pubkey_str)));
     const auto label = network::group_loopback_label("customer-abc");
     for (const std::string device : {"my-laptop", "work-pc", "any-name", "x1"}) {
         auto result = dns_svc->resolve(device + "." + label + ".lo.lemonade-nexus.io");
@@ -636,7 +637,7 @@ TEST_F(DnsResolveTest, GroupLoopbackAnswersLoopbackForAnyDeviceNameInTheGroup) {
 }
 
 TEST_F(DnsResolveTest, GroupLoopbackRefusesUnknownOrMalformedNames) {
-    ASSERT_TRUE(tree_svc->insert_join_node(loopback_group("customer-abc", root_pubkey_str)));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, loopback_group("customer-abc", root_pubkey_str)));
     const auto label = network::group_loopback_label("customer-abc");
     const std::string tail = ".lo.lemonade-nexus.io";
     EXPECT_FALSE(dns_svc->resolve("dev.g00000000000000000000" + tail).has_value());
@@ -648,7 +649,7 @@ TEST_F(DnsResolveTest, GroupLoopbackRefusesUnknownOrMalformedNames) {
 }
 
 TEST_F(DnsResolveTest, GroupLoopbackAnswersOnEveryReplicaAndEndsWithTheGroup) {
-    ASSERT_TRUE(tree_svc->insert_join_node(loopback_group("customer-abc", root_pubkey_str)));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, loopback_group("customer-abc", root_pubkey_str)));
     const auto name = "laptop." + network::group_loopback_label("customer-abc") +
                       ".lo.lemonade-nexus.io";
 
@@ -670,8 +671,8 @@ TEST_F(DnsResolveTest, GroupLoopbackAnswersOnEveryReplicaAndEndsWithTheGroup) {
     }
 
     // The group is deleted on both servers: the names stop resolving.
-    ASSERT_TRUE(tree_svc->delete_node_direct("customer-abc"));
-    ASSERT_TRUE(replica_tree.delete_node_direct("customer-abc"));
+    ASSERT_TRUE(test_support::remove_node(*tree_svc, "customer-abc"));
+    ASSERT_TRUE(test_support::remove_node(replica_tree, "customer-abc"));
     EXPECT_FALSE(dns_svc->resolve(name).has_value());
     EXPECT_FALSE(replica_dns.resolve(name).has_value());
 

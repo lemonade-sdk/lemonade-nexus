@@ -17,6 +17,7 @@ signs, and publishes a release. Servers install it in place with
 - [Reviewed release inputs](#reviewed-release-inputs)
 - [Release guards](#release-guards)
 - [Bootstrap procedure (one time)](#bootstrap-procedure-one-time)
+- [The tree operations release (one time)](#the-tree-operations-release-one-time)
 - [The updater on a server](#the-updater-on-a-server)
 - [Limits](#limits)
 
@@ -338,6 +339,62 @@ again.
 6. Commit `release/bootstrap-complete` with the bootstrap tag through a
    reviewed pull request. The next release refuses to publish until the file
    names that tag.
+
+## The tree operations release (one time)
+
+**Empty start (no tree data kept).** When the fleet is installed directly
+with each Tier 1 server's `data/tree` moved aside, no merge is needed: Tier 1
+commits the application root for `root_pubkey` as tree log height 1 by itself
+(see [Tree Merge Ceremony](Tree-Merge-Ceremony#empty-start-no-tree-data-kept)).
+`sudo nexus-tree-migrate` on ns1 only confirms that no server awaits a merge.
+
+**Keeping existing trees.** The rest of this section applies when the trees
+must survive.
+
+The first release in which tree operations always run (no
+`tree_ops_enabled` setting) needs one owner step after its rollout: the
+[Tree Merge Ceremony](Tree-Merge-Ceremony). The rollout itself is a normal
+release; no server is deployed by hand.
+
+1. **Release.** Run the release workflow as usual. The release needs no
+   configuration change: a configuration that still names `tree_ops_enabled`
+   or `tree_log_enabled` starts and logs that the setting is ignored.
+2. **Rolling update.** `nexus-updater` installs it on one server at a time.
+   On each Tier 1 server the new release keeps the tree it holds, refuses tree
+   writes with `503` and `Retry-After` (joins, group edits, invites, moves,
+   deletions, account deletion), and votes for no tree block. Tree reads and
+   existing tunnels keep working. A server that still runs the old release
+   keeps its direct writes until its turn; those writes are in its tree when
+   the merge collects it. The health gate passes: the tree log is healthy at
+   height 0.
+3. **Wait for every server.** The merge refuses to start while any Tier 1
+   member runs the old release (it has no export route) and refuses to build
+   without an export from every current Tier 1 member.
+4. **Owner step on the root server (ns1).** Get the script (the package
+   installs it as `/usr/bin/nexus-tree-migrate`; `nexus-updater` replaces only
+   the server binaries, so on an updated server fetch `scripts/nexus-tree-migrate`
+   from the release tag). Then:
+
+   ```bash
+   sudo python3 nexus-tree-migrate \
+       --backup /var/lib/lemonade-nexus-backup-20261025-boot/state.tar
+   ```
+
+   Review the report: what each server gains and loses, every tie-break, and
+   every dropped node. Then sign and deliver with the digest it printed:
+
+   ```bash
+   sudo python3 nexus-tree-migrate \
+       --backup /var/lib/lemonade-nexus-backup-20261025-boot/state.tar \
+       --commit --expect-tree-digest <tree digest from the dry run>
+   ```
+
+5. **Check.** On every Tier 1 server `GET /api/tree/sync` shows `"mode":
+   "ops"`, `"height": 1`, and the same `"state_root"`. Tree writes work again
+   and go through Tier 1 consensus.
+
+Until step 4, tree writes stay refused on the updated servers. There is no
+time limit, but plan the rollout and step 4 together.
 
 ## The updater on a server
 

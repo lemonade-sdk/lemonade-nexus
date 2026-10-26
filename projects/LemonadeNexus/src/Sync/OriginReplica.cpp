@@ -201,6 +201,15 @@ std::size_t OriginReplica::prune_tombstones(uint64_t cutoff_timestamp) {
     return removed;
 }
 
+std::size_t OriginReplica::prune_expired(uint64_t cutoff_timestamp) {
+    std::lock_guard lock(mutex_);
+    const auto removed = std::erase_if(entries_, [cutoff_timestamp](const auto& kv) {
+        return kv.second.timestamp < cutoff_timestamp;
+    });
+    if (removed) ++version_;
+    return removed;
+}
+
 std::size_t OriginReplica::erase_keys(const std::function<bool(const std::string&)>& match) {
     std::lock_guard lock(mutex_);
     const auto removed =

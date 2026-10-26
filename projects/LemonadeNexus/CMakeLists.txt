@@ -84,6 +84,12 @@ if(UNIX AND NOT APPLE)
     install(PROGRAMS "${CMAKE_SOURCE_DIR}/scripts/nexus-bootstrap"
             DESTINATION bin
             COMPONENT Runtime)
+    # The one-time tree merge, run by the operator on the root server
+    # (docs/Tree-Merge-Ceremony.md). It holds no key; the server does the
+    # signing through its root-only control socket.
+    install(PROGRAMS "${CMAKE_SOURCE_DIR}/scripts/nexus-tree-migrate"
+            DESTINATION bin
+            COMPONENT Runtime)
     # Verifier-owned release policy: generated after the final tree and ELF
     # hashes are known, so it is an external package input, not a tracked file.
     # Runtime accepts it only after Genesis delegation and release-authority

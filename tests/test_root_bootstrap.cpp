@@ -1,5 +1,5 @@
 // Closed public root-claim surface: no public caller (authentication,
-// registration, open_registration) may create the global permission root,
+// registration, which is always open) may create the global permission root,
 // assign its ownership, or create or restore root-level grants. Fresh root
 // initialization is unavailable pending the deferred authority work. Covers
 // both HTTP entry points (/api/auth and /api/join), preservation of existing
@@ -32,6 +32,7 @@
 #include <gtest/gtest.h>
 #include "test_http_ready.hpp"
 #include "support/tree_ops_mode.hpp"
+#include "support/tree_seed.hpp"
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -193,7 +194,6 @@ protected:
         stranger_kp = crypto->ed25519_keygen();
         // Mesh trust anchor only; the test starts with NO application root.
         config.root_pubkey = hex_of(mesh_kp);
-        config.open_registration = true;
 
         crypto::Ed25519Keypair server_kp = crypto->ed25519_keygen();
         relay = std::make_unique<relay::RelayService>(io, 0, *crypto);
@@ -206,7 +206,7 @@ protected:
         ddns = std::make_unique<network::DdnsService>(io, *crypto, *storage, *attestation, *gossip);
         acme = std::make_unique<acme::AcmeService>(*storage);
 
-        auto* tree_ops = tree_ops_mode.enable(config, *tree, *crypto);
+        auto* tree_ops = tree_ops_mode.enable(*tree, *crypto);
         join_holder().ctx = new api::ApiContext{
             .config           = config,
             .auth             = *auth,
@@ -320,7 +320,22 @@ protected:
         root.mgmt_pubkey = prefixed_b64(kp);
         root.assignments = {{.management_pubkey = prefixed_b64(kp),
                              .permissions = perms}};
-        EXPECT_TRUE(tree->bootstrap_root(root));
+        EXPECT_TRUE(test_support::put_node(*tree, root));
+    }
+
+    // The EstablishRoot op Tier 1 commits for the configured root key
+    // `root_hex`, applied through the fixture's submitter. A malformed key is
+    // refused before any op is built.
+    tree::TreeOpVerdict establish_root(const std::string& root_hex) {
+        const auto root_key = core::root_principal_from_hex(root_hex);
+        if (!root_key) return {tree::TreeOpRefusal::Invalid, "malformed root key"};
+        tree_ops_mode.submitter->set_root_key(*root_key);
+        tree::TreeOp op;
+        op.kind = tree::TreeOpKind::EstablishRoot;
+        op.target = "root";
+        op.principal = *root_key;
+        op.body.source = tree::TreeOpSource::Session;
+        return tree_ops_mode.submitter->submit(std::move(op)).verdict;
     }
 
     // The Customer node a joiner's endpoint is placed under (if any).
@@ -384,7 +399,7 @@ TEST_F(RootClaimHttpTest, FirstCallerCannotClaimRootViaJoin) {
     EXPECT_FALSE(tree->get_node("root").has_value());
 }
 
-// open_registration cannot be used to acquire root permissions: a joiner gets
+// Open registration cannot be used to acquire root permissions: a joiner gets
 // its own Customer/Endpoint nodes, while the pre-existing root record stays
 // exactly as seeded — same owner, same single assignment.
 TEST_F(RootClaimHttpTest, OpenRegistrationCannotGrantRootPermissions) {
@@ -455,7 +470,7 @@ TEST_F(RootClaimHttpTest, ReducedAndRevokedRootGrantsPreserved) {
     auto node = tree->get_node("root");
     tree::TreeNode reduced = *node;
     reduced.assignments[0].permissions = {"read"};
-    EXPECT_TRUE(tree->update_node_direct("root", reduced));
+    EXPECT_TRUE(test_support::put_node(*tree, reduced));
 
     EXPECT_EQ(login(owner_kp)->status, 200);
     EXPECT_EQ(login(stranger_kp)->status, 200);
@@ -465,7 +480,7 @@ TEST_F(RootClaimHttpTest, ReducedAndRevokedRootGrantsPreserved) {
     // Operator revokes the assignment entirely.
     tree::TreeNode revoked = reduced;
     revoked.assignments.clear();
-    EXPECT_TRUE(tree->update_node_direct("root", revoked));
+    EXPECT_TRUE(test_support::put_node(*tree, revoked));
 
     EXPECT_EQ(login(owner_kp)->status, 200);
     EXPECT_EQ(join(stranger_kp)->status, 200);
@@ -518,7 +533,7 @@ TEST_F(RootClaimHttpTest, GroupOwnerAdministersTheirGroup) {
     legacy.assignments = {{.management_pubkey = prefixed_b64(stranger_kp),
                            .permissions = {"read", "write", "add_child",
                                            "delete_node", "edit_node"}}};
-    ASSERT_TRUE(tree->update_node_direct(customer->id, legacy));
+    ASSERT_TRUE(test_support::put_node(*tree, legacy));
     ASSERT_FALSE(tree->check_permission(prefixed_b64(stranger_kp), customer->id,
                                         acl::Permission::Admin));
 
@@ -532,31 +547,15 @@ TEST_F(RootClaimHttpTest, GroupOwnerAdministersTheirGroup) {
                                         acl::Permission::Admin));
 }
 
-// The closed-registration link-token exemption recognizes the owner of the
-// EXISTING root (pure validation of stored data) and no one else.
-TEST_F(RootClaimHttpTest, ClosedRegistrationExemptionUsesExistingOwnershipOnly) {
-    seed_root(owner_kp);
-    config.open_registration = false;
-
-    auto res = join(owner_kp);
-    ASSERT_TRUE(static_cast<bool>(res));
-    ASSERT_EQ(res->status, 200) << res->body;
-
-    res = join(stranger_kp);
-    ASSERT_TRUE(static_cast<bool>(res));
-    ASSERT_EQ(res->status, 403) << res->body;
-    EXPECT_NE(res->body.find("registration closed"), std::string::npos);
-    EXPECT_FALSE(find_customer(stranger_kp).has_value());
-}
-
 // --- Post-epoch establishment (the deferred root-initialization authority) ---
 
-// Once a node holds finalized epoch authority, ensure_application_root creates
-// the root from the configured root management key, and joining works.
+// Once a node holds finalized epoch authority, Tier 1 commits an EstablishRoot
+// op for the configured root management key (TreeConsensus::set_root_request),
+// and joining works.
 TEST_F(RootClaimHttpTest, PostEpochEstablishmentCreatesTheRootFromTheConfiguredKey) {
     const auto hex = crypto::to_hex(std::span<const uint8_t>(
         owner_kp.public_key.data(), owner_kp.public_key.size()));
-    EXPECT_TRUE(core::ensure_application_root(*tree, hex));
+    EXPECT_TRUE(establish_root(hex).ok());
 
     auto root = tree->get_node("root");
     ASSERT_TRUE(root.has_value());
@@ -571,23 +570,23 @@ TEST_F(RootClaimHttpTest, PostEpochEstablishmentCreatesTheRootFromTheConfiguredK
     ASSERT_EQ(res->status, 200) << res->body;
 
     // One-shot: a second establishment changes nothing.
-    EXPECT_FALSE(core::ensure_application_root(*tree, hex));
+    EXPECT_FALSE(establish_root(hex).ok());
 }
 
 TEST_F(RootClaimHttpTest, EstablishmentNeverOverwritesAnExistingRoot) {
     seed_root(owner_kp);
     const auto other_hex = crypto::to_hex(std::span<const uint8_t>(
         stranger_kp.public_key.data(), stranger_kp.public_key.size()));
-    EXPECT_FALSE(core::ensure_application_root(*tree, other_hex));
+    EXPECT_FALSE(establish_root(other_hex).ok());
     EXPECT_EQ(tree->get_node("root")->mgmt_pubkey, prefixed_b64(owner_kp));
 }
 
 // A missing or malformed configured key establishes nothing: join keeps
 // refusing with 409, never a default owner.
 TEST_F(RootClaimHttpTest, AMalformedConfiguredKeyEstablishesNothing) {
-    EXPECT_FALSE(core::ensure_application_root(*tree, ""));
-    EXPECT_FALSE(core::ensure_application_root(*tree, "zz"));
-    EXPECT_FALSE(core::ensure_application_root(*tree, std::string(63, 'a')));
+    EXPECT_FALSE(establish_root("").ok());
+    EXPECT_FALSE(establish_root("zz").ok());
+    EXPECT_FALSE(establish_root(std::string(63, 'a')).ok());
     EXPECT_FALSE(tree->get_node("root").has_value());
 
     auto res = join(stranger_kp);

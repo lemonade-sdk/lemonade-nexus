@@ -18,6 +18,8 @@
 //   {"op":"turn","release_number":N}
 //   {"op":"report","release_number":N,"result":"failed"|"upgraded"}
 //   {"op":"stage_boot_chain","bundle":"<release approval bundle JSON text>"}
+//   {"op":"tree_merge_<step>", ...}   the one-time tree merge
+//                                     (TreeMigrationControl.hpp)
 //
 // Every reply has "ok" (bool); a refusal adds "error". docs/Upgrade-Control.md
 // lists the reply fields. The gate answers come only from finalized upgrade
@@ -29,6 +31,7 @@
 #include <LemonadeNexus/Security/Upgrade/UpgradeService.hpp>
 
 #include <asio.hpp>
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <filesystem>
@@ -42,8 +45,10 @@ namespace nexus::core {
 /// The production socket path. The directory is the service's runtime
 /// directory.
 inline constexpr std::string_view kUpgradeControlSocketPath = "/run/lemonade-nexus/upgrade.sock";
-/// Largest request or reply line, including an approval bundle.
-inline constexpr std::size_t kMaxUpgradeControlLine = 64 * 1024;
+/// Largest request or reply line. The tree merge requests carry every
+/// server's tree export, so the limit is larger than an approval bundle
+/// needs. Only a root peer can send a line.
+inline constexpr std::size_t kMaxUpgradeControlLine = 32 * 1024 * 1024;
 
 /// The tree log progress for the health report (Design-Auto-Update Phase 4
 /// step 7).
@@ -64,6 +69,9 @@ struct UpgradeControlHooks {
     /// The tree log progress, or nullopt while the tree log is off. Must be
     /// thread-safe against the owner of the tree log.
     std::function<std::optional<UpgradeTreeStatus>()> tree_status;
+    /// Answers a tree_merge_* request (handle_tree_migration_request). Unset,
+    /// those requests are refused.
+    std::function<nlohmann::json(const nlohmann::json& request)> tree_merge;
     /// Seals a second copy of the boot set to the PCR 8/9 of `accepted`, an
     /// approval the release chain already accepted and verified.
     std::function<BootChainStageResult(const security::ReleaseApprovalBundleV1& accepted)>
