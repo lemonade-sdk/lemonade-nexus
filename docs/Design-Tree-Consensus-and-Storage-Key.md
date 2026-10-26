@@ -742,8 +742,9 @@ Always on, no setting (`Security/Storage/StorageVault.hpp`):
   `tree/deltas`, `tree/log`, and the TLS and ACME private keys
   (`certs/<fqdn>/privkey.pem` and `certs/account.key`). Coverage generation
   2: `tree/committed-ops.json`, `onboarding/admissions.json`, the account
-  data store directories `chat-<hash>/` and `keyenv-<hash>/`, and the user
-  credentials (`credentials/<user>.json` and `credentials/revoked.json`).
+  data store directories `chat-<hash>/` and `keyenv-<hash>/`, the user
+  credentials (`credentials/<user>.json` and `credentials/revoked.json`), and
+  the per-token link token files (`link_tokens/<sha256>.json`).
   `FileStorageService`, `KeyWrappingService`, `resolve_jwt_secret`, `TreeLog`,
   `PermissionTreeService`, `resolve_tls_cert`, `AcmeService`, and the
   credential file functions of both auth providers (`Auth/CredentialFile.hpp`)
@@ -804,11 +805,13 @@ Always on, no setting (`Security/Storage/StorageVault.hpp`):
   identity (`ACLService::set_signing_keypair`). Moving ACL rows to a
   DEK-derived key is a re-keying choice, and a live SQLite file does not fit
   the whole-file vault container.
-- **Not covered (legacy).** The per-token files under `link_tokens/` come
-  from releases before `v2026.10.26` and stay plaintext so that
-  `TokenLinkAuthProvider` can still redeem them. The current release mints no
-  new ones; it only restores a legacy token whose redemption did not complete
-  (`legacy_refund`).
+- **Legacy link token files.** Releases before `v2026.10.26` wrote one file
+  per link token (`link_tokens/<sha256>.json`). The adoption encrypts them in
+  place, and `TokenLinkAuthProvider` reads, removes, and restores them through
+  the vault, so they still redeem once. A record that does not open refuses
+  redemption, and it is neither removed nor replaced by a refund. The current
+  release mints no new ones; it only restores a legacy token whose redemption
+  did not complete (`legacy_refund`).
 - **Migration (B10).** `plaintext`, then `migrating` (stage
   `<file>.vault-new`, request a new unlock round trip, verify every staged
   copy against the plaintext), then `encrypted` (overwrite and replace). The

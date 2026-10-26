@@ -6,6 +6,7 @@
 #include <LemonadeNexus/Acme/AcmeService.hpp>
 #include <LemonadeNexus/Auth/Ed25519AuthProvider.hpp>
 #include <LemonadeNexus/Auth/PasskeyAuthProvider.hpp>
+#include <LemonadeNexus/Auth/TokenLinkAuthProvider.hpp>
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
@@ -284,14 +285,27 @@ TEST_F(StorageVaultTest, CoverageCoversAcmeKeysNotPublicCerts) {
     EXPECT_FALSE(vault->covers(data / "certs" / "server-abc.eu-west.seip.lemonade-nexus.io" / "meta.json"));
 }
 
-// Link token (invite) state is encrypted at rest: the provider's ledger and
-// the gossip replica file. A plaintext token file from an earlier release is
-// not covered, so the provider still reads it during the upgrade window.
+// Link token (invite) state is encrypted at rest: the provider's ledger, the
+// gossip replica file, and (coverage generation 2) the one-file-per-token
+// records of earlier releases, which the adoption encrypts in place.
 TEST_F(StorageVaultTest, CoverageCoversLinkTokenState) {
     build();
     EXPECT_TRUE(vault->covers(data / "link_tokens" / "ledger.json"));
     EXPECT_TRUE(vault->covers(data / "link_replica" / "replica.json"));
-    EXPECT_FALSE(vault->covers(data / "link_tokens" / (std::string(64, 'a') + ".json")));
+    const auto legacy = data / "link_tokens" / (std::string(64, 'a') + ".json");
+    EXPECT_TRUE(vault->covers(legacy));
+    EXPECT_FALSE(vault->covers(data / "link_tokens" / (std::string(64, 'a') + ".json.tmp")));
+    // The ledger keeps its own domain: its object does not open as a legacy
+    // record, and a legacy record does not open as the ledger.
+    keys.unlock();
+    ASSERT_TRUE(run_to_done());
+    ASSERT_TRUE(vault->write(data / "link_tokens" / "ledger.json", "{\"events\":[]}"));
+    ASSERT_TRUE(vault->write(legacy, "{}"));
+    const auto ledger_object = read_raw(data / "link_tokens" / "ledger.json");
+    write_raw(data / "link_tokens" / "ledger.json", read_raw(legacy));
+    EXPECT_EQ(vault->read(data / "link_tokens" / "ledger.json").status, VaultReadStatus::Rejected);
+    write_raw(legacy, ledger_object);
+    EXPECT_EQ(vault->read(legacy).status, VaultReadStatus::Rejected);
 }
 
 // A symlink anywhere in a covered directory makes the scan incomplete, and an
@@ -1249,6 +1263,140 @@ TEST_F(StorageVaultTest, LockedCredentialsRefuseSignInAndWriteNothing) {
     // After the unlock the same Ed25519 provider reads the files again.
     keys.unlock();
     EXPECT_TRUE(sign_in(provider, crypto, device).authenticated);
+    files.stop();
+}
+
+// --- Legacy link token files -------------------------------------------------------
+
+/// The file a release before v2026.10.26 wrote for `token`:
+/// link_tokens/<hex sha256(token)>.json.
+fs::path legacy_token_file(nexus::crypto::SodiumCryptoService& crypto, const fs::path& data,
+                           const std::string& token) {
+    const auto hash = crypto.sha256(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(token.data()), token.size()));
+    return data / "link_tokens" /
+           (nexus::crypto::to_hex(std::span<const uint8_t>(hash)) + ".json");
+}
+
+std::string legacy_record(uint64_t expires_at) {
+    return nlohmann::json{{"owner_user_id", "owner-1"},
+                          {"owner_pubkey", "ed25519:owner"},
+                          {"group_node_id", "group-1"},
+                          {"created_at", 1},
+                          {"expires_at", expires_at},
+                          {"permissions", nlohmann::json::array({"read"})}}
+        .dump();
+}
+
+uint64_t in_one_hour() {
+    return static_cast<uint64_t>(
+               std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count()) +
+           3600;
+}
+
+// A legacy invite that a generation-1 server kept as plaintext is adopted in
+// place and still redeems exactly once.
+TEST_F(StorageVaultTest, APlaintextLegacyInviteIsAdoptedAndRedeemsOnce) {
+    const std::string token = "lnk_legacy_adopted";
+    const auto path = legacy_token_file(crypto, data, token);
+    write_raw(path, legacy_record(in_one_hour()));
+    migrate_first_generation();
+    ASSERT_FALSE(encrypted(read_raw(path)));
+
+    build();
+    tick();
+    ASSERT_FALSE(vault->adoption_pending());
+    EXPECT_TRUE(encrypted(read_raw(path)));
+    crash_and_restart();
+
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    files.set_vault(vault.get());
+    nexus::auth::TokenLinkAuthProvider provider{files, crypto};
+    const auto seen = provider.verify(token);
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_EQ(seen->group_node_id, "group-1");
+    const auto consumed = provider.consume(token);
+    ASSERT_TRUE(consumed.has_value());
+    EXPECT_EQ(consumed->owner_user_id, "owner-1");
+    EXPECT_TRUE(consumed->token_hash.empty());
+    EXPECT_FALSE(fs::exists(path));
+    EXPECT_FALSE(provider.consume(token).has_value());
+    EXPECT_FALSE(provider.verify(token).has_value());
+    files.stop();
+}
+
+// A redemption that fails after the consume puts the token back under the
+// data key, and it redeems once more.
+TEST_F(StorageVaultTest, ALegacyInviteRefundIsWrittenUnderTheDataKey) {
+    const std::string token = "lnk_legacy_refund";
+    const auto path = legacy_token_file(crypto, data, token);
+    migrate();
+    ASSERT_TRUE(vault->write(path, legacy_record(in_one_hour())));
+
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    files.set_vault(vault.get());
+    nexus::auth::TokenLinkAuthProvider provider{files, crypto};
+    const auto consumed = provider.consume(token);
+    ASSERT_TRUE(consumed.has_value());
+    EXPECT_FALSE(fs::exists(path));
+    ASSERT_TRUE(provider.refund(token, *consumed));
+    EXPECT_TRUE(encrypted(read_raw(path)));
+    // A second refund finds the record and does not replace it.
+    const auto refunded = read_raw(path);
+    EXPECT_FALSE(provider.refund(token, *consumed));
+    EXPECT_EQ(read_raw(path), refunded);
+    ASSERT_TRUE(provider.consume(token).has_value());
+    EXPECT_FALSE(provider.consume(token).has_value());
+    files.stop();
+}
+
+// A legacy record that does not open refuses redemption; it is neither
+// consumed, nor treated as absent by a refund, nor removed by a revocation.
+TEST_F(StorageVaultTest, ATamperedOrLockedLegacyInviteRefusesRedemption) {
+    const std::string token = "lnk_legacy_tampered";
+    const auto path = legacy_token_file(crypto, data, token);
+    migrate();
+    ASSERT_TRUE(vault->write(path, legacy_record(in_one_hour())));
+    const auto good = read_raw(path);
+
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    files.set_vault(vault.get());
+    nexus::auth::TokenLinkAuthProvider provider{files, crypto};
+    nexus::auth::LinkTokenRecord record;
+    record.owner_user_id = "owner-1";
+    record.group_node_id = "group-1";
+    record.expires_at = in_one_hour();
+
+    for (const bool plaintext : {false, true}) {
+        SCOPED_TRACE(plaintext ? "planted plaintext" : "tampered ciphertext");
+        auto bad = good;
+        if (plaintext) {
+            bad = legacy_record(in_one_hour());
+        } else {
+            bad.back() = static_cast<char>(bad.back() ^ 0x01);
+        }
+        write_raw(path, bad);
+        EXPECT_FALSE(provider.verify(token).has_value());
+        EXPECT_FALSE(provider.consume(token).has_value());
+        EXPECT_FALSE(provider.refund(token, record));
+        EXPECT_EQ(provider.revoke_where([](const auto&) { return true; }), 0u);
+        EXPECT_EQ(read_raw(path), bad);
+    }
+
+    // Locked: refused the same way, and the file stays.
+    write_raw(path, good);
+    crash_and_restart(/*holders_up=*/false);
+    files.set_vault(vault.get());
+    EXPECT_FALSE(provider.consume(token).has_value());
+    EXPECT_FALSE(provider.refund(token, record));
+    EXPECT_EQ(read_raw(path), good);
+    keys.unlock();
+    EXPECT_TRUE(provider.consume(token).has_value());
     files.stop();
 }
 

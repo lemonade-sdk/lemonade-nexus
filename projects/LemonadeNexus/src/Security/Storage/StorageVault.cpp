@@ -137,6 +137,9 @@ std::vector<VaultCoverage> StorageVault::default_coverage() {
         // User credentials (CredentialFile.hpp): each user's Ed25519 keys and
         // passkeys, and the Ed25519 revocation list.
         {"user-credentials", "credentials", "", ".json", 2},
+        // Link tokens minted by releases before v2026.10.26, one file per
+        // token. After the ledger group, so ledger.json keeps its own domain.
+        {"link-token-legacy", "link_tokens", "", ".json", 2},
     };
 }
 
