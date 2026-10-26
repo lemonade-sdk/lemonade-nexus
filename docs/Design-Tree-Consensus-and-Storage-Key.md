@@ -687,7 +687,8 @@ like attestation budgets.
 Everything in the table under [Current State](#current-state) except the boot
 set: the node identity key, vote keys, JWT secret, TLS and ACME keys, ACL and
 DDNS keys (derived from the DEK instead of the gossip key), the tree log and
-snapshots, and account data. `wrap_local.key` is retired.
+snapshots, and account data. `wrap_local.key` is retired. B12 states what the
+implementation covers and which of these items stay outside the vault.
 
 A server whose platform cannot pass the `StorageUnlock` attestation never
 unlocks a DEK: a holder answers only after a verdict that proves every claim
@@ -777,30 +778,84 @@ Always on, no setting (`Security/Storage/StorageVault.hpp`):
   `HKDF(DEK, "LEMONADE-NEXUS-STORAGE-V1", "lemonade-nexus-storage-file-key-v1")`.
   The associated data is `aead_aad("storage-file-at-rest", {domain, relative
   path, key id})`. The key id is a second HKDF output of the DEK.
-- **Covered.** `identity/keypair.enc`, `identity/jwt_secret.hex`,
+- **Covered** (`StorageVault::default_coverage()`). Coverage generation 1:
+  `identity/keypair.enc`, `identity/jwt_secret.hex`,
   `identity/ddns_credentials.enc`, `account/replica.json`,
   `link_tokens/ledger.json`, `link_replica/replica.json`, `tree/nodes`,
   `tree/deltas`, `tree/log`, and the TLS and ACME private keys
-  (`certs/<fqdn>/privkey.pem` and `certs/account.key`;
-  `StorageVault::default_coverage()`). `FileStorageService`,
-  `KeyWrappingService`, `resolve_jwt_secret`, `TreeLog`, `resolve_tls_cert`,
-  and `AcmeService` route these paths through the vault. The TLS certificate
-  chain and `meta.json` stay plaintext: they are not secret.
-- **Vote keys are not covered.** `EpochStore::store_vote_key` writes the vote
-  private key, and consensus votes while the DEK is locked (B8), so the vault
-  cannot cover it. A host that can seal encrypts it under the sealed vote-key
-  wrapping key (B6, `vote-key-<epoch>.sealed.json`). A host that cannot seal
-  keeps `vote-key-<epoch>.json` under the machine-bound wrapping, which a
-  reader of the whole data directory can unwrap.
-- **No secret at rest, so not coverage gaps.** ACL rows: `acl.db` already stores `perms_enc`
-  under XChaCha20-Poly1305, keyed from the gossip identity
-  (`ACLService::set_signing_keypair`). Moving ACL rows to a DEK-derived key is
-  a re-keying choice, not a plaintext gap, and a live SQLite file does not fit
+  (`certs/<fqdn>/privkey.pem` and `certs/account.key`). Coverage generation
+  2: `tree/committed-ops.json`, `onboarding/admissions.json`, the account
+  data store directories `chat-<hash>/` and `keyenv-<hash>/`, the user
+  credentials (`credentials/<user>.json` and `credentials/revoked.json`), and
+  the per-token link token files (`link_tokens/<sha256>.json`).
+  `FileStorageService`, `KeyWrappingService`, `resolve_jwt_secret`, `TreeLog`,
+  `PermissionTreeService`, `resolve_tls_cert`, `AcmeService`, and the
+  credential file functions of both auth providers (`Auth/CredentialFile.hpp`)
+  route these paths through the vault.
+- **Credential reads fail closed.** A credential read is absent (a new user),
+  unreadable (locked, refused by the vault, or not JSON), or present. An
+  unreadable file is never treated as empty and never written over: the
+  operation that needs it is refused. An unreadable user file stops the
+  registration of new identities, because the file can name the key or the
+  credential. An unreadable `revoked.json` counts every Ed25519 key and
+  session as revoked, and revocation changes are refused until it opens. The
+  auth providers are created after the data key unlocks (`main`), and they
+  read the files again after a failed load.
+- **Coverage additions.** Each coverage group names the generation that added
+  it, and `vault-state.json` records the generation of the files (`coverage`;
+  a state file without it records 1). On a server that is already
+  `encrypted`, the files of a newer group are plaintext. Until the vault adopts
+  them, that plaintext is authoritative, as before a migration commits, and
+  `files_ready()` stays false, so the services that read covered files wait.
+  With the DEK in memory and a verified unlock, the vault stages each file of
+  the new groups, reads it back, and compares it with the plaintext. It then
+  records the new generation with phase `promoting` (the switch point) and
+  overwrites and replaces the plaintext. After that record the new groups
+  refuse plaintext like every other group. A group of an earlier generation
+  never accepts plaintext. A file in a new group that has the header but does
+  not open under the DEK stops the adoption, and the files stay locked. A
+  rotation that began before the update is discarded before its commit and
+  runs again after the adoption.
+- **Not covered, because the file is read before the unlock.** The vault
+  refuses every read while the DEK is locked, and these readers run during the
+  unlock (B8):
+  - Everything under `security/`: the epoch and consensus state, the storage
+    key records, the wrapped DEK (`data-key.json`, already wrapped to `S`), and
+    `vault-state.json`.
+  - The vote keys. `EpochStore::store_vote_key` writes the vote private key,
+    and consensus votes while the DEK is locked, so the vault cannot cover it.
+    A host that can seal encrypts it under the sealed vote-key wrapping key
+    (B6, `vote-key-<epoch>.sealed.json`). A host that cannot seal keeps
+    `vote-key-<epoch>.json` under the machine-bound wrapping
+    (`identity/wrap_local.key` and `/etc/machine-id`), which a reader of the
+    whole data directory can unwrap.
+  - `identity/wrap_local.key`. The file share store and the machine-bound
+    vote-key copies read it before the unlock, so moving it under the DEK would
+    stop a cold start. On a host that seals, the vote keys stop depending on it
+    when their migration completes (B6).
+  - `identity/peers.json` and `identity/ns_slots.json` (gossip starts before
+    the unlock), and `ipam/allocations.json` (IPAM starts before the unlock).
+    These hold mesh addresses that gossip also distributes.
+  - The boot set (B6): the sealed copies in `sealed/`, and
+    `identity/keypair.json` until the sealed migration removes it. A host
+    that cannot seal keeps `keypair.json` (the B6 limit).
+- **Not covered, because the file is public or protected another way.**
+  `identity/keypair.pub`, `identity/server_cert.json`, the TLS certificate
+  chain and `meta.json`, `certs/account_url.txt` (the account identifier that
+  each ACME request names), and `identity/hostname`. The DNS replica
+  (`dns/replica.json`): gossip replicates these records to every server, and
+  each entry is origin-signed and verified again on load. ACL rows: `acl.db`
+  already stores `perms_enc` under XChaCha20-Poly1305, keyed from the gossip
+  identity (`ACLService::set_signing_keypair`). Moving ACL rows to a
+  DEK-derived key is a re-keying choice, and a live SQLite file does not fit
   the whole-file vault container.
-- `wrap_local.key` is not retired. The file share store and the machine-bound
-  vote-key copies read it before the unlock, so moving it under the DEK would
-  stop a cold start (B8). On a host that seals, the vote keys stop depending on
-  it when their migration completes (B6).
+- **Legacy link token files.** Releases before `v2026.10.26` wrote one file
+  per link token (`link_tokens/<sha256>.json`). The adoption encrypts them in
+  place, and `TokenLinkAuthProvider` reads, removes, and restores them through
+  the vault, so they still redeem once. A record that does not open refuses
+  redemption, and it is neither removed nor replaced by a refund. The current
+  release mints no new ones; it only restores a legacy token whose redemption
+  did not complete (`legacy_refund`).
 - **Migration (B10).** `plaintext`, then `migrating` (stage
   `<file>.vault-new`, request a new unlock round trip, verify every staged
   copy against the plaintext), then `encrypted` (overwrite and replace). The
@@ -845,7 +900,7 @@ This part does not change the trust model and can ship first.
 | 4 | `storage-threshold` crate: library review, key generation, re-share, share refresh, DLEQ, threshold ECIES. | — |
 | 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose, per-epoch share refresh, daily `StorageKeyRotation`. | 2, 4 |
 | 6 | `nexus-attestd` Seal and Unseal; boot set sealed. **Implemented** (B6). | — |
-| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented** (B12), including the TLS and ACME private keys. Vote keys are read before the unlock and are sealed through the boot set instead (B6). ACL rows are already encrypted under a separate key. | 5, 6 |
+| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented** (B12), including the TLS and ACME private keys and coverage generation 2 (committed op ids, admission records, account data store, user credentials, legacy link token files). Vote keys are read before the unlock and are sealed through the boot set instead (B6); B12 lists every file that is not covered and the reason. | 5, 6 |
 
 Phases 1, 4, and 6 can run in parallel.
 

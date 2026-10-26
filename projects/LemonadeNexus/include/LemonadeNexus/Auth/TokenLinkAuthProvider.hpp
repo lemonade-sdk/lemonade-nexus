@@ -142,8 +142,10 @@ private:
     void load();
     [[nodiscard]] static LinkTokenRecord record_from_grant(const LinkTokenEvent& mint);
 
-    // Tokens minted by an earlier release: one plaintext file per token,
-    // named by plain SHA-256 of the token, valid on this server only.
+    // Tokens minted by a release before v2026.10.26: one file per token, named
+    // by plain SHA-256 of the token, valid on this server only. Read, written,
+    // and removed through the storage vault when it covers them; an
+    // unreadable file refuses redemption and is never removed or replaced.
     [[nodiscard]] std::filesystem::path legacy_token_path(std::string_view token) const;
     [[nodiscard]] std::optional<LinkTokenRecord> legacy_verify(std::string_view token);
     [[nodiscard]] std::optional<LinkTokenRecord> legacy_consume(std::string_view token);

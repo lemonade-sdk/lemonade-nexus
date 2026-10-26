@@ -321,6 +321,16 @@ Membership and rule changes apply only at the epoch boundary. An epoch can
 legitimately outlive its target duration; the target is a pacing goal, not a
 timer that expires authority.
 
+A current member can miss a boundary stage, for example a lost message or a
+restart inside the boundary. Its own commit of the handoff then does not
+activate it, because it did not prepare the same handoff. It leaves the
+finished epoch when it verifies the finalized handoff proof: the broadcast
+proof, or the authority chain it requests after an announcement of a newer
+epoch. It enters the new epoch as a member only when the handoff names it
+with its registered vote key and it holds the DKG outcome the handoff names.
+Otherwise it continues as Tier 2, as a restart would make it. A proof that
+does not verify changes nothing.
+
 ## Genesis and Trust Continuity
 
 Genesis is a temporary bootstrap authority, not a permanent root:
@@ -603,9 +613,11 @@ server (`Auth/LinkTokenLedger.hpp`, `TokenLinkAuthProvider`).
 - **Storage.** The provider's ledger (`link_tokens/ledger.json`) and the
   replica file (`link_replica/replica.json`) are storage-vault files,
   encrypted under the data key once the vault runs encrypted. On restart the
-  replica entries are verified again before use. A plaintext token file from
-  an earlier release (`link_tokens/<sha256>.json`) is still redeemed, once, on
-  the server that minted it, until it expires.
+  replica entries are verified again before use. A token file from an
+  earlier release (`link_tokens/<sha256>.json`) is still redeemed, once, on
+  the server that minted it, until it expires. It is a storage-vault file
+  too: an encrypted server encrypts it in place, and a record that does not
+  open refuses redemption.
 
 **Single use.** A `Join` with a token and an
 `AcceptInvite` carry the signed `Mint` in a link extension of the op

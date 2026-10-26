@@ -23,6 +23,12 @@ constexpr uint32_t kRecordsFormatVersion = 1;
 /// Finalized records held ahead of a gap, and records served per request.
 constexpr std::size_t kMaxPendingRecords = 64;
 constexpr std::size_t kMaxRecordsPerReply = 64;
+/// The step between the pages of a proof search. Consecutive pages overlap by
+/// two blocks, so every block in the searched range arrives in one page with
+/// the two blocks that complete its three-chain.
+constexpr uint64_t kProofSearchStep = constants::kMaxSyncChainBlocks - 2;
+/// A search page unanswered this long is asked again, of the next peer.
+constexpr uint64_t kProofSearchTimeoutMs = 2 * constants::kUpgradeStatusIntervalMs;
 /// Statuses kept; far above any real participant count.
 constexpr std::size_t kMaxTrackedStatuses = 2 * constants::kMaxUpgradeParticipants;
 
@@ -98,6 +104,9 @@ void UpgradeService::attach() {
     driver_.set_upgrade_sink([this](const SecurityMessage& message) { on_message(message); });
     driver_.set_upgrade_verdict_sink(
         [this](const AttestationVerdict& verdict) { on_verdict(verdict); });
+    driver_.set_upgrade_chain_sink([this](const SyncResponse& response, const NodeId& from) {
+        on_certified_chain(response, from);
+    });
 }
 
 bool UpgradeService::start(uint64_t now_ms) {
@@ -182,6 +191,7 @@ void UpgradeService::tick(uint64_t now_ms) {
     if (status_cadence_.due(now_ms)) send_status();
     witness();
     if (sync_cadence_.due(now_ms)) sync_records();
+    if (proof_search_ && proof_search_->next_after) request_page(*proof_search_->next_after);
 }
 
 void UpgradeService::send_status() {
@@ -216,11 +226,15 @@ void UpgradeService::sync_records() {
     std::erase(members, config_.self);
     if (members.empty()) return;
     const NodeId& target = members[sync_cursor_++ % members.size()];
+    // A record held without its proof is asked for again, so that a peer that
+    // holds the proof sends it along with every later record.
+    const auto unproven = first_unproven();
+    const uint64_t have = unproven ? records_[*unproven].first.sequence - 1 : state_.sequence;
     (void)router_.send(target, router_.compose(SecurityMessageKind::Upgrade,
                                                UpgradeMsg{UpgradeTopic::RecordRequest,
-                                                          u64_bytes(state_.sequence),
-                                                          std::nullopt},
+                                                          u64_bytes(have), std::nullopt},
                                                current_epoch()));
+    if (unproven) search_proof(*unproven, target);
 }
 
 // --- Witnessing ---------------------------------------------------------------------
@@ -443,32 +457,22 @@ void UpgradeService::handle_record_proof(const SecurityMessage& message) {
     const auto& upgrade = std::get<UpgradeMsg>(message.body);
     if (!upgrade.proof.has_value() || upgrade.proof->chain.empty()) return;
     const auto record = decode_upgrade_record(upgrade.body);
-    if (!record || record->network_id != config_.network_id ||
-        record->sequence <= state_.sequence || pending_records_.contains(record->sequence)) {
+    if (!record || record->network_id != config_.network_id) return;
+    if (record->sequence <= state_.sequence) {
+        // A record this node holds without its proof takes the proof of the
+        // same bytes.
+        (void)recover_proof(upgrade.body, *upgrade.proof);
         return;
     }
-    const EpochId epoch = upgrade.proof->chain.front().proposal.epoch;
-    std::size_t quorum = 0;
-    std::map<NodeId, crypto::Ed25519PublicKey> vote_keys;
-    if (const EpochManager* epochs = runtime_.epochs();
-        epochs != nullptr && epochs->current().id == epoch) {
-        quorum = epochs->current().consensus_quorum;
-        vote_keys = epochs->current_vote_keys();
-    } else if (const auto authority = driver_.authority_for_epoch(epoch)) {
-        quorum = authority->consensus_quorum;
-        vote_keys = authority->vote_keys;
-    } else {
-        return;  // Nothing to verify against; the record sync asks again later.
-    }
-    const QcValidationContext context{constants::kConsensusRulesetVersion, config_.network_id,
-                                      epoch, quorum};
-    const BlockPayload payload{BlockPayloadKind::UpgradeProgress, upgrade.body};
-    if (verify_commit_proof(block_payload_digest(payload), *upgrade.proof, context, vote_keys) !=
-        CommitProofFailure::None) {
+    if (pending_records_.contains(record->sequence)) return;
+    // Without the finalizing epoch's keys nothing verifies; the record sync
+    // asks again later.
+    const auto epoch = verified_proof_epoch(upgrade.body, *upgrade.proof);
+    if (!epoch) {
         spdlog::debug("[upgrade] record proof from {} does not verify", short_id(message.sender));
         return;
     }
-    const auto witnesses = witnesses_for(epoch);
+    const auto witnesses = witnesses_for(*epoch);
     if (!witnesses) return;
     if (record->sequence == state_.sequence + 1 || record->event == UpgradeEvent::Start) {
         if (accept_record(*record, upgrade.proof, &*witnesses, true)) return;
@@ -481,6 +485,169 @@ void UpgradeService::handle_record_proof(const SecurityMessage& message) {
                                        UpgradeMsg{UpgradeTopic::RecordRequest,
                                                   u64_bytes(state_.sequence), std::nullopt},
                                        current_epoch()));
+}
+
+std::optional<EpochId> UpgradeService::verified_proof_epoch(const std::vector<uint8_t>& body,
+                                                           const CommitProof& proof) const {
+    if (proof.chain.empty()) return std::nullopt;
+    const EpochId epoch = proof.chain.front().proposal.epoch;
+    std::size_t quorum = 0;
+    std::map<NodeId, crypto::Ed25519PublicKey> vote_keys;
+    if (const EpochManager* epochs = runtime_.epochs();
+        epochs != nullptr && epochs->current().id == epoch) {
+        quorum = epochs->current().consensus_quorum;
+        vote_keys = epochs->current_vote_keys();
+    } else if (const auto authority = driver_.authority_for_epoch(epoch)) {
+        quorum = authority->consensus_quorum;
+        vote_keys = authority->vote_keys;
+    } else {
+        return std::nullopt;
+    }
+    const QcValidationContext context{constants::kConsensusRulesetVersion, config_.network_id,
+                                      epoch, quorum};
+    const BlockPayload payload{BlockPayloadKind::UpgradeProgress, body};
+    if (verify_commit_proof(block_payload_digest(payload), proof, context, vote_keys) !=
+        CommitProofFailure::None) {
+        return std::nullopt;
+    }
+    return epoch;
+}
+
+bool UpgradeService::recover_proof(const std::vector<uint8_t>& body, const CommitProof& proof) {
+    const auto held = std::find_if(records_.begin(), records_.end(), [&body](const auto& entry) {
+        return !entry.second.has_value() && encode_upgrade_record(entry.first) == body;
+    });
+    if (held == records_.end() || !verified_proof_epoch(body, proof)) return false;
+    held->second = proof;
+    const uint64_t sequence = held->first.sequence;
+    persist();
+    spdlog::info("[upgrade] record {}: commit proof recovered", sequence);
+    if (proof_search_ && proof_search_->sequence == sequence) proof_search_.reset();
+    // Peers that lack the proof take it from this broadcast.
+    broadcast_record(sequence);
+    return true;
+}
+
+std::optional<std::size_t> UpgradeService::first_unproven() const {
+    for (std::size_t i = 0; i < records_.size(); ++i) {
+        if (!records_[i].second.has_value()) return i;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<uint64_t, uint64_t>> UpgradeService::search_bounds(
+    std::size_t index) const {
+    const HotStuffService* consensus = runtime_.consensus();
+    if (consensus == nullptr || index >= records_.size()) return std::nullopt;
+    const EpochId epoch = current_epoch();
+    uint64_t lower = 0;
+    for (std::size_t i = index; i-- > 0;) {
+        const auto& proof = records_[i].second;
+        if (!proof.has_value()) continue;
+        // An earlier record of an earlier epoch bounds nothing here.
+        if (proof->chain.front().proposal.epoch == epoch) {
+            lower = proof->chain.front().proposal.height.underlying();
+        }
+        break;
+    }
+    std::optional<uint64_t> upper;
+    for (std::size_t i = index + 1; i < records_.size(); ++i) {
+        const auto& proof = records_[i].second;
+        if (!proof.has_value()) continue;
+        // A later record finalized in an earlier epoch: so was this one, and
+        // only the current epoch's chain is served.
+        if (proof->chain.front().proposal.epoch != epoch) return std::nullopt;
+        upper = proof->chain.front().proposal.height.underlying();
+        break;
+    }
+    if (!upper) upper = consensus->last_committed_height().underlying() + 1;
+    if (*upper <= lower + 1) return std::nullopt;
+    return std::make_pair(lower, *upper);
+}
+
+// When the commit itself produced no proof, no peer holds one either. This
+// node then rebuilds it from the certified chain that its peers' consensus
+// still holds. The pages step down from the upper bound, because a peer that
+// restarted holds only the blocks above its restart.
+void UpgradeService::search_proof(std::size_t index, const NodeId& peer) {
+    // Only an active member holds the epoch state that a sync reply is
+    // checked against. A restarting member waits: its own restart sync must
+    // anchor on the current chain, not on an old page.
+    const HotStuffService* consensus = runtime_.consensus();
+    if (runtime_.epochs() == nullptr || consensus == nullptr || !consensus->synced() ||
+        driver_.phase() != DriverPhase::Active || !is_member(config_.self)) {
+        return;
+    }
+    const uint64_t sequence = records_[index].first.sequence;
+    if (proof_search_ && proof_search_->sequence == sequence &&
+        now_ms_ - proof_search_->sent_ms < kProofSearchTimeoutMs) {
+        return;  // A page is in flight.
+    }
+    const auto bounds = search_bounds(index);
+    if (!bounds) {
+        proof_search_.reset();
+        return;
+    }
+    const auto [lower, upper] = *bounds;
+    proof_search_ = ProofSearch{sequence, peer, lower, 0, 0};
+    request_page(upper > lower + kProofSearchStep + 1 ? upper - kProofSearchStep - 1 : lower);
+}
+
+void UpgradeService::request_page(uint64_t after) {
+    if (!proof_search_) return;
+    proof_search_->after = after;
+    proof_search_->sent_ms = now_ms_;
+    proof_search_->next_after.reset();
+    const EpochId epoch = current_epoch();
+    (void)router_.send(proof_search_->peer,
+                       router_.compose(SecurityMessageKind::SyncRequest,
+                                       SyncRequest{epoch, Height{after}}, epoch));
+}
+
+void UpgradeService::on_certified_chain(const SyncResponse& response, const NodeId& from) {
+    if (!healthy_ || response.chain.empty()) return;
+    std::vector<std::pair<Digest, std::vector<uint8_t>>> wanted;
+    for (const auto& [record, proof] : records_) {
+        if (proof.has_value()) continue;
+        auto body = encode_upgrade_record(record);
+        const Digest digest =
+            block_payload_digest(BlockPayload{BlockPayloadKind::UpgradeProgress, body});
+        wanted.emplace_back(digest, std::move(body));
+    }
+    const auto& chain = response.chain;
+    for (std::size_t i = 0; i + 2 < chain.size() && !wanted.empty(); ++i) {
+        const auto match = std::find_if(wanted.begin(), wanted.end(), [&](const auto& entry) {
+            return entry.first == chain[i].proposal.transitions_digest;
+        });
+        if (match == wanted.end()) continue;
+        CommitProof proof;
+        proof.chain.push_back({chain[i].proposal, chain[i].justify});
+        proof.chain.push_back({chain[i + 1].proposal, chain[i + 1].justify});
+        proof.chain.push_back({chain[i + 2].proposal, chain[i + 2].justify});
+        proof.certifying = i + 3 < chain.size() ? chain[i + 3].justify : response.high_qc;
+        if (recover_proof(match->second, proof)) wanted.erase(match);
+    }
+
+    // The next page of this node's own search, when this reply answers it.
+    if (!proof_search_ || from != proof_search_->peer || proof_search_->next_after) return;
+    const ProofSearch search = *proof_search_;
+    const bool sought = std::any_of(records_.begin(), records_.end(), [&](const auto& entry) {
+        return entry.first.sequence == search.sequence && !entry.second.has_value();
+    });
+    // A page that does not start right above the requested height means the
+    // peer holds no committed block there; the next sync round asks another.
+    if (!sought || chain.front().proposal.height.underlying() != search.after + 1 ||
+        search.after <= search.lower) {
+        if (sought && search.after <= search.lower) {
+            spdlog::debug("[upgrade] record {}: no finalizing block in the chain of {}",
+                          search.sequence, short_id(from));
+        }
+        proof_search_.reset();
+        return;
+    }
+    proof_search_->next_after = search.after > search.lower + kProofSearchStep
+                                    ? search.after - kProofSearchStep
+                                    : search.lower;
 }
 
 void UpgradeService::handle_record_request(const SecurityMessage& message) {

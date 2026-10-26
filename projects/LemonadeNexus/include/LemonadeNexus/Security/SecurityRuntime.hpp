@@ -98,6 +98,15 @@ public:
                                                 std::optional<EpochVoteKey> own_vote_key,
                                                 const Digest& previous_checkpoint);
 
+    /// Ends this node's hold on an epoch that a finalized handoff already
+    /// replaced. The caller must have verified that handoff first. Consensus,
+    /// the epoch share, any DKG session, and the epoch state end here, so the
+    /// node holds no epoch role, the same as a Tier 2 server. A caller that
+    /// holds the DKG outcome the handoff names can then enter the new epoch
+    /// with adopt_epoch_from_handoff. Returns false when no epoch state is
+    /// held. io thread.
+    bool leave_epoch();
+
 private:
     [[nodiscard]] bool start_consensus(EpochVoteKey own_vote_key, const Digest& previous_checkpoint);
     [[nodiscard]] AuthorityEpochContext authority_context() const;

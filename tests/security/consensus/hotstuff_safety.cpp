@@ -115,6 +115,54 @@ TEST_F(HotStuffSafety, LongerChainCommitsInOrder) {
     EXPECT_EQ(store.commits.back().height, 3u);
 }
 
+// Production incident: an upgrade record committed on every live member
+// with no commit proof. One of five members was down, so the votes for the
+// child of the record's block went to a leader that never formed their
+// certificate. The view timed out and the next leader extended the same
+// block again. commit_proof took the first child it found, the dead one,
+// found no grandchild under it, and returned nothing.
+TEST_F(HotStuffSafety, ACommitProofSkipsAChildThatNoCertificateExtends) {
+    make_service(0);
+    const auto chain = harness.build_chain(2);
+    const Block& b1 = chain[0];
+    const Block& b2 = chain[1];
+    const auto qc_b2 = harness.qc_for(b2.proposal);
+    // The live child, at the view after the timeout.
+    const Block b3 = harness.make_block(3, 4, b2.digest, qc_b2, 0x70);
+    // The dead child: chosen so that it orders first in chain state, as it
+    // did on the fleet.
+    std::optional<Block> dead;
+    for (uint8_t seed = 0x80; seed < 0xF0 && !dead; seed = static_cast<uint8_t>(seed + 4)) {
+        Block candidate = harness.make_block(3, 3, b2.digest, qc_b2, seed);
+        if (candidate.digest < b3.digest) dead = candidate;
+    }
+    ASSERT_TRUE(dead.has_value());
+    const Block b4 = harness.make_block(4, 5, b3.digest, harness.qc_for(b3.proposal), 0x74);
+    const Block b5 = harness.make_block(5, 6, b4.digest, harness.qc_for(b4.proposal), 0x78);
+
+    ASSERT_FALSE(feed(b1).rejected.has_value());
+    ASSERT_FALSE(feed(b2).rejected.has_value());
+    ASSERT_FALSE(feed(*dead).rejected.has_value());
+    ASSERT_FALSE(feed(b3).rejected.has_value());
+    ASSERT_FALSE(feed(b4).rejected.has_value());
+    const auto result = feed(b5);
+    ASSERT_FALSE(result.rejected.has_value());
+    ASSERT_FALSE(result.commits.empty());
+    EXPECT_EQ(result.commits.back().proposal_digest, b2.digest);
+
+    const auto proof = service->commit_proof(b2.digest);
+    ASSERT_TRUE(proof.has_value()) << "the dead sibling hid the committing chain";
+    ASSERT_EQ(proof->chain.size(), 3u);
+    EXPECT_EQ(nexus::security::proposal_digest(proof->chain[1].proposal), b3.digest);
+    EXPECT_EQ(nexus::security::proposal_digest(proof->chain[2].proposal), b4.digest);
+    EXPECT_EQ(nexus::security::verify_commit_proof(b2.proposal.transitions_digest, *proof,
+                                                   harness.validation_context(),
+                                                   harness.vote_keys),
+              nexus::security::CommitProofFailure::None);
+    // The dead child is not committed and has no proof.
+    EXPECT_FALSE(service->commit_proof(dead->digest).has_value());
+}
+
 TEST_F(HotStuffSafety, ReplayNeverVotesTwice) {
     make_service(0);
     const auto chain = harness.build_chain(3);

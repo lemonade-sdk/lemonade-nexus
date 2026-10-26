@@ -18,6 +18,88 @@ namespace {
 
 struct MultiEpochMesh : RotatingMeshBase {
     MultiEpochMesh() : RotatingMeshBase(5) {}
+
+    struct MissedActivation {
+        Node* stale = nullptr;
+        std::vector<Node*> members;
+    };
+
+    /// Runs the 1 -> 2 boundary with every founder and one reserve in the
+    /// pool. A founder that the first attempt selects verifies none of the
+    /// final attestations: its own challenges are lost and no verdict reaches
+    /// it. It then cannot form the readiness set the others commit, so it
+    /// never joins the ceremony. The mesh waits out the DKG stall window,
+    /// excludes it, and activates Epoch 2 under a replacement attempt. The
+    /// stale member stays online and ticking the whole time. With
+    /// `lose_handoff_proofs`, no handoff proof reaches it either.
+    MissedActivation activate_without_one(Node* candidate, bool lose_handoff_proofs) {
+        MissedActivation out;
+        std::vector<Node*> pool = founders;
+        pool.push_back(candidate);
+        observe(founders, pool, 1);
+        run_to_plan(founders);
+        const auto selected = selected_nodes(*founders.front());
+        for (Node* node : selected) {
+            if (node != founders.front() &&
+                std::find(founders.begin(), founders.end(), node) != founders.end()) {
+                out.stale = node;
+                break;
+            }
+        }
+        if (out.stale == nullptr) {
+            ADD_FAILURE() << "the first attempt selected no second founder";
+            return out;
+        }
+        Node* stale = out.stale;
+        std::erase_if(mesh.captured_final_challenges,
+                      [stale](const auto& entry) { return entry.first == stale->id; });
+        mesh.drop_if = [stale, lose_handoff_proofs](const Queued& item,
+                                                    const SecurityMessage& message) {
+            if (item.from == stale->id && message.kind == SecurityMessageKind::AttestationChallenge) {
+                return true;
+            }
+            return lose_handoff_proofs && item.to == stale->id &&
+                   message.kind == SecurityMessageKind::EpochHandoffProof;
+        };
+        std::vector<Node*> observers;
+        for (Node* founder : founders) {
+            if (founder != stale) observers.push_back(founder);
+        }
+
+        wait_for_keys(founders, selected, 2);
+        final_attest_subjects(9, selected, observers);
+        const std::size_t ready_before = mesh.captured_readiness.size();
+        for (int i = 0; i < 900 && mesh.captured_readiness.size() == ready_before; ++i) {
+            step(1, with_candidates(founders, selected));
+        }
+        if (mesh.captured_readiness.size() == ready_before) {
+            ADD_FAILURE() << "readiness never finalized";
+            return out;
+        }
+        EXPECT_EQ(stale->runtime->authority().dkg(), nullptr)
+            << "the stale member must miss the ceremony";
+
+        const std::size_t plans_before = mesh.captured_plans.size();
+        mesh.now_ms += (constants::kDkgStallSeconds + 5) * 1000;
+        for (int i = 0; i < 900 && mesh.captured_plans.size() == plans_before; ++i) {
+            step(1, with_candidates(founders, selected));
+            answer_final_challenges();
+        }
+        if (mesh.captured_plans.size() == plans_before) {
+            ADD_FAILURE() << "no replacement plan committed";
+            return out;
+        }
+        const NextEpochPlan& replacement = latest_plan();
+        EXPECT_TRUE(std::find(replacement.selected.begin(), replacement.selected.end(),
+                              stale->id) == replacement.selected.end())
+            << "the silent member survived into the replacement attempt";
+
+        out.members = selected_nodes(*founders.front());
+        wait_for_keys(founders, out.members, 2);
+        final_attest_subjects(11, out.members, observers);
+        run_to_activation(founders, out.members, 2);
+        return out;
+    }
 };
 
 // An idle Tier 2 reserve, holding only the pinned anchor, walks to the chain
@@ -178,10 +260,10 @@ TEST_F(MultiEpochMesh, RepeatedPromotionAndLateJoiningAcrossFourEpochs) {
     EXPECT_GT(members.front()->driver->last_committed_height(), before);
 
     // --- Stale-state recovery: the epoch-2 member D restarts at epoch 5. ---
-    // Its stored epoch is history. First run: it syncs into silence, walks
-    // the chain, and advances only its ANCHOR — the stale membership yields
-    // no vote and no progress. Second run: the advanced anchor supersedes the
-    // stored epoch and it resumes as Tier 2.
+    // Its stored epoch is history. It syncs into silence and walks the chain.
+    // The first verified link moves it off its finished epoch, and it walks on
+    // as Tier 2: the stale membership yields no vote and no progress, and no
+    // second restart is necessary. A later restart keeps it there.
     mesh.offline.erase(demoted->id);
     restart_node(*demoted);
     demoted->driver->start(mesh.now_ms);
@@ -197,8 +279,10 @@ TEST_F(MultiEpochMesh, RepeatedPromotionAndLateJoiningAcrossFourEpochs) {
     }
     ASSERT_NE(demoted->driver->verified_authority(), nullptr);
     EXPECT_EQ(demoted->driver->verified_authority()->epoch, 5u);
-    // Still only availability lost: it never rejoined its dead epoch.
-    EXPECT_EQ(demoted->driver->phase(), DriverPhase::Syncing);
+    // It never rejoined its dead epoch.
+    EXPECT_EQ(demoted->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(demoted->runtime->epochs(), nullptr);
+    EXPECT_FALSE(demoted->driver->is_tier1_member());
 
     restart_node(*demoted);
     demoted->driver->start(mesh.now_ms);
@@ -503,6 +587,150 @@ TEST_F(MultiEpochMesh, ABoundaryOutlivingTheTargetEpochStillActivates) {
     for (Node* member : members) {
         EXPECT_FALSE(member->driver->eligibility().ledger().faults().contains(truant->id));
     }
+}
+
+// A current member misses one boundary stage and the mesh activates the next
+// epoch without it. Its own commit of the handoff can never activate it,
+// because it never prepared that handoff. The broadcast handoff proof,
+// verified under its own epoch's frozen keys, moves it off the finished epoch
+// to the role a restart would give it: Tier 2, holding the verified chain.
+TEST_F(MultiEpochMesh, AMemberThatMissedTheActivationContinuesAsTierTwo) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+
+    const auto [stale, members] = activate_without_one(reserves[0], false);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_NE(stale, nullptr);
+    ASSERT_FALSE(members.empty());
+
+    // The proof arrived with the commit; no chain request was necessary.
+    EXPECT_EQ(stale->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(stale->runtime->epochs(), nullptr);
+    EXPECT_EQ(stale->runtime->consensus(), nullptr);
+    EXPECT_FALSE(stale->runtime->authority().key_epoch().has_value());
+    EXPECT_FALSE(stale->driver->is_tier1_member());
+    ASSERT_NE(stale->driver->verified_authority(), nullptr);
+    EXPECT_EQ(stale->driver->verified_authority()->epoch, 2u);
+    EXPECT_EQ(stale->driver->verified_authority()->members,
+              members.front()->runtime->epochs()->current().tier1_members.members());
+
+    // The followed link is durable: a restart keeps the node on the verified
+    // chain as Tier 2 and never resumes the finished epoch.
+    restart_node(*stale);
+    stale->driver->start(mesh.now_ms);
+    EXPECT_EQ(stale->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(stale->runtime->epochs(), nullptr);
+    ASSERT_NE(stale->driver->verified_authority(), nullptr);
+    EXPECT_EQ(stale->driver->verified_authority()->epoch, 2u);
+
+    // Epoch 2 keeps committing under its own membership.
+    const Height before = members.front()->driver->last_committed_height();
+    advance_commit(with_candidates(founders, members));
+    EXPECT_GT(members.front()->driver->last_committed_height(), before);
+}
+
+// The same miss, with every handoff proof to the stale member lost. A proof
+// that does not verify moves nothing. The announcement of Epoch 2 is a hint
+// only; the stale member acts on it by asking for the authority chain, and
+// the verified page moves it off the finished epoch.
+TEST_F(MultiEpochMesh, AMemberThatLostTheHandoffProofsFollowsTheVerifiedChain) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+
+    const auto [stale, members] = activate_without_one(reserves[0], true);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_NE(stale, nullptr);
+    ASSERT_FALSE(members.empty());
+    ASSERT_FALSE(mesh.captured_handoffs.empty());
+    ASSERT_EQ(stale->driver->current_epoch(), 1u) << "no proof reached the stale member yet";
+
+    // Hostile copies of the genuine proof: a membership the commit never
+    // certified, and a certificate without its quorum. Neither changes state.
+    const EpochHandoffProofMsg genuine = mesh.captured_handoffs.back();
+    EpochHandoffProofMsg widened = genuine;
+    widened.handoff.members.push_back(stale->id);
+    stale->driver->on_epoch_handoff_proof(widened);
+    EpochHandoffProofMsg unsigned_proof = genuine;
+    unsigned_proof.proof.certifying.signers.resize(1);
+    stale->driver->on_epoch_handoff_proof(unsigned_proof);
+    AuthorityChainPage forged_page;
+    forged_page.links.push_back(unsigned_proof);
+    stale->driver->on_authority_chain_page(forged_page, founders[0]->id);
+    EXPECT_EQ(stale->driver->current_epoch(), 1u);
+    EXPECT_EQ(stale->driver->phase(), DriverPhase::Active);
+    ASSERT_NE(stale->driver->verified_authority(), nullptr);
+    EXPECT_EQ(stale->driver->verified_authority()->epoch, 1u);
+
+    for (int i = 0; i < 60 && stale->runtime->epochs() != nullptr; ++i) {
+        step(1, with_candidates(founders, members));
+    }
+    EXPECT_EQ(stale->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(stale->runtime->epochs(), nullptr);
+    EXPECT_FALSE(stale->driver->is_tier1_member());
+    ASSERT_NE(stale->driver->verified_authority(), nullptr);
+    EXPECT_EQ(stale->driver->verified_authority()->epoch, 2u);
+}
+
+// A selected member holds its DKG outcome and is ready for the handoff, but
+// its consensus traffic is lost while the others commit it. The others leave
+// Epoch 1, so its own commit can never come. The announcement of Epoch 2
+// makes it ask for the authority chain, and the verified link activates it as
+// the member the handoff names. It then votes in Epoch 2.
+TEST_F(MultiEpochMesh, ASelectedMemberThatMissedTheHandoffCommitJoinsItsEpoch) {
+    bootstrap();
+    run_until_committed(1);
+
+    observe(founders, founders, 1);
+    run_to_plan(founders);
+    const auto selected = selected_nodes(*founders.front());
+    ASSERT_EQ(selected.size(), founders.size());
+    wait_for_keys(founders, selected, 2);
+
+    Node* late = founders[1];
+    const auto ready = [late] {
+        const EpochManager* epochs = late->runtime->epochs();
+        return epochs != nullptr && epochs->transition() != nullptr &&
+               epochs->transition()->phase == EpochTransitionPhase::Ready;
+    };
+    for (int i = 0; i < 900 && !ready(); ++i) {
+        step(1);
+        answer_final_challenges();
+    }
+    ASSERT_TRUE(ready()) << "the member never held the DKG outcome";
+    mesh.drop_if = [late](const Queued& item, const SecurityMessage& message) {
+        const bool consensus = message.kind == SecurityMessageKind::HotStuffProposal ||
+                               message.kind == SecurityMessageKind::HotStuffVote ||
+                               message.kind == SecurityMessageKind::HotStuffTimeout;
+        return consensus && (item.to == late->id || item.from == late->id);
+    };
+
+    std::vector<Node*> others;
+    for (Node* founder : founders) {
+        if (founder != late) others.push_back(founder);
+    }
+    run_to_activation(founders, others, 2);
+    ASSERT_EQ(late->driver->current_epoch(), 1u) << "the member's own commit cannot have come";
+
+    for (int i = 0; i < 60 && late->driver->current_epoch() != 2u; ++i) {
+        step(1);
+    }
+    EXPECT_EQ(late->driver->current_epoch(), 2u);
+    EXPECT_EQ(late->driver->phase(), DriverPhase::Active);
+    EXPECT_TRUE(late->driver->is_tier1_member());
+    ASSERT_TRUE(late->runtime->authority().key_epoch().has_value());
+    EXPECT_EQ(*late->runtime->authority().key_epoch(), 2u);
+    ASSERT_NE(late->driver->verified_authority(), nullptr);
+    EXPECT_EQ(late->driver->verified_authority()->epoch, 2u);
+
+    // Its consensus traffic flows again, and it commits with Epoch 2.
+    mesh.drop_if = nullptr;
+    const Height before = late->driver->last_committed_height();
+    for (int i = 0; i < 800 && late->driver->last_committed_height() <= before; ++i) {
+        step(1);
+    }
+    EXPECT_GT(late->driver->last_committed_height(), before);
 }
 
 // A modified anchor record never loads: the driver fails closed rather than

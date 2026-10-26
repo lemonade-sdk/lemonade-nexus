@@ -767,34 +767,37 @@ std::optional<CommitProof> HotStuffService::commit_proof(const Digest& proposal_
         return std::nullopt;
     }
     // Walk down from the child: each child's justify certifies its parent
-    // under the strict rule, so the links identify themselves.
-    const auto child_of = [this](const Digest& parent) -> const BlockRecord* {
+    // under the strict rule, so the links identify themselves. A block can
+    // have more than one child. When the leader that collects the votes for
+    // a child is down, the view times out and the next leader extends the
+    // same parent again; the first child stays in chain state with no
+    // certificate above it. Every candidate is tried, so such a dead sibling
+    // cannot hide the certified chain that committed the block.
+    const auto children_of = [this](const Digest& parent) {
+        std::vector<const BlockRecord*> children;
         for (const auto& [digest, record] : blocks_) {
             if (record.proposal.parent_digest == parent &&
                 record.justify.proposal_digest == parent) {
-                return &record;
+                children.push_back(&record);
             }
         }
-        return nullptr;
+        return children;
     };
-    const BlockRecord* child = child_of(proposal_digest);
-    if (child == nullptr) {
-        return std::nullopt;
+    for (const BlockRecord* child : children_of(proposal_digest)) {
+        for (const BlockRecord* grandchild : children_of(child->digest)) {
+            const auto certifying = qc_by_block_.find(grandchild->digest);
+            if (certifying == qc_by_block_.end()) {
+                continue;
+            }
+            CommitProof proof;
+            proof.chain.push_back({committed->second.proposal, committed->second.justify});
+            proof.chain.push_back({child->proposal, child->justify});
+            proof.chain.push_back({grandchild->proposal, grandchild->justify});
+            proof.certifying = certifying->second;
+            return proof;
+        }
     }
-    const BlockRecord* grandchild = child_of(child->digest);
-    if (grandchild == nullptr) {
-        return std::nullopt;
-    }
-    const auto certifying = qc_by_block_.find(grandchild->digest);
-    if (certifying == qc_by_block_.end()) {
-        return std::nullopt;
-    }
-    CommitProof proof;
-    proof.chain.push_back({committed->second.proposal, committed->second.justify});
-    proof.chain.push_back({child->proposal, child->justify});
-    proof.chain.push_back({grandchild->proposal, grandchild->justify});
-    proof.certifying = certifying->second;
-    return proof;
+    return std::nullopt;
 }
 
 TimeoutVote HotStuffService::make_timeout_vote() const {

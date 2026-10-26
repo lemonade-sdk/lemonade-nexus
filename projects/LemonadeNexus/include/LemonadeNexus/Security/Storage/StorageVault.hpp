@@ -44,9 +44,47 @@
 // key id matches the DEK in memory, so either side of the switch reads the
 // same content.
 //
-// Not covered (boot set, B6): the gossip identity and the storage share, both
-// sealed. Rollback of a whole file to an older ciphertext under the same DEK is
-// not detected.
+// Coverage additions. Each VaultCoverage group names the coverage generation
+// that added it (`since`), and vault-state.json records the generation the
+// files were encrypted under ("coverage"; a file without it records 1). When a
+// release adds a group to a vault already in "encrypted", the files of that
+// group are plaintext. Until the vault adopts them, the plaintext of that group
+// stays authoritative, as during step 2 above, and files_ready() stays false,
+// so no service that reads covered files starts. Adoption runs on the first
+// tick with the DEK in memory and a verified unlock: it stages each file of the
+// new groups, reads it back and compares it with the plaintext, records the new
+// generation together with phase "promoting", and then overwrites and replaces
+// the plaintext. After that record the group is encrypted like every other
+// group: plaintext there is refused. A file of a new group that has the header
+// but does not open under the DEK stops the adoption (fail closed). A group of
+// an earlier generation never accepts plaintext after the migration.
+//
+// Covered (default_coverage()): the node identity, the JWT secret, the DDNS
+// credentials, the account envelope replica and the account data store (chat
+// blobs and group-key envelopes), the link token ledger and replica, the tree
+// nodes, deltas, log, and committed operation ids, the server admission
+// records, the user credentials and the Ed25519 revocation list, the link
+// token files of releases before v2026.10.26, and the TLS and ACME private
+// keys.
+//
+// Not covered, with the reason:
+//   - Boot set (B6): the gossip identity and the storage share are sealed by
+//     the vTPM. identity/keypair.json is the unsealed legacy copy until the
+//     sealed migration finishes; a host that cannot seal keeps it (B6 limit).
+//   - Read before the unlock (B8, B12 startup): everything under security/
+//     (epoch, consensus, storage key records, the wrapped DEK, this state
+//     file, vote keys), identity/wrap_local.key, identity/peers.json and
+//     identity/ns_slots.json (gossip), and ipam/allocations.json (IPAM starts
+//     before the unlock). The vault refuses every read while the DEK is locked.
+//   - Public or authenticated another way: public keys and certificates
+//     (identity/keypair.pub, identity/server_cert.json, certs/<fqdn>/
+//     fullchain.pem and meta.json), certs/account_url.txt, identity/hostname,
+//     the DNS replica (every entry is origin-signed and verified on load), and
+//     acl.db (the permission column is already encrypted; a live SQLite file
+//     does not fit one sealed object).
+// Rollback of a whole file to an older ciphertext under the same DEK is not
+// detected, and neither is a vault-state.json edited to an earlier coverage
+// generation (the state file itself is not authenticated).
 //
 // Thread safety: every public member is thread-safe. tick() and attach() run on
 // the security io thread. The vault calls the DataKeySource under its own
@@ -103,11 +141,18 @@ public:
 
 /// One group of covered files: `directory` (relative to the data root, "/"
 /// separated) and either one exact `name` or every name ending in `suffix`.
+/// The group covers files in `directory` and in every directory below it. A
+/// `directory` that ends in "*" names every top-level directory that starts
+/// with the text before the "*" (for example "chat-*"), and covers only the
+/// files directly inside each one. `since` is the coverage generation that
+/// added the group (1 for the groups of the first Phase 7 release); see
+/// "Coverage additions" above.
 struct VaultCoverage {
     std::string domain;
     std::string directory;
     std::string name;
     std::string suffix;
+    uint32_t since = 1;
 };
 
 enum class VaultMode : uint8_t { Plaintext, Migrating, Encrypted };
@@ -187,9 +232,13 @@ public:
 
     [[nodiscard]] VaultMode mode() const;
     [[nodiscard]] VaultPhase phase() const;
-    /// False only when the files are encrypted and the DEK is not in memory.
+    /// False when the files are encrypted and the DEK is not in memory, or
+    /// while groups added by a newer coverage generation wait for adoption.
     /// Services that read covered files start after this turns true.
     [[nodiscard]] bool files_ready() const;
+    /// True when the files are encrypted and groups added after the recorded
+    /// coverage generation are not adopted yet; tick() adopts them.
+    [[nodiscard]] bool adoption_pending() const;
     /// Unix ms of the last completed migration or rotation; 0 when none.
     [[nodiscard]] uint64_t last_rotation_ms() const;
     [[nodiscard]] bool rotation_requested() const;
@@ -258,6 +307,14 @@ private:
     void discard_staged();
     [[nodiscard]] bool save_state();
 
+    /// True when `file` belongs to a group of the recorded coverage generation.
+    [[nodiscard]] bool adopted(const Covered& file) const;
+    /// True when reads and writes of `file` use the DEK: the files are
+    /// encrypted and its group is adopted.
+    [[nodiscard]] bool sealed_at_rest(const Covered& file) const;
+    [[nodiscard]] bool adoption_pending_locked() const;
+
+    void tick_adoption(uint64_t wall_ms);
     void tick_migration(uint64_t wall_ms);
     void tick_rotation(uint64_t wall_ms);
     void start_rotation();
@@ -275,6 +332,10 @@ private:
     VaultMode mode_ = VaultMode::Plaintext;
     VaultPhase phase_ = VaultPhase::Idle;
     KeyId target_key_id_{};
+    /// The newest `since` in coverage_.
+    uint32_t current_generation_ = 1;
+    /// The coverage generation recorded in the state file.
+    uint32_t coverage_generation_ = 1;
     uint64_t last_rotation_ms_ = 0;
     bool rotation_requested_ = false;
     std::vector<Covered> pending_;

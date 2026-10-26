@@ -1,6 +1,8 @@
 #include <LemonadeNexus/Auth/TokenLinkAuthProvider.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Security/DurableWrite.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Tree/TreeRules.hpp>
 
@@ -37,8 +39,70 @@ uint64_t system_now_ms() {
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-/// Write a legacy token `record` to `path`, replacing any file there.
-bool write_legacy_record(const std::filesystem::path& path, const LinkTokenRecord& record) {
+enum class LegacyFileState { Absent, Unreadable, Present };
+
+struct LegacyFile {
+    LegacyFileState state = LegacyFileState::Absent;
+    json data;
+};
+
+/// Read a legacy token record, through the storage vault when it covers the
+/// path (StorageVault "link-token-legacy"). Unreadable (locked, refused, read
+/// failure, or not a JSON object) is never treated as absent.
+LegacyFile read_legacy_file(const storage::FileStorageService& storage,
+                            const std::filesystem::path& path) {
+    LegacyFile out;
+    std::string text;
+    if (auto* vault = storage.vault_for(path)) {
+        auto read = vault->read(path);
+        if (read.status == security::VaultReadStatus::Missing) return out;
+        if (read.status != security::VaultReadStatus::Ok) {
+            spdlog::error("[token-link] legacy token file {} does not open under the data key",
+                          path.filename().string());
+            out.state = LegacyFileState::Unreadable;
+            return out;
+        }
+        text = std::move(read.bytes);
+    } else {
+        std::error_code ec;
+        const auto status = std::filesystem::status(path, ec);
+        if (ec || !std::filesystem::exists(status)) {
+            if (!ec || ec == std::errc::no_such_file_or_directory) return out;
+            out.state = LegacyFileState::Unreadable;
+            return out;
+        }
+        std::ifstream ifs(path, std::ios::binary);
+        std::ostringstream ss;
+        if (ifs) ss << ifs.rdbuf();
+        if (!ifs || ifs.bad()) {
+            out.state = LegacyFileState::Unreadable;
+            return out;
+        }
+        text = std::move(ss).str();
+    }
+    auto parsed = json::parse(text, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_object()) {
+        out.state = LegacyFileState::Unreadable;
+        return out;
+    }
+    out.state = LegacyFileState::Present;
+    out.data = std::move(parsed);
+    return out;
+}
+
+/// Remove a legacy token file (and a staged vault copy). True when it is gone.
+bool remove_legacy_file(const storage::FileStorageService& storage,
+                        const std::filesystem::path& path) {
+    if (auto* vault = storage.vault_for(path)) return vault->remove(path);
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return !std::filesystem::exists(path, ec) && !ec;
+}
+
+/// Write a legacy token `record` to `path` durably, through the vault when it
+/// covers the path.
+bool write_legacy_record(const storage::FileStorageService& storage,
+                         const std::filesystem::path& path, const LinkTokenRecord& record) {
     json j = {
         {"owner_user_id", record.owner_user_id},
         {"owner_pubkey",  record.owner_pubkey},
@@ -47,19 +111,15 @@ bool write_legacy_record(const std::filesystem::path& path, const LinkTokenRecor
         {"expires_at",    record.expires_at},
         {"permissions",   record.permissions},
     };
-    try {
-        std::filesystem::create_directories(path.parent_path());
-        std::ofstream ofs(path, std::ios::trunc);
-        if (!ofs) {
-            spdlog::error("[token-link] Failed to open token file: {}", path.string());
-            return false;
-        }
-        ofs << j.dump(2);
-        return ofs.good();
-    } catch (const std::exception& e) {
-        spdlog::error("[token-link] Exception writing token file: {}", e.what());
+    const auto text = j.dump(2);
+    if (auto* vault = storage.vault_for(path)) return vault->write(path, text);
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (!security::write_durable(path, text)) {
+        spdlog::error("[token-link] Failed to write token file: {}", path.string());
         return false;
     }
+    return true;
 }
 
 } // namespace
@@ -348,16 +408,11 @@ void TokenLinkAuthProvider::purge() {
 std::optional<LinkTokenRecord> TokenLinkAuthProvider::legacy_verify(std::string_view token) {
     if (token.empty()) return std::nullopt;
 
-    auto path = legacy_token_path(token);
-    json j;
-    {
-        std::ifstream ifs(path);
-        if (!ifs) return std::nullopt;
-        std::ostringstream ss;
-        ss << ifs.rdbuf();
-        j = json::parse(ss.str(), nullptr, false);
-        if (j.is_discarded() || !j.is_object()) return std::nullopt;
-    }
+    const auto path = legacy_token_path(token);
+    const auto file = read_legacy_file(storage_, path);
+    // An unreadable record is refused, and it stays on disk as it is.
+    if (file.state != LegacyFileState::Present) return std::nullopt;
+    const auto& j = file.data;
 
     LinkTokenRecord record{
         .owner_user_id = j.value("owner_user_id", std::string{}),
@@ -382,8 +437,7 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::legacy_verify(std::string_
     }
 
     if (record.expires_at <= now_sec()) {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
+        (void)remove_legacy_file(storage_, path);
         spdlog::debug("[token-link] Rejected expired link token");
         return std::nullopt;
     }
@@ -393,13 +447,14 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::legacy_verify(std::string_
 }
 
 std::optional<LinkTokenRecord> TokenLinkAuthProvider::legacy_consume(std::string_view token) {
+    // consume() holds mutex_, so the read and the removal are one step for
+    // every other redemption on this server.
     auto record = legacy_verify(token);
     if (!record) return std::nullopt;
 
-    std::error_code ec;
-    if (!std::filesystem::remove(legacy_token_path(token), ec)) {
-        // Already consumed by a concurrent request — treat as spent.
-        spdlog::warn("[token-link] Link token already consumed");
+    if (!remove_legacy_file(storage_, legacy_token_path(token))) {
+        // Still on disk: not consumed, so not handed out.
+        spdlog::error("[token-link] Link token file could not be removed; not redeemed");
         return std::nullopt;
     }
 
@@ -410,9 +465,9 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::legacy_consume(std::string
 bool TokenLinkAuthProvider::legacy_refund(std::string_view token, const LinkTokenRecord& record) {
     if (record.expires_at <= now_sec()) return false;
     const auto path = legacy_token_path(token);
-    std::error_code ec;
-    if (std::filesystem::exists(path, ec) || ec) return false;
-    if (!write_legacy_record(path, record)) return false;
+    // Present or unreadable: a record stands there and is never replaced.
+    if (read_legacy_file(storage_, path).state != LegacyFileState::Absent) return false;
+    if (!write_legacy_record(storage_, path, record)) return false;
     spdlog::info("[token-link] Restored unused link token for group {}", record.group_node_id);
     return true;
 }
@@ -447,7 +502,8 @@ std::size_t TokenLinkAuthProvider::revoke_where(
         for (const auto& e : to_publish) (void)publisher(e);
     }
 
-    // Tokens an earlier release stored as one plaintext file each.
+    // Tokens an earlier release stored as one file each. An unreadable file is
+    // skipped and stays: it is neither matched nor removed.
     const auto dir = storage_.data_root() / std::string(kLedgerCategory);
     std::error_code ec;
     if (std::filesystem::is_directory(dir, ec)) {
@@ -456,12 +512,9 @@ std::size_t TokenLinkAuthProvider::revoke_where(
             if (entry.path().extension() != ".json" || entry.path().filename() == kLedgerFile) {
                 continue;
             }
-            std::ifstream ifs(entry.path());
-            if (!ifs) continue;
-            std::ostringstream ss;
-            ss << ifs.rdbuf();
-            const auto j = json::parse(ss.str(), nullptr, false);
-            if (j.is_discarded() || !j.is_object()) continue;
+            const auto file = read_legacy_file(storage_, entry.path());
+            if (file.state != LegacyFileState::Present) continue;
+            const auto& j = file.data;
             LinkTokenRecord record;
             record.owner_user_id = j.value("owner_user_id", std::string{});
             record.owner_pubkey  = j.value("owner_pubkey", std::string{});
@@ -469,7 +522,7 @@ std::size_t TokenLinkAuthProvider::revoke_where(
             if (match(record)) doomed.push_back(entry.path());
         }
         for (const auto& path : doomed) {
-            if (std::filesystem::remove(path, ec)) ++removed;
+            if (remove_legacy_file(storage_, path)) ++removed;
         }
     }
     if (removed > 0) spdlog::info("[token-link] Revoked {} link token(s)", removed);
