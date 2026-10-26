@@ -32,6 +32,9 @@ if(APPLE)
         "-framework Security"
         "-framework SystemConfiguration"
     )
+elseif(ANDROID)
+    # Bionic has pthreads in libc; there is no libpthread.
+    target_link_libraries(virtual-netstack INTERFACE dl m)
 elseif(UNIX)
     target_link_libraries(virtual-netstack INTERFACE pthread dl m)
 elseif(WIN32)

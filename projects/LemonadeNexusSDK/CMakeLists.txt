@@ -112,6 +112,29 @@ if(BUILD_SDK_SHARED)
             MACOSX_RPATH ON
             INSTALL_NAME_DIR "@rpath")
 
+    # iOS apps load a dynamic library only from a framework bundle in the
+    # app's Frameworks directory: lemonade_nexus_sdk.framework, packed into an
+    # XCFramework by scripts/build-sdk-mobile.sh.
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set_target_properties(LemonadeNexusSDKShared PROPERTIES
+                FRAMEWORK TRUE
+                MACOSX_FRAMEWORK_IDENTIFIER io.lemonade-nexus.sdk
+                MACOSX_FRAMEWORK_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+                MACOSX_FRAMEWORK_BUNDLE_VERSION "${PROJECT_VERSION}"
+                MACOSX_FRAMEWORK_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist.in")
+    endif()
+
+    # The visibility preset hides only the SDK's own code; symbols from the
+    # static OpenSSL and Rust archives would still be exported. On the mobile
+    # builds export the ln_* API alone, so an app that also bundles OpenSSL or
+    # BoringSSL cannot bind to this copy (Android resolves symbols in one flat
+    # namespace).
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        target_link_options(LemonadeNexusSDKShared PRIVATE "LINKER:-exported_symbol,_ln_*")
+    elseif(ANDROID)
+        target_link_options(LemonadeNexusSDKShared PRIVATE "LINKER:--exclude-libs,ALL")
+    endif()
+
     if(NOT MSVC AND TARGET all_projects)
         add_dependencies(all_projects LemonadeNexusSDKShared)
     endif()

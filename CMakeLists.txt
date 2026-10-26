@@ -82,6 +82,23 @@ endif()
 # sidecar/embeddable profiles.
 option(LEMONADE_NEXUS_MINIMAL_DEPS "Build without TPM FAPI support" OFF)
 
+# The client SDK alone, for the mobile builds (scripts/build-sdk-mobile.sh):
+# only the SDK's own dependencies, no server, sidecar, tools or tests, so the
+# build cross-compiles for iOS and Android.
+option(LEMONADE_NEXUS_SDK_ONLY "Build only the client SDK and its dependencies" OFF)
+
+if(LEMONADE_NEXUS_SDK_ONLY)
+    include(libraries/openssl)
+    include(libraries/nlohmann_json)
+    include(libraries/spdlog)
+    include(libraries/httplib)
+    include(libraries/libsodium)
+    include(libraries/boringtun)
+    include(libraries/virtual-netstack)
+    add_subdirectory(projects/LemonadeNexusSDK)
+    return()
+endif()
+
 include(libraries/openssl)        # Must come before tss2-fapi, httplib, and jwt-cpp (they depend on OpenSSL)
 include(libraries/tss2-fapi)      # TPM2 Feature API (Linux only; no-op elsewhere)
 include(libraries/asio)
