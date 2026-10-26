@@ -13,7 +13,7 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../sdk/sdk.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import '../platform/platform_integration.dart';
 import '../platform/settings_store.dart';
 import 'app_state.dart';

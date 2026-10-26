@@ -854,15 +854,20 @@ class LemonadeNexusSdk {
     return _parseJson(json, NetworkJoinResponse.fromJson);
   }
 
-  /// Leaves the current network.
+  /// Leaves the current network: deletes this device's node.
   Future<void> leaveNetwork() async {
     _checkDisposed();
     _checkConnected();
-    final json = await _offThread((f, c) => f.leaveNetwork(c));
-    if (json == null) {
-      throw SdkException(LnError.internal, message: 'Failed to leave network');
+    final (error, json) = await _offThread((f, c) => f.leaveNetwork(c));
+    if (error != LnError.success) {
+      String? reason;
+      if (json != null) {
+        try {
+          reason = (jsonDecode(json) as Map<String, dynamic>)['error']?.toString();
+        } catch (_) {}
+      }
+      throw SdkException(error, message: reason ?? 'Failed to leave network', rawJson: json);
     }
-    // Success
   }
 
   // =========================================================================
@@ -971,6 +976,15 @@ class LemonadeNexusSdk {
       throw SdkException(LnError.internal, message: 'Failed to get mesh peers');
     }
     return _parseJsonList(json, MeshPeer.fromJson);
+  }
+
+  /// Whether the mesh dataplane is up right now. Unlike [getMeshStatus],
+  /// whose `isUp` is the orchestrator's last periodic snapshot (false for a
+  /// while after [enableMesh]), this reads the dataplane itself.
+  bool isMeshActive() {
+    _checkDisposed();
+    if (_client == null) return false;
+    return _ffi.meshIsActive(_client!);
   }
 
   /// Forces an immediate mesh peer refresh.

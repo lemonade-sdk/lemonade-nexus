@@ -11,8 +11,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../sdk/ffi_bindings.dart' show LnError;
-import '../sdk/lemonade_nexus_sdk.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import '../state/providers.dart';
 import '../../theme/app_theme.dart';
 

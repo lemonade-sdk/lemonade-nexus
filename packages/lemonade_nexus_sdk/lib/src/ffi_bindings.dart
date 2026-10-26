@@ -628,6 +628,13 @@ typedef _LnMeshRefreshDart = int Function(
   LnClientHandle client,
 );
 
+typedef _LnMeshIsActive = ffi.Int32 Function(
+  LnClientHandle client,
+);
+typedef _LnMeshIsActiveDart = int Function(
+  LnClientHandle client,
+);
+
 // Stats & server listing
 typedef _LnStats = ffi.Int32 Function(
   LnClientHandle client,
@@ -956,6 +963,8 @@ class LemonadeNexusFfi {
       _lib.lookupFunction<_LnMeshPeers, _LnMeshPeersDart>('ln_mesh_peers');
   late final _lnMeshRefresh =
       _lib.lookupFunction<_LnMeshRefresh, _LnMeshRefreshDart>('ln_mesh_refresh');
+  late final _lnMeshIsActive =
+      _lib.lookupFunction<_LnMeshIsActive, _LnMeshIsActiveDart>('ln_mesh_is_active');
 
   // Stats & server listing
   late final _lnStats =
@@ -1055,6 +1064,13 @@ class LemonadeNexusFfi {
             '/lib/liblemonade_nexus_sdk.so';
         _lib = ffi.DynamicLibrary.open(
             File(bundled).existsSync() ? bundled : 'liblemonade_nexus_sdk.so');
+      } else if (Platform.isIOS) {
+        // The plugin's XCFramework is embedded in the app's Frameworks dir.
+        _lib = ffi.DynamicLibrary.open(
+            'lemonade_nexus_sdk.framework/lemonade_nexus_sdk');
+      } else if (Platform.isAndroid) {
+        // Packaged from the plugin's jniLibs into the APK's native libraries.
+        _lib = ffi.DynamicLibrary.open('liblemonade_nexus_sdk.so');
       } else {
         throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
       }
@@ -1855,15 +1871,12 @@ class LemonadeNexusFfi {
     }
   }
 
-  String? leaveNetwork(LnClientHandle client) {
+  /// The SDK result and its JSON ({success, error?}), also on failure.
+  (LnError, String?) leaveNetwork(LnClientHandle client) {
     final outJson = calloc<ffi.Pointer<ffi.Char>>();
     try {
       final result = _lnLeaveNetwork(client, outJson);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
+      return (LnError.fromCode(result), toStringAndFree(outJson.value));
     } finally {
       calloc.free(outJson);
     }
@@ -1956,6 +1969,9 @@ class LemonadeNexusFfi {
   LnError meshRefresh(LnClientHandle client) {
     return LnError.fromCode(_lnMeshRefresh(client));
   }
+
+  /// Whether the client's mesh dataplane is up right now (no network I/O).
+  bool meshIsActive(LnClientHandle client) => _lnMeshIsActive(client) == 1;
 
   // =========================================================================
   // Stats & Server Listing

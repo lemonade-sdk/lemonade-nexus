@@ -112,6 +112,11 @@ class DnsDiscoveryService {
   /// Per-query timeout for DoH requests.
   final Duration queryTimeout;
 
+  /// Whether to look up the client's region by geo-IP (ip-api.com, plain
+  /// HTTP). false uses the system locale only, which sends the client's IP
+  /// address to no third party; discovery then still finds every region.
+  final bool geoIpLookup;
+
   /// Cached region for the current session (avoid re-detecting on every call).
   String? _cachedRegion;
   bool _regionDetected = false;
@@ -145,6 +150,7 @@ class DnsDiscoveryService {
     this.domain = 'lemonade-nexus.io',
     this.defaultHttpPort = 9100,
     this.queryTimeout = const Duration(seconds: 3),
+    this.geoIpLookup = true,
   });
 
   // ---------------------------------------------------------------------------
@@ -292,7 +298,8 @@ class DnsDiscoveryService {
     if (_regionDetected) {
       return _cachedRegion;
     }
-    final detected = await _detectRegionViaGeoIP();
+    final detected =
+        geoIpLookup ? await _detectRegionViaGeoIP() : _regionFromLocale();
     _cachedRegion = detected;
     _regionDetected = true;
     return detected;

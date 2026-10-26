@@ -12,7 +12,7 @@ Dart FFI wrapper for the Lemonade Nexus C SDK.
 | `sdk.dart` | Barrel export |
 
 The C ABI surface is defined in
-[`projects/LemonadeNexusSDK/include/LemonadeNexusSDK/lemonade_nexus.h`](../../../../../projects/LemonadeNexusSDK/include/LemonadeNexusSDK/lemonade_nexus.h).
+[`projects/LemonadeNexusSDK/include/LemonadeNexusSDK/lemonade_nexus.h`](../../../../projects/LemonadeNexusSDK/include/LemonadeNexusSDK/lemonade_nexus.h).
 Keep the binding list in sync with that header; do not track a manual
 function count here.
 
@@ -70,7 +70,7 @@ function count here.
 ## Usage
 
 ```dart
-import 'package:nexus_client/src/sdk/lemonade_nexus_sdk.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 
 final sdk = LemonadeNexusSdk();
 

@@ -1,0 +1,35 @@
+name: lemonade_nexus_sdk
+description: Dart FFI bindings for the Lemonade Nexus client SDK, with the native library for iOS and Android.
+version: 0.9.8
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+  flutter: '>=3.22.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.0
+  http: ^1.1.0
+  json_annotation: ^4.8.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  build_runner: ^2.4.6
+  json_serializable: ^6.7.1
+  flutter_lints: ^6.0.0
+
+# The desktop clients bundle the library themselves (see
+# .github/workflows/flutter-clients.yml); on iOS and Android this plugin ships
+# it: ios/Frameworks/lemonade_nexus_sdk.xcframework and
+# android/src/main/jniLibs/<abi>/liblemonade_nexus_sdk.so, written by
+# scripts/build-sdk-mobile.sh or downloaded at build time (native/manifest.json).
+flutter:
+  plugin:
+    platforms:
+      android:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true

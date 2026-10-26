@@ -12,11 +12,11 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../sdk/sdk.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import '../platform/app_paths.dart';
 import '../platform/settings_store.dart';
 import '../platform/secure_store.dart';
-import '../services/dns_discovery.dart';
+import 'package:lemonade_nexus_sdk/dns_discovery.dart';
 import '../services/passkey_manager.dart';
 import 'cluster_keyring.dart';
 
