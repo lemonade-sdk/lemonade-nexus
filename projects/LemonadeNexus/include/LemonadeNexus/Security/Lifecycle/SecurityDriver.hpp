@@ -258,6 +258,12 @@ public:
     /// run the mutual eligibility round.
     [[nodiscard]] bool is_founding_member(const NodeId& node) const;
 
+    /// True when `node` is a member of the verified epoch authority this
+    /// driver holds (verified_authority()). Feeds the router's challenger
+    /// gate on a node without epoch state, so a Tier 2 server answers the
+    /// current Tier 1. A read of verified facts, never a grant. io thread.
+    [[nodiscard]] bool is_verified_authority_member(const NodeId& node) const;
+
     /// The canonical final-attestation context for one selected node under
     /// one plan, or an empty digest when the plan does not name the node.
     /// Pure derivation; public so a verifier of captured traffic can rebuild

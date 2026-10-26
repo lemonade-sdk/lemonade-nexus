@@ -67,6 +67,75 @@ TEST_F(Tier2Path, AReserveCanProveEveryFactWithoutBeingTierOne) {
     }
 }
 
+// Production incident: a Tier 2 server holds no epoch state after Epoch 1, and
+// its router refused every challenge from the current Tier 1 as coming from a
+// non-member, so re-attestation and upgrade witnessing never reached it. The
+// committee it verified from the Genesis key is what admits the challenger.
+TEST_F(Tier2Path, AReserveAnswersTheCommitteeItVerified) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+    std::vector<Node*> everyone = founders;
+    everyone.insert(everyone.end(), reserves.begin(), reserves.end());
+    for (int i = 0; i < 400; ++i) {
+        if (std::all_of(reserves.begin(), reserves.end(), [](Node* r) {
+                return r->driver->verified_authority() != nullptr;
+            })) {
+            break;
+        }
+        step(1, everyone);
+    }
+
+    struct CountingProducer : IEvidenceProducer {
+        int calls = 0;
+        std::optional<AttestationEvidence> produce(const AttestationChallenge&) override {
+            ++calls;
+            return std::nullopt;
+        }
+    };
+
+    Node* reserve = reserves[0];
+    ASSERT_NE(reserve->driver->verified_authority(), nullptr);
+    ASSERT_EQ(reserve->runtime->epochs(), nullptr) << "a reserve holds no epoch state";
+    for (Node* founder : founders) {
+        EXPECT_TRUE(reserve->driver->is_verified_authority_member(founder->id));
+    }
+    EXPECT_FALSE(reserve->driver->is_verified_authority_member(reserves[1]->id));
+    EXPECT_FALSE(reserve->driver->is_verified_authority_member(genesis_node->id));
+
+    // The production router configuration, with a producer that counts.
+    CountingProducer producer;
+    SecurityRouter router(
+        SecurityRouterConfig{
+            .network_id = network,
+            .genesis_anchor_id = genesis_node->id,
+            .founding_member =
+                [reserve](const NodeId& peer) { return reserve->driver->is_founding_member(peer); },
+            .authority_member =
+                [reserve](const NodeId& peer) {
+                    return reserve->driver->is_verified_authority_member(peer);
+                }},
+        *reserve->runtime, *reserve->transport, reserve->events, *reserve->sealer, &producer);
+    const auto challenge_from = [&](Node* challenger) {
+        auto challenge = challenger->runtime->attestation().create_challenge(
+            reserve->id, reserve->identity.public_key, 1, 1, AttestationPurpose::Eligibility);
+        EXPECT_TRUE(challenge.has_value());
+        return encode_security_message(challenger->router->compose(
+            SecurityMessageKind::AttestationChallenge, *challenge, 1));
+    };
+
+    for (Node* founder : founders) {
+        EXPECT_NE(router.receive(founder->id, challenge_from(founder), mesh.now_ms).dropped,
+                  DropReason::NotMember);
+    }
+    EXPECT_EQ(producer.calls, static_cast<int>(kFounders));
+
+    // Another Tier 2 server is not the committee.
+    EXPECT_EQ(router.receive(reserves[1]->id, challenge_from(reserves[1]), mesh.now_ms).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(producer.calls, static_cast<int>(kFounders));
+}
+
 // The participation half specifically: a reserve holds no epoch vote key and
 // cannot produce a HotStuff vote, so the vote-based emitter can never speak for
 // it. The challenge-response is what fills the gap, and it is a real exchange

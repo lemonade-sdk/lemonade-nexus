@@ -130,7 +130,11 @@ bool SecurityRouter::challenger_is_member(const NodeId& from) const {
     };
     const EpochManager* epochs = runtime_.epochs();
     if (epochs == nullptr) {
-        return pre_epoch_challenger(from);
+        // No epoch state here: before Epoch 1, or a Tier 2 server after it.
+        // The Tier 2 case knows the current Tier 1 from its verified
+        // authority chain, never from a peer's claim.
+        return pre_epoch_challenger(from) ||
+               (config_.authority_member && config_.authority_member(from));
     }
     const EpochState& cur = epochs->current();
     if (cur.id == 0) {

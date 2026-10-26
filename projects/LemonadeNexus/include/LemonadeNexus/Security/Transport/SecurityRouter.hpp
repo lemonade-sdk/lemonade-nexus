@@ -149,6 +149,14 @@ struct SecurityRouterConfig {
     /// set, so founders can challenge one another before any epoch exists.
     /// The list is accepted only from the anchor; unset admits only the anchor.
     std::function<bool(const NodeId&)> founding_member;
+    /// Answers whether an identity is a member of this node's verified
+    /// current epoch authority: the committee proved from the Genesis key
+    /// through the finalized handoff chain. A node that holds no epoch state
+    /// (a Tier 2 server) uses it to admit challenges and SVSM activation
+    /// offers from the current Tier 1, which eligibility re-attestation and
+    /// upgrade witnessing need. It grants nothing beyond producing evidence.
+    /// Unset admits no such challenger.
+    std::function<bool(const NodeId&)> authority_member;
     /// Answers whether `holder` may make this node attest for a storage unlock:
     /// true only while this node has a pending unlock request to that holder
     /// whose attestation context is `context`. An all-zero context asks
@@ -198,8 +206,9 @@ private:
 
     [[nodiscard]] bool within_budget(const NodeId& sender, uint64_t now_ms);
     /// True when `from` is authorized to issue a challenge to this node in
-    /// the current lifecycle phase: the pinned anchor while no epoch is
-    /// active, a current Tier 1 member once one is.
+    /// the current lifecycle phase: the pinned anchor (or a founder) while no
+    /// epoch is active, a current Tier 1 member once one is. A node without
+    /// epoch state also admits members of its verified current authority.
     [[nodiscard]] bool challenger_is_member(const NodeId& from) const;
     /// The challenge gate: membership by phase for every purpose except
     /// StorageUnlock, which only this node's pending unlock request to `from`

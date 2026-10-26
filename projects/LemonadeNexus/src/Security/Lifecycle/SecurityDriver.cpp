@@ -762,6 +762,12 @@ bool SecurityDriver::is_founding_member(const NodeId& node) const {
                        [&node](const auto& entry) { return entry.first == node; });
 }
 
+bool SecurityDriver::is_verified_authority_member(const NodeId& node) const {
+    return authority_.has_value() &&
+           std::find(authority_->members.begin(), authority_->members.end(), node) !=
+               authority_->members.end();
+}
+
 void SecurityDriver::begin_founding_observations() {
     // One challenge per peer per pass: the service holds one pending challenge
     // per subject. The liveness cadence repeats the pass until continuity has

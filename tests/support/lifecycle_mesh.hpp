@@ -471,6 +471,10 @@ struct DriverMeshBase : ::testing::Test {
                     [&node](const NodeId& peer) {
                         return node.driver && node.driver->is_founding_member(peer);
                     },
+                .authority_member =
+                    [&node](const NodeId& peer) {
+                        return node.driver && node.driver->is_verified_authority_member(peer);
+                    },
                 .storage_unlock_challenger =
                     [&node](const NodeId& holder, const Digest& context) {
                         return node.storage_gate && node.storage_gate(holder, context);

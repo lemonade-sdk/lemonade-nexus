@@ -984,6 +984,56 @@ TEST_F(RouterMesh, ActivationOfferWithoutProducerIsNoService) {
               DropReason::NotMember);
 }
 
+TEST_F(RouterMesh, NodeWithoutEpochStateAnswersItsVerifiedAuthority) {
+    // Production incident: a Tier 2 server holds no epoch state after Epoch 1,
+    // so the pre-epoch rule (anchor or founder) refused every challenge from
+    // the current Tier 1 as NotMember. Its verified authority names the
+    // committee; that, and nothing a peer claims, admits the challenger.
+    Node* tier2 = outsider;
+    ASSERT_EQ(tier2->runtime->epochs(), nullptr);
+    Node* member = founders[1];
+    Node* stranger = founders[2];
+    const auto challenge_from = [&](Node* sender) {
+        return encode_security_message(sender->router->compose(
+            SecurityMessageKind::AttestationChallenge,
+            gate_passing_challenge(network, tier2->id), 1));
+    };
+    const auto offer_from = [&](Node* sender) {
+        return encode_security_message(sender->router->compose(
+            SecurityMessageKind::SvsmAkActivationOffer,
+            routed_activation_offer(network, sender->id, tier2->id, 1), 1));
+    };
+
+    // Unset, the gate stays closed to everyone but the anchor.
+    EXPECT_EQ(tier2->deliver(member->id, challenge_from(member), mesh.now_ms).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(tier2->producer.calls, 0);
+
+    SecurityRouterConfig config;
+    config.network_id = network;
+    config.genesis_anchor_id = founders[0]->id;
+    config.authority_member = [&](const NodeId& node) { return node == member->id; };
+    SecurityRouter gated(config, *tier2->runtime, *tier2->transport, tier2->events,
+                         *tier2->sealer, &tier2->producer);
+
+    // A member of the verified authority reaches the producer (which answers
+    // nothing here, hence NoService), for a challenge and an activation offer.
+    EXPECT_EQ(gated.receive(member->id, challenge_from(member), mesh.now_ms).dropped,
+              DropReason::NoService);
+    EXPECT_EQ(tier2->producer.calls, 1);
+    EXPECT_EQ(gated.receive(member->id, offer_from(member), mesh.now_ms).dropped,
+              DropReason::NoService);
+    EXPECT_EQ(tier2->producer.activation_calls, 1);
+
+    // Anyone else stays a membership drop before any platform work.
+    EXPECT_EQ(gated.receive(stranger->id, challenge_from(stranger), mesh.now_ms).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(gated.receive(stranger->id, offer_from(stranger), mesh.now_ms).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(tier2->producer.calls, 1);
+    EXPECT_EQ(tier2->producer.activation_calls, 1);
+}
+
 TEST_F(RouterMesh, PreQuorumAnchorChallengeIsBoundedPerWindow) {
     Node* anchor = founders[0];
     Node* b = founders[1];
