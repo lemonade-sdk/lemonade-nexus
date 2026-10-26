@@ -118,6 +118,12 @@ public:
     /// A validated certificate from a peer: proof the network reached its
     /// view. The driver derives the restart view floor from these.
     virtual void on_sync_certificate(const QuorumCertificate&, const NodeId&) {}
+    /// A sync reply from a peer, after the router checked that its blocks
+    /// link and that its certificate is a valid quorum over the last block.
+    /// The chain is candidate data: a reader verifies whatever it builds
+    /// from it again. The upgrade service rebuilds lost commit proofs from
+    /// it.
+    virtual void on_certified_chain(const SyncResponse&, const NodeId&) {}
     /// The handoff-chain exchange. The request is answered from local
     /// records; the page is candidate data the driver verifies from its own
     /// trusted anchor, link by link.

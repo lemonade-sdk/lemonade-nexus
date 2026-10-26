@@ -595,6 +595,9 @@ RouteResult SecurityRouter::route_sync_response(const SyncResponse& response, co
             qc.proposal_digest != proposal_digest(response.chain.back().proposal)) {
             return drop(DropReason::ServiceRejected, code(ConsensusFailure::JustifyInvalid));
         }
+        if (!genesis_form) {
+            events_.on_certified_chain(response, from);
+        }
         const Height committed_before = consensus->last_committed_height();
         bool gap = false;
         std::vector<ConsensusCommit> commits;

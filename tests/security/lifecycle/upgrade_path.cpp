@@ -16,6 +16,8 @@
 #include <LemonadeNexus/Security/Upgrade/RolloutProof.hpp>
 #include <LemonadeNexus/Security/Upgrade/UpgradeService.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <fstream>
 
 namespace lifecycle_test {
@@ -206,6 +208,60 @@ protected:
     }
 
     [[nodiscard]] const UpgradeChainState& finalized() { return upgrade(founders.front()).state(); }
+
+    /// Adopts N+1 and runs until every server holds the Start record and the
+    /// record that opens the first turn. Returns that record's sequence.
+    uint64_t open_first_turn() {
+        EXPECT_TRUE(run_until([&] {
+            return std::all_of(reserves.begin(), reserves.end(), [](Node* r) {
+                return r->driver->verified_authority() != nullptr;
+            });
+        }));
+        EXPECT_EQ(upgrade(founders.front())
+                      .offer_approval(release_approval_bundle_json(signer->approval(kN1, kN))),
+                  ReleaseOfferResult::Adopted);
+        EXPECT_TRUE(run_until([&] { return finalized().release_number == kN1; }));
+        for (Node* node : servers()) upgrade(node).stage(kN1);
+        EXPECT_TRUE(run_until([&] {
+            const auto all = servers();
+            return finalized().in_turn.has_value() &&
+                   std::all_of(all.begin(), all.end(), [&](Node* node) {
+                       return upgrade(node).state().sequence == finalized().sequence;
+                   });
+        }));
+        return finalized().sequence;
+    }
+
+    /// Rewrites the node's upgrade records the way the earlier release left
+    /// them on the fleet: the proof of record `unproven` is empty, and only
+    /// the first `keep` records remain when `keep` is set.
+    void rewrite_records(const Node& node, std::size_t unproven,
+                         std::optional<std::size_t> keep = std::nullopt) {
+        const auto path = node.dir / "upgrade" / "upgrade-records.json";
+        nlohmann::json root;
+        {
+            std::ifstream in(path);
+            ASSERT_TRUE(in) << "no upgrade records";
+            root = nlohmann::json::parse(in);
+        }
+        auto& records = root.at("records");
+        auto& proofs = root.at("proofs");
+        ASSERT_GT(proofs.size(), unproven);
+        proofs[unproven] = "";
+        if (keep) {
+            records.erase(records.begin() + static_cast<std::ptrdiff_t>(*keep), records.end());
+            proofs.erase(proofs.begin() + static_cast<std::ptrdiff_t>(*keep), proofs.end());
+        }
+        std::ofstream(path, std::ios::trunc) << root.dump();
+    }
+
+    /// The node's own rollout proof, verified, or nullopt.
+    std::optional<VerifiedRollout> verified_own_proof(const Node* node) {
+        const auto proof = upgrade(node).rollout_proof(genesis_node->identity.public_key);
+        if (!proof) return std::nullopt;
+        std::string error;
+        return verify_rollout_proof(*proof, network, error);
+    }
 
     std::optional<ReleaseSigner> signer;
     std::map<NodeId, UpgradeStack> stacks;
@@ -689,6 +745,172 @@ TEST_F(UpgradePath, ARolledBackReleaseRecordIsRefusedAndAFreshServerCatchesUpToT
                chain(fresh).current().has_value();
     })) << "the fresh server did not catch up to the floor";
     EXPECT_TRUE(approves(fresh, kN1));
+}
+
+// Production incident (release 2026102601): one Tier 1 member was down when a
+// record committed, and the commit produced no proof on any live member
+// (HotStuffSafety.ACommitProofSkipsAChildThatNoCertificateExtends). No server
+// could serve a complete rollout proof, so the release guard refused the next
+// release. The members still held the finalizing blocks in consensus, and the
+// proof comes back from that certified chain, including on a member that
+// restarted after the commit and holds none of those blocks itself.
+TEST_F(UpgradePath, ARecordFinalizedWithoutItsProofGetsTheProofBackFromTheCertifiedChain) {
+    bootstrap();
+    ASSERT_FALSE(HasFatalFailure());
+    const uint64_t sequence = open_first_turn();
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_GE(sequence, 2u);
+    ASSERT_TRUE(rollout_proof_from_any()) << "the commits produced the proofs";
+
+    // Every server holds record 2 without its proof, as on the fleet.
+    Node* restarted = founders[1];
+    for (Node* node : servers()) {
+        rewrite_records(*node, 1);
+        ASSERT_FALSE(HasFatalFailure());
+        if (node == restarted) {
+            restart_node(*node);
+            node->driver->start(mesh.now_ms);
+        } else {
+            build_stack(*node);
+        }
+    }
+    for (Node* node : servers()) {
+        EXPECT_EQ(upgrade(node).state().sequence, sequence);
+    }
+    ASSERT_FALSE(rollout_proof_from_any()) << "a server still held the lost proof";
+
+    const auto all = servers();
+    ASSERT_TRUE(run_until([&] {
+        return std::all_of(all.begin(), all.end(), [&](Node* node) {
+            const auto rollout = verified_own_proof(node);
+            return rollout && rollout->state.sequence == sequence;
+        });
+    })) << "a server never got the lost commit proof back";
+
+    // The proof the release guard reads, from the member that restarted.
+    const auto proof = upgrade(restarted).rollout_proof(genesis_node->identity.public_key);
+    ASSERT_TRUE(proof);
+    std::string error;
+    const auto rollout = verify_rollout_proof(*proof, network, error);
+    ASSERT_TRUE(rollout) << error;
+    EXPECT_EQ(rollout->state.release_number, kN1);
+    EXPECT_EQ(rollout->state.in_turn, finalized().in_turn);
+    // The recovered proof was kept on disk.
+    build_stack(*restarted);
+    EXPECT_TRUE(verified_own_proof(restarted));
+}
+
+// Production incident (release 2026102601): a member that restarted while a
+// record committed never received it or any later record. Its peers held that
+// record without a proof, so none could send it, and the member stayed at the
+// Start record. Once the peers rebuild the proof, the record sync delivers
+// the record and every later one.
+TEST_F(UpgradePath, AMemberThatMissedLaterRecordsCatchesUpWhenNoPeerHeldTheirProof) {
+    bootstrap();
+    ASSERT_FALSE(HasFatalFailure());
+    const uint64_t sequence = open_first_turn();
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_GE(sequence, 2u);
+
+    // The member holds the Start record only; every other server holds
+    // record 2 without its proof.
+    Node* behind = founders[2];
+    for (Node* node : servers()) {
+        if (node == behind) {
+            rewrite_records(*node, 1, 1);
+        } else {
+            rewrite_records(*node, 1);
+        }
+        ASSERT_FALSE(HasFatalFailure());
+        build_stack(*node);
+    }
+    ASSERT_EQ(upgrade(behind).state().sequence, 1u);
+    {
+        // The member proves only an open rollout with no turn, as on the fleet.
+        const auto rollout = verified_own_proof(behind);
+        ASSERT_TRUE(rollout);
+        EXPECT_EQ(rollout->state.sequence, 1u);
+        std::string reason;
+        EXPECT_FALSE(rollout_complete(*rollout, kN1, reason));
+    }
+
+    ASSERT_TRUE(run_until([&] {
+        const auto rollout = verified_own_proof(behind);
+        return upgrade(behind).state().sequence == sequence && rollout &&
+               rollout->state.sequence == sequence;
+    })) << "the member stayed at sequence " << upgrade(behind).state().sequence;
+    EXPECT_EQ(upgrade(behind).state().in_turn, finalized().in_turn);
+    EXPECT_EQ(upgrade(behind).state().head, finalized().head);
+}
+
+// A proof rebuilt from a peer's certified chain is candidate data: it is kept
+// only when it verifies under the epoch's vote keys and quorum and commits the
+// held record's exact bytes.
+TEST_F(UpgradePath, ARebuiltProofIsKeptOnlyWhenItVerifies) {
+    bootstrap();
+    ASSERT_FALSE(HasFatalFailure());
+    const uint64_t sequence = open_first_turn();
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_GE(sequence, 2u);
+    Node* member = founders[3];
+    Node* peer = founders[0];
+
+    // The finalizing block of record 2 in the peer's certified chain.
+    nlohmann::json root;
+    {
+        std::ifstream in(member->dir / "upgrade" / "upgrade-records.json");
+        ASSERT_TRUE(in);
+        root = nlohmann::json::parse(in);
+    }
+    const auto body = nexus::crypto::from_hex(root.at("records").at(1).get<std::string>());
+    const Digest wanted = block_payload_digest(BlockPayload{BlockPayloadKind::UpgradeProgress, body});
+    const HotStuffService* consensus = peer->runtime->consensus();
+    ASSERT_NE(consensus, nullptr);
+    std::optional<SyncResponse> genuine;
+    for (uint64_t after = 0; after < consensus->last_committed_height().underlying() && !genuine;
+         ++after) {
+        const auto page = consensus->certified_page_after(Height{after});
+        if (!page || page->chain.size() < 3 ||
+            page->chain.front().first.transitions_digest != wanted) {
+            continue;
+        }
+        SyncResponse response;
+        response.high_qc = page->certifying;
+        for (const auto& [proposal, justify] : page->chain) {
+            response.chain.push_back(ProposalMessage{proposal, justify, std::nullopt});
+        }
+        genuine = std::move(response);
+    }
+    ASSERT_TRUE(genuine) << "no page starts at the record's block";
+
+    rewrite_records(*member, 1);
+    ASSERT_FALSE(HasFatalFailure());
+    build_stack(*member);
+    ASSERT_FALSE(verified_own_proof(member));
+
+    {   // A certificate over the record's block with forged signatures.
+        auto forged = *genuine;
+        for (auto& signer : forged.chain[1].justify.signers) signer.signature[0] ^= 1;
+        upgrade(member).on_certified_chain(forged, peer->id);
+        EXPECT_FALSE(verified_own_proof(member)) << "a forged certificate was kept";
+    }
+    {   // The child removed: the three blocks no longer link.
+        auto forged = *genuine;
+        forged.chain.erase(forged.chain.begin() + 1);
+        upgrade(member).on_certified_chain(forged, peer->id);
+        EXPECT_FALSE(verified_own_proof(member)) << "a broken chain was kept";
+    }
+    {   // The closing certificate covers the child, not the grandchild.
+        auto forged = *genuine;
+        forged.chain.resize(3);
+        forged.high_qc = forged.chain[1].justify;
+        upgrade(member).on_certified_chain(forged, peer->id);
+        EXPECT_FALSE(verified_own_proof(member)) << "an unclosed three-chain was kept";
+    }
+    upgrade(member).on_certified_chain(*genuine, peer->id);
+    const auto rollout = verified_own_proof(member);
+    ASSERT_TRUE(rollout) << "the genuine chain did not rebuild the proof";
+    EXPECT_EQ(rollout->state.sequence, sequence);
 }
 
 /// The r21 network: founded on a format-2 approval, before any server kept a

@@ -1884,6 +1884,12 @@ void SecurityDriver::on_upgrade_message(const SecurityMessage& message) {
     }
 }
 
+void SecurityDriver::on_certified_chain(const SyncResponse& response, const NodeId& from) {
+    if (upgrade_chain_sink_) {
+        upgrade_chain_sink_(response, from);
+    }
+}
+
 void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
     progress(now_ms_);
     for (const auto& commit : commits) {

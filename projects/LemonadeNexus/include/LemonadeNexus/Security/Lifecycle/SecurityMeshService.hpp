@@ -264,6 +264,9 @@ private:
         void on_sync_certificate(const QuorumCertificate& q, const NodeId& n) override {
             if (target) target->on_sync_certificate(q, n);
         }
+        void on_certified_chain(const SyncResponse& s, const NodeId& n) override {
+            if (target) target->on_certified_chain(s, n);
+        }
         void on_vote_accepted(const Vote& v) override {
             if (target) target->on_vote_accepted(v);
         }
