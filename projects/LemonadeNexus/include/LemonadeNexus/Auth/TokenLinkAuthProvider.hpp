@@ -81,11 +81,10 @@ public:
     /// expired, or spent.
     [[nodiscard]] std::optional<LinkTokenRecord> verify(std::string_view token);
 
-    /// Verify and burn a token (single use). Records a Spend event and
-    /// publishes it. With a settle window set (set_replication), waits that
-    /// long after publishing and refuses the token when another server's
-    /// spend of the same generation counts instead (the spend with the
-    /// smallest origin key). Blocks the calling thread for the window.
+    /// Verify and burn a token on this server. Records a Spend event and
+    /// publishes it. Single use across servers is enforced by the tree
+    /// operation that redeems the token: it carries the signed grant, and
+    /// consensus refuses a second redemption on every replica (TreeOps.hpp).
     [[nodiscard]] std::optional<LinkTokenRecord> consume(std::string_view token);
 
     /// Restore a token that consume() burned for a join that did not use it
@@ -107,10 +106,7 @@ public:
 
     /// Wire replication. Call before the provider serves requests. Without a
     /// signer, events stay local and unsigned (origin kLinkTokenLocalOrigin).
-    /// `settle_window` is the consume() wait described there; zero disables
-    /// it (tree operations order the redemption instead).
-    void set_replication(EventSigner signer, EventPublisher publisher,
-                         std::chrono::milliseconds settle_window);
+    void set_replication(EventSigner signer, EventPublisher publisher);
 
     /// Add an event another Tier 1 server made. The caller has verified its
     /// origin signature, network, and that the sender is Tier 1. Returns true
@@ -123,10 +119,6 @@ public:
 
     /// Test seam: Unix seconds source used in place of the system clock.
     void set_clock_for_testing(std::function<uint64_t()> now_sec);
-
-    /// Default consume() wait without tree operations: long enough for a
-    /// spend to cross the backbone between Tier 1 servers.
-    static constexpr std::chrono::milliseconds kDefaultSettleWindow{500};
 
     /// Revoke every token whose record matches `match` (only the owner and
     /// target fields are reliable). Used when an account is deleted. A
@@ -164,7 +156,6 @@ private:
     LinkTokenLedger              ledger_;
     EventSigner                  signer_;
     EventPublisher               publisher_;
-    std::chrono::milliseconds    settle_window_{0};
     std::string                  self_origin_;   ///< origin of the last signed local event
     uint64_t                     local_seq_{0};
     std::function<uint64_t()>    clock_;

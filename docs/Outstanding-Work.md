@@ -18,6 +18,10 @@ Check this list before the next release. Nothing below is a blocker unless marke
   and keep the permission tree; clients send every tree read and write to a Tier 1 server they verify
   from the Genesis key. Any relay, Tier 1 or Tier 2, verifies relay tickets against
   its verified Tier 1 membership and its own relay id.
+- **Tree operations always on** (owner decision, 2026-10-25). `tree_ops_enabled` and
+  `tree_log_enabled` are removed with every direct tree write path; a stale key, option, or
+  environment variable is ignored with a warning. The live fleet migrates once through the
+  [Tree Merge Ceremony](Tree-Merge-Ceremony); see section 7.
 - **Relays work end to end** (owner approval, 2026-10-25). The relay handles the wire `Allocate`
   message and pairs two peers by a rendezvous only they can derive; the SDK falls back to a relay
   for peers it cannot reach directly.
@@ -197,3 +201,26 @@ section 2.
 - Subagent runs are capped by the local inference engine's memory ceiling, not by agent count.
   Fresh-context agents with short briefs fit; forked-context agents inherit the whole session and get
   refused before they start.
+
+## 7. Tree operations: the fleet migration and follow-ups
+
+The rollout steps are in `Releasing.md` ("The tree operations release"). What remains:
+
+- **Empty start (owner decision, 2026-10-25).** The network is effectively empty: the live fleet
+  is installed directly with each Tier 1 server's `data/tree` moved aside. Tier 1 then commits the
+  application root for `root_pubkey` as height 1 by itself; `sudo nexus-tree-migrate` on ns1
+  only confirms that nothing awaits a merge.
+- **Keeping trees instead.** After the rolling update reaches all six servers, run
+  `nexus-tree-migrate` on ns1 (10.10.12.40): a dry run (with `--backup` to keep ns1's tree),
+  review, then `--commit --expect-tree-digest <digest>`. Until then tree writes answer `503`
+  on every Tier 1 server that kept a tree.
+- **Backup under the current data key.** ns1 reads its backup with the data key it holds now. A
+  monthly data key rotation after the backup was taken makes the backup unreadable; run the merge
+  before ns1's next rotation, or restore the tree files with the key of that time.
+- **Delete the record transfer pool.** `GossipService` still carries the tree record transfer
+  pool (`Digest`, `DeltaRequest`, `DeltaResponse`), `FileStorageService` its pool files, and
+  `PermissionTreeService::apply_delta` with the retention sink. Nothing feeds or reads them now;
+  they are retired on every server. Remove them, with `test_gossip_delta_transfer.cpp` and the
+  `apply_delta` cases of `test_permission_tree.cpp`, in a follow-up change.
+- **Not tested on the fleet.** The migration ran in unit and multi-server tests only. Nobody has run
+  it against the encrypted production trees.

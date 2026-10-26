@@ -24,7 +24,7 @@ A self-hosted userspace mesh VPN with encrypted peer-to-peer connections, crypto
 ### Security
 - [Security](Security) — Roles, epoch authority, Genesis, trust chain, threat assumptions, limitations
 - [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key) — Approved; Phases 1 to 3 experimental: tree changes through Tier 1 consensus, and a 65% threshold storage key
-- [Tree Merge Ceremony](Tree-Merge-Ceremony) — Experimental runbook: merge every server's tree into tree log height 1, then switch to tree operations
+- [Tree Merge Ceremony](Tree-Merge-Ceremony) — One-time migration: merge every server's tree into tree log height 1, signed by the root management key
 - [Design: In-Place Auto-Update](Design-Auto-Update) — Draft; release workflow, updater, approval supersession, mixed-version gate, and upgrade turns implemented, not hardware-qualified
 - [Wire and Storage Compatibility Between Releases](Wire-Compatibility) — What a release may change and what it must keep
 - [Upgrade Control Interface](Upgrade-Control) — The root-only socket between the server and `nexus-updater`

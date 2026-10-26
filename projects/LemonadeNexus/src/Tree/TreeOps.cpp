@@ -543,8 +543,8 @@ TreeOpVerdict plan_join(const TreeOp& op, Overlay& overlay) {
     }
 
     // Returning device: it keeps its tunnel address (a node stored without one
-    // gets a derived address) and records a rotated mesh key. Best effort,
-    // like the direct path: a mesh key another node holds leaves the key
+    // gets a derived address) and records a rotated mesh key. Best effort: a
+    // mesh key another node holds leaves the key
     // unchanged (the API layer refuses such claims first).
     std::string new_ip = existing->tunnel_ip;
     if (new_ip.empty()) {
@@ -1058,8 +1058,8 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             break;
         }
         case TreeOpKind::DeleteNode: {
-            // A group admin removes the group's devices through the API, as
-            // with tree operations off. A signed delta keeps the stricter
+            // A group admin removes the group's devices through the API. A
+            // signed delta keeps the stricter
             // delta rule: delete_node on the node itself.
             const bool admin_removal = body.source != TreeOpSource::Delta &&
                                        rules::admin_anchor(nodes, op.target, op.principal);
@@ -1106,8 +1106,9 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             break;
         case TreeOpKind::Join:
             // A join is authorized by the verified device statement and the
-            // submitter's admission policy (open registration or a link
-            // token), not by a tree permission. plan_op checks placement.
+            // submitter (registration is open; a link token places the
+            // device in the inviter's group), not by a tree permission.
+            // plan_op checks placement.
             break;
         case TreeOpKind::EstablishRoot: {
             // Only the configured root management key, never a key the

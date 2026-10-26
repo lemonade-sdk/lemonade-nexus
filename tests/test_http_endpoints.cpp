@@ -35,6 +35,7 @@
 #include <gtest/gtest.h>
 #include "test_http_ready.hpp"
 #include "support/tree_ops_mode.hpp"
+#include "support/tree_seed.hpp"
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <jwt-cpp/jwt.h>
@@ -263,7 +264,7 @@ protected:
             dns_io.run();
         });
 
-        auto* tree_ops = tree_ops_mode.enable(config, *tree, *crypto);
+        auto* tree_ops = tree_ops_mode.enable(*tree, *crypto);
         test_api::install(config, *auth, *tree, *ipam, *gossip, *crypto,
                           *key_wrapping, *storage, *acme, *http, *ddns, *dns,
                           *relay, *relay_discovery, *routing, *attestation,
@@ -498,8 +499,10 @@ protected:
                 }
             }
 
-            // Use atomic endpoint update to avoid TOCTOU
-            tree->update_node_endpoint(hb_node_id, ep);
+            if (auto node = tree->get_node(hb_node_id)) {
+                node->listen_endpoint = ep;
+                (void)test_support::put_node(*tree, *node);
+            }
 
             json j;
             j["success"] = true;
@@ -1366,10 +1369,13 @@ TEST_F(HttpEndpointTest, DeltaSignerMismatchWithSessionIsRejected) {
     // WOULD authorize it) but whose key differs from the session identity.
     auto other_kp = crypto->ed25519_keygen();
     auto other_pubkey = "ed25519:" + crypto::to_base64(other_kp.public_key);
-    tree->grant_assignment("root", {.management_pubkey = other_pubkey,
-                                    .permissions = {"read", "write",
-                                                    "add_child", "delete_node",
-                                                    "edit_node", "admin"}});
+    {
+        auto root = *tree->get_node("root");
+        root.assignments.push_back({.management_pubkey = other_pubkey,
+                                    .permissions = {"read", "write", "add_child",
+                                                    "delete_node", "edit_node", "admin"}});
+        ASSERT_TRUE(test_support::put_node(*tree, root));
+    }
 
     // Session authenticates as a DIFFERENT key (root), delta signs as other
     auto token = make_jwt(root_pubkey_str);
@@ -1488,7 +1494,7 @@ TEST_F(HttpEndpointTest, RoutingRegisterUsesTrustedMeshKey) {
         reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
     delta.signature = crypto::to_base64(
         crypto->ed25519_sign(root_keypair.private_key, msg));
-    ASSERT_TRUE(tree->apply_delta(delta));
+    ASSERT_TRUE(test_support::put_node(*tree, node));
 
     auto cli = make_client();
     httplib::Headers h = {{"Authorization", "Bearer " + make_jwt("p17_ep1")}};
@@ -1541,7 +1547,7 @@ TEST_F(HttpEndpointTest, RoutingRegisterRejectsForeignMeshKey) {
         reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
     delta.signature = crypto::to_base64(
         crypto->ed25519_sign(root_keypair.private_key, msg));
-    ASSERT_TRUE(tree->apply_delta(delta));
+    ASSERT_TRUE(test_support::put_node(*tree, node));
 
     auto cli = make_client();
     httplib::Headers h = {{"Authorization", "Bearer " + make_jwt("p17_ep2")}};
@@ -1613,14 +1619,12 @@ TEST_F(HttpEndpointTest, AssignmentEndpointAppliesTheAdminRules) {
     EXPECT_EQ(bad->status, 400);
 }
 
-// --- Tree write routes with and without tree operations ---
+// --- Tree write routes through tree operations ---
 //
-// test_http_endpoints_tree_ops builds this file with NEXUS_TEST_TREE_OPS, so
-// each case here and above also runs with ServerConfig::tree_ops_enabled.
-// Only the version counter and a joined endpoint's tunnel address (derived
-// from the tree instead of allocated by IPAM) may differ between the builds.
+// Every write route builds a tree operation; the fixture's submitter applies
+// it locally. A joined endpoint's tunnel address is derived from the tree.
 
-TEST_F(HttpEndpointTest, NodeRoutesAnswerTheSameInBothModes) {
+TEST_F(HttpEndpointTest, NodeRoutesWriteThroughTreeOperations) {
     auto cli = make_client();
     // POST /api/tree/node names the node "node-" + the first 16 characters of
     // the caller's key in the URL-safe base64 alphabet. Pick a key whose
@@ -1727,16 +1731,14 @@ TEST_F(HttpEndpointTest, NodeVersionsAdvanceOnlyWithTreeOperations) {
 
     const auto stored = tree->get_node(ep);
     ASSERT_TRUE(stored.has_value());
-    // Join wrote version 1 and the update version 2; the direct paths keep 0,
-    // and at 0 the stored JSON has no "version" field at all.
-    EXPECT_EQ(stored->version, test_support::kTreeOpsBuild ? 2u : 0u);
-    EXPECT_EQ(json(*stored).contains("version"), test_support::kTreeOpsBuild);
+    // Join wrote version 1 and the update version 2.
+    EXPECT_EQ(stored->version, 2u);
+    EXPECT_TRUE(json(*stored).contains("version"));
 }
 
 TEST_F(HttpEndpointTest, TreeOpsWithoutSubmitterFailClosed) {
-    // The flag on with no submitter wired must not fall back to direct writes.
+    // No submitter wired: the write fails; there is no other write path.
     auto cli = make_client();
-    test_api::current().config->tree_ops_enabled = true;
     test_api::current().ctx->tree_ops = nullptr;
 
     tree::TreeNode child;
@@ -1756,9 +1758,9 @@ TEST_F(HttpEndpointTest, TreeOpsWithoutSubmitterFailClosed) {
     EXPECT_TRUE(tree->get_children("root").empty());
 }
 
-// The production heartbeat route (MeshApiHandler). With tree operations on,
-// a changed endpoint is a SetEndpoint operation that only the node's own key
-// may submit, and an unchanged endpoint writes nothing.
+// The production heartbeat route (MeshApiHandler). A changed endpoint is a
+// SetEndpoint operation that only the node's own key may submit, and an
+// unchanged endpoint writes nothing.
 TEST_F(HttpEndpointTest, HeartbeatEndpointWritesFollowTheTreeOperationRules) {
     auto device_kp = crypto->ed25519_keygen();
     auto join_res = join_node(device_kp);
@@ -1812,9 +1814,7 @@ TEST_F(HttpEndpointTest, HeartbeatEndpointWritesFollowTheTreeOperationRules) {
         EXPECT_EQ(json::parse(res->body).value("endpoint", std::string{}), "203.0.113.9:51940");
         EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
         EXPECT_EQ(tree->get_node(node_id)->version, version_after_write);
-        if (test_support::kTreeOpsBuild) {
-            EXPECT_EQ(json::parse(res->body).value("status", std::string{}), "unchanged");
-        }
+        EXPECT_EQ(json::parse(res->body).value("status", std::string{}), "unchanged");
     }
 
     // An IPv4 endpoint that is not a unicast address is refused.
@@ -1828,27 +1828,25 @@ TEST_F(HttpEndpointTest, HeartbeatEndpointWritesFollowTheTreeOperationRules) {
         EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
     }
 
-    if (test_support::kTreeOpsBuild) {
-        EXPECT_EQ(first_status, "committed");
-        EXPECT_EQ(tree->get_node(node_id)->version, version_before + 1);
+    EXPECT_EQ(first_status, "committed");
+    EXPECT_EQ(tree->get_node(node_id)->version, version_before + 1);
 
-        // The same endpoint again: no operation, no version change.
-        res = mesh_cli.Post("/api/mesh/heartbeat", session(device_kp), body.dump(),
-                            "application/json");
-        ASSERT_NE(res, nullptr);
-        EXPECT_EQ(json::parse(res->body).value("status", std::string{}), "unchanged");
-        EXPECT_EQ(tree->get_node(node_id)->version, version_before + 1);
+    // The same endpoint again: no operation, no version change.
+    res = mesh_cli.Post("/api/mesh/heartbeat", session(device_kp), body.dump(),
+                        "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(json::parse(res->body).value("status", std::string{}), "unchanged");
+    EXPECT_EQ(tree->get_node(node_id)->version, version_before + 1);
 
-        // A session naming the node but holding another key is refused by the
-        // operation's ownership rule.
-        const auto other_kp = crypto->ed25519_keygen();
-        const json moved = {{"node_id", node_id}, {"endpoint", "203.0.113.10:51940"}};
-        res = mesh_cli.Post("/api/mesh/heartbeat", session(other_kp), moved.dump(),
-                            "application/json");
-        ASSERT_NE(res, nullptr);
-        EXPECT_EQ(res->status, 403);
-        EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
-    }
+    // A session naming the node but holding another key is refused by the
+    // operation's ownership rule.
+    const auto other_kp = crypto->ed25519_keygen();
+    const json moved = {{"node_id", node_id}, {"endpoint", "203.0.113.10:51940"}};
+    res = mesh_cli.Post("/api/mesh/heartbeat", session(other_kp), moved.dump(),
+                        "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 403);
+    EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
     mesh_srv.stop();
     mesh_thread.join();
 }
@@ -1869,7 +1867,6 @@ TEST_F(HttpEndpointTest, AnUncommittedTreeWriteAnswersPendingWithItsOpId) {
             return admission;
         },
         std::chrono::milliseconds(20));
-    test_api::current().config->tree_ops_enabled = true;
     test_api::current().ctx->tree_ops = &ordered;
     test_api::current().ctx->tree_op_status = [&pool](const std::string& id) {
         return pool.status(id);
@@ -1948,7 +1945,7 @@ TEST_F(HttpEndpointTest, GroupAdminReadsAndRemovesTheGroupsDevices) {
     device.type = tree::NodeType::Endpoint;
     device.mgmt_pubkey = "ed25519:" + device_b64;
     device.assignments = {{"ed25519:" + device_b64, {"read", "write", "edit_node"}}};
-    ASSERT_TRUE(tree->insert_join_node(device));
+    ASSERT_TRUE(test_support::put_node(*tree, device));
     ASSERT_FALSE(tree->check_permission("ed25519:" + owner_b64, "grp-device",
                                         acl::Permission::Read));
 
@@ -2146,7 +2143,7 @@ protected:
             n.mesh_pubkey = "mesh-" + id;
             n.tunnel_ip = "10.64.9." + std::to_string(tree->get_children(parent).size() + 2) + "/32";
         }
-        ASSERT_TRUE(tree->insert_join_node(n)) << id;
+        ASSERT_TRUE(test_support::put_node(*tree, n)) << id;
     }
 
     /// Node ids in the requester's peer list, and the full response body.
@@ -2202,7 +2199,7 @@ TEST_F(MeshPeersConnectTest, GroupAdminNeedsAGrantOnEachDevice) {
     auto group = tree->get_node("mc_group");
     ASSERT_TRUE(group.has_value());
     group->assignments = {{caller, {"admin"}}};
-    ASSERT_TRUE(tree->update_node_direct("mc_group", *group));
+    ASSERT_TRUE(test_support::put_node(*tree, *group));
     add("mc_admin_dev", "mc_group", tree::NodeType::Endpoint, {{caller, {"admin"}}});
     add("mc_read_dev", "mc_group", tree::NodeType::Endpoint, {{caller, {"read"}}});
     const auto ids = listed();
@@ -2339,7 +2336,7 @@ TEST_F(HttpEndpointTest, ARefusedJoinDoesNotSpendTheLinkToken) {
     group.type = tree::NodeType::Customer;
     group.mgmt_pubkey = root_pubkey_str;
     group.assignments = {{root_pubkey_str, {"admin"}}};
-    ASSERT_TRUE(tree->insert_join_node(group));
+    ASSERT_TRUE(test_support::put_node(*tree, group));
 
     auto placed = join_node(first_kp, token);
     ASSERT_NE(placed, nullptr);
@@ -2353,10 +2350,10 @@ TEST_F(HttpEndpointTest, ARefusedJoinDoesNotSpendTheLinkToken) {
     EXPECT_EQ(spent->status, 403) << spent->body;
 }
 
-// With tree operations on, the Join operation assigns tunnel addresses on
-// every replica, so POST /api/ipam/allocate refuses a local tunnel address.
-// The fixture shadows that route with a stand-in, so this test serves the
-// production route on its own server.
+// The Join operation assigns tunnel addresses on every replica, so
+// POST /api/ipam/allocate refuses a local tunnel address. The fixture shadows
+// that route with a stand-in, so this test serves the production route on its
+// own server.
 TEST_F(HttpEndpointTest, TunnelAllocationIsRefusedWithTreeOperations) {
     httplib::Server srv;
     test_api::handler().register_routes(srv, srv);
@@ -2365,8 +2362,6 @@ TEST_F(HttpEndpointTest, TunnelAllocationIsRefusedWithTreeOperations) {
     std::thread server_thread([&srv] { srv.listen_after_bind(); });
     ASSERT_TRUE(wait_http_ready(static_cast<uint16_t>(port)));
 
-    auto& cfg = *test_api::current().config;
-    const bool original = cfg.tree_ops_enabled;
     httplib::Client cli("127.0.0.1", port);
     const httplib::Headers root = {{"Authorization", "Bearer " + make_jwt(root_pubkey_str)}};
     auto allocate = [&](const std::string& block) {
@@ -2374,7 +2369,6 @@ TEST_F(HttpEndpointTest, TunnelAllocationIsRefusedWithTreeOperations) {
         return cli.Post("/api/ipam/allocate", root, body.dump(), "application/json");
     };
 
-    cfg.tree_ops_enabled = true;
     auto tunnel = allocate("tunnel");
     ASSERT_NE(tunnel, nullptr);
     EXPECT_EQ(tunnel->status, 409) << tunnel->body;
@@ -2383,12 +2377,6 @@ TEST_F(HttpEndpointTest, TunnelAllocationIsRefusedWithTreeOperations) {
     ASSERT_NE(priv, nullptr);
     EXPECT_EQ(priv->status, 200) << priv->body;
 
-    cfg.tree_ops_enabled = false;
-    auto direct = allocate("tunnel");
-    ASSERT_NE(direct, nullptr);
-    EXPECT_EQ(direct->status, 200) << direct->body;
-
-    cfg.tree_ops_enabled = original;
     srv.stop();
     server_thread.join();
 }
@@ -2396,8 +2384,8 @@ TEST_F(HttpEndpointTest, TunnelAllocationIsRefusedWithTreeOperations) {
 // --- Invites into a chosen group, joining another network, and moves ---
 //
 // Serves the production tree, auth (link token), and mesh routes on their own
-// server; the base fixture shadows some of them with stand-ins. In the
-// tree-operation build every write below goes through a tree operation.
+// server; the base fixture shadows some of them with stand-ins. Every write
+// below goes through a tree operation.
 class InviteHttpTest : public HttpEndpointTest {
 protected:
     httplib::Server srv;

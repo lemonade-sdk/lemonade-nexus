@@ -20,7 +20,8 @@ between the two; there is no other socket.
   other peer before it reads a byte.
 - There is no network listener and no token. Nothing in the server
   configuration changes the socket path or the accepted user.
-- One JSON object per line in each direction. A line is at most 64 KiB.
+- One JSON object per line in each direction. A line is at most 32 MiB: the
+  tree merge requests carry every server's tree export.
 - If the socket cannot bind, the server logs a warning and runs without it.
   The updater then sees no gate and waits.
 
@@ -38,6 +39,7 @@ Every reply has `"ok"` (bool). A refusal adds `"error"` (string).
 | `{"op":"report","release_number":N,"result":"failed"}` | | The health gate failed and the updater rolled back. The server reports Failed in its status; a Halt record follows |
 | `{"op":"report","release_number":N,"result":"upgraded"}` | `counted` (always `false`) | Informational. "Upgraded" counts only through a witness quorum |
 | `{"op":"stage_boot_chain","bundle":"<JSON text>"}` | `staged`, `detail` | Before a reboot into a new boot chain: seal a second copy of the boot set to the PCR 8/9 of the approval. The bundle must be the approval the release chain accepted (offer it first); any other bundle is refused, so the updater cannot choose the PCRs |
+| `{"op":"tree_merge_context"}` and the other `tree_merge_*` requests | see [Tree Merge Ceremony](Tree-Merge-Ceremony) | The one-time tree merge, run by `nexus-tree-migrate` on the root server: the context, a root-signed export request for a member, the backup export, the dry-run build, and the signature for the reviewed merge (`Core/TreeMigrationControl.hpp`) |
 
 `release_number` is `YYYYMMDD * 100 + N`, from 1 to `9999123199`.
 

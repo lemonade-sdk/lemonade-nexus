@@ -240,7 +240,6 @@ protected:
         config.data_root = (root / "root").string();
         config.root_pubkey = hex_array(root_identity.public_key);
         config.genesis_pubkey = b64_array(gossip->keypair().public_key);
-        config.onboard_enabled = true;
 
         admission = std::make_unique<core::ServerAdmissionService>(
             config, *crypto, *kw, *storage, *gossip);

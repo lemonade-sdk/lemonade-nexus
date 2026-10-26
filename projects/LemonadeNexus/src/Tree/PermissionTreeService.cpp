@@ -102,192 +102,6 @@ bool PermissionTreeService::is_open() const {
     return holds_files_;
 }
 
-// --- Join bootstrap (bypasses delta permission checks) ---
-
-bool PermissionTreeService::bootstrap_root(const TreeNode& root_node) {
-    std::lock_guard lock(mutex_);
-
-    if (nodes_.contains("root")) {
-        spdlog::info("[{}] root node already exists, skipping bootstrap", name());
-        return false;
-    }
-
-    nodes_[root_node.id] = root_node;
-    if (!persist_node(root_node)) {
-        spdlog::error("[{}] failed to persist bootstrap root node", name());
-        nodes_.erase(root_node.id);
-        return false;
-    }
-
-    spdlog::info("[{}] bootstrapped root node with pubkey '{}'",
-                  name(), root_node.mgmt_pubkey);
-    return true;
-}
-
-bool PermissionTreeService::insert_join_node(const TreeNode& node) {
-    std::lock_guard lock(mutex_);
-
-    if (node.id.empty()) {
-        spdlog::error("[{}] insert_join_node: empty node id", name());
-        return false;
-    }
-
-    if (nodes_.contains(node.id)) {
-        // Idempotent: node already exists from a previous join
-        spdlog::info("[{}] insert_join_node: node '{}' already exists, skipping",
-                      name(), node.id);
-        return true;
-    }
-
-    if (!node.parent_id.empty() && !nodes_.contains(node.parent_id)) {
-        spdlog::error("[{}] insert_join_node: parent '{}' not found for node '{}'",
-                       name(), node.parent_id, node.id);
-        return false;
-    }
-
-    // Reject a colliding identifier owned by a different node; the incumbent
-    // keeps it (no rename), which removes the order-dependent squatting vector.
-    if (!node.endpoint_identifier.empty()) {
-        auto ix = identifier_index_.find(node.endpoint_identifier);
-        if (ix != identifier_index_.end() && ix->second != node.id) {
-            spdlog::error("[{}] insert_join_node: endpoint_identifier '{}' already "
-                          "bound to node '{}' — rejecting colliding node '{}'",
-                          name(), node.endpoint_identifier, ix->second, node.id);
-            return false;
-        }
-    }
-
-    // Same rule for the transport static: one key, one node. The API layer
-    // refuses equivalence-aware claims first; this exact-match backstop holds
-    // the invariant against any other caller.
-    if (rules::mesh_pubkey_taken(nodes_, node.mesh_pubkey, node.id)) {
-        spdlog::error("[{}] insert_join_node: mesh public key already bound to another "
-                      "node — rejecting node '{}'",
-                      name(), node.id);
-        return false;
-    }
-
-    nodes_[node.id] = node;
-    if (!persist_node(node)) {
-        spdlog::error("[{}] failed to persist join node '{}'", name(), node.id);
-        nodes_.erase(node.id);
-        return false;
-    }
-
-    if (!node.endpoint_identifier.empty()) {
-        identifier_index_[node.endpoint_identifier] = node.id;
-    }
-
-    spdlog::info("[{}] inserted join node '{}' (type={}, parent={})",
-                  name(), node.id,
-                  node_type_to_string(node.type), node.parent_id);
-    return true;
-}
-
-bool PermissionTreeService::update_node_direct(const std::string& node_id,
-                                                const TreeNode& updated) {
-    std::lock_guard lock(mutex_);
-
-    auto it = nodes_.find(node_id);
-    if (it == nodes_.end()) {
-        spdlog::error("[{}] update_node_direct: node '{}' not found", name(), node_id);
-        return false;
-    }
-
-    if (rules::mesh_pubkey_taken(nodes_, updated.mesh_pubkey, node_id)) {
-        spdlog::error("[{}] update_node_direct: mesh public key already bound to another "
-                      "node — rejecting update of '{}'",
-                      name(), node_id);
-        return false;
-    }
-
-    const std::string old_identifier = it->second.endpoint_identifier;
-
-    it->second = updated;
-    it->second.id = node_id; // Preserve original ID
-    if (!persist_node(it->second)) {
-        spdlog::error("[{}] update_node_direct: failed to persist '{}'", name(), node_id);
-        return false;
-    }
-
-    // Keep the reverse index in sync if the identifier changed.
-    if (old_identifier != it->second.endpoint_identifier) {
-        if (!old_identifier.empty()) identifier_index_.erase(old_identifier);
-        if (!it->second.endpoint_identifier.empty()) {
-            identifier_index_[it->second.endpoint_identifier] = node_id;
-        }
-    }
-
-    spdlog::info("[{}] updated node '{}' directly", name(), node_id);
-    return true;
-}
-
-bool PermissionTreeService::update_node_endpoint(const std::string& node_id,
-                                                  const std::string& new_endpoint) {
-    std::lock_guard lock(mutex_);
-
-    auto it = nodes_.find(node_id);
-    if (it == nodes_.end()) {
-        spdlog::error("[{}] update_node_endpoint: node '{}' not found", name(), node_id);
-        return false;
-    }
-
-    it->second.listen_endpoint = new_endpoint;
-    if (!persist_node(it->second)) {
-        spdlog::error("[{}] update_node_endpoint: failed to persist '{}'", name(), node_id);
-        return false;
-    }
-
-    spdlog::debug("[{}] updated endpoint for node '{}' to '{}'",
-                   name(), node_id, new_endpoint);
-    return true;
-}
-
-bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
-    std::lock_guard lock(mutex_);
-
-    auto it = nodes_.find(node_id);
-    if (it == nodes_.end()) {
-        spdlog::error("[{}] delete_node_direct: node '{}' not found", name(), node_id);
-        return false;
-    }
-
-    const std::string deleted_mgmt_pubkey = it->second.mgmt_pubkey;
-    const std::string parent_id           = it->second.parent_id;
-
-    if (!it->second.endpoint_identifier.empty()) {
-        identifier_index_.erase(it->second.endpoint_identifier);
-    }
-    nodes_.erase(it);
-    if (!remove_node(node_id)) {
-        spdlog::warn("[{}] delete_node_direct: storage delete failed for '{}'", name(), node_id);
-    }
-
-    // Sweep the link-join grants that referenced this device's management key
-    // from its sibling endpoints and its group node, so a deleted device leaves
-    // no dangling ACL. Guard: never strip a node the key legitimately owns
-    // (mgmt_pubkey match) — deleting one of an owner's self-owned devices must
-    // not revoke the owner across the rest of the group.
-    if (!deleted_mgmt_pubkey.empty()) {
-        for (auto& [id, node] : nodes_) {
-            const bool in_scope = (node.parent_id == parent_id) || (id == parent_id);
-            if (!in_scope) continue;
-            if (node.mgmt_pubkey == deleted_mgmt_pubkey) continue; // owner-owned
-            const auto before = node.assignments.size();
-            std::erase_if(node.assignments, [&](const Assignment& a) {
-                return a.management_pubkey == deleted_mgmt_pubkey;
-            });
-            if (node.assignments.size() != before && !persist_node(node)) {
-                spdlog::warn("[{}] delete_node_direct: failed to persist ACL sweep on '{}'",
-                             name(), id);
-            }
-        }
-    }
-
-    spdlog::info("[{}] deleted node '{}' directly", name(), node_id);
-    return true;
-}
-
 bool PermissionTreeService::is_mgmt_pubkey_in_use(const std::string& mgmt_pubkey) const {
     if (mgmt_pubkey.empty()) return false;
     // Match on key bytes: this is the owner-protection guard on revocation, so a
@@ -301,180 +115,10 @@ bool PermissionTreeService::is_mgmt_pubkey_in_use(const std::string& mgmt_pubkey
     return false;
 }
 
-bool PermissionTreeService::grant_assignment(const std::string& node_id,
-                                              const Assignment& assignment) {
-    std::lock_guard lock(mutex_);
-
-    auto it = nodes_.find(node_id);
-    if (it == nodes_.end()) {
-        spdlog::warn("[{}] grant_assignment: node '{}' not found", name(), node_id);
-        return false;
-    }
-
-    // Idempotent: skip if pubkey already has an assignment
-    for (const auto& a : it->second.assignments) {
-        if (a.management_pubkey == assignment.management_pubkey) {
-            spdlog::debug("[{}] grant_assignment: pubkey already assigned on '{}'",
-                           name(), node_id);
-            return true;
-        }
-    }
-
-    it->second.assignments.push_back(assignment);
-    if (!persist_node(it->second)) {
-        spdlog::error("[{}] grant_assignment: failed to persist node '{}'",
-                       name(), node_id);
-        it->second.assignments.pop_back();
-        return false;
-    }
-
-    spdlog::info("[{}] granted assignment on '{}' to pubkey '{}'",
-                  name(), node_id, assignment.management_pubkey.substr(0, 24));
-    return true;
-}
-
 bool PermissionTreeService::administers(std::string_view signer,
                                         std::string_view node_id) const {
     std::lock_guard lock(mutex_);
     return rules::admin_anchor(nodes_, node_id, signer).has_value();
-}
-
-PermissionTreeService::AssignmentChange PermissionTreeService::set_assignment(
-        const std::string& node_id, std::string_view signer, std::string_view principal,
-        const std::vector<std::string>& permissions, std::string& reason) {
-    std::lock_guard lock(mutex_);
-
-    if (const auto ruling = rules::assignment_change_refusal(nodes_, node_id, signer,
-                                                             principal, permissions)) {
-        reason = ruling->reason;
-        return change_for(ruling->refusal);
-    }
-
-    auto it = nodes_.find(node_id);
-    TreeNode updated = it->second;
-    rules::replace_assignment(updated.assignments, principal, permissions);
-    if (!persist_node(updated)) {
-        reason = "failed to persist node";
-        return AssignmentChange::StorageError;
-    }
-    it->second = std::move(updated);
-    spdlog::info("[{}] assignments on '{}' changed for '{}' by '{}'", name(), node_id,
-                 std::string(principal).substr(0, 24), std::string(signer).substr(0, 24));
-    return AssignmentChange::Applied;
-}
-
-PermissionTreeService::AssignmentChange PermissionTreeService::change_for(
-        rules::AssignmentRefusal refusal) {
-    switch (refusal) {
-        case rules::AssignmentRefusal::NotFound:  return AssignmentChange::NotFound;
-        case rules::AssignmentRefusal::Forbidden: return AssignmentChange::Forbidden;
-        case rules::AssignmentRefusal::Invalid:   return AssignmentChange::Invalid;
-        case rules::AssignmentRefusal::Conflict:  return AssignmentChange::Conflict;
-    }
-    return AssignmentChange::Invalid;
-}
-
-PermissionTreeService::AssignmentChange PermissionTreeService::apply_planned_direct_locked(
-        const TreeOp& op, std::string& reason) {
-    TreeOpEffect effect;
-    if (const auto verdict = plan_op(op, nodes_, effect); !verdict.ok()) {
-        reason = verdict.reason;
-        return verdict.refusal == TreeOpRefusal::NotFound ? AssignmentChange::NotFound
-                                                          : AssignmentChange::Invalid;
-    }
-    // The direct paths do not maintain versions (TreeNode::version), so each
-    // written node keeps the version it had.
-    for (auto node : effect.writes) {
-        if (auto it = nodes_.find(node.id); it != nodes_.end()) node.version = it->second.version;
-        if (!persist_node(node)) {
-            reason = "failed to persist node";
-            return AssignmentChange::StorageError;
-        }
-        nodes_[node.id] = std::move(node);
-    }
-    return AssignmentChange::Applied;
-}
-
-PermissionTreeService::AssignmentChange PermissionTreeService::accept_invite(
-        const std::string& target_id, std::string_view invitee, std::string_view inviter,
-        const std::vector<std::string>& permissions, std::string& reason) {
-    std::lock_guard lock(mutex_);
-    if (const auto ruling = rules::invite_acceptance_refusal(nodes_, target_id, invitee, inviter,
-                                                             permissions)) {
-        reason = ruling->reason;
-        return change_for(ruling->refusal);
-    }
-    TreeOp op;
-    op.kind = TreeOpKind::AcceptInvite;
-    op.target = target_id;
-    op.principal = std::string(invitee);
-    op.body.inviter = std::string(inviter);
-    op.body.invite_permissions = permissions;
-    const auto change = apply_planned_direct_locked(op, reason);
-    if (change == AssignmentChange::Applied) {
-        spdlog::info("[{}] '{}' joined group '{}' by invite of '{}'", name(),
-                     std::string(invitee).substr(0, 24), target_id,
-                     std::string(inviter).substr(0, 24));
-    }
-    return change;
-}
-
-PermissionTreeService::AssignmentChange PermissionTreeService::move_node(
-        const std::string& node_id, const std::string& new_parent_id, std::string_view signer,
-        std::string& reason) {
-    std::lock_guard lock(mutex_);
-    if (const auto ruling = rules::move_refusal(nodes_, node_id, new_parent_id, signer)) {
-        reason = ruling->reason;
-        return change_for(ruling->refusal);
-    }
-    TreeOp op;
-    op.kind = TreeOpKind::MoveNode;
-    op.target = node_id;
-    op.principal = std::string(signer);
-    op.body.new_parent_id = new_parent_id;
-    const auto change = apply_planned_direct_locked(op, reason);
-    if (change == AssignmentChange::Applied) {
-        spdlog::info("[{}] moved node '{}' under '{}'", name(), node_id, new_parent_id);
-    }
-    return change;
-}
-
-bool PermissionTreeService::delete_account(std::string_view principal, AccountDeletion& out,
-                                           std::string& reason) {
-    std::vector<TreeNode> removed;
-    std::vector<AccountDeletion> accounts;
-    {
-        std::lock_guard lock(mutex_);
-        if (!holds_files_) {
-            reason = "the tree is closed";
-            return false;
-        }
-        TreeOp op;
-        op.kind = TreeOpKind::DeleteAccount;
-        op.principal = std::string(principal);
-        op.target = derive_join_node_id(crypto_, op.principal);
-        if (op.target.empty()) {
-            reason = "an account deletion needs an ed25519 principal";
-            return false;
-        }
-        const auto scope = rules::account_scope(nodes_, op.principal);
-        TreeOpEffect effect;
-        if (const auto verdict = plan_op(op, nodes_, effect); !verdict.ok()) {
-            reason = verdict.reason;
-            return false;
-        }
-        if (!write_effect_locked(effect, /*keep_versions=*/true, removed)) {
-            reason = "failed to persist node";
-            return false;
-        }
-        out = AccountDeletion{op.principal, op.target, removed, scope.swept_keys};
-        accounts.push_back(out);
-        spdlog::info("[{}] deleted account '{}' ({} nodes removed, {} nodes changed)", name(),
-                     op.target, effect.removals.size(), effect.writes.size());
-    }
-    notify_removed(removed);
-    notify_accounts(accounts);
-    return true;
 }
 
 bool PermissionTreeService::may_connect(std::string_view principal, std::string_view from_node_id,
@@ -860,13 +504,12 @@ void PermissionTreeService::persist_committed_ops_after(const TreeOpVerdict& ver
     }
 }
 
-bool PermissionTreeService::write_effect_locked(const TreeOpEffect& effect, bool keep_versions,
+bool PermissionTreeService::write_effect_locked(const TreeOpEffect& effect,
                                                 std::vector<TreeNode>& removed) {
     // Persist writes before removals, so a failed write never leaves a node
     // deleted for an op that did not complete.
-    for (auto node : effect.writes) {
+    for (const auto& node : effect.writes) {
         auto it = nodes_.find(node.id);
-        if (keep_versions && it != nodes_.end()) node.version = it->second.version;
         if (!persist_node(node)) {
             spdlog::error("[{}] failed to persist node '{}'", name(), node.id);
             return false;
@@ -878,7 +521,7 @@ bool PermissionTreeService::write_effect_locked(const TreeOpEffect& effect, bool
         if (!node.endpoint_identifier.empty()) {
             identifier_index_[node.endpoint_identifier] = node.id;
         }
-        nodes_[node.id] = std::move(node);
+        nodes_[node.id] = node;
     }
     for (const auto& id : effect.removals) {
         auto it = nodes_.find(id);
@@ -910,7 +553,7 @@ TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op,
     }
 
     const auto removed_before = removed.size();
-    if (!write_effect_locked(effect, /*keep_versions=*/false, removed)) {
+    if (!write_effect_locked(effect, removed)) {
         spdlog::error("[{}] tree op on '{}' did not complete", name(), op.target);
         return TreeOpVerdict{TreeOpRefusal::StorageError, "failed to persist node"};
     }
@@ -936,6 +579,11 @@ TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op,
 rules::NodeMap PermissionTreeService::nodes_snapshot() const {
     std::lock_guard lock(mutex_);
     return nodes_;
+}
+
+CommittedOpIds PermissionTreeService::committed_ids() const {
+    std::lock_guard lock(mutex_);
+    return committed_ops_;
 }
 
 security::Digest PermissionTreeService::tree_digest() const {

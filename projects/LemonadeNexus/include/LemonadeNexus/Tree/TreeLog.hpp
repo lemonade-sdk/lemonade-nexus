@@ -39,7 +39,7 @@ namespace nexus::tree {
 /// Format version of every tree log file. open() refuses any other value.
 /// Version 2: state roots cover the committed op ids, and entries carry a
 /// kind. A version 1 log does not open; delete it and let replication refill
-/// it (Configuration.md, experimental tree operations).
+/// it (Configuration.md, tree operations).
 inline constexpr uint32_t kTreeLogFormatVersion = 2;
 
 /// What a log entry records.

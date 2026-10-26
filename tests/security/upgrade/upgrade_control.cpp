@@ -156,6 +156,23 @@ TEST_F(UpgradeControl, StagingIsRefusedWithoutAHook) {
     EXPECT_TRUE(reply.contains("error"));
 }
 
+TEST_F(UpgradeControl, TreeMergeRequestsGoToTheirHookOnly) {
+    EXPECT_FALSE(call({{"op", "tree_merge_context"}})["ok"].get<bool>());
+    json seen;
+    hooks.tree_merge = [&seen](const json& request) {
+        seen = request;
+        return json{{"ok", true}, {"answered", request.value("op", "")}};
+    };
+    const auto reply = call({{"op", "tree_merge_build"}, {"exports", json::array()}});
+    EXPECT_TRUE(reply["ok"].get<bool>());
+    EXPECT_EQ(reply["answered"], "tree_merge_build");
+    EXPECT_EQ(seen["op"], "tree_merge_build");
+    // Other requests never reach it.
+    seen = nullptr;
+    (void)call({{"op", "status"}});
+    EXPECT_TRUE(seen.is_null());
+}
+
 TEST_F(UpgradeControl, HealthCarriesTheTreeLogWhenItRuns) {
     EXPECT_TRUE(call({{"op", "health"}})["tree"].is_null());
     hooks.tree_status = [] {

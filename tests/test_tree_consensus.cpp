@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include "support/tree_seed.hpp"
 #ifdef _WIN32
 #  include <process.h>
 #  define getpid _getpid
@@ -667,13 +668,24 @@ TEST_F(TreeConsensusTest, APayloadThatMissesTheHeaderDigestIsNotStored) {
     EXPECT_EQ(service->block_payload(b.digest), nullptr);
 }
 
-TEST_F(TreeConsensusTest, AHaltedHandlerVotesForNothing) {
-    // Write the tree outside the log, then restart: the handler halts.
-    ASSERT_TRUE(tree_svc->bootstrap_root(tree::make_root_node(root_key)));
-    ASSERT_FALSE(open_consensus());
-    EXPECT_FALSE(tc->healthy());
+TEST_F(TreeConsensusTest, AHandlerAwaitingTheMergeVotesForNothing) {
+    // A tree written before tree operations, and a log still at the empty
+    // base: the handler awaits the merge commit. Height 1 belongs to it, so
+    // no tree block earns this server's vote, and no write is accepted.
+    ASSERT_TRUE(test_support::put_root(*tree_svc, root_key));
+    ASSERT_TRUE(open_consensus());
+    EXPECT_TRUE(tc->healthy());
+    EXPECT_TRUE(tc->awaiting_merge());
+    EXPECT_EQ(tc->status_summary().pre_merge_nodes, 1u);
     EXPECT_FALSE(votes_for_first_block({seal(create_op(customer("acme", root_key), root_key))}));
-    EXPECT_EQ(tc->submit(seal(root_op())).verdict.refusal, TreeOpRefusal::Unavailable);
+    const auto refused = tc->submit(seal(root_op()));
+    EXPECT_EQ(refused.verdict.refusal, TreeOpRefusal::Unavailable);
+    EXPECT_NE(refused.verdict.reason.find("tree merge commit"), std::string::npos);
+    // No EstablishRoot op is requested for the root-less log either.
+    bool requested = false;
+    tc->set_root_request([&requested] { requested = true; });
+    tc->maintain();
+    EXPECT_FALSE(requested);
 }
 
 // =========================================================================
@@ -703,6 +715,38 @@ protected:
     TreeOp acme;
     std::vector<TestBlock> blocks;
 };
+
+// The empty start: a Tier 1 server with no tree log and an empty tree (its
+// data/tree moved aside) does not await a merge. It asks for the EstablishRoot
+// op of the configured root key, and the first committed tree block, height 1,
+// holds just the application root owned by that key.
+TEST_F(TreeConsensusCommitTest, AnEmptyServerReachesHeightOneWithTheRootAlone) {
+    EXPECT_FALSE(tc->awaiting_merge());
+    EXPECT_TRUE(tc->healthy());
+    EXPECT_EQ(tc->log().height(), 0u);
+    bool requested = false;
+    tc->set_root_request([&requested] { requested = true; });
+    tc->maintain();
+    EXPECT_TRUE(requested);
+
+    mirror = base_state();
+    root = seal(root_op());
+    blocks.push_back(tree_block(nullptr, 1, TreeBatch{{root}}, now_ms, mirror));
+    blocks.push_back(block(&blocks[0], 2));
+    blocks.push_back(block(&blocks[1], 3));
+    blocks.push_back(block(&blocks[2], 4));
+    for (const auto& b : blocks) ASSERT_FALSE(deliver(b).rejected.has_value());
+    EXPECT_EQ(tc->log().height(), 1u);
+    const auto nodes = tree_svc->nodes_snapshot();
+    ASSERT_EQ(nodes.size(), 1u);
+    EXPECT_EQ(tree::canonical_principal(nodes.at("root").mgmt_pubkey),
+              tree::canonical_principal(root_key));
+    // The root exists now: no second request.
+    requested = false;
+    now_ms += 60'000;
+    tc->maintain();
+    EXPECT_FALSE(requested);
+}
 
 TEST_F(TreeConsensusCommitTest, CommittedBlocksAreLoggedThenApplied) {
     commit_two_blocks();
@@ -1114,16 +1158,15 @@ protected:
     }
 
     ReplicaServer& make_replica(const std::string& name,
-                                tree::TreeLogMode mode = tree::TreeLogMode::Ops,
                                 const std::function<void(tree::PermissionTreeService&)>& seed = {}) {
         auto r = std::make_unique<ReplicaServer>();
         r->dir = dir / name;
-        open_replica(*r, mode, seed);
+        open_replica(*r, seed);
         replicas.push_back(std::move(r));
         return *replicas.back();
     }
 
-    void open_replica(ReplicaServer& r, tree::TreeLogMode mode,
+    void open_replica(ReplicaServer& r,
                       const std::function<void(tree::PermissionTreeService&)>& seed = {}) {
         r.storage = std::make_unique<storage::FileStorageService>(r.dir / "data");
         r.storage->start();
@@ -1135,7 +1178,6 @@ protected:
         config.network_id = network;
         config.root_key = root_key;
         config.wall_clock_ms = [this] { return now_ms; };
-        config.mode = mode;
         r.tc = std::make_unique<tree::TreeConsensus>(std::move(config), *r.tree, *crypto_svc,
                                                      r.dir / "data" / "tree" / "log");
         r.tc->set_authority_source(lookup);
@@ -1193,7 +1235,7 @@ TEST_F(TreeReplicationTest, ARestartedReplicaReplaysItsLog) {
     ASSERT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Applied);
     const auto digest = r.tree->tree_digest();
     close_replica(r);
-    open_replica(r, tree::TreeLogMode::Ops);
+    open_replica(r);
     EXPECT_EQ(r.tc->log().height(), 2u);
     EXPECT_EQ(r.tree->tree_digest(), digest);
     EXPECT_EQ(r.tc->log().state().root, tc->log().state().root);
@@ -1432,9 +1474,9 @@ TEST_F(TreeReplicationTest, ACertifiedEntryThatDoesNotChainIsNotApplied) {
     // This server's log started from another tree (an earlier build did
     // that), so the mesh's first entry can never apply to it. It refuses the
     // entry and keeps its own state.
-    auto& r = make_replica("divergent", tree::TreeLogMode::Ops,
+    auto& r = make_replica("divergent",
                            [this](tree::PermissionTreeService& t) {
-                               ASSERT_TRUE(t.bootstrap_root(tree::make_root_node(root_key)));
+                               ASSERT_TRUE(test_support::put_root(t, root_key));
                                tree::TreeLog earlier(dir / "divergent" / "data" / "tree" / "log");
                                ASSERT_EQ(earlier.open(t.nodes_snapshot()),
                                          tree::TreeLog::OpenResult::Ok);
@@ -1446,51 +1488,34 @@ TEST_F(TreeReplicationTest, ACertifiedEntryThatDoesNotChainIsNotApplied) {
     EXPECT_TRUE(r.tree->get_node("root").has_value());  // the last state stays served
 }
 
-// Ops mode never starts a log from a populated local tree: servers with
+// A server never starts a log from a populated local tree: servers with
 // different trees would hold logs with different bases, and the merge commit
-// could no longer become height 1. The server halts and writes no log.
-TEST_F(TreeReplicationTest, OpsModeWithoutALogHaltsOnAPopulatedTree) {
+// could no longer become height 1. It opens a log on the empty base, keeps
+// serving its tree, and refuses every consensus entry until the merge commit
+// arrives (test_tree_merge.cpp covers the merge itself).
+TEST_F(TreeReplicationTest, APreMergeTreeAwaitsTheMergeAndRefusesConsensusEntries) {
     commit_two_blocks();
-    auto r = std::make_unique<ReplicaServer>();
-    r->dir = dir / "populated";
-    r->storage = std::make_unique<storage::FileStorageService>(r->dir / "data");
-    r->storage->start();
-    r->tree = std::make_unique<tree::PermissionTreeService>(*r->storage, *crypto_svc);
-    r->tree->start();
-    ASSERT_TRUE(r->tree->bootstrap_root(tree::make_root_node(root_key)));
-    tree::TreeConsensusConfig config;
-    config.self = members[3];
-    config.network_id = network;
-    config.root_key = root_key;
-    config.wall_clock_ms = [this] { return now_ms; };
-    config.mode = tree::TreeLogMode::Ops;
-    const auto log_dir = r->dir / "data" / "tree" / "log";
-    r->tc = std::make_unique<tree::TreeConsensus>(std::move(config), *r->tree, *crypto_svc,
-                                                  log_dir);
-    r->tc->set_authority_source(lookup);
-
-    EXPECT_FALSE(r->tc->start());
-    EXPECT_FALSE(r->tc->healthy());
-    EXPECT_NE(r->tc->halt_reason().find("no tree log and a populated tree"), std::string::npos);
-    EXPECT_FALSE(tree::TreeLog(log_dir).exists());
-    EXPECT_EQ(r->tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Halted);
-    EXPECT_TRUE(r->tree->get_node("root").has_value());  // the local tree is untouched
-    replicas.push_back(std::move(r));
-}
-
-TEST_F(TreeReplicationTest, AReadOnlyLogLeavesTheTreeToItsLocalWrites) {
-    commit_two_blocks();
-    auto& r = make_replica("readonly", tree::TreeLogMode::ReadOnly,
-                           [this](tree::PermissionTreeService& t) {
-                               ASSERT_TRUE(t.bootstrap_root(tree::make_root_node(root_key)));
-                           });
+    auto& r = make_replica("populated", [this](tree::PermissionTreeService& t) {
+        ASSERT_TRUE(test_support::put_root(t, root_key));
+    });
     const auto local = r.tree->tree_digest();
-    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Applied);
-    EXPECT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Applied);
-    EXPECT_EQ(r.tc->log().state().root, tc->log().state().root);
+    EXPECT_TRUE(r.tc->healthy());
+    EXPECT_TRUE(r.tc->awaiting_merge());
+    EXPECT_TRUE(tree::TreeLog(r.dir / "data" / "tree" / "log").exists());
+    EXPECT_EQ(r.tc->log().state().root, tree::empty_base_root());
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Refused);
+    EXPECT_NE(r.tc->status_summary().last_refusal.find("merge commit"), std::string::npos);
+    EXPECT_EQ(r.tc->log().height(), 0u);
+    EXPECT_EQ(r.tree->tree_digest(), local);  // the local tree is untouched
+
+    // A committed block delivered by consensus is not applied either.
+    EXPECT_TRUE(r.tc->awaiting_merge());
+
+    // A restart awaits the merge again; nothing was lost or applied.
+    close_replica(r);
+    open_replica(r);
+    EXPECT_TRUE(r.tc->awaiting_merge());
     EXPECT_EQ(r.tree->tree_digest(), local);
-    EXPECT_EQ(r.tc->log().applied_height(), 0u);
-    EXPECT_EQ(r.tc->submit(seal(root_op())).verdict.refusal, TreeOpRefusal::Unavailable);
 }
 
 TEST_F(TreeReplicationTest, ASnapshotWithEditedCommittedIdsIsNotUsed) {

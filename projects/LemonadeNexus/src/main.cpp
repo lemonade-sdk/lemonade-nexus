@@ -17,6 +17,7 @@
 #include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeConsensus.hpp>
+#include <LemonadeNexus/Tree/TreeMerge.hpp>
 #include <LemonadeNexus/Tree/TreeOpSubmitter.hpp>
 #include <LemonadeNexus/Tree/TreeRole.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
@@ -33,6 +34,7 @@
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/ApplicationRoot.hpp>
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
+#include <LemonadeNexus/Core/TreeMigrationControl.hpp>
 #include <LemonadeNexus/Core/UpgradeControl.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
@@ -231,17 +233,6 @@ int main(int argc, char* argv[]) {
     }
     gossip.set_ipam(&ipam);
 
-    // Tree record transfer: the tree retains applied signed statements
-    // through gossip's bounded pool (transfer only, never re-applies them),
-    // and gossip evaluates received records against the tree's existing
-    // operation-derived permissions.
-    // In ops mode the committed tree log replaces this transfer.
-    if (!config.tree_ops_enabled) {
-        tree.set_delta_retention_sink(
-            [&gossip](const nexus::storage::FileStorageService::RetainedDelta& rec) {
-                return gossip.retain_local_delta(rec);
-            });
-    }
     gossip.set_tree(&tree);
     // No tree role before finalized membership says so: the record transfer
     // pool is not read, and tree log entries are neither taken nor served.
@@ -270,7 +261,7 @@ int main(int argc, char* argv[]) {
     // hang until our own DNS service is up. Run it detached; discovered peers are
     // added once they resolve and get a ServerHello on the next gossip tick. Self
     // entries are dropped by the gossip identity guard.
-    if (config.dns_seed_discovery) {
+    {
         std::thread([&gossip,
                      base   = config.dns_base_domain,
                      region = config.region,
@@ -338,6 +329,9 @@ int main(int argc, char* argv[]) {
     struct TreeStatusSource {
         std::mutex mutex;
         const nexus::tree::TreeConsensus* tree = nullptr;
+        /// The tree merge requests (TreeMigrationControl.hpp), once the tree
+        /// services exist.
+        std::function<nlohmann::json(const nlohmann::json&)> tree_merge;
     } tree_status_source;
 #if defined(LEMONADE_HAVE_UPGRADE_CONTROL)
     // The turn gate, health report, and boot-chain staging for nexus-updater:
@@ -351,6 +345,18 @@ int main(int argc, char* argv[]) {
         const auto t = tree_status_source.tree->status_summary();
         return nexus::core::UpgradeTreeStatus{t.healthy, t.height, t.applied_height, t.behind,
                                               static_cast<uint64_t>(t.held)};
+    };
+    upgrade_control_config.hooks.tree_merge =
+        [&tree_status_source](const nlohmann::json& request) -> nlohmann::json {
+        std::function<nlohmann::json(const nlohmann::json&)> handler;
+        {
+            std::lock_guard lock(tree_status_source.mutex);
+            handler = tree_status_source.tree_merge;
+        }
+        if (!handler) {
+            return {{"ok", false}, {"error", "the tree services have not started yet"}};
+        }
+        return handler(request);
     };
     upgrade_control_config.hooks.stage_boot_chain =
         [staging = nexus::core::BootChainStagingInputs{
@@ -692,16 +698,14 @@ int main(int argc, char* argv[]) {
     // Link tokens (invites) replicate between Tier 1 servers over the
     // backbone, so any Tier 1 server redeems them. Events are signed with the
     // gossip identity under their own domain and name a token only by its
-    // hash; no server stores or sends the token. Without tree operations a
-    // redemption waits for a concurrent redemption on another server to
-    // arrive before it is used; with them, consensus orders the redemption.
+    // hash; no server stores or sends the token. Consensus orders a
+    // redemption: the tree operation that uses a token refuses a second use
+    // on every replica.
     auth_service.set_link_token_replication(
         [&gossip](nexus::auth::LinkTokenEvent& e) { return gossip.sign_link_token_event(e); },
         [&gossip](const nexus::auth::LinkTokenEvent& e) {
             return gossip.broadcast_link_token_event(e);
-        },
-        config.tree_ops_enabled ? std::chrono::milliseconds{0}
-                                : nexus::auth::TokenLinkAuthProvider::kDefaultSettleWindow);
+        });
     gossip.set_link_token_sink([&auth_service](const nexus::auth::LinkTokenEvent& e) {
         return auth_service.apply_replicated_link_token(e);
     });
@@ -1013,30 +1017,31 @@ int main(int argc, char* argv[]) {
     admission.start();
 
     // ========================================================================
-    // Experimental tree operations (Phases 2 and 3), off by default:
-    //   --tree-log  read-only log: build and replicate it, writes stay direct
-    //   --tree-ops  ops: Tier 1 consensus orders writes, every Tier 1 member
-    //               applies the committed (or replicated) log
-    // The objects live for the process; the tree log runs only while this
-    // server holds the tree (TreeRole below starts and stops it).
+    // Tree operations (design Phases 2 and 3): Tier 1 consensus orders every
+    // tree write, and every Tier 1 member applies the committed (or
+    // replicated) log. There is no other tree write path. The objects live
+    // for the process; the tree log runs only while this server holds the
+    // tree (TreeRole below starts and stops it).
     // ========================================================================
     std::unique_ptr<nexus::tree::TreeConsensus> tree_consensus;
     // Destroyed before tree_consensus on every exit path: the control socket
-    // reads the tree log status.
+    // reads the tree log status and serves the tree merge through it.
     struct ClearTreeStatus {
         TreeStatusSource& source;
         ~ClearTreeStatus() {
             std::lock_guard lock(source.mutex);
             source.tree = nullptr;
+            source.tree_merge = nullptr;
         }
     } clear_tree_status{tree_status_source};
     std::unique_ptr<nexus::tree::TreeOpSubmitter> tree_ops;
     std::function<std::optional<nexus::tree::TreeOpOutcome>(const std::string&)> tree_op_status;
     std::function<nlohmann::json()> tree_log_status;
+    std::function<std::pair<int, nlohmann::json>(const nlohmann::json&)> tree_merge_export;
+    std::function<std::pair<int, nlohmann::json>(const nlohmann::json&)> tree_merge_commit;
     std::function<void()> sync_ipam;
     auto* mesh = security_mesh->service.get();
-    if (config.tree_ops_enabled || config.tree_log_enabled) {
-        const bool ops_mode = config.tree_ops_enabled;
+    {
         const auto network_bytes = nexus::crypto::from_hex(security_mesh->network_id_hex);
         nexus::security::NetworkId network_id{};
         if (network_bytes.size() != network_id.size()) {
@@ -1046,21 +1051,34 @@ int main(int argc, char* argv[]) {
         std::copy(network_bytes.begin(), network_bytes.end(), network_id.begin());
         nexus::security::NodeId self{};
         self.bytes = gossip.keypair().public_key;
+        const std::string self_principal =
+            "ed25519:" + nexus::crypto::to_base64(std::span<const uint8_t>(
+                             self.bytes.data(), self.bytes.size()));
         const std::string root_key =
             nexus::core::root_principal_from_hex(config.root_pubkey).value_or("");
+        const auto wall_clock_ms = [] {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count());
+        };
+        // This server's identity key is the configured root management key.
+        const bool holds_root_key = [&] {
+            if (!root_pubkey || config.root_pubkey.empty()) return false;
+            std::vector<uint8_t> want;
+            try {
+                want = nexus::crypto::from_hex(config.root_pubkey);
+            } catch (const std::exception&) {
+                return false;
+            }
+            return std::vector<uint8_t>(root_pubkey->begin(), root_pubkey->end()) == want;
+        }();
 
         nexus::tree::TreeConsensusConfig tree_config;
         tree_config.self = self;
         tree_config.network_id = network_id;
         tree_config.root_key = root_key;
-        tree_config.mode = ops_mode ? nexus::tree::TreeLogMode::Ops
-                                    : nexus::tree::TreeLogMode::ReadOnly;
         tree_config.vault = storage_vault.get();
-        tree_config.wall_clock_ms = [] {
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                             std::chrono::system_clock::now().time_since_epoch())
-                                             .count());
-        };
+        tree_config.wall_clock_ms = wall_clock_ms;
         // Not started here: until TreeRole starts it on Tier 1 entry the
         // handler is halted and refuses every block, op, and entry.
         tree_consensus = std::make_unique<nexus::tree::TreeConsensus>(
@@ -1093,7 +1111,9 @@ int main(int argc, char* argv[]) {
         tree_log_status = [consensus, &gossip] {
             const auto s = consensus->status_summary();
             nlohmann::json out = gossip.tree_sync_status();
-            out["mode"] = s.mode == nexus::tree::TreeLogMode::Ops ? "ops" : "read-only";
+            out["mode"] = s.awaiting_merge ? "awaiting-merge" : "ops";
+            out["awaiting_merge"] = s.awaiting_merge;
+            out["pre_merge_nodes"] = s.pre_merge_nodes;
             out["healthy"] = s.healthy;
             out["halt_reason"] = s.halt_reason;
             out["height"] = s.height;
@@ -1105,58 +1125,203 @@ int main(int argc, char* argv[]) {
             return out;
         };
 
-        if (ops_mode) {
-            // The committed log carries tree changes between Tier 1 members,
-            // so the record transfer pool for tree records is retired.
-            gossip.retire_tree_transfer();
-            // Tree-derived tunnel addresses are recorded in the IPAM file.
-            sync_ipam = [&tree, &ipam] {
-                std::map<std::string, std::string> assigned;
-                for (const auto& [id, node] : tree.nodes_snapshot()) {
-                    if (!node.tunnel_ip.empty()) assigned.emplace(id, node.tunnel_ip);
-                }
-                (void)ipam.sync_tree_tunnel_addresses(assigned);
-            };
-            consensus->set_applied_hook(sync_ipam);
+        // The committed log carries tree changes between Tier 1 members, so
+        // the record transfer pool for tree records stays retired.
+        gossip.retire_tree_transfer();
+        // Tree-derived tunnel addresses are recorded in the IPAM file.
+        sync_ipam = [&tree, &ipam] {
+            std::map<std::string, std::string> assigned;
+            for (const auto& [id, node] : tree.nodes_snapshot()) {
+                if (!node.tunnel_ip.empty()) assigned.emplace(id, node.tunnel_ip);
+            }
+            (void)ipam.sync_tree_tunnel_addresses(assigned);
+        };
+        consensus->set_applied_hook(sync_ipam);
 
-            // Ops are signed with this server's gossip identity under their own
-            // domain tag; the key never leaves GossipService.
-            tree_ops = std::make_unique<nexus::tree::TreeOpSubmitter>(
-                tree, crypto, network_id, gossip.keypair(),
-                [consensus](nexus::tree::TreeOp op) { return consensus->submit(std::move(op)); },
-                std::chrono::milliseconds(nexus::tree::kTreeOpCommitWaitMs));
-            tree_ops->set_root_key(root_key);
-            consensus->set_broadcast([mesh](nexus::security::TreeOpSubmitMsg message) {
-                mesh->broadcast_tree_op(std::move(message));
+        // Ops are signed with this server's gossip identity under their own
+        // domain tag; the key never leaves GossipService.
+        tree_ops = std::make_unique<nexus::tree::TreeOpSubmitter>(
+            tree, crypto, network_id, gossip.keypair(),
+            [consensus](nexus::tree::TreeOp op) { return consensus->submit(std::move(op)); },
+            std::chrono::milliseconds(nexus::tree::kTreeOpCommitWaitMs));
+        tree_ops->set_root_key(root_key);
+        consensus->set_broadcast([mesh](nexus::security::TreeOpSubmitMsg message) {
+            mesh->broadcast_tree_op(std::move(message));
+        });
+        consensus->set_root_request([submitter = tree_ops.get(), root_key] {
+            nexus::tree::TreeOp op;
+            op.kind = nexus::tree::TreeOpKind::EstablishRoot;
+            op.target = "root";
+            op.principal = root_key;
+            op.body.source = nexus::tree::TreeOpSource::Session;
+            const auto admission = submitter->submit_async(std::move(op));
+            if (!admission.verdict.ok()) {
+                spdlog::warn("[tree] root operation not submitted: {}", admission.verdict.reason);
+            }
+        });
+        mesh->register_payload_handler(*consensus);
+        mesh->set_tree_op_sink([consensus](const nexus::security::TreeOpSubmitMsg& message,
+                                           const nexus::security::NodeId& from) {
+            consensus->receive_forwarded(message, from);
+        });
+        tree_op_status = [consensus](const std::string& op_id) {
+            return consensus->status(op_id);
+        };
+
+        // The one-time tree merge (docs/Tree-Merge-Ceremony.md), Tier 1 side:
+        // a member that awaits the merge gives its signed export to a request
+        // the root management key signed, and takes the signed merge commit
+        // through the same verification as replication.
+        nexus::core::TreeMergeExportSource export_source;
+        export_source.crypto = &crypto;
+        export_source.network_id = network_id;
+        export_source.root_key = root_key;
+        export_source.self = self_principal;
+        export_source.keypair = &gossip.keypair();
+        export_source.awaiting_merge = [consensus] { return consensus->awaiting_merge(); };
+        export_source.collect = [&tree, &ipam, &storage, &gossip, holds_root_key] {
+            const std::string label =
+                "tier1-" + nexus::crypto::to_hex(std::span<const uint8_t>(
+                               gossip.keypair().public_key.data(), 8));
+            return nexus::tree::collect_tree_export(label, holds_root_key, tree.nodes_snapshot(),
+                                                    ipam, storage);
+        };
+        export_source.wall_clock_ms = wall_clock_ms;
+        auto export_endpoint =
+            std::make_shared<nexus::core::TreeMergeExportEndpoint>(std::move(export_source));
+        tree_merge_export = [export_endpoint](const nlohmann::json& body) {
+            return export_endpoint->answer(body);
+        };
+        tree_merge_commit = [consensus, mesh](const nlohmann::json& body)
+            -> std::pair<int, nlohmann::json> {
+            const auto entry = nexus::tree::tree_log_entry_from_json(body);
+            if (!entry || entry->kind != nexus::tree::TreeLogEntryKind::Merge) {
+                return {400, {{"error", "the body is not a tree merge commit"}}};
+            }
+            auto promise = std::make_shared<
+                std::promise<std::pair<nexus::tree::ReplicaResult, nexus::tree::TreeLogStatus>>>();
+            auto future = promise->get_future();
+            mesh->post([consensus, promise, entry = *entry] {
+                const auto result = consensus->receive_replicated(entry);
+                promise->set_value({result, consensus->status_summary()});
             });
-            consensus->set_root_request([submitter = tree_ops.get(), root_key] {
-                nexus::tree::TreeOp op;
-                op.kind = nexus::tree::TreeOpKind::EstablishRoot;
-                op.target = "root";
-                op.principal = root_key;
-                op.body.source = nexus::tree::TreeOpSource::Session;
-                const auto admission = submitter->submit_async(std::move(op));
-                if (!admission.verdict.ok()) {
-                    spdlog::warn("[tree] root operation not submitted: {}",
-                                 admission.verdict.reason);
+            if (future.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+                return {503, {{"error", "the tree log did not answer in time; retry"}}};
+            }
+            const auto [result, status] = future.get();
+            const nlohmann::json state = {{"height", status.height},
+                                          {"state_root", nexus::crypto::to_base64(status.root)}};
+            switch (result) {
+                case nexus::tree::ReplicaResult::Applied: {
+                    auto out = state;
+                    out["status"] = "installed";
+                    return {200, out};
                 }
-            });
-            mesh->register_payload_handler(*consensus);
-            mesh->set_tree_op_sink([consensus](const nexus::security::TreeOpSubmitMsg& message,
-                                               const nexus::security::NodeId& from) {
-                consensus->receive_forwarded(message, from);
-            });
-            tree_op_status = [consensus](const std::string& op_id) {
-                return consensus->status(op_id);
+                case nexus::tree::ReplicaResult::Duplicate: {
+                    auto out = state;
+                    out["status"] = "already-installed";
+                    return {200, out};
+                }
+                case nexus::tree::ReplicaResult::Refused:
+                    return {403, {{"error", status.last_refusal}}};
+                case nexus::tree::ReplicaResult::Halted:
+                    return {409, {{"error", "the tree log is halted: " + status.halt_reason}}};
+                default:
+                    return {409, {{"error", "the commit was not applied"}}};
+            }
+        };
+
+        // Root holder side, on the local control socket: the steps that need
+        // the root management key or the data key (TreeMigrationControl.hpp).
+        nexus::core::TreeMigrationHooks migration;
+        migration.crypto = &crypto;
+        migration.wall_clock_ms = wall_clock_ms;
+        migration.random_nonce_hex = [&crypto] {
+            std::array<uint8_t, 16> nonce{};
+            crypto.random_bytes(std::span<uint8_t>(nonce));
+            return nexus::crypto::to_hex(std::span<const uint8_t>(nonce));
+        };
+        migration.facts = [mesh, &gossip, network_id, root_key, self_principal,
+                           holds_root_key] {
+            nexus::core::TreeMigrationFacts facts;
+            facts.network_id = network_id;
+            facts.root_key = root_key;
+            facts.holds_root_key = holds_root_key;
+            facts.signer = self_principal;
+            const auto snapshot = mesh->membership();
+            facts.membership_known = snapshot.known;
+            const auto peers = gossip.get_peers();
+            for (const auto& member : snapshot.members) {
+                const auto b64 = nexus::crypto::to_base64(
+                    std::span<const uint8_t>(member.bytes.data(), member.bytes.size()));
+                nexus::core::TreeMigrationMember m;
+                m.signer = "ed25519:" + b64;
+                for (const auto& peer : peers) {
+                    if (nexus::crypto::canonical_key_b64(peer.pubkey) != b64) continue;
+                    m.address = peer.advertised_endpoint.empty() ? peer.endpoint
+                                                                 : peer.advertised_endpoint;
+                    m.http_port = peer.http_port;
+                    if (const auto cert =
+                            nlohmann::json::parse(peer.certificate_json, nullptr, false);
+                        cert.is_object()) {
+                        m.server_id = cert.value("server_id", "");
+                    }
+                }
+                facts.members.push_back(std::move(m));
+            }
+            return facts;
+        };
+        migration.sign_with_root_key =
+            [&crypto, &root_privkey, holds_root_key](std::span<const uint8_t> message)
+            -> std::optional<nexus::crypto::Ed25519Signature> {
+            if (!holds_root_key || !root_privkey) return std::nullopt;
+            return crypto.ed25519_sign(*root_privkey, message);
+        };
+        migration.export_backup = [&crypto, vault = storage_vault.get(), network_id, &gossip](
+                                      const std::filesystem::path& backup_root,
+                                      std::string& error) -> std::optional<nlohmann::json> {
+            std::error_code ec;
+            if (!std::filesystem::is_directory(backup_root / "tree" / "nodes", ec)) {
+                error = "no tree/nodes directory under " + backup_root.string();
+                return std::nullopt;
+            }
+            // Covered files open with this server's data key, at the same
+            // relative paths; the copy itself is never written.
+            const auto view = vault->copy_view(backup_root);
+            nexus::storage::FileStorageService copy_storage{backup_root};
+            copy_storage.set_vault(view.get());
+            copy_storage.start();
+            nexus::tree::PermissionTreeService copy_tree{copy_storage, crypto};
+            copy_tree.start();
+            nexus::ipam::IPAMService copy_ipam{copy_storage};
+            copy_ipam.start();
+            const auto nodes = copy_tree.nodes_snapshot();
+            const auto listed = copy_storage.list_nodes().size();
+            const auto exported = nexus::tree::collect_tree_export(
+                "root-server-backup", true, nodes, copy_ipam, copy_storage);
+            copy_ipam.stop();
+            copy_tree.stop();
+            copy_storage.stop();
+            if (nodes.size() != listed) {
+                error = std::to_string(listed - std::min(listed, nodes.size())) + " of " +
+                        std::to_string(listed) +
+                        " node files in the backup do not open with this server's data key";
+                return std::nullopt;
+            }
+            spdlog::warn("[tree-merge] exported {} nodes from the backup at {}",
+                         exported.nodes.size(), backup_root.string());
+            return nexus::tree::sign_tree_export(crypto, nexus::tree::tree_export_to_json(exported),
+                                                 network_id, gossip.keypair());
+        };
+        {
+            std::lock_guard lock(tree_status_source.mutex);
+            tree_status_source.tree_merge = [migration](const nlohmann::json& request) {
+                return nexus::core::handle_tree_migration_request(request, migration);
             };
-            spdlog::warn("EXPERIMENTAL: tree operations enabled (ops mode). Tier 1 orders tree "
-                         "writes through consensus and every Tier 1 member applies the "
-                         "committed log; a member that joins or lags catches up by replication "
-                         "from Tier 1. A Tier 2 server holds no tree.");
-        } else {
-            spdlog::warn("EXPERIMENTAL: tree log enabled (read-only mode). Tier 1 members build "
-                         "and replicate the tree log; tree writes keep the direct paths.");
         }
+        spdlog::info("Tree operations: Tier 1 orders tree writes through consensus and every "
+                     "Tier 1 member applies the committed log; a member that joins or lags "
+                     "catches up by replication from Tier 1. A Tier 2 server holds no tree.");
     }
 
     // ========================================================================
@@ -1172,12 +1337,9 @@ int main(int argc, char* argv[]) {
             [&] {
                 storage.ensure_tree_directories();
                 tree.start();
-                // With tree operations on, the root is an EstablishRoot op that
-                // Tier 1 commits (TreeConsensus::set_root_request); a direct
-                // write would bypass consensus.
-                if (!config.tree_ops_enabled) {
-                    nexus::core::ensure_application_root(tree, config.root_pubkey);
-                }
+                // The root is an EstablishRoot op that Tier 1 commits
+                // (TreeConsensus::set_root_request), or it comes with the
+                // tree merge commit.
                 gossip.set_tree_role(true);
                 if (tree_consensus) {
                     if (!tree_consensus->start()) {
@@ -1185,7 +1347,7 @@ int main(int argc, char* argv[]) {
                         // tree but applies, votes for, and accepts no tree
                         // operation. The updater's health report shows the
                         // halt.
-                        spdlog::error("EXPERIMENTAL tree operations halted at Tier 1 entry: {}",
+                        spdlog::error("Tree operations halted at Tier 1 entry: {}",
                                       tree_consensus->halt_reason());
                     }
                     // Only a server that holds the tree reports a tree log to
@@ -1319,6 +1481,8 @@ int main(int argc, char* argv[]) {
         .tree_ops         = tree_ops.get(),
         .tree_op_status   = tree_op_status,
         .tree_log_status  = tree_log_status,
+        .tree_merge_export = tree_merge_export,
+        .tree_merge_commit = tree_merge_commit,
         .storage_vault    = storage_vault.get(),
         // Any server serves the chain: it is candidate data the client
         // verifies against its pinned Genesis key.

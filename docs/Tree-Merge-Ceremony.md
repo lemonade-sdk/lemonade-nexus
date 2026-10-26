@@ -5,33 +5,67 @@ title: Tree Merge Ceremony
 
 # Tree Merge Ceremony
 
-Status: **experimental**. This runbook implements design section A9 of
+Status: **supported one-time migration**. This runbook implements design
+section A9 of
 [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key).
-It has been run only against test data. It has not been run against a live
-mesh.
+It is tested with unit and multi-server tests. It has not run against the live
+mesh yet.
 
 ## Table of Contents
 - [Purpose](#purpose)
-- [What the ceremony trusts](#what-the-ceremony-trusts)
+- [Empty start: no tree data kept](#empty-start-no-tree-data-kept)
+- [What the merge trusts](#what-the-merge-trusts)
+- [How a server behaves until the merge](#how-a-server-behaves-until-the-merge)
 - [Before you start](#before-you-start)
-- [Step 1: Run the tree log in read-only mode (release N)](#step-1-run-the-tree-log-in-read-only-mode-release-n)
-- [Step 2: Freeze tree writes and export every tree](#step-2-freeze-tree-writes-and-export-every-tree)
-- [Step 3: Merge the exports and resolve conflicts](#step-3-merge-the-exports-and-resolve-conflicts)
-- [Step 4: Sign the merge offline with the root management key](#step-4-sign-the-merge-offline-with-the-root-management-key)
-- [Step 5: Install the commit and let it replicate](#step-5-install-the-commit-and-let-it-replicate)
-- [Step 6: Switch every server to ops mode (release N+1)](#step-6-switch-every-server-to-ops-mode-release-n1)
+- [Step 1: Roll out the release](#step-1-roll-out-the-release)
+- [Step 2: Dry run on the root server](#step-2-dry-run-on-the-root-server)
+- [Step 3: Sign and deliver](#step-3-sign-and-deliver)
+- [Step 4: Check every Tier 1 server](#step-4-check-every-tier-1-server)
+- [The merge rule](#the-merge-rule)
 - [Recovery](#recovery)
+- [Test data without encryption](#test-data-without-encryption)
 - [Limits](#limits)
 
 ## Purpose
 
 Before tree operations, each server kept and changed its own permission tree.
 The trees differ. Tree operations need one tree that every server agrees on.
-The ceremony merges every server's tree once and commits the result as height
-1 of the tree log. After the ceremony, every tree change is a tree operation
-that Tier 1 consensus orders.
+The merge collects every server's tree once, merges them by a fixed rule, and
+commits the result as height 1 of the tree log. After the merge, every tree
+change is a tree operation that Tier 1 consensus orders.
 
-## What the ceremony trusts
+The owner runs one script, `nexus-tree-migrate`, on the root server: once as a
+dry run, and once to sign and deliver. Everything else is the normal signed
+release and the rolling update.
+
+## Empty start: no tree data kept
+
+When no tree data needs to survive, skip the merge. The install moves each
+Tier 1 server's `data/tree` (with any tree log) aside. A Tier 1 server with no
+tree log and an empty tree does not await a merge: it opens a log on the empty
+base and asks Tier 1 for the `EstablishRoot` operation of its configured
+`root_pubkey`. Tier 1 commits it as height 1, which holds only the application
+root, owned by the root management key. No command is needed.
+
+The authority is unchanged: a replica accepts `EstablishRoot` only when it
+names the replica's own configured `root_pubkey` and no root exists, only from
+a submitter in the block epoch's Tier 1 set, and only through consensus. It
+is one-shot: a second root is refused (`AlreadyExists`).
+
+To check from the root server (ns1), run the one command:
+
+```bash
+sudo nexus-tree-migrate
+```
+
+It reports that no Tier 1 member awaits a merge and exits. Then
+`GET /api/tree/sync` on each Tier 1 server shows `"mode": "ops"`,
+`"height": 1` (or more after the first writes), and the same `"state_root"`.
+
+Move the trees aside on every Tier 1 server or on none: a server that keeps an
+old tree awaits a merge and withholds its vote, and the script refuses a mix.
+
+## What the merge trusts
 
 - The merged tree is authorized only by the **root management key** signature
   (`root_pubkey` in the configuration). Every server verifies that signature
@@ -39,193 +73,202 @@ that Tier 1 consensus orders.
   `genesis_pubkey`. The server or person that delivers the commit is not
   trusted.
 - The commit is valid only as height 1, on top of an empty tree log base. A
-  server whose log already holds height 1 refuses another merge commit. There
-  is no command that replaces the tree after that.
-- The merge tool reads and writes no key material. Only the root server's
-  `--sign-tree-merge` command uses the root management key, and it signs only
-  a canonical merge preimage for the configured network.
+  server whose log already holds height 1 refuses another merge commit, and a
+  merge entry at any other height does not verify. There is no command that
+  replaces the tree after that.
+- Each Tier 1 member gives its tree only for an export request that the root
+  management key signed for that member (`lemonade-nexus/tree-export-request:v1`,
+  at most 10 minutes from its clock, a nonce it has not served). It signs its
+  export with its own gossip identity (`lemonade-nexus/tree-export-signature:v1`).
+- The root server merges only when the exports are signed by exactly the
+  current Tier 1 members by finalized membership, each once, plus at most its
+  own backup export. Only the root server's export counts as the root
+  server's. Without a backup, the merged root is the application root of the
+  root management key (as `EstablishRoot` creates it).
+- The root management key and the data key never leave the running servers.
+  The script holds no key. On the root server's control socket (root peers
+  only, [Upgrade Control](Upgrade-Control)) the key signs only an export
+  request for a current member, and the preimage of a merge that the server
+  built itself from verified exports, after the rebuilt tree digest equals the
+  digest of the reviewed dry run.
+
+## How a server behaves until the merge
+
+A release with tree operations runs them on every server; there is no
+setting. When a Tier 1 server holds a tree written before tree operations and
+no tree log, it **awaits the merge**:
+
+- It opens a tree log on the empty base and keeps its tree as it is. Tree
+  reads, sessions, and tunnels keep working.
+- Every tree write (join, group and node edits, assignments, invites, moves,
+  deletions, account deletion, endpoint changes) answers `503` with
+  `Retry-After: 30` and the reason. The write is not queued, so nothing applies
+  later or twice.
+- It proposes no tree block, withholds its vote from every tree block, and
+  requests no root. No tree block can take height 1 before the merge commit.
+- It applies only the merge commit. A consensus entry is refused and named in
+  the status.
+- `GET /api/tree/sync` shows `"mode": "awaiting-merge"`, `"healthy": true`,
+  `"height": 0`, and `"pre_merge_nodes"`. The updater's health gate passes.
+- A restart keeps this state.
+
+When the merge commit arrives (by `POST /api/tree/merge/commit` or by the
+`"tree"` stream from another member), the server verifies it, writes it as
+height 1, and replaces its tree with the merged tree. A crash between the
+write and the replacement is repaired at the next start from the log.
+
+A server with an empty tree and no log starts a new log normally. A Tier 2
+server holds no tree.
 
 ## Before you start
 
-- Every server runs a release that contains this feature.
-- Only Tier 1 members hold the tree in this release. A Tier 2 server deletes
-  its tree at startup and answers `GET /api/tree/sync` with `421`. Export the
-  tree of every server that is Tier 2 now from a copy of its data directory
-  taken before it ran this release, or the devices that joined through it are
-  lost from the merge.
 - You know which server holds the root management key (the root server). Its
-  identity public key is `root_pubkey`.
-- You have the mesh network id (64 hex digits). The startup log prints it, or
-  derive it from `genesis_pubkey`.
-- Plan a maintenance window. Tree writes made after the export in step 2 are
-  lost when the servers switch to ops mode in step 6.
+  identity public key is `root_pubkey`. On the production mesh this is ns1.
+- The root server's own tree (optional, `--backup`): a Tier 2 server deleted
+  its tree at startup. To keep it, use the backup taken before that release
+  ran (on ns1: `/var/lib/lemonade-nexus-backup-20261025-boot/state.tar`). The
+  script accepts a tar file or a directory and finds the data directory in it
+  (the directory that holds `tree/nodes`). Without `--backup`, the root server
+  contributes no tree.
+- The backup's files open only with the data key the root server holds now.
+  Run the merge before the root server's next monthly data key rotation.
+- Every Tier 1 member must be reachable from the root server on its public
+  API (`https://<address>:9100` by default, or `--server SIGNER=URL`).
 
-## Step 1: Run the tree log in read-only mode (release N)
+## Step 1: Roll out the release
 
-On every server, set `tree_log_enabled` (`--tree-log` or `SP_TREE_LOG=1`) and
-restart. Do not set `tree_ops_enabled`.
+Publish the release as usual ([Releasing](Releasing#the-tree-operations-release-one-time)).
+`nexus-updater` installs it on one server at a time. Each updated Tier 1
+server awaits the merge. A server that still runs the old release keeps its
+direct writes until its turn; those writes are part of its tree when the
+merge collects it.
 
-In read-only mode a Tier 1 server:
+Wait until every server runs the release. The script refuses to continue while
+a Tier 1 member answers the export route with `404` (old release).
 
-- builds an empty tree log at `data/tree/log`;
-- runs the `"tree"` sync stream: Tier 1 serves log entries, and every Tier 1
-  member pulls them from Tier 1;
-- keeps the direct tree write paths. The log never changes the live tree.
-
-Check each Tier 1 server with `GET /api/tree/sync` on the private API.
-Expect `"mode": "read-only"`, `"healthy": true`, and `"height": 0`.
-
-## Step 2: Freeze tree writes and export every tree
-
-1. Announce the window. Ask admins and users to make no tree changes (joins,
-   group edits, deletes) until step 6 completes.
-2. On each server, stop the service, copy the data directory, and start the
-   service again. Run the export against the copy:
-
-   ```bash
-   nexus-tree-merge export --data-root /path/to/copy --server east --root-server --out east.json
-   nexus-tree-merge export --data-root /path/to/copy --server west --out west.json
-   ```
-
-   Give each server a unique `--server` label. Mark exactly one export with
-   `--root-server`: the server that holds the root management key.
-
-The export records each node, the devices whose tunnel allocation the
-server's IPAM file holds (the server each device joined), and the groups whose
-`create_node` delta the server's delta log holds (each group's creator
-record).
-
-## Step 3: Merge the exports and resolve conflicts
-
-Write a merge spec:
-
-```json
-{
-  "network_id": "<64-hex network id>",
-  "root_pubkey": "<64-hex root management key>",
-  "exports": ["east.json", "west.json"],
-  "resolutions": {}
-}
-```
-
-Run the merge:
+## Step 2: Dry run on the root server
 
 ```bash
-nexus-tree-merge merge --spec spec.json --out unsigned.json \
-    --preimage preimage.json --report report.json
+sudo nexus-tree-migrate \
+    --backup /var/lib/lemonade-nexus-backup-20261025-boot/state.tar
 ```
 
-The merge rule, per node:
+The package installs the script as `/usr/bin/nexus-tree-migrate`.
+`nexus-updater` replaces only the server binaries, so on an updated server
+download `scripts/nexus-tree-migrate` from the release tag and run it with
+`sudo python3`.
 
-1. A resolution in the spec decides: a server label takes that server's
-   copy, and `"drop"` removes the node.
-2. The root comes from the root server.
+The script:
+
+1. asks the root server for the network, the root key, and the current Tier 1
+   members;
+2. extracts the backup to `/var/lib/lemonade-nexus/tree-migration/backup`
+   (regular files and directories only), and has the root server export it with
+   its data key;
+3. for each member, has the root server sign an export request, and sends it
+   to the member's `POST /api/tree/merge/export`;
+4. saves the exports in `/var/lib/lemonade-nexus/tree-migration/exports.json`
+   (mode 0600);
+5. has the root server build the merge and prints the report.
+
+The report lists, for each server, the nodes the merge adds to, removes from,
+and changes in its tree; every node decided by the tie-break; every dropped
+node with the reason; and the tree digest. Nothing is signed.
+
+Review it. A dropped device or group joins again after the merge.
+
+## Step 3: Sign and deliver
+
+```bash
+sudo nexus-tree-migrate \
+    --backup /var/lib/lemonade-nexus-backup-20261025-boot/state.tar \
+    --commit --expect-tree-digest <tree digest from the dry run>
+```
+
+The script collects the exports again. The root server builds the merge
+again, refuses unless the tree digest equals the one you reviewed, signs the
+preimage with the root management key, and verifies the signature. The
+script saves the commit to `/var/lib/lemonade-nexus/tree-migration/commit.json`
+and sends it to every member's `POST /api/tree/merge/commit`. A member that
+does not take it directly gets it from the others by replication.
+
+## Step 4: Check every Tier 1 server
+
+`GET /api/tree/sync` on the private API of each Tier 1 server must show
+`"mode": "ops"`, `"healthy": true`, `"height": 1`, and the same
+`"state_root"` as the script printed. Tree writes work again.
+
+## The merge rule
+
+Per node id, the first rule that decides wins (`tree::merge_tree_exports`,
+`TreeMerge.hpp`):
+
+1. An operator resolution decides. The supported migration passes none.
+2. The root comes from the root server's export, when it holds one.
 3. A node that one export holds, or that every holding export holds
    identically, is taken.
-4. A device comes from the server it joined.
-5. A group comes from the server that holds its creator record.
-6. Anything else is a conflict.
+4. A device comes from the server whose IPAM file records its tunnel
+   allocation (the server it joined).
+5. A group comes from the server whose delta log records its `create_node`
+   delta (its creator).
+6. **Tie-break.** Among the copies with rule 4 or 5 evidence when two or more
+   have it, else among all copies: the highest `version`; then the copy that
+   the most exports hold identically; then the root server's copy; then the
+   copy whose encoding is first in byte order.
 
-After selection, a node whose parent is missing (`orphan`) and two nodes that
-share an endpoint identifier, mesh key, or tunnel address
-(`duplicate_identifier`, `duplicate_mesh_key`, `duplicate_tunnel_address`) are
-conflicts too. Independent IPAM files often gave the same tunnel address to
-two devices; resolve this by dropping one device and joining it again after
-step 6.
+Then, on the selected nodes:
 
-With conflicts, the tool prints one line per conflict, writes the report, and
-exits with status 2. Add resolutions to the spec and run the merge again.
-Without conflicts, it writes `unsigned.json` (the unsigned height-1 commit)
-and `preimage.json` (the exact bytes the root management key signs), and
-prints the height-1 state root.
+7. Two nodes that share an endpoint identifier, a mesh key, or a tunnel
+   address (independent IPAM files often gave one address to two devices):
+   the root is kept; otherwise the node whose join an export records, then the
+   node the most exports hold, then the smallest id. The others are dropped.
+8. Every node that does not reach the root through its parents (a missing or
+   dropped parent, or a cycle) is dropped.
 
-## Step 4: Sign the merge offline with the root management key
-
-Copy `preimage.json` to the root server. Run, with the same configuration the
-service uses:
-
-```bash
-lemonade-nexus --data-root /var/lib/lemonade-nexus/data \
-    --root-pubkey <root_pubkey> --genesis-pubkey <genesis_pubkey> \
-    --sign-tree-merge preimage.json signature.b64
-```
-
-The command refuses a file that is not a canonical merge preimage for this
-network, and refuses to sign unless this server's identity is the configured
-root key. It prints the node count, tree digest, and state root. Compare them
-with the merge output before you continue.
-
-Copy `signature.b64` back and finalize:
-
-```bash
-nexus-tree-merge finalize --unsigned unsigned.json --signature signature.b64 \
-    --out commit.json
-```
-
-`finalize` verifies the signature and writes the signed commit.
-
-## Step 5: Install the commit and let it replicate
-
-Install the commit on one Tier 1 server. Stop the service first: the tree log
-belongs to the running process.
-
-```bash
-lemonade-nexus --data-root /var/lib/lemonade-nexus/data \
-    --root-pubkey <root_pubkey> --genesis-pubkey <genesis_pubkey> \
-    --install-tree-merge commit.json
-```
-
-The command verifies the signature against the configured anchors and writes
-the commit as tree log height 1. Start the service again.
-
-The `"tree"` stream carries the commit to every other server. Each server
-verifies the root signature itself before it appends the commit. You can also
-install the same file on every server by hand.
-
-Wait until `GET /api/tree/sync` on every server shows `"height": 1` and the
-same `"state_root"`. A server that shows a `last_refusal` that names the log
-base started its log from a non-empty tree; see [Recovery](#recovery).
-
-## Step 6: Switch every server to ops mode (release N+1)
-
-On every server, set `tree_ops_enabled` (`--tree-ops` or `SP_TREE_OPS=1`) and
-restart. At start, the server finds that its live tree is behind the committed
-log and replaces it with the log state: the merged tree.
-
-Do not switch a server that has no tree log. In ops mode, a server with no
-log and a populated tree halts tree operations at start instead of starting
-a log from its own tree: such a log would not match the other servers' logs,
-and it would block the merge commit, which is valid only at height 1 on the
-empty base. The halt reason names the cause. Install the commit on that
-server (step 5) and restart it. From then on, every
-tree write is a tree operation, Tier 1 orders it, and a Tier 1 member that
-joins or lags applies the replicated log. Tier 2 servers hold no tree.
-
-Check `GET /api/tree/sync`: `"mode": "ops"`, `"healthy": true`, and the same
-`"state_root"` on every Tier 1 server. End the maintenance window.
+The result depends only on the exports: their order, and the order of nodes
+in them, does not change it. The merge refuses to produce a commit only for
+malformed input (repeated server labels, more than one root server export,
+a bad resolution, no root in any export).
 
 ## Recovery
 
-- **A server refuses every entry and reports that the entry does not chain.**
-  Its log started from another tree. Stop it, move `data/tree/log` aside,
-  start it in read-only or ops mode with an empty tree, and let replication
-  refill the log. In ops mode the server then replaces its live tree with the
-  committed tree.
-- **The merged tree is wrong, and no server has switched to ops mode.** Stop
-  every server, move `data/tree/log` aside on each, and run the ceremony
-  again from step 1. Do not do this after any server switched to ops mode:
-  committed tree operations would be lost.
-- **A server halts tree operations at start.** The log does not verify, the
-  live tree changed outside the log, or the server is in ops mode with a
-  populated tree and no log. Read `halt_reason` in
-  `GET /api/tree/sync`. The server keeps serving its last committed tree and
-  applies nothing until the cause is fixed.
+- **The dry run refuses.** It names the cause: a member that runs the old
+  release, a member that is not reachable (use `--server SIGNER=URL`), a member
+  that does not await the merge, or a backup that does not open. Fix it and run
+  the dry run again. Nothing changed.
+- **The digest does not match at step 3.** A tree changed between the dry run
+  and the commit (only possible through a server outside the merge). Run the
+  dry run again and review it.
+- **A member did not take the commit.** It receives it by replication. To send
+  it again, run step 3 again: a member that holds it answers
+  `already-installed`.
+- **A server refuses consensus entries and reports that it awaits the merge.**
+  It missed the merge (for example, it was offline and kept its old tree). It
+  takes the merge commit by replication from any member; nothing else is
+  needed.
+- **A server halts tree operations at start.** The log does not verify, or the
+  tree changed outside the log. Read `halt_reason` in `GET /api/tree/sync`.
+  The server keeps serving its last committed tree and applies nothing until
+  the cause is fixed.
+
+## Test data without encryption
+
+`nexus-tree-merge` (export, merge, finalize), `lemonade-nexus
+--sign-tree-merge`, and `--install-tree-merge` work on plaintext data
+directories only. They refuse a data directory whose files are under the data
+key. Use them for test data; use `nexus-tree-migrate` for a mesh.
 
 ## Limits
 
-- Changes made between the export and the switch-over are lost.
-- The conflict rules use the evidence a server has on disk (IPAM records and
-  the delta log). A node with no evidence and different copies is always a
-  conflict for an admin.
-- The root management key stays on the root server (design Open Decision 1).
-  "Offline" means the signing is a one-shot command, not a network request.
+- The merge decides by the evidence on disk and then by the tie-break; it
+  cannot know which of two differing copies a user meant. The dry run shows
+  every such decision for review.
+- Dropped nodes are not in the merged tree. Those devices join again.
+- Tree writes are refused on updated servers from their update until the
+  merge.
+- For an address URL the script checks the TLS certificate chain but not the
+  name. The exports stay authenticated by their signatures.
+- A backup under an earlier data key does not open.
+- Pre-merge trees of other Tier 2 servers are not collected: only current
+  Tier 1 members and the root server contribute. The production mesh has no
+  other Tier 2 server.

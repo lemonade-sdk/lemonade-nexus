@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <set>
+#include "support/tree_seed.hpp"
 #ifdef _WIN32
 #  include <process.h>
 #  define getpid _getpid
@@ -80,13 +81,13 @@ protected:
         tree::TreeNode root;
         root.id = "root";
         root.type = tree::NodeType::Root;
-        tree_svc->bootstrap_root(root);
+        test_support::put_node(*tree_svc, root);
 
         tree::TreeNode customer;
         customer.id = "customer-a";
         customer.parent_id = "root";
         customer.type = tree::NodeType::Customer;
-        ASSERT_TRUE(tree_svc->insert_join_node(customer));
+        ASSERT_TRUE(test_support::put_node(*tree_svc, customer));
     }
 
     void TearDown() override {
@@ -114,7 +115,7 @@ protected:
 
 TEST_F(RoutingIdentifierTreeTest, ValidBindingAndReverseLookup) {
     auto ep = make_endpoint("ep-1", true, "cpu-1", "mac-1");
-    ASSERT_TRUE(tree_svc->insert_join_node(ep));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, ep));
 
     EXPECT_TRUE(tree_svc->validate_identifier_binding(ep));
 
@@ -130,24 +131,9 @@ TEST_F(RoutingIdentifierTreeTest, TamperedBindingRejected) {
     EXPECT_FALSE(tree_svc->validate_identifier_binding(ep));
 }
 
-TEST_F(RoutingIdentifierTreeTest, CollidingNewRegistrationRejectedIncumbentKept) {
-    auto incumbent = make_endpoint("ep-1", true, "cpu-1", "mac-1");
-    ASSERT_TRUE(tree_svc->insert_join_node(incumbent));
-
-    // A different node claims the SAME identifier — must be rejected.
-    tree::TreeNode squatter = make_endpoint("ep-2", true, "cpu-2", "mac-2");
-    squatter.endpoint_identifier = incumbent.endpoint_identifier;
-    EXPECT_FALSE(tree_svc->insert_join_node(squatter));
-
-    // Incumbent still owns the identifier (never auto-renamed).
-    auto resolved = tree_svc->resolve_by_identifier(incumbent.endpoint_identifier);
-    ASSERT_TRUE(resolved.has_value());
-    EXPECT_EQ(resolved->id, "ep-1");
-}
-
 TEST_F(RoutingIdentifierTreeTest, IndexSurvivesReload) {
     auto ep = make_endpoint("ep-1", false, "cpu-1", "mac-1");
-    ASSERT_TRUE(tree_svc->insert_join_node(ep));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, ep));
     const std::string ident = ep.endpoint_identifier;
 
     // Restart the service: index must be rebuilt from persisted nodes.
@@ -200,7 +186,7 @@ protected:
         if (grant_connect) {
             n.assignments = {{caller_pubkey, {"connect_private"}}};
         }
-        ASSERT_TRUE(tree_svc->insert_join_node(n));
+        ASSERT_TRUE(test_support::put_node(*tree_svc, n));
     }
 
     void SetUp() override {
@@ -215,7 +201,7 @@ protected:
         tree_svc->start();
 
         tree::TreeNode root; root.id = "root"; root.type = tree::NodeType::Root;
-        tree_svc->bootstrap_root(root);
+        test_support::put_node(*tree_svc, root);
         add("customer-a", "root", tree::NodeType::Customer);
         add("client-1",   "customer-a", tree::NodeType::Endpoint);
         add("ep-sibling", "customer-a", tree::NodeType::Endpoint, /*grant=*/true);

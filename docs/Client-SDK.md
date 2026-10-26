@@ -199,8 +199,8 @@ identity key, so a copied session token cannot delete an account. The server
 side is described in [Security](Security#account-deletion).
 
 On status `"deleted"` the SDK stops the mesh, clears its session token and
-node id, and (C ABI) stops the account image service. With tree operations
-on, the answer can be status `"pending"` with an `op_id`. The SDK then keeps
+node id, and (C ABI) stops the account image service. The answer can be
+status `"pending"` with an `op_id`. The SDK then keeps
 its session, and the deletion takes effect when Tier 1 commits it.
 
 The SDK does not delete local files. After a deletion, the application

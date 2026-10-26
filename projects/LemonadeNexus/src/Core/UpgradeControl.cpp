@@ -55,6 +55,10 @@ std::string handle_upgrade_control_request(security::UpgradeService& service,
     if (op_it == request.end() || !op_it->is_string()) return refuse("missing op");
     const auto op = op_it->get<std::string>();
 
+    if (op.starts_with("tree_merge_")) {
+        if (!hooks.tree_merge) return refuse("the tree merge is not available");
+        return hooks.tree_merge(request).dump();
+    }
     if (op == "status") {
         const auto& state = service.state();
         json rollout = nullptr;

@@ -88,8 +88,7 @@ public:
     /// Wire link token replication between Tier 1 servers (see
     /// TokenLinkAuthProvider::set_replication). Call before serving requests.
     void set_link_token_replication(TokenLinkAuthProvider::EventSigner signer,
-                                    TokenLinkAuthProvider::EventPublisher publisher,
-                                    std::chrono::milliseconds settle_window);
+                                    TokenLinkAuthProvider::EventPublisher publisher);
 
     /// Add a link token event another Tier 1 server made (see
     /// TokenLinkAuthProvider::apply_replicated).

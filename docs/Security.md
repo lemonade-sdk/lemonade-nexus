@@ -92,9 +92,64 @@ or a peer's word (`Tree/TreeRole.hpp`):
   before its persisted state verifies) serves no tree and deletes nothing.
   Unknown is not evidence that it left Tier 1.
 
-A server that enters Tier 1 gets the tree through Tier 1 replication in ops
-mode. The default direct-write mode has no tree replication: a new member
-starts from an empty tree with the application root from `root_pubkey`.
+A server that enters Tier 1 gets the tree through Tier 1 tree log
+replication. Tree operations are the only tree write path; no server changes
+its tree outside the committed log.
+
+### The one-time tree merge
+
+Servers that wrote their trees before tree operations hold different trees.
+The [Tree Merge Ceremony](Tree-Merge-Ceremony) commits one merged tree as tree
+log height 1, once. Its security rules:
+
+- **Authority is the root management key's signature.** Every server
+  verifies the merge commit against its own configured `root_pubkey` and the
+  network id from its own Genesis key, whoever delivers it (the `"tree"`
+  stream, or `POST /api/tree/merge/commit`). The deliverer is not trusted.
+- **One-shot.** The commit is valid only as height 1 on the empty base. A
+  server whose log holds height 1 refuses another merge; a merge entry at any
+  other height does not verify. No command replaces the tree after that.
+- **Nothing takes height 1 first.** A server that holds a pre-merge tree opens
+  its log on the empty base, refuses tree writes (`503`, retryable), proposes
+  nothing, withholds its vote from every tree block, requests no root, and
+  refuses every consensus entry. It applies only the merge commit.
+- **Signed, complete inputs.** A Tier 1 member gives its export only for a
+  request that the root management key signed for that member, issued within
+  10 minutes, with a nonce it has not served. It signs the export with its
+  gossip identity under `lemonade-nexus/tree-export-signature:v1`, bound to
+  the network. The root server merges only when the signers are exactly the
+  current Tier 1 members by finalized membership, each once, plus at most its
+  own backup export, which only it may mark as the root server's. Without a
+  backup the merged root is the root management key's application root.
+- **Empty start.** A Tier 1 server with no tree log and an empty tree awaits
+  no merge. Tier 1 commits the `EstablishRoot` operation for the configured
+  `root_pubkey` as height 1; replicas accept it only for their own configured
+  key, only while no root exists, and only through consensus.
+- **Deterministic merge.** The merge rule (`tree::merge_tree_exports`,
+  TreeMerge.hpp) depends only on the exports. It always decides, and it
+  reports every tie-break and every dropped node.
+- **Narrow signing.** On the root server's control socket (root peers only)
+  the root management key signs two document types: an export request for a
+  current member, and the preimage of a merge that the server built itself
+  from verified exports, and only when the rebuilt tree digest equals the
+  reviewed dry run.
+- **Keys stay in the process.** The data key reads the root server's backup
+  (`StorageVault::copy_view`, read-only, same relative paths, current data
+  key only). The script holds no key.
+
+Limits:
+
+- The root holder reviews the dry run. The merge rule decides by evidence on
+  disk (IPAM records, the delta log) and then by the tie-break; it cannot know
+  which of two differing copies a user meant.
+- Dropped nodes (shared identifiers, nodes that do not reach the root) are
+  gone after the merge; those devices join again.
+- The script reaches Tier 1 members over their public HTTPS API. For an
+  address URL it checks the certificate chain but not the name. The exports
+  stay authenticated by their signatures; their confidentiality against an
+  active attacker on that path then rests on the chain check only.
+- A backup whose files are under an earlier data key (before a monthly
+  rotation) does not open.
 
 Clients send every tree read and write directly to a Tier 1 server. The SDK
 verifies the membership from its pinned Genesis key and accepts a server only
@@ -552,7 +607,7 @@ server (`Auth/LinkTokenLedger.hpp`, `TokenLinkAuthProvider`).
   an earlier release (`link_tokens/<sha256>.json`) is still redeemed, once, on
   the server that minted it, until it expires.
 
-**Single use with tree operations.** A `Join` with a token and an
+**Single use.** A `Join` with a token and an
 `AcceptInvite` carry the signed `Mint` in a link extension of the op
 (`TreeOpBody::invite_grant`). Every replica checks, against the block: the
 grant is a well-formed mint signed by a trusted submitter of the block's
@@ -564,18 +619,11 @@ submitted it. A refused op does not commit the redemption, and its submitter
 restores the token. An invite minted by a server that is not a trusted
 submitter of the block's epoch is refused.
 
-**Single use without tree operations (current default).** Without consensus,
-single use rests on the replicated `Spend` events. The redeeming server
-records and sends its spend, waits `kDefaultSettleWindow` (500 ms) for a
-concurrent spend of the same generation from another Tier 1 server, and
-refuses the token when that other spend counts. Limit: when a spend takes
-longer than the window to arrive (a lost datagram is repaired only by the
-next 30-second digest), two servers can both use one token. Both log the
-double redemption, and every server agrees on which spend counts. This race
-cannot be closed without consensus or a synchronous request path between
-servers, which the backbone does not have. A redemption also fails while the
-token's `Mint` has not reached the redeeming server yet (normally under a
-second after minting).
+The replicated `Spend` and `Refund` events keep every server's ledger in
+step; they decide no redemption. A redemption fails while the token's `Mint`
+has not reached the redeeming server yet (normally under a second after
+minting).
+
 ### Account deletion
 
 An account deletes itself through `POST /api/account/delete` (SDK
@@ -621,14 +669,10 @@ passkey credentials. When the account key owns no node any longer, the
 server revokes it. A revoked key cannot authenticate, and its sessions end,
 including a session that names only the user id (passkey).
 
-**Tree modes.** With tree operations on, the route submits one
-`DeleteAccount` operation (kind 10). Every Tier 1 server validates and applies
-it at the same block, computes the same scope, and runs both cleanups. The
-committed op id keeps a replay refused after a restart. With tree operations
-off, the server that receives the request applies the same plan directly
-(`PermissionTreeService::delete_account`) and runs the same cleanups. That
-mode has no tree replication, so the deletion applies to that server only, as
-every direct write does.
+**Ordering.** The route submits one `DeleteAccount` operation (kind 10).
+Every Tier 1 server validates and applies it at the same block, computes the
+same scope, and runs both cleanups. The committed op id keeps a replay
+refused after a restart.
 
 **Idempotence.** A deletion with nothing left changes nothing and succeeds.
 After a deletion the revoked key cannot request another one.
@@ -640,10 +684,11 @@ Limits:
   that applied the deletion refuses it, because its tree no longer
   authorizes the envelope.
 - Key revocations, passkey credentials, and chat blobs are stored per server.
-  With tree operations off, only the server that served the request removes
-  them. Link token revocations replicate to every Tier 1 server; a token whose
-  `Mint` has not reached the deleting server yet (normally under a second
-  after minting) is not revoked there.
+  Each Tier 1 server that applies the deletion removes its own copies; a
+  server outside Tier 1 at that time keeps its copies. Link token revocations
+  replicate to every Tier 1 server; a token whose `Mint` has not reached the
+  deleting server yet (normally under a second after minting) is not revoked
+  there.
 - Local files (the identity key, the account image cache, and certificate
   directories) stay on the client. The client deletes them (see
   [Client SDK](Client-SDK#account-deletion)).

@@ -1,10 +1,14 @@
 #include <LemonadeNexus/Tree/TreeMerge.hpp>
 
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/IPAM/IPAMService.hpp>
 #include <LemonadeNexus/Security/CanonicalEncoding.hpp>
+#include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Tree/TreeOps.hpp>
 
 #include <algorithm>
+#include <array>
+#include <set>
 #include <tuple>
 
 namespace nexus::tree {
@@ -245,6 +249,168 @@ std::optional<TreeExport> tree_export_from_json(const json& doc) {
     return out;
 }
 
+// --- Collecting and signing exports ----------------------------------------------
+
+TreeExport collect_tree_export(std::string server, bool root_server, const rules::NodeMap& nodes,
+                               const ipam::IPAMService& ipam,
+                               const storage::FileStorageService& storage) {
+    TreeExport exported;
+    exported.server = std::move(server);
+    exported.root_server = root_server;
+    for (const auto& [id, node] : nodes) {
+        if (node.type == NodeType::Endpoint && !node.tunnel_ip.empty()) {
+            const auto allocation = ipam.get_allocation(id);
+            if (allocation && allocation->tunnel &&
+                allocation->tunnel->base_network == node.tunnel_ip) {
+                exported.joined_here.insert(id);
+            }
+        }
+        exported.nodes.push_back(node);
+    }
+    for (const auto& delta : storage.read_deltas_since(0)) {
+        if (delta.operation == "create_node") exported.created_here.insert(delta.target_node_id);
+    }
+    return exported;
+}
+
+namespace {
+
+std::vector<uint8_t> export_signature_message(const json& unsigned_doc) {
+    const std::string text =
+        std::string(kTreeExportSignatureDomain) + "\n" + unsigned_doc.dump();
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+std::string principal_of(const crypto::Ed25519PublicKey& key) {
+    return "ed25519:" + b64(std::span<const uint8_t>(key.data(), key.size()));
+}
+
+std::optional<crypto::Ed25519Signature> signature_from_b64(const std::string& text) {
+    std::vector<uint8_t> raw;
+    try {
+        raw = crypto::from_base64(text);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    if (raw.size() != crypto::kEd25519SignatureSize) return std::nullopt;
+    crypto::Ed25519Signature sig{};
+    std::copy(raw.begin(), raw.end(), sig.begin());
+    return sig;
+}
+
+bool is_lower_hex(std::string_view text) {
+    return std::all_of(text.begin(), text.end(),
+                       [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+}  // namespace
+
+json sign_tree_export(crypto::SodiumCryptoService& crypto, json doc,
+                      const security::NetworkId& network_id,
+                      const crypto::Ed25519Keypair& keypair) {
+    doc.erase("signature");
+    doc["network_id"] = crypto::to_hex(network_id);
+    doc["signer"] = principal_of(keypair.public_key);
+    const auto message = export_signature_message(doc);
+    doc["signature"] = b64(crypto.ed25519_sign(keypair.private_key, message));
+    return doc;
+}
+
+std::optional<std::string> verify_tree_export(crypto::SodiumCryptoService& crypto,
+                                              const json& doc,
+                                              const security::NetworkId& network_id,
+                                              std::string& signer) {
+    if (!doc.is_object() || !doc.contains("signature") || !doc["signature"].is_string() ||
+        !doc.contains("signer") || !doc["signer"].is_string() || !doc.contains("network_id") ||
+        !doc["network_id"].is_string()) {
+        return "the export is not signed";
+    }
+    if (doc["network_id"].get<std::string>() != crypto::to_hex(network_id)) {
+        return "the export names another network";
+    }
+    const auto key = principal_key(doc["signer"].get<std::string>());
+    if (!key) return "the export signer is not an Ed25519 key";
+    const auto sig = signature_from_b64(doc["signature"].get<std::string>());
+    if (!sig) return "the export signature is not 64 bytes of base64";
+    json unsigned_doc = doc;
+    unsigned_doc.erase("signature");
+    if (!crypto.ed25519_verify(*key, export_signature_message(unsigned_doc), *sig)) {
+        return "the export signature does not verify";
+    }
+    signer = principal_of(*key);
+    return std::nullopt;
+}
+
+std::string tree_export_request(const security::NetworkId& network_id, const std::string& target,
+                                uint64_t issued_ms, const std::string& nonce_hex) {
+    // nlohmann::json objects keep keys sorted, so dump() is canonical.
+    return json{{"type", std::string(kTreeExportRequestType)},
+                {"network_id", crypto::to_hex(network_id)},
+                {"target", target},
+                {"issued_ms", issued_ms},
+                {"nonce", nonce_hex}}
+        .dump();
+}
+
+std::optional<TreeExportRequest> verify_tree_export_request(
+    crypto::SodiumCryptoService& crypto, const json& body, const security::NetworkId& network_id,
+    const std::string& root_key, const std::string& self, uint64_t now_ms,
+    std::string& refusal) {
+    const auto refuse = [&](std::string reason) -> std::optional<TreeExportRequest> {
+        refusal = std::move(reason);
+        return std::nullopt;
+    };
+    const auto configured = principal_key(root_key);
+    if (!configured) return refuse("no root management key is configured");
+    if (!body.is_object() || !body.contains("request") || !body["request"].is_string() ||
+        !body.contains("signature") || !body["signature"].is_string()) {
+        return refuse("the body needs request and signature strings");
+    }
+    const auto& text = body["request"].get_ref<const std::string&>();
+    if (text.size() > 1024) return refuse("the request is too large");
+    const json request = json::parse(text, nullptr, false);
+    if (request.is_discarded() || !request.is_object() || request.dump() != text ||
+        request.size() != 5 || request.value("type", "") != kTreeExportRequestType ||
+        !request.contains("issued_ms") || !request["issued_ms"].is_number_unsigned() ||
+        !request.contains("nonce") || !request["nonce"].is_string() ||
+        !request.contains("target") || !request["target"].is_string() ||
+        !request.contains("network_id") || !request["network_id"].is_string()) {
+        return refuse("the request is not a canonical tree export request");
+    }
+    if (request["network_id"].get<std::string>() != crypto::to_hex(network_id)) {
+        return refuse("the request names another network");
+    }
+    const auto target = principal_key(request["target"].get<std::string>());
+    const auto mine = principal_key(self);
+    if (!target || !mine || *target != *mine) return refuse("the request names another server");
+    const auto nonce = request["nonce"].get<std::string>();
+    if (nonce.size() != 32 || !is_lower_hex(nonce)) {
+        return refuse("the request nonce is not 32 lowercase hex digits");
+    }
+    const auto issued = request["issued_ms"].get<uint64_t>();
+    if (issued > now_ms + kTreeExportRequestWindowMs ||
+        issued + kTreeExportRequestWindowMs < now_ms) {
+        return refuse("the request is outside the request window of this server's clock");
+    }
+    const auto sig = signature_from_b64(body["signature"].get<std::string>());
+    if (!sig) return refuse("the signature is not 64 bytes of base64");
+    const std::span<const uint8_t> message(reinterpret_cast<const uint8_t*>(text.data()),
+                                           text.size());
+    if (!crypto.ed25519_verify(*configured, message, *sig)) {
+        return refuse("the request is not signed by the configured root management key");
+    }
+    return TreeExportRequest{nonce, issued};
+}
+
+bool TreeExportNonces::admit(const std::string& nonce, uint64_t issued_ms, uint64_t now_ms) {
+    std::erase_if(seen_, [&](const auto& kv) {
+        return kv.second + 2 * kTreeExportRequestWindowMs < now_ms;
+    });
+    if (seen_.contains(nonce) || seen_.size() >= kMax) return false;
+    seen_.emplace(nonce, issued_ms);
+    return true;
+}
+
 // --- The merge rule --------------------------------------------------------------
 
 namespace {
@@ -252,6 +418,7 @@ namespace {
 struct Copy {
     const TreeExport* from;
     const TreeNode* node;
+    std::vector<uint8_t> encoding;
 };
 
 void add_conflict(MergeResult& out, std::string id, std::string kind, std::string detail,
@@ -264,29 +431,32 @@ void add_conflict(MergeResult& out, std::string id, std::string kind, std::strin
 std::vector<std::string> servers_of(const std::vector<Copy>& copies) {
     std::vector<std::string> out;
     for (const auto& c : copies) out.push_back(c.from->server);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
 }
 
-/// Flags every value shared by two or more merged nodes.
-void check_unique(MergeResult& out, const char* kind, const char* what,
-                  std::string TreeNode::*field, const std::vector<std::string>& ids,
-                  const std::map<std::string, std::string>& source) {
-    std::map<std::string, std::vector<std::string>> holders;
-    for (const auto& id : ids) {
-        const auto& value = out.nodes.at(id).*field;
-        if (!value.empty()) holders[value].push_back(id);
-    }
-    for (const auto& [value, holding] : holders) {
-        if (holding.size() < 2) continue;
-        std::vector<std::string> servers;
-        for (const auto& id : holding) servers.push_back(source.at(id));
-        std::string list;
-        for (const auto& id : holding) list += (list.empty() ? "" : ", ") + id;
-        for (const auto& id : holding) {
-            add_conflict(out, id, kind,
-                         std::string(what) + " " + value + " is held by " + list, servers);
+/// Rule 6: the copy to take among `candidates` (pointers into `all`).
+const Copy* tie_break(const std::vector<const Copy*>& candidates, const std::vector<Copy>& all,
+                      const TreeExport* root_server) {
+    const auto holders = [&](const Copy* c) {
+        return std::count_if(all.begin(), all.end(),
+                             [&](const Copy& other) { return other.encoding == c->encoding; });
+    };
+    const Copy* best = nullptr;
+    for (const Copy* c : candidates) {
+        if (best == nullptr) {
+            best = c;
+            continue;
         }
+        const auto key = [&](const Copy* x) {
+            return std::make_tuple(x->node->version, holders(x), x->from == root_server);
+        };
+        const auto a = key(c);
+        const auto b = key(best);
+        if (a > b || (a == b && c->encoding < best->encoding)) best = c;
     }
+    return best;
 }
 
 }  // namespace
@@ -307,9 +477,9 @@ MergeResult merge_tree_exports(const std::vector<TreeExport>& exports,
             ++root_servers;
         }
     }
-    if (root_servers != 1) {
+    if (root_servers > 1) {
         add_conflict(out, "root", "bad_exports",
-                     "exactly one export must be marked as the root server; found " +
+                     "at most one export may be marked as the root server; found " +
                          std::to_string(root_servers),
                      {});
         root_server = nullptr;
@@ -319,7 +489,9 @@ MergeResult merge_tree_exports(const std::vector<TreeExport>& exports,
     // on the order of `exports`.
     std::map<std::string, std::vector<Copy>> copies;
     for (const auto& [server, e] : by_server) {
-        for (const auto& node : e->nodes) copies[node.id].push_back({e, &node});
+        for (const auto& node : e->nodes) {
+            copies[node.id].push_back({e, &node, encode_tree_node(node)});
+        }
     }
 
     std::map<std::string, std::string> source;  // node id -> server it came from
@@ -347,22 +519,17 @@ MergeResult merge_tree_exports(const std::vector<TreeExport>& exports,
             }
             continue;
         }
-        if (id == "root") {
-            if (root_server == nullptr) continue;  // reported as bad_exports
+        if (id == "root" && root_server != nullptr) {
             const auto pick = std::find_if(held.begin(), held.end(), [&](const Copy& c) {
                 return c.from == root_server;
             });
-            if (pick == held.end()) {
-                add_conflict(out, id, "root_missing",
-                             "the root server's export holds no root", servers_of(held));
-            } else {
+            if (pick != held.end()) {
                 take(*pick, "root server");
+                continue;
             }
-            continue;
         }
-        const auto first = encode_tree_node(*held.front().node);
         const bool identical = std::all_of(held.begin(), held.end(), [&](const Copy& c) {
-            return encode_tree_node(*c.node) == first;
+            return c.encoding == held.front().encoding;
         });
         if (identical) {
             take(held.front(), held.size() == 1 ? "single copy" : "identical copies");
@@ -389,38 +556,107 @@ MergeResult merge_tree_exports(const std::vector<TreeExport>& exports,
             take(*evidence.front(), rule);
             continue;
         }
-        add_conflict(out, id, "divergent",
-                     rule == nullptr
-                         ? "copies differ and no rule decides this node type"
-                         : std::string("copies differ and ") + std::to_string(evidence.size()) +
-                               " servers hold the " + rule + " evidence",
-                     servers_of(held));
+        std::vector<const Copy*> candidates = evidence;
+        if (candidates.size() < 2) {
+            candidates.clear();
+            for (const auto& c : held) candidates.push_back(&c);
+        }
+        const Copy* pick = tie_break(candidates, held, root_server);
+        std::string others;
+        for (const auto& server : servers_of(held)) {
+            if (server != pick->from->server) others += (others.empty() ? "" : ",") + server;
+        }
+        take(*pick, std::string("tie-break over ") + std::to_string(candidates.size()) +
+                        " differing copies (also held by " + others + ")");
     }
     for (const auto& [id, server] : resolutions) {
         if (!copies.contains(id)) {
             add_conflict(out, id, "bad_resolution", "no export holds this node", {server});
         }
     }
+    if (!out.nodes.contains("root")) {
+        add_conflict(out, "root", "root_missing", "no export holds a root", {});
+    }
 
-    // Structure of the merged tree.
-    const auto ids = sorted_ids(out.nodes);
-    for (const auto& id : ids) {
-        const auto& node = out.nodes.at(id);
-        if (id == "root") continue;
-        if (node.parent_id.empty() || !out.nodes.contains(node.parent_id)) {
-            add_conflict(out, id, "orphan",
-                         "parent '" + node.parent_id + "' is not in the merged tree",
-                         {source.at(id)});
+    const auto holders_of = [&](const std::string& id) {
+        const auto it = copies.find(id);
+        return it == copies.end() ? std::vector<std::string>{} : servers_of(it->second);
+    };
+    const auto drop = [&](const std::string& id, std::string reason, std::string detail) {
+        out.nodes.erase(id);
+        out.dropped.push_back({id, std::move(reason), std::move(detail), holders_of(id)});
+    };
+
+    // Rule 7: shared identifiers. Rank: the root, a recorded join, the most
+    // holders, the smallest id.
+    const auto joined_somewhere = [&](const std::string& id) {
+        return std::any_of(exports.begin(), exports.end(),
+                           [&](const TreeExport& e) { return e.joined_here.contains(id); });
+    };
+    const auto keeps_before = [&](const std::string& a, const std::string& b) {
+        const auto key = [&](const std::string& id) {
+            return std::make_tuple(id == "root", joined_somewhere(id), holders_of(id).size());
+        };
+        const auto ka = key(a);
+        const auto kb = key(b);
+        if (ka != kb) return ka > kb;
+        return a < b;
+    };
+    const std::array<std::tuple<const char*, const char*, std::string TreeNode::*>, 3> fields = {{
+        {"duplicate_identifier", "endpoint identifier", &TreeNode::endpoint_identifier},
+        {"duplicate_mesh_key", "mesh key", &TreeNode::mesh_pubkey},
+        {"duplicate_tunnel_address", "tunnel address", &TreeNode::tunnel_ip},
+    }};
+    for (const auto& [reason, what, field] : fields) {
+        std::map<std::string, std::vector<std::string>> holding;
+        for (const auto& [id, node] : out.nodes) {
+            const auto& value = node.*field;
+            if (!value.empty()) holding[value].push_back(id);
+        }
+        for (auto& [value, ids] : holding) {
+            if (ids.size() < 2) continue;
+            std::sort(ids.begin(), ids.end(), keeps_before);
+            for (std::size_t i = 1; i < ids.size(); ++i) {
+                drop(ids[i], reason, std::string(what) + " " + value + " is kept by " + ids[0]);
+            }
         }
     }
-    check_unique(out, "duplicate_identifier", "endpoint identifier",
-                 &TreeNode::endpoint_identifier, ids, source);
-    check_unique(out, "duplicate_mesh_key", "mesh key", &TreeNode::mesh_pubkey, ids, source);
-    check_unique(out, "duplicate_tunnel_address", "tunnel address", &TreeNode::tunnel_ip, ids,
-                 source);
+
+    // Rule 8: everything that does not reach the root.
+    if (out.nodes.contains("root")) {
+        std::map<std::string, std::vector<std::string>> children;
+        for (const auto& [id, node] : out.nodes) {
+            if (id != "root") children[node.parent_id].push_back(id);
+        }
+        std::set<std::string> reached{"root"};
+        std::vector<std::string> frontier{"root"};
+        while (!frontier.empty()) {
+            const auto id = frontier.back();
+            frontier.pop_back();
+            for (const auto& child : children[id]) {
+                if (reached.insert(child).second) frontier.push_back(child);
+            }
+        }
+        std::vector<std::string> unreached;
+        for (const auto& [id, node] : out.nodes) {
+            if (!reached.contains(id)) unreached.push_back(id);
+        }
+        const auto selected = out.nodes;
+        for (const auto& id : unreached) {
+            const auto& parent = selected.at(id).parent_id;
+            if (parent.empty() || !selected.contains(parent)) {
+                drop(id, "orphan", "parent '" + parent + "' is not in the merged tree");
+            } else {
+                drop(id, "unreachable", "parent '" + parent + "' does not reach the root");
+            }
+        }
+    }
 
     std::sort(out.conflicts.begin(), out.conflicts.end(), [](const auto& a, const auto& b) {
         return std::tie(a.node_id, a.kind, a.detail) < std::tie(b.node_id, b.kind, b.detail);
+    });
+    std::sort(out.dropped.begin(), out.dropped.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.node_id, a.reason) < std::tie(b.node_id, b.reason);
     });
     std::sort(out.decisions.begin(), out.decisions.end());
     return out;
@@ -434,6 +670,136 @@ json merge_conflicts_to_json(const std::vector<MergeConflict>& conflicts) {
                            {"detail", c.detail},
                            {"servers", c.servers}});
     }
+    return out;
+}
+
+json merge_report(const std::vector<TreeExport>& exports, const MergeResult& result) {
+    json dropped = json::array();
+    for (const auto& d : result.dropped) {
+        dropped.push_back(json{{"node_id", d.node_id},
+                               {"reason", d.reason},
+                               {"detail", d.detail},
+                               {"servers", d.servers}});
+    }
+    json servers = json::object();
+    for (const auto& e : exports) {
+        std::vector<std::string> added;
+        std::vector<std::string> removed;
+        std::vector<std::string> changed;
+        std::map<std::string, const TreeNode*> mine;
+        for (const auto& node : e.nodes) mine.emplace(node.id, &node);
+        for (const auto& [id, node] : result.nodes) {
+            const auto it = mine.find(id);
+            if (it == mine.end()) {
+                added.push_back(id);
+            } else if (encode_tree_node(*it->second) != encode_tree_node(node)) {
+                changed.push_back(id);
+            }
+        }
+        for (const auto& [id, node] : mine) {
+            if (!result.nodes.contains(id)) removed.push_back(id);
+        }
+        std::sort(added.begin(), added.end());
+        std::sort(changed.begin(), changed.end());
+        servers[e.server] = json{{"nodes", e.nodes.size()},
+                                 {"root_server", e.root_server},
+                                 {"added", added},
+                                 {"removed", removed},
+                                 {"changed", changed}};
+    }
+    return json{{"node_count", result.nodes.size()},
+                {"decisions", result.decisions},
+                {"dropped", std::move(dropped)},
+                {"conflicts", merge_conflicts_to_json(result.conflicts)},
+                {"servers", std::move(servers)}};
+}
+
+// --- The supported migration -------------------------------------------------------
+
+SignedMergeBuild build_signed_merge(crypto::SodiumCryptoService& crypto,
+                                    const std::vector<json>& docs,
+                                    const SignedMergeInput& input) {
+    SignedMergeBuild out;
+    const auto refuse = [&](std::string reason) {
+        out = SignedMergeBuild{};
+        out.refusal = std::move(reason);
+        return out;
+    };
+    const auto root_signer = principal_key(input.root_signer);
+    if (!root_signer) return refuse("the root signer is not an Ed25519 key");
+    // Compare principals by key bytes: spellings of one key differ.
+    std::map<std::string, bool> required;  // canonical principal -> seen
+    std::set<std::string> members;         // canonical principals
+    required.emplace(principal_of(*root_signer), false);
+    for (const auto& member : input.members) {
+        const auto key = principal_key(member);
+        if (!key) return refuse("a Tier 1 member is not an Ed25519 key");
+        required.emplace(principal_of(*key), false);
+        members.insert(principal_of(*key));
+    }
+    json signers = json::object();
+    for (const auto& doc : docs) {
+        std::string signer;
+        if (const auto refusal = verify_tree_export(crypto, doc, input.network_id, signer)) {
+            return refuse(*refusal);
+        }
+        const auto slot = required.find(signer);
+        if (slot == required.end()) {
+            return refuse("an export is signed by " + signer +
+                          ", which is neither a Tier 1 member nor the root server");
+        }
+        if (slot->second) return refuse("two exports are signed by " + signer);
+        slot->second = true;
+        auto parsed = tree_export_from_json(doc);
+        if (!parsed) return refuse("the export signed by " + signer + " is malformed");
+        if (parsed->root_server != (signer == principal_of(*root_signer))) {
+            return refuse("only the root server's export is marked as the root server export");
+        }
+        if (signers.contains(parsed->server)) {
+            return refuse("server label " + parsed->server + " repeats");
+        }
+        signers[parsed->server] = signer;
+        out.exports.push_back(std::move(*parsed));
+    }
+    for (const auto& [signer, seen] : required) {
+        if (seen) continue;
+        if (signer == principal_of(*root_signer) && !members.contains(signer)) {
+            // The root server has no tree of its own to give (no backup).
+            // The root then is the application root of the root management
+            // key, as an EstablishRoot op creates it.
+            TreeExport key_root;
+            key_root.server = "root-management-key";
+            key_root.root_server = true;
+            key_root.nodes = {make_root_node(input.root_key)};
+            if (signers.contains(key_root.server)) {
+                return refuse("server label " + key_root.server + " repeats");
+            }
+            signers[key_root.server] = "";
+            out.exports.push_back(std::move(key_root));
+            continue;
+        }
+        return refuse("no export from " + signer +
+                      "; every Tier 1 member must contribute one");
+    }
+
+    out.result = merge_tree_exports(out.exports, {});
+    out.report = merge_report(out.exports, out.result);
+    out.report["signers"] = std::move(signers);
+    if (!out.result.conflicts.empty()) return out;
+    out.entry = build_merge_entry(out.result.nodes, input.block_time_ms, input.network_id,
+                                  input.root_key);
+    if (!out.entry) {
+        out.report["conflicts"].push_back(json{{"node_id", ""},
+                                               {"kind", "too_large"},
+                                               {"detail", "the merged tree exceeds the merge body "
+                                                          "limits"},
+                                               {"servers", json::array()}});
+        return out;
+    }
+    out.preimage = merge_preimage(*out.entry, input.network_id, out.result.nodes.size());
+    out.report["tree_digest"] = b64(out.entry->tree_digest);
+    out.report["state_root"] = b64(out.entry->state_root);
+    out.report["block_time_ms"] = out.entry->block_time_ms;
     return out;
 }
 

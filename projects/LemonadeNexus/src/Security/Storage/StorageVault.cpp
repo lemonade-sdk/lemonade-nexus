@@ -338,6 +338,22 @@ std::optional<std::string> StorageVault::seal_for(const fs::path& path,
     return seal(*file, dek, plaintext);
 }
 
+std::unique_ptr<StorageVault> StorageVault::copy_view(fs::path copy_root) const {
+    copy_root = copy_root.lexically_normal();
+    // The state file sits at the same place relative to the copy's root.
+    auto state_relative = state_path_.parent_path().lexically_relative(data_root_);
+    if (state_relative.empty() || state_relative.generic_string().starts_with("..")) {
+        state_relative = fs::path("security") / "storage";
+    }
+    auto view = std::make_unique<StorageVault>(copy_root, copy_root / state_relative, crypto_,
+                                               coverage_, options_);
+    view->read_only_ = true;
+    view->load();
+    std::lock_guard lock(mutex_);
+    view->source_ = source_;
+    return view;
+}
+
 // --- State ---------------------------------------------------------------------------
 
 std::optional<VaultMode> StorageVault::recorded_mode(const fs::path& state_directory) {
@@ -418,7 +434,7 @@ void StorageVault::load() {
         phase_ = VaultPhase::Idle;
         return;
     }
-    if (mode_ == VaultMode::Encrypted && phase_ == VaultPhase::Promoting) {
+    if (mode_ == VaultMode::Encrypted && phase_ == VaultPhase::Promoting && !read_only_) {
         // The migration or rotation committed; the replacements need no key.
         promote_all(target_key_id_);
         phase_ = VaultPhase::Idle;
@@ -460,7 +476,7 @@ bool StorageVault::files_ready() const {
 
 bool StorageVault::request_rotation() {
     std::lock_guard lock(mutex_);
-    if (mode_ != VaultMode::Encrypted) return false;
+    if (read_only_ || mode_ != VaultMode::Encrypted) return false;
     if (rotation_requested_) return true;
     rotation_requested_ = true;
     return save_state();
@@ -519,6 +535,7 @@ bool StorageVault::write(const fs::path& path, std::string_view bytes) {
     const auto file = classify(path);
     if (!file) return false;
     std::lock_guard lock(mutex_);
+    if (read_only_) return false;
     return write_locked(*file, bytes);
 }
 
@@ -555,6 +572,7 @@ bool StorageVault::remove(const fs::path& path) {
     const auto file = classify(path);
     if (!file) return false;
     std::lock_guard lock(mutex_);
+    if (read_only_) return false;
     std::error_code ec;
     // The staged copy goes first, so a crash never leaves it as the only copy
     // of a file the owner deleted.
@@ -688,7 +706,7 @@ void StorageVault::discard_staged() {
 
 void StorageVault::tick(uint64_t wall_ms) {
     std::lock_guard lock(mutex_);
-    if (source_ == nullptr) return;
+    if (source_ == nullptr || read_only_) return;
     if (mode_ == VaultMode::Encrypted) {
         tick_rotation(wall_ms);
     } else {

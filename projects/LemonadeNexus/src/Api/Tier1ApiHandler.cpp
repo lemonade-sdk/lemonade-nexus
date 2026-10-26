@@ -95,6 +95,36 @@ void Tier1ApiHandler::do_register_routes(httplib::Server& pub,
                                {"signature", crypto::to_base64(proof.signature)},
                            });
     });
+
+    // The one-time tree merge (docs/Tree-Merge-Ceremony.md). Both routes are
+    // tree routes: a server that does not hold the tree answers 421
+    // (TreeRouteGate). The request and the commit carry their own authority,
+    // the root management key's signature, so no session is needed.
+    const auto merge_route = [](const std::function<std::pair<int, nlohmann::json>(
+                                    const nlohmann::json&)>& hook,
+                                std::size_t max_body) {
+        return [&hook, max_body](const httplib::Request& req, httplib::Response& res) {
+            if (!hook) {
+                error_response(res, "the tree merge is not available", 404);
+                return;
+            }
+            if (req.body.size() > max_body) {
+                error_response(res, "the body is too large", 413);
+                return;
+            }
+            auto body = parse_body(req, res);
+            if (!body) return;
+            const auto [status, reply] = hook(*body);
+            if (status >= 400 && reply.contains("error") && reply["error"].is_string()) {
+                error_response(res, reply["error"].get<std::string>(), status);
+            } else {
+                json_response(res, reply, status);
+            }
+        };
+    };
+    pub.Post("/api/tree/merge/export", merge_route(ctx_.tree_merge_export, 4 * 1024));
+    // A merge body of kMaxTreeMergeBodyBytes in base64, plus the record.
+    pub.Post("/api/tree/merge/commit", merge_route(ctx_.tree_merge_commit, 24u * 1024u * 1024u));
 }
 
 }  // namespace nexus::api

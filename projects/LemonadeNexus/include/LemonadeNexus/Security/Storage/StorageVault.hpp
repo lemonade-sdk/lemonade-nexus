@@ -58,6 +58,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -215,6 +216,16 @@ public:
                                                       std::span<const uint8_t> dek,
                                                       std::string_view plaintext) const;
 
+    /// A read-only vault over a copy of this server's data directory at
+    /// `copy_root`, for example one extracted from a backup. It has this
+    /// vault's coverage and reads with the DEK this vault holds, so a covered
+    /// file opens only when it is a genuine copy of this server's file at the
+    /// same relative path, under the current DEK. Its mode comes from the
+    /// copy's own state file, read as load() reads it. The view writes,
+    /// removes, rotates, and migrates nothing. Not owning: this vault and its
+    /// data key source must outlive the view.
+    [[nodiscard]] std::unique_ptr<StorageVault> copy_view(std::filesystem::path copy_root) const;
+
 private:
     struct Covered {
         std::filesystem::path path;
@@ -270,6 +281,8 @@ private:
     bool pending_loaded_ = false;
     std::set<std::string> staged_originals_;
     mutable bool last_scan_ok_ = true;
+    /// Set on a copy_view(): every mutation is refused.
+    bool read_only_ = false;
 };
 
 }  // namespace nexus::security
