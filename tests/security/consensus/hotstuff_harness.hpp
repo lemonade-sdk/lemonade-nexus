@@ -31,6 +31,7 @@ using nexus::security::Digest;
 using nexus::security::EpochId;
 using nexus::security::EpochVoteKey;
 using nexus::security::Height;
+using nexus::security::CertifiedChain;
 using nexus::security::HotStuffConfig;
 using nexus::security::HotStuffService;
 using nexus::security::HotStuffState;
@@ -230,7 +231,7 @@ public:
     std::size_t quorum = 0;
 };
 
-// Logs every call. store_before_vote can be told to refuse.
+// Logs every call. store_before_vote and store_chain can be told to refuse.
 class RecordingStore final : public IConsensusStore {
 public:
     struct StoreCall {
@@ -260,9 +261,23 @@ public:
         return commits.back();
     }
 
+    [[nodiscard]] bool store_chain(EpochId, const CertifiedChain& chain) override {
+        if (fail_store_chain) return false;
+        chains.push_back(chain);
+        return true;
+    }
+
+    [[nodiscard]] std::variant<CertifiedChain, LoadResult> load_chain(EpochId) const override {
+        if (seed_chain) return *seed_chain;
+        return LoadResult::Absent;
+    }
+
     bool fail_store_before_vote = false;
+    bool fail_store_chain = false;
     bool seed_corrupt = false;
     std::optional<HotStuffState> seed_state;
+    std::optional<CertifiedChain> seed_chain;
+    std::vector<CertifiedChain> chains;
     std::vector<StoreCall> calls;
     std::vector<ConsensusCommit> commits;
 };

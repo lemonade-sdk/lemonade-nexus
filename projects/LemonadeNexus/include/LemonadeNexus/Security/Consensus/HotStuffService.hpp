@@ -8,7 +8,8 @@
 // timeouts; it returns what may leave the node.
 //
 // Safety invariants this class enforces:
-//   - No vote leaves before its safety state is on disk.
+//   - No vote leaves before its safety state is on disk, and no safety state
+//     reaches disk before the blocks its high certificate names.
 //   - No vote at or below last_voted_view, and none before restart sync.
 //   - A justify QC is evidence: it must validate, or be the genesis anchor.
 //   - The parent IS the justified block (REQUIRE_PARENT_QC).
@@ -108,6 +109,12 @@ public:
     // Stored state: restart, no vote until sync_to_certified(). Corrupt:
     // permanently unusable. Throws std::invalid_argument on an empty leader
     // order or a zero quorum.
+    //
+    // On restart it also restores the stored chain (IConsensusStore::
+    // load_chain) into chain state, without a vote and without a commit.
+    // Every certificate is validated again first; the restore stops at the
+    // first block that fails. A missing or damaged chain record restores
+    // nothing, and restart sync supplies the blocks from peers.
     HotStuffService(HotStuffConfig config, EpochVoteKey own_vote_key, IConsensusStore& store);
 
     /// `payload` is the block payload the proposal message carried, or
@@ -167,13 +174,8 @@ public:
 
     /// One bounded page of the certified chain, for a replica that fell
     /// behind by more than one uncommitted chain (SyncRequest::after_height).
-    struct CertifiedPage {
-        /// Oldest first, each block with its justify; block k is certified by
-        /// block k+1's justify. At most kMaxSyncChainBlocks entries.
-        std::vector<std::pair<Proposal, QuorumCertificate>> chain;
-        /// The certificate over the last block of `chain`.
-        QuorumCertificate certifying;
-    };
+    /// At most kMaxSyncChainBlocks entries.
+    using CertifiedPage = CertifiedChain;
     /// The committed blocks above `after`, then the uncommitted chain when
     /// the page reaches it, with the certificate over the last block. Only
     /// certified blocks of this replica's committed chain are served; the
@@ -239,6 +241,15 @@ private:
     [[nodiscard]] bool extends_locked(const Proposal& proposal) const;
     [[nodiscard]] std::size_t pending_count() const;
     [[nodiscard]] std::optional<ConsensusFailure> view_window_failure(View view) const;
+    /// The header and certificate checks every adopted or restored block
+    /// passes: binding, justify, and a valid certificate over this block.
+    [[nodiscard]] std::optional<ConsensusFailure> certified_block_failure(
+        const Proposal& proposal, const QuorumCertificate& justify,
+        const QuorumCertificate& certifying) const;
+    void restore_stored_chain();
+    /// Stores the uncommitted chain below the high certificate when it
+    /// changed. False only when the store refused it.
+    [[nodiscard]] bool store_certified_chain();
     void advance_high_qc(const QuorumCertificate& certificate);
     void apply_chain_rules(const QuorumCertificate& justify,
                            std::vector<ConsensusCommit>& commits);
@@ -276,6 +287,12 @@ private:
     // One parentless adoption is allowed after a restart: the sync anchor.
     // Its quorum certificate proves the content; everything above it links.
     bool anchor_adopted_ = false;
+    // Chain state holds blocks restored from this node's own chain record.
+    // They do not use up the sync anchor: peers that moved on past them may
+    // still anchor this replica once.
+    bool restored_ = false;
+    // qc_digest of the certificate the stored chain record ends with.
+    std::optional<Digest> stored_chain_qc_;
 
     std::vector<EquivocationRecord> evidence_;
 };

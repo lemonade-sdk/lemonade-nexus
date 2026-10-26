@@ -31,8 +31,10 @@ inline constexpr uint16_t kBftProtocolVersion = 1;
 inline constexpr uint16_t kQcFormatVersion = 1;
 
 // On-disk format of the durable consensus store records
-// (hotstuff-safety-<epoch>.json and hotstuff-commit-<epoch>.json). The format
-// is new; every write carries this version and every read requires it.
+// (hotstuff-safety-<epoch>.json, hotstuff-commit-<epoch>.json, and
+// hotstuff-chain-<epoch>.json). Every write carries this version and every
+// read requires it. A chain file can be absent: the releases before it did
+// not write one.
 inline constexpr uint32_t kConsensusStoreFormatVersion = 1;
 
 // --- Domain-separation strings ----------------------------------------------

@@ -47,8 +47,65 @@ HotStuffService::HotStuffService(HotStuffConfig config,
     last_voted_view_ = state.last_voted_view;
     high_qc_ = state.high_qc;
     locked_qc_ = state.locked_qc;
+    restore_stored_chain();
     current_view_ = std::max(high_qc_.view + 1, last_voted_view_ + 1);
     synced_ = false;
+}
+
+// The record is this node's own, but it is read like a sync reply: every
+// certificate is validated again and the blocks must link. A record that
+// does not pass restores only the blocks before the first failure. The safety
+// state alone bounds every vote, so a short restore costs liveness, never
+// safety, and restart sync fills the rest from peers.
+void HotStuffService::restore_stored_chain() {
+    const auto stored = store_.load_chain(config_.epoch);
+    const auto* record = std::get_if<CertifiedChain>(&stored);
+    if (record == nullptr) return;
+    std::optional<std::pair<Digest, Height>> previous;
+    for (std::size_t i = 0; i < record->chain.size(); ++i) {
+        const auto& [proposal, justify] = record->chain[i];
+        const QuorumCertificate& certifying =
+            i + 1 < record->chain.size() ? record->chain[i + 1].second : record->certifying;
+        if (certified_block_failure(proposal, justify, certifying).has_value()) return;
+        if (previous.has_value()) {
+            if (proposal.parent_digest != previous->first ||
+                proposal.height != previous->second + 1) {
+                return;
+            }
+        } else if (proposal.parent_digest == config_.genesis_digest && proposal.height != 1) {
+            return;
+        }
+        const Digest digest = proposal_digest(proposal);
+        if (const auto seen = accepted_by_view_.find(proposal.view);
+            seen != accepted_by_view_.end() && seen->second != digest) {
+            return;
+        }
+        blocks_[digest] = BlockRecord{proposal, justify, digest, std::nullopt};
+        qc_by_block_[justify.proposal_digest] = justify;
+        qc_by_block_[digest] = certifying;
+        accepted_by_view_[proposal.view] = digest;
+        // The record is written before the safety state that names its
+        // certificate, so after a crash between the two it can be the newer.
+        advance_high_qc(certifying);
+        restored_ = true;
+        previous = std::make_pair(digest, proposal.height);
+    }
+}
+
+bool HotStuffService::store_certified_chain() {
+    const Digest certificate = qc_digest(high_qc_);
+    if (stored_chain_qc_ == certificate) return true;
+    CertifiedChain record{uncommitted_chain(), high_qc_};
+    // Nothing to store at the genesis anchor. A certificate can also arrive
+    // ahead of its block (an orphan's justify). The record then keeps the
+    // last chain this node could store, and peers supply the newer blocks.
+    if (record.chain.empty() ||
+        proposal_digest(record.chain.back().first) != high_qc_.proposal_digest) {
+        return true;
+    }
+    if (!store_.store_chain(config_.epoch, record)) return false;
+    stored_chain_qc_ = certificate;
+    return true;
 }
 
 void HotStuffService::sync_to_certified(View certified_view_floor) {
@@ -298,6 +355,16 @@ ProposalResult HotStuffService::receive_proposal(const Proposal& proposal,
         return result;
     }
 
+    // The high certificate reaches disk with this vote. Its block goes
+    // first: a certificate over a block that no member holds is a parent no
+    // leader can extend, so a committee that restarts at once could never
+    // propose again. A refusal withholds the vote, like a refused safety
+    // write.
+    if (!store_certified_chain()) {
+        result.rejected = ConsensusFailure::StorageRejected;
+        return result;
+    }
+
     HotStuffState pending;
     pending.epoch = config_.epoch;
     pending.consensus_ruleset = config_.consensus_ruleset;
@@ -540,10 +607,9 @@ std::variant<Proposal, ConsensusFailure> HotStuffService::make_proposal(
     return proposal;
 }
 
-std::optional<ConsensusFailure> HotStuffService::adopt_certified_block(
+std::optional<ConsensusFailure> HotStuffService::certified_block_failure(
     const Proposal& proposal, const QuorumCertificate& justify,
-    const QuorumCertificate& certifying, std::vector<ConsensusCommit>& commits_out) {
-    if (failed_) return ConsensusFailure::NotSynced;
+    const QuorumCertificate& certifying) const {
     if (proposal.security_ruleset != config_.security_ruleset ||
         proposal.consensus_ruleset != config_.consensus_ruleset) {
         return ConsensusFailure::RulesetMismatch;
@@ -568,7 +634,21 @@ std::optional<ConsensusFailure> HotStuffService::adopt_certified_block(
         validate_quorum_certificate(certifying, context, config_.vote_keys)) {
         return ConsensusFailure::JustifyInvalid;
     }
+    return std::nullopt;
+}
 
+std::optional<ConsensusFailure> HotStuffService::adopt_certified_block(
+    const Proposal& proposal, const QuorumCertificate& justify,
+    const QuorumCertificate& certifying, std::vector<ConsensusCommit>& commits_out) {
+    if (failed_) return ConsensusFailure::NotSynced;
+    if (const auto failure = certified_block_failure(proposal, justify, certifying)) {
+        return failure;
+    }
+
+    const Digest digest = proposal_digest(proposal);
+    // A block already in chain state links by definition: a repeat delivery
+    // of the anchor does not use up the anchor.
+    const bool known = blocks_.contains(digest);
     if (proposal.parent_digest == config_.genesis_digest) {
         if (proposal.height != 1) return ConsensusFailure::ParentQcMismatch;
     } else if (const auto parent = blocks_.find(proposal.parent_digest);
@@ -576,30 +656,32 @@ std::optional<ConsensusFailure> HotStuffService::adopt_certified_block(
         if (proposal.height != parent->second.proposal.height + 1) {
             return ConsensusFailure::ParentQcMismatch;
         }
-    } else if (anchor_adopted_ || !blocks_.empty()) {
+    } else if (!known && (anchor_adopted_ || (!blocks_.empty() && !restored_))) {
         return ConsensusFailure::MissingParent;
     }
     // Reaching here parentless means this is the sync anchor: the ancestors
     // below it were committed before the restart and are gone. The block's
     // own quorum certificate, already validated above, proves the content at
-    // its declared height. The flag is consumed only on acceptance, below.
+    // its declared height. Blocks restored from this node's own record do not
+    // count: peers may have moved past them. The flag is consumed only on
+    // acceptance, below.
 
     if (const auto seen = accepted_by_view_.find(proposal.view);
         seen != accepted_by_view_.end() && seen->second != digest) {
         return ConsensusFailure::Equivocation;
     }
-    if (!blocks_.contains(digest) && pending_count() >= constants::kMaxPendingProposals) {
+    if (!known && pending_count() >= constants::kMaxPendingProposals) {
         return ConsensusFailure::PendingLimit;
     }
 
-    if (proposal.parent_digest != config_.genesis_digest &&
+    if (!known && proposal.parent_digest != config_.genesis_digest &&
         !blocks_.contains(proposal.parent_digest)) {
         anchor_adopted_ = true;
     }
     // Sync carries headers only; a payload this node already holds stays.
     std::optional<BlockPayload> kept_payload;
-    if (const auto known = blocks_.find(digest); known != blocks_.end()) {
-        kept_payload = known->second.payload;
+    if (const auto existing = blocks_.find(digest); existing != blocks_.end()) {
+        kept_payload = existing->second.payload;
     }
     blocks_[digest] = BlockRecord{proposal, justify, digest, std::move(kept_payload)};
     qc_by_block_[justify.proposal_digest] = justify;

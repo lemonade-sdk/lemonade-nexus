@@ -6,6 +6,7 @@
 #include "support/lifecycle_mesh.hpp"
 
 #include <algorithm>
+#include <map>
 
 namespace lifecycle_test {
 namespace {
@@ -539,13 +540,107 @@ TEST_F(DriverMesh, SequentialRestartsKeepEveryMemberCommitting) {
     }
 }
 
+// Stops every Tier 1 member at the same moment and starts them again from
+// their directories. Messages in flight to the old processes are lost.
+void restart_committee_at_once(DriverMeshBase& fixture) {
+    fixture.mesh.queue.clear();
+    for (Node* member : fixture.founders) {
+        fixture.restart_node(*member);
+    }
+    for (Node* member : fixture.founders) {
+        member->driver->start(fixture.mesh.now_ms);
+        ASSERT_EQ(member->driver->phase(), DriverPhase::Syncing);
+        ASSERT_NE(member->runtime->consensus(), nullptr);
+        ASSERT_TRUE(member->runtime->consensus()->usable()) << "the stored safety state loads";
+        ASSERT_GT(member->runtime->consensus()->state().last_voted_view, 0u);
+    }
+}
+
+[[nodiscard]] Height highest_commit(const std::vector<Node*>& members) {
+    Height highest = 0;
+    for (Node* member : members) {
+        highest = std::max(highest, member->driver->last_committed_height());
+    }
+    return highest;
+}
+
+// Production incident: the consensus store kept the high certificate but not
+// the block it certifies. After all five members restarted together, no
+// member held that block, no leader could propose on it, and Epoch 1
+// consensus stopped for good.
+TEST_F(DriverMesh, EveryMemberRestartedAtOnceCommitsAgain) {
+    bootstrap();
+    run_until_committed(3);
+    ASSERT_FALSE(HasFatalFailure());
+
+    for (int round = 0; round < 2; ++round) {
+        const Height before = highest_commit(founders);
+        std::map<NodeId, View> voted;
+        for (Node* member : founders) {
+            voted[member->id] = member->runtime->consensus()->state().last_voted_view;
+        }
+        restart_committee_at_once(*this);
+        ASSERT_FALSE(HasFatalFailure());
+
+        run_until_committed(before + 3, 400);
+        ASSERT_FALSE(HasFatalFailure()) << "round " << round << ": no commit after the restart";
+        for (Node* member : founders) {
+            EXPECT_EQ(member->driver->phase(), DriverPhase::Active);
+            EXPECT_EQ(member->driver->current_epoch(), 1u);
+            EXPECT_GT(member->runtime->consensus()->state().last_voted_view, voted[member->id])
+                << "round " << round << ": a member did not vote again";
+        }
+    }
+}
+
+// The fleet runs with consensus state from the binary that stored no blocks.
+// The new binary loads that state in place. Installed one member at a time,
+// each member takes the blocks from its running peers through restart sync
+// and stores them with its next vote. After that, a restart of the whole
+// committee at once recovers.
+TEST_F(DriverMesh, StateWithoutStoredBlocksLoadsAndThenSurvivesAFullRestart) {
+    bootstrap();
+    run_until_committed(3);
+    ASSERT_FALSE(HasFatalFailure());
+
+    const auto drop_stored_blocks = [](Node& member) {
+        std::size_t removed = 0;
+        for (const auto& entry : fs::directory_iterator(member.dir / "consensus")) {
+            if (entry.path().filename().string().starts_with("hotstuff-chain-")) {
+                fs::remove(entry.path());
+                ++removed;
+            }
+        }
+        return removed;
+    };
+
+    for (Node* member : founders) {
+        const Height before = highest_commit(founders);
+        restart_node(*member);
+        (void)drop_stored_blocks(*member);
+        member->driver->start(mesh.now_ms);
+        ASSERT_EQ(member->driver->phase(), DriverPhase::Syncing);
+        ASSERT_TRUE(member->runtime->consensus()->usable()) << "the old safety state loads";
+        run_until_committed(before + 3, 200);
+        ASSERT_FALSE(HasFatalFailure());
+        ASSERT_EQ(member->driver->phase(), DriverPhase::Active);
+    }
+
+    const Height before = highest_commit(founders);
+    restart_committee_at_once(*this);
+    ASSERT_FALSE(HasFatalFailure());
+    run_until_committed(before + 3, 400);
+    ASSERT_FALSE(HasFatalFailure()) << "no commit after the full restart";
+}
+
 // The recovery install: every server gets the fixed binary and keeps its Epoch 1
 // state (epoch record, authority chain, consensus and eligibility stores). The
 // Tier 1 members restart one at a time, each rejoining before the next goes
-// down, because the consensus store keeps the safety state but not the blocks
-// a certificate names: a committee restarted all at once holds no parent to
-// extend. Afterwards the next boundary hands off to Epoch 2, with each member
-// holding different evidence for every node, as production verifiers do.
+// down: state from a release that stored no blocks names a certificate whose
+// block only the running peers hold (see
+// StateWithoutStoredBlocksLoadsAndThenSurvivesAFullRestart). Afterwards the
+// next boundary hands off to Epoch 2, with each member holding different
+// evidence for every node, as production verifiers do.
 TEST_F(DriverMesh, ACommitteeRestartedOneAtATimeOnItsStateHandsOffToEpochTwo) {
     bootstrap();
     run_until_committed(2);
