@@ -4,6 +4,8 @@
 // security/lifecycle/storage_key_path.cpp.
 
 #include <LemonadeNexus/Acme/AcmeService.hpp>
+#include <LemonadeNexus/Auth/Ed25519AuthProvider.hpp>
+#include <LemonadeNexus/Auth/PasskeyAuthProvider.hpp>
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
@@ -126,6 +128,8 @@ const std::vector<std::string> kGenerationTwo = {
     "onboarding/admissions.json",
     "chat-aa11/c1.json",
     "keyenv-bb22/p1.json",
+    "credentials/u1.json",
+    "credentials/revoked.json",
 };
 
 class StorageVaultTest : public ::testing::Test {
@@ -152,6 +156,8 @@ protected:
             {"onboarding/admissions.json", "{\"data\":{\"admissions\":[]}}"},
             {"chat-aa11/c1.json", "{\"data\":\"chat blob\"}"},
             {"keyenv-bb22/p1.json", "{\"data\":\"key envelope\"}"},
+            {"credentials/u1.json", "{\"user_id\":\"u1\",\"ed25519_pubkeys\":[]}"},
+            {"credentials/revoked.json", "[]"},
         };
         for (const auto& [rel, text] : originals) write_raw(data / rel, text);
         write_raw(data / "identity/keypair.pub", "public");
@@ -1012,6 +1018,237 @@ TEST_F(StorageVaultTest, AdmissionsAndAccountDataAreWrittenThroughTheVault) {
     EXPECT_EQ(key_envelope->data, envelope.data);
     EXPECT_TRUE(files.delete_file(category, "p9.json"));
     EXPECT_TRUE(files.list_files(category).empty());
+    files.stop();
+}
+
+// --- User credentials --------------------------------------------------------------
+
+/// One Ed25519 device that signs in through Ed25519AuthProvider.
+struct Device {
+    nexus::crypto::Ed25519Keypair keys;
+    std::string pubkey_b64;
+};
+
+Device make_device(nexus::crypto::SodiumCryptoService& crypto) {
+    Device d;
+    d.keys = crypto.ed25519_keygen();
+    d.pubkey_b64 = nexus::crypto::to_base64(std::span<const uint8_t>(d.keys.public_key));
+    return d;
+}
+
+nexus::auth::AuthResult sign_in(nexus::auth::Ed25519AuthProvider& provider,
+                                nexus::crypto::SodiumCryptoService& crypto, const Device& d) {
+    const auto challenge = provider.issue_challenge(d.pubkey_b64)["challenge"].get<std::string>();
+    const auto bytes = nexus::crypto::from_base64(challenge);
+    const auto signature =
+        crypto.ed25519_sign(d.keys.private_key, std::span<const uint8_t>(bytes));
+    return provider.do_authenticate(
+        {{"pubkey", d.pubkey_b64},
+         {"challenge", challenge},
+         {"signature", nexus::crypto::to_base64(std::span<const uint8_t>(signature))}});
+}
+
+nlohmann::json passkey_registration(const std::string& user_id, const std::string& id) {
+    return {{"user_id", user_id},
+            {"credential_id", id},
+            {"public_key_x", std::string(64, 'a')},
+            {"public_key_y", std::string(64, 'b')}};
+}
+
+std::map<std::string, std::string> snapshot(const fs::path& dir) {
+    std::map<std::string, std::string> out;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        out[entry.path().filename().string()] = read_raw(entry.path());
+    }
+    return out;
+}
+
+// Credentials that a generation-1 server wrote as plaintext are adopted in
+// place; sign-in and revocation work through the vault afterwards, also after
+// a restart.
+TEST_F(StorageVaultTest, PlaintextCredentialsAreAdoptedAndSignInWorksAfterRestart) {
+    const auto alice = make_device(crypto);
+    const auto revoked = make_device(crypto);
+    std::string alice_id;
+    keys.unlock();
+    build(1, first_generation_coverage());
+    ASSERT_TRUE(run_to_done());
+    {
+        nexus::storage::FileStorageService files{data};
+        files.start();
+        files.set_vault(vault.get());
+        nexus::auth::Ed25519AuthProvider provider{files, crypto, "jwt-secret"};
+        const auto first = sign_in(provider, crypto, alice);
+        ASSERT_TRUE(first.authenticated) << first.error_message;
+        alice_id = first.user_id;
+        ASSERT_TRUE(sign_in(provider, crypto, revoked).authenticated);
+        ASSERT_TRUE(provider.revoke_pubkey(revoked.pubkey_b64));
+        files.stop();
+    }
+    const auto alice_file = data / "credentials" / (alice_id + ".json");
+    ASSERT_FALSE(encrypted(read_raw(alice_file)));
+    ASSERT_FALSE(encrypted(read_raw(data / "credentials/revoked.json")));
+    vault.reset();
+    auto state = nlohmann::json::parse(read_raw(state_path()));
+    state.erase("coverage");
+    write_raw(state_path(), state.dump());
+
+    build();
+    ASSERT_TRUE(vault->adoption_pending());
+    tick();
+    ASSERT_FALSE(vault->adoption_pending());
+    EXPECT_TRUE(encrypted(read_raw(alice_file)));
+    EXPECT_TRUE(encrypted(read_raw(data / "credentials/revoked.json")));
+
+    for (int run = 0; run < 2; ++run) {
+        SCOPED_TRACE(run == 0 ? "after the adoption" : "after a restart");
+        nexus::storage::FileStorageService files{data};
+        files.start();
+        files.set_vault(vault.get());
+        nexus::auth::Ed25519AuthProvider provider{files, crypto, "jwt-secret"};
+        const auto again = sign_in(provider, crypto, alice);
+        ASSERT_TRUE(again.authenticated) << again.error_message;
+        EXPECT_EQ(again.user_id, alice_id);
+        EXPECT_FALSE(sign_in(provider, crypto, revoked).authenticated);
+        EXPECT_TRUE(provider.is_pubkey_revoked(revoked.pubkey_b64));
+        files.stop();
+        crash_and_restart();
+    }
+}
+
+TEST_F(StorageVaultTest, NewUsersRegisterUnderTheDataKey) {
+    migrate();
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    files.set_vault(vault.get());
+    nexus::auth::Ed25519AuthProvider ed25519{files, crypto, "jwt-secret"};
+    const auto device = make_device(crypto);
+    const auto result = sign_in(ed25519, crypto, device);
+    ASSERT_TRUE(result.authenticated) << result.error_message;
+    EXPECT_TRUE(encrypted(read_raw(data / "credentials" / (result.user_id + ".json"))));
+
+    nexus::auth::PasskeyAuthProvider passkey{files, crypto, "example.test", "jwt-secret"};
+    const auto registered = passkey.do_register(passkey_registration("carol", "cred-carol"));
+    ASSERT_TRUE(registered.authenticated) << registered.error_message;
+    const auto carol = data / "credentials/carol.json";
+    EXPECT_TRUE(encrypted(read_raw(carol)));
+    const auto opened = vault->read(carol);
+    ASSERT_EQ(opened.status, VaultReadStatus::Ok);
+    EXPECT_NE(opened.bytes.find("cred-carol"), std::string::npos);
+    files.stop();
+}
+
+// A credential file that does not open refuses sign-in, registration, and
+// every change, and stays byte for byte as it was.
+TEST_F(StorageVaultTest, ATamperedCredentialFileRefusesSignInAndIsNotOverwritten) {
+    migrate();
+    const auto device = make_device(crypto);
+    std::string user_id;
+    {
+        nexus::storage::FileStorageService files{data};
+        files.start();
+        files.set_vault(vault.get());
+        nexus::auth::Ed25519AuthProvider provider{files, crypto, "jwt-secret"};
+        const auto result = sign_in(provider, crypto, device);
+        ASSERT_TRUE(result.authenticated) << result.error_message;
+        user_id = result.user_id;
+        nexus::auth::PasskeyAuthProvider passkey{files, crypto, "example.test", "jwt-secret"};
+        ASSERT_TRUE(passkey.do_register(passkey_registration(user_id, "cred-1")).authenticated);
+        files.stop();
+    }
+    const auto path = data / "credentials" / (user_id + ".json");
+    auto tampered = read_raw(path);
+    tampered.back() = static_cast<char>(tampered.back() ^ 0x01);
+    write_raw(path, tampered);
+    const auto before = snapshot(data / "credentials");
+
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    files.set_vault(vault.get());
+    nexus::auth::Ed25519AuthProvider provider{files, crypto, "jwt-secret"};
+    // The key is in the unreadable file, so it is neither found nor
+    // registered again as a new identity.
+    EXPECT_FALSE(sign_in(provider, crypto, device).authenticated);
+    EXPECT_FALSE(sign_in(provider, crypto, make_device(crypto)).authenticated);
+    nexus::auth::PasskeyAuthProvider passkey{files, crypto, "example.test", "jwt-secret"};
+    EXPECT_FALSE(passkey.do_register(passkey_registration(user_id, "cred-2")).authenticated);
+    EXPECT_FALSE(passkey.do_register(passkey_registration("dave", "cred-3")).authenticated);
+    EXPECT_FALSE(passkey.remove_user_credentials(user_id));
+    EXPECT_EQ(snapshot(data / "credentials"), before);
+    files.stop();
+}
+
+// An unreadable revocation list counts every key as revoked and is never
+// replaced by a partial list.
+TEST_F(StorageVaultTest, ATamperedRevocationListRefusesEverySessionAndIsNotOverwritten) {
+    migrate();
+    const auto device = make_device(crypto);
+    const auto other = make_device(crypto);
+    {
+        nexus::storage::FileStorageService files{data};
+        files.start();
+        files.set_vault(vault.get());
+        nexus::auth::Ed25519AuthProvider provider{files, crypto, "jwt-secret"};
+        ASSERT_TRUE(sign_in(provider, crypto, device).authenticated);
+        ASSERT_TRUE(sign_in(provider, crypto, other).authenticated);
+        ASSERT_TRUE(provider.revoke_pubkey(other.pubkey_b64));
+        files.stop();
+    }
+    const auto revoked = data / "credentials/revoked.json";
+    const auto good = read_raw(revoked);
+    write_raw(revoked, "[]");  // planted plaintext
+    const auto before = snapshot(data / "credentials");
+
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    files.set_vault(vault.get());
+    {
+        nexus::auth::Ed25519AuthProvider provider{files, crypto, "jwt-secret"};
+        EXPECT_FALSE(sign_in(provider, crypto, device).authenticated);
+        EXPECT_FALSE(sign_in(provider, crypto, other).authenticated);
+        EXPECT_TRUE(provider.is_pubkey_revoked(device.pubkey_b64));
+        EXPECT_TRUE(provider.is_user_revoked("any-user"));
+        EXPECT_FALSE(provider.revoke_pubkey(device.pubkey_b64));
+        EXPECT_FALSE(provider.unrevoke_pubkey(other.pubkey_b64));
+        EXPECT_EQ(snapshot(data / "credentials"), before);
+    }
+    // The same provider recovers once the file opens again.
+    write_raw(revoked, good);
+    {
+        nexus::auth::Ed25519AuthProvider provider{files, crypto, "jwt-secret"};
+        EXPECT_TRUE(sign_in(provider, crypto, device).authenticated);
+        EXPECT_FALSE(sign_in(provider, crypto, other).authenticated);
+    }
+    files.stop();
+}
+
+// With the data key locked, nothing signs in, registers, or writes.
+TEST_F(StorageVaultTest, LockedCredentialsRefuseSignInAndWriteNothing) {
+    migrate();
+    const auto device = make_device(crypto);
+    {
+        nexus::storage::FileStorageService files{data};
+        files.start();
+        files.set_vault(vault.get());
+        nexus::auth::Ed25519AuthProvider provider{files, crypto, "jwt-secret"};
+        ASSERT_TRUE(sign_in(provider, crypto, device).authenticated);
+        files.stop();
+    }
+    crash_and_restart(/*holders_up=*/false);
+    const auto before = snapshot(data / "credentials");
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    files.set_vault(vault.get());
+    nexus::auth::Ed25519AuthProvider provider{files, crypto, "jwt-secret"};
+    EXPECT_FALSE(sign_in(provider, crypto, device).authenticated);
+    EXPECT_FALSE(sign_in(provider, crypto, make_device(crypto)).authenticated);
+    nexus::auth::PasskeyAuthProvider passkey{files, crypto, "example.test", "jwt-secret"};
+    EXPECT_FALSE(passkey.do_register(passkey_registration("erin", "cred-4")).authenticated);
+    EXPECT_EQ(snapshot(data / "credentials"), before);
+
+    // After the unlock the same Ed25519 provider reads the files again.
+    keys.unlock();
+    EXPECT_TRUE(sign_in(provider, crypto, device).authenticated);
     files.stop();
 }
 

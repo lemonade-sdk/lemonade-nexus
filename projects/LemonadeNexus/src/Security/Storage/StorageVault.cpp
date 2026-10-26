@@ -134,6 +134,9 @@ std::vector<VaultCoverage> StorageVault::default_coverage() {
         // stores what.
         {"account-chat", "chat-*", "", ".json", 2},
         {"account-key-envelope", "keyenv-*", "", ".json", 2},
+        // User credentials (CredentialFile.hpp): each user's Ed25519 keys and
+        // passkeys, and the Ed25519 revocation list.
+        {"user-credentials", "credentials", "", ".json", 2},
     };
 }
 

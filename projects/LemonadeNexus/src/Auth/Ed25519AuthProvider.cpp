@@ -1,5 +1,7 @@
 #include <LemonadeNexus/Auth/Ed25519AuthProvider.hpp>
+
 #include <LemonadeNexus/Auth/AccountDeletionProof.hpp>
+#include <LemonadeNexus/Auth/CredentialFile.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
@@ -10,8 +12,6 @@
 
 #include <chrono>
 #include <filesystem>
-#include <fstream>
-#include <sstream>
 
 namespace nexus::auth {
 
@@ -27,40 +27,6 @@ uint64_t now_unix_seconds() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
-}
-
-/// Read a credential file. Returns an empty object when the file is missing
-/// or contains invalid JSON, matching the semantics callers relied on
-/// (null initial json: operator[]/value() behaved like an empty object).
-json read_credential_file(const std::filesystem::path& path) {
-    std::ifstream ifs(path);
-    if (!ifs) return json::object();
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    auto data = json::parse(ss.str(), nullptr, false);
-    return data.is_discarded() ? json::object() : data;
-}
-
-/// Write `data` to `path`, creating the parent directory if needed. Fail-
-/// closed: logs and returns false on any open, write, or exception failure.
-bool write_credential_file(const std::filesystem::path& path, const json& data) {
-    try {
-        std::filesystem::create_directories(path.parent_path());
-        std::ofstream ofs(path, std::ios::trunc);
-        if (!ofs) {
-            spdlog::error("[ed25519] Failed to open credential file: {}", path.string());
-            return false;
-        }
-        ofs << data.dump(2);
-        if (!ofs.good()) {
-            spdlog::error("[ed25519] Failed to write credential file: {}", path.string());
-            return false;
-        }
-        return true;
-    } catch (const std::exception& e) {
-        spdlog::error("[ed25519] Exception writing credential file: {}", e.what());
-        return false;
-    }
 }
 
 } // namespace
@@ -158,6 +124,14 @@ AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
     // Canonical form from here down: a variant encoding of the same key would
     // otherwise miss the revocation set and auto-register as a fresh identity.
     const auto pubkey_b64 = crypto::to_base64(std::span<const uint8_t>(pubkey));
+
+    // Without the revocation list no key can be checked against it.
+    if (!revocations_readable()) {
+        return AuthResult{
+            .authenticated = false,
+            .error_message = "Credential store unavailable"
+        };
+    }
 
     // Revoked (deleted) devices can't re-authenticate or re-join.
     if (is_pubkey_revoked(pubkey_b64)) {
@@ -329,15 +303,18 @@ std::string Ed25519AuthProvider::auto_register(const std::string& pubkey_b64,
                                                 const crypto::Ed25519PublicKey& pubkey) {
     auto user_id = derive_user_id(pubkey);
 
+    std::lock_guard lock(cache_mutex_);
+    // An unreadable credential file can name this key under another user, so
+    // a new identity for it is not created.
+    if (store_degraded_) {
+        spdlog::error("[ed25519] refusing to register pubkey {}: a credential file is "
+                      "unreadable", pubkey_b64.substr(0, 16));
+        return {};
+    }
     if (!save_ed25519_credential(user_id, pubkey_b64)) {
         return {};
     }
-
-    {
-        std::lock_guard lock(cache_mutex_);
-        pubkey_to_user_[pubkey_b64] = user_id;
-    }
-
+    pubkey_to_user_[pubkey_b64] = user_id;
     return user_id;
 }
 
@@ -347,12 +324,21 @@ std::string Ed25519AuthProvider::auto_register(const std::string& pubkey_b64,
 
 // The blocklist is keyed by canonical form on both insert and query, so the same
 // key in a different encoding cannot slip past the exact-string match.
+bool Ed25519AuthProvider::revocations_readable() {
+    if (!cache_loaded_.load(std::memory_order_acquire)) {
+        load_credentials_from_disk();
+    }
+    std::lock_guard lock(cache_mutex_);
+    return !revocations_unreadable_;
+}
+
 bool Ed25519AuthProvider::is_pubkey_revoked(const std::string& pubkey_b64) {
     if (pubkey_b64.empty()) return false;
     if (!cache_loaded_.load(std::memory_order_acquire)) {
         load_credentials_from_disk();
     }
     std::lock_guard lock(cache_mutex_);
+    if (revocations_unreadable_) return true;  // unknown counts as revoked
     // Verbatim first, so an undecodable legacy entry still matches, then by bytes.
     if (revoked_pubkeys_.contains(pubkey_b64)) return true;
     const auto canon = crypto::canonical_key_b64(pubkey_b64);
@@ -378,6 +364,7 @@ bool Ed25519AuthProvider::is_user_revoked(const std::string& user_id) {
         load_credentials_from_disk();
     }
     std::lock_guard lock(cache_mutex_);
+    if (revocations_unreadable_) return true;  // unknown counts as revoked
     return revoked_user_ids_.contains(user_id);
 }
 
@@ -388,6 +375,12 @@ bool Ed25519AuthProvider::revoke_pubkey(const std::string& pubkey_b64) {
     }
 
     std::lock_guard lock(cache_mutex_);
+    // Writing the list now would replace the unreadable one.
+    if (revocations_unreadable_) {
+        spdlog::error("[ed25519] cannot revoke pubkey {}: the revocation list is unreadable",
+                      pubkey_b64.substr(0, 16));
+        return false;
+    }
     // Never silently drop a revocation: keep the raw string if it won't decode.
     const auto canon = crypto::canonical_key_b64(pubkey_b64);
     const auto key = canon.empty() ? pubkey_b64 : canon;
@@ -418,6 +411,11 @@ bool Ed25519AuthProvider::unrevoke_pubkey(const std::string& pubkey_b64) {
     }
 
     std::lock_guard lock(cache_mutex_);
+    if (revocations_unreadable_) {
+        spdlog::error("[ed25519] cannot unrevoke pubkey {}: the revocation list is unreadable",
+                      pubkey_b64.substr(0, 16));
+        return false;
+    }
     const auto canon = crypto::canonical_key_b64(pubkey_b64);
     const auto key = canon.empty() ? pubkey_b64 : canon;
 
@@ -440,10 +438,10 @@ bool Ed25519AuthProvider::unrevoke_pubkey(const std::string& pubkey_b64) {
 }
 
 bool Ed25519AuthProvider::persist_revoked_list() {
-    auto revoked_path = storage_.data_root() / "credentials" / "revoked.json";
+    if (revocations_unreadable_) return false;
     json arr = json::array();
     for (const auto& pk : revoked_pubkeys_) arr.push_back(pk);
-    return write_credential_file(revoked_path, arr);
+    return write_credential_file(storage_, revocation_path(storage_), arr);
 }
 
 // ============================================================================
@@ -452,10 +450,25 @@ bool Ed25519AuthProvider::persist_revoked_list() {
 
 bool Ed25519AuthProvider::save_ed25519_credential(const std::string& user_id,
                                                     const std::string& pubkey_b64) {
-    auto cred_path = storage_.data_root() / "credentials" / (user_id + ".json");
+    const auto cred_path = credential_path(storage_, user_id);
 
-    // Read existing file if present (may have passkey credentials too)
-    auto file_data = read_credential_file(cred_path);
+    // The file may hold passkey credentials too. An unreadable one is refused
+    // and left as it is: it is never replaced by a new file.
+    auto file = read_credential_file(storage_, cred_path);
+    if (file.state == CredentialFileState::Unreadable ||
+        (file.state == CredentialFileState::Present && !file.data.is_object())) {
+        spdlog::error("[ed25519] refusing to write credential file for user {}: the file is "
+                      "unreadable or invalid", user_id);
+        return false;
+    }
+    json file_data = file.state == CredentialFileState::Present ? std::move(file.data)
+                                                                : json::object();
+    if (file_data.contains("user_id") &&
+        (!file_data["user_id"].is_string() || file_data["user_id"].get<std::string>() != user_id)) {
+        spdlog::error("[ed25519] refusing to write credential file for user {}: the file "
+                      "claims another identity", user_id);
+        return false;
+    }
 
     file_data["user_id"] = user_id;
 
@@ -483,15 +496,22 @@ bool Ed25519AuthProvider::save_ed25519_credential(const std::string& user_id,
         });
     }
 
-    return write_credential_file(cred_path, file_data);
+    return write_credential_file(storage_, cred_path, file_data);
 }
 
 bool Ed25519AuthProvider::remove_ed25519_credential(const std::string& user_id,
                                                      const std::string& pubkey_b64) {
-    auto cred_path = storage_.data_root() / "credentials" / (user_id + ".json");
+    const auto cred_path = credential_path(storage_, user_id);
 
-    // Read existing file if present (may have passkey credentials too)
-    auto file_data = read_credential_file(cred_path);
+    // The file may hold passkey credentials too.
+    auto file = read_credential_file(storage_, cred_path);
+    if (file.state == CredentialFileState::Absent) return true;
+    if (file.state == CredentialFileState::Unreadable || !file.data.is_object()) {
+        spdlog::error("[ed25519] cannot scrub credential file for user {}: the file is "
+                      "unreadable or invalid", user_id);
+        return false;
+    }
+    auto& file_data = file.data;
 
     // User no longer in the file: nothing to scrub, and the blocklist still
     // guards auth, so this is not an error.
@@ -515,79 +535,81 @@ bool Ed25519AuthProvider::remove_ed25519_credential(const std::string& user_id,
 
     if (!removed) return true;  // key not in the file; already clean
 
-    return write_credential_file(cred_path, file_data);
+    return write_credential_file(storage_, cred_path, file_data);
 }
 
 void Ed25519AuthProvider::load_credentials_from_disk() {
     std::lock_guard lock(cache_mutex_);
     if (cache_loaded_) return;
 
-    auto creds_dir = storage_.data_root() / "credentials";
-    if (!std::filesystem::exists(creds_dir)) {
-        cache_loaded_.store(true, std::memory_order_release);
-        return;
+    // Recomputed on every attempt. An attempt that found an unreadable file
+    // leaves cache_loaded_ false, so the next call reads again: the file can
+    // open once the data key is in memory or the file is restored. Entries
+    // already loaded stay, and a revocation is never forgotten.
+    store_degraded_ = false;
+    revocations_unreadable_ = false;
+
+    const auto listing = list_credential_files(storage_);
+    if (!listing.complete) {
+        store_degraded_ = true;
+        revocations_unreadable_ = true;
+    }
+    const auto revoked_path = revocation_path(storage_);
+    std::size_t unreadable = 0;
+    for (const auto& path : listing.files) {
+        if (path.filename() == revoked_path.filename()) continue;
+        const auto file = read_credential_file(storage_, path);
+        if (file.state == CredentialFileState::Absent) continue;  // removed since the scan
+        if (file.state == CredentialFileState::Unreadable || !file.data.is_object()) {
+            spdlog::error("[ed25519] credential file {} is unreadable or invalid; new "
+                          "identities are refused until it opens",
+                          path.filename().string());
+            store_degraded_ = true;
+            ++unreadable;
+            continue;
+        }
+        const auto& file_data = file.data;
+        const auto user_id = file_data.value("user_id", std::string{});
+        if (user_id.empty()) continue;
+        if (!file_data.contains("ed25519_pubkeys") || !file_data["ed25519_pubkeys"].is_array()) {
+            continue;
+        }
+        for (const auto& pk_entry : file_data["ed25519_pubkeys"]) {
+            if (!pk_entry.is_object()) continue;
+            // Canonicalize on load: files written before canonicalization
+            // may hold a variant encoding of the same key.
+            auto pk = crypto::canonical_key_b64(pk_entry.value("pubkey", std::string{}));
+            if (!pk.empty()) pubkey_to_user_[pk] = user_id;
+        }
     }
 
-    try {
-        for (const auto& entry : std::filesystem::directory_iterator(creds_dir)) {
-            if (entry.path().extension() != ".json") continue;
-
-            std::ifstream ifs(entry.path());
-            if (!ifs) continue;
-
-            std::ostringstream ss;
-            ss << ifs.rdbuf();
-            auto file_data = json::parse(ss.str(), nullptr, false);
-            if (file_data.is_discarded()) continue;
-
-            auto user_id = file_data.value("user_id", std::string{});
-            if (user_id.empty()) continue;
-
-            if (file_data.contains("ed25519_pubkeys") &&
-                file_data["ed25519_pubkeys"].is_array()) {
-                for (const auto& pk_entry : file_data["ed25519_pubkeys"]) {
-                    // Canonicalize on load: files written before canonicalization
-                    // may hold a variant encoding of the same key.
-                    auto pk = crypto::canonical_key_b64(pk_entry.value("pubkey", std::string{}));
-                    if (!pk.empty()) {
-                        pubkey_to_user_[pk] = user_id;
-                    }
-                }
+    // The device-revocation blocklist (deleted devices).
+    const auto revoked = read_credential_file(storage_, revoked_path);
+    if (revoked.state == CredentialFileState::Unreadable ||
+        (revoked.state == CredentialFileState::Present && !revoked.data.is_array())) {
+        spdlog::error("[ed25519] the revocation list is unreadable or invalid; Ed25519 "
+                      "authentication and sessions are refused until it opens");
+        revocations_unreadable_ = true;
+    } else if (revoked.state == CredentialFileState::Present) {
+        for (const auto& pk : revoked.data) {
+            if (!pk.is_string()) continue;
+            // Repair pre-canonicalization entries so a revoked key stays
+            // revoked whichever encoding it was stored in; keep undecodable
+            // ones verbatim rather than dropping a revocation.
+            auto raw = pk.get<std::string>();
+            auto canon = crypto::canonical_key_b64(raw);
+            revoked_pubkeys_.insert(canon.empty() ? raw : canon);
+            if (auto user_id = user_id_of(canon); !user_id.empty()) {
+                revoked_user_ids_.insert(user_id);
             }
         }
-    } catch (const std::exception& e) {
-        spdlog::error("[ed25519] Error loading credentials from disk: {}", e.what());
     }
 
-    // Load the device-revocation blocklist (deleted devices).
-    try {
-        std::ifstream rifs(creds_dir / "revoked.json");
-        if (rifs) {
-            std::ostringstream rss;
-            rss << rifs.rdbuf();
-            auto revoked_data = json::parse(rss.str(), nullptr, false);
-            if (revoked_data.is_array()) {
-                for (const auto& pk : revoked_data) {
-                    if (!pk.is_string()) continue;
-                    // Repair pre-canonicalization entries so a revoked key stays
-                    // revoked whichever encoding it was stored in; keep undecodable
-                    // ones verbatim rather than dropping a revocation.
-                    auto raw = pk.get<std::string>();
-                    auto canon = crypto::canonical_key_b64(raw);
-                    revoked_pubkeys_.insert(canon.empty() ? raw : canon);
-                    if (auto user_id = user_id_of(canon); !user_id.empty()) {
-                        revoked_user_ids_.insert(user_id);
-                    }
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        spdlog::error("[ed25519] Error loading revocations: {}", e.what());
-    }
-
-    cache_loaded_.store(true, std::memory_order_release);
-    spdlog::info("[ed25519] Loaded {} Ed25519 identity mappings from disk",
-                 pubkey_to_user_.size());
+    const bool clean = !store_degraded_ && !revocations_unreadable_;
+    cache_loaded_.store(clean, std::memory_order_release);
+    spdlog::info("[ed25519] Loaded {} Ed25519 identity mappings from disk ({} unreadable "
+                 "file(s))",
+                 pubkey_to_user_.size(), unreadable);
 }
 
 // ============================================================================

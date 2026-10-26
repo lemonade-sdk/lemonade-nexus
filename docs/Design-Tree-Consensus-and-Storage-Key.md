@@ -741,11 +741,22 @@ Always on, no setting (`Security/Storage/StorageVault.hpp`):
   `link_tokens/ledger.json`, `link_replica/replica.json`, `tree/nodes`,
   `tree/deltas`, `tree/log`, and the TLS and ACME private keys
   (`certs/<fqdn>/privkey.pem` and `certs/account.key`). Coverage generation
-  2: `tree/committed-ops.json`, `onboarding/admissions.json`, and the account
-  data store directories `chat-<hash>/` and `keyenv-<hash>/`.
+  2: `tree/committed-ops.json`, `onboarding/admissions.json`, the account
+  data store directories `chat-<hash>/` and `keyenv-<hash>/`, and the user
+  credentials (`credentials/<user>.json` and `credentials/revoked.json`).
   `FileStorageService`, `KeyWrappingService`, `resolve_jwt_secret`, `TreeLog`,
-  `PermissionTreeService`, `resolve_tls_cert`, and `AcmeService` route these
-  paths through the vault.
+  `PermissionTreeService`, `resolve_tls_cert`, `AcmeService`, and the
+  credential file functions of both auth providers (`Auth/CredentialFile.hpp`)
+  route these paths through the vault.
+- **Credential reads fail closed.** A credential read is absent (a new user),
+  unreadable (locked, refused by the vault, or not JSON), or present. An
+  unreadable file is never treated as empty and never written over: the
+  operation that needs it is refused. An unreadable user file stops the
+  registration of new identities, because the file can name the key or the
+  credential. An unreadable `revoked.json` counts every Ed25519 key and
+  session as revoked, and revocation changes are refused until it opens. The
+  auth providers are created after the data key unlocks (`main`), and they
+  read the files again after a failed load.
 - **Coverage additions.** Each coverage group names the generation that added
   it, and `vault-state.json` records the generation of the files (`coverage`;
   a state file without it records 1). On a server that is already
@@ -793,15 +804,11 @@ Always on, no setting (`Security/Storage/StorageVault.hpp`):
   identity (`ACLService::set_signing_keypair`). Moving ACL rows to a
   DEK-derived key is a re-keying choice, and a live SQLite file does not fit
   the whole-file vault container.
-- **Not covered yet (open work).** The user credential files
-  (`credentials/<user>.json` and `credentials/revoked.json`) hold public keys,
-  WebAuthn counters, and the revocation list. `Ed25519AuthProvider` and
-  `PasskeyAuthProvider` read and write them with their own file code, and a
-  missing file reads as empty, so moving them under the vault needs reads
-  that fail closed first. The per-token files under `link_tokens/` come from
-  an earlier release and stay plaintext so that `TokenLinkAuthProvider` can
-  still redeem them. The release mints no new ones; it only restores a
-  legacy token whose redemption did not complete (`legacy_refund`).
+- **Not covered (legacy).** The per-token files under `link_tokens/` come
+  from releases before `v2026.10.26` and stay plaintext so that
+  `TokenLinkAuthProvider` can still redeem them. The current release mints no
+  new ones; it only restores a legacy token whose redemption did not complete
+  (`legacy_refund`).
 - **Migration (B10).** `plaintext`, then `migrating` (stage
   `<file>.vault-new`, request a new unlock round trip, verify every staged
   copy against the plaintext), then `encrypted` (overwrite and replace). The
@@ -846,7 +853,7 @@ This part does not change the trust model and can ship first.
 | 4 | `storage-threshold` crate: library review, key generation, re-share, share refresh, DLEQ, threshold ECIES. | — |
 | 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose, per-epoch share refresh, daily `StorageKeyRotation`. | 2, 4 |
 | 6 | `nexus-attestd` Seal and Unseal; boot set sealed. **Implemented** (B6). | — |
-| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented** (B12), including the TLS and ACME private keys and coverage generation 2 (committed op ids, admission records, account data store). Files read before the unlock, such as the vote keys and `wrap_local.key`, stay under machine-bound wrapping; B12 lists every file that is not covered and the reason. | 5, 6 |
+| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented** (B12), including the TLS and ACME private keys and coverage generation 2 (committed op ids, admission records, account data store, user credentials). Files read before the unlock, such as the vote keys and `wrap_local.key`, stay under machine-bound wrapping; B12 lists every file that is not covered and the reason. | 5, 6 |
 
 Phases 1, 4, and 6 can run in parallel.
 

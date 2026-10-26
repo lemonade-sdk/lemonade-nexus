@@ -63,7 +63,8 @@
 // credentials, the account envelope replica and the account data store (chat
 // blobs and group-key envelopes), the link token ledger and replica, the tree
 // nodes, deltas, log, and committed operation ids, the server admission
-// records, and the TLS and ACME private keys.
+// records, the user credentials and the Ed25519 revocation list, and the TLS
+// and ACME private keys.
 //
 // Not covered, with the reason:
 //   - Boot set (B6): the gossip identity and the storage share are sealed by
@@ -80,10 +81,8 @@
 //     the DNS replica (every entry is origin-signed and verified on load), and
 //     acl.db (the permission column is already encrypted; a live SQLite file
 //     does not fit one sealed object).
-//   - Not yet: credentials/ (the auth providers use their own file code, and
-//     a missing file reads as empty), and the per-token files that an earlier
-//     release wrote under link_tokens/ (read as plaintext until they are
-//     redeemed).
+//   - Legacy: the per-token files that releases before v2026.10.26 wrote
+//     under link_tokens/ (read as plaintext until they are redeemed).
 // Rollback of a whole file to an older ciphertext under the same DEK is not
 // detected, and neither is a vault-state.json edited to an earlier coverage
 // generation (the state file itself is not authenticated).

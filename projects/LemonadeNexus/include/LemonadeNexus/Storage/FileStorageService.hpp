@@ -19,7 +19,7 @@ namespace nexus::storage {
 ///   tree/deltas/<sequence>.json   — sequential delta log
 ///   tree/retained_deltas/         — delta transfer pool (record primitives)
 ///   identity/                     — server keypair, peers
-///   credentials/<user_id>.json    — WebAuthn credentials
+///   credentials/<user_id>.json    — Ed25519 keys and WebAuthn credentials
 ///   ipam/allocations.json         — IP allocations
 ///   certs/<domain>/               — TLS certificates
 class FileStorageService : public core::IService<FileStorageService>,
