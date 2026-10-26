@@ -257,6 +257,16 @@ release, fails the run.
 |---|---|---|
 | `release/bootstrap-complete` | The bootstrap tag, one line | After every server runs the bootstrap release ([Bootstrap procedure](#bootstrap-procedure-one-time)). The release after it refuses to publish until this names the bootstrap tag. |
 
+### `release/hand-installed`
+
+A release installed by hand on every server, outside the rolling update, has
+no complete rollout records, so no server can prove its rollout. List its tag
+in `release/hand-installed` (one tag per line) through a reviewed pull request
+after every server runs it and reports healthy. The next release then treats
+that rollout as complete and lists its hashes as `previous_release_paths`.
+Add a tag only when every server runs that release: a server still on an
+older release drops out of attestation when the next release publishes.
+
 ## Release guards
 
 The workflow refuses to publish in these cases:
@@ -297,7 +307,8 @@ The workflow refuses to publish in these cases:
    omits either release's hashes fails. An approval that keeps an older
    release after a completed rollout also fails. For the release after the
    bootstrap release, `release/bootstrap-complete` replaces the proof: the
-   bootstrap release has no rollout records.
+   bootstrap release has no rollout records. For the release after a release
+   listed in `release/hand-installed`, that file replaces the proof.
 3. **A failed mixed-version gate.** The `mixed-version` job
    (`mixed-version.yml`) runs the previous release's server next to the new
    one. For the bootstrap release this job is skipped: there is no previous
