@@ -93,7 +93,10 @@ struct MemoryTransport : ISecurityTransport {
     MemoryTransport(MemoryMesh& mesh, NodeId self) : mesh(mesh), self(self) {}
 
     bool send_to(const NodeId& peer, std::span<const uint8_t> envelope) override {
-        if (!mesh.nodes.contains(peer) || envelope.size() > constants::kMaxSecurityMessageBytes) {
+        // Like the gossip transport, nothing travels to this node's own
+        // identity: a self-addressed message must take the local path.
+        if (peer == self || !mesh.nodes.contains(peer) ||
+            envelope.size() > constants::kMaxSecurityMessageBytes) {
             return false;
         }
         mesh.queue.push_back({self, peer, {envelope.begin(), envelope.end()}});

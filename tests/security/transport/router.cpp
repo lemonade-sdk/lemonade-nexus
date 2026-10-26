@@ -82,7 +82,10 @@ struct MemoryTransport : ISecurityTransport {
     MemoryTransport(MemoryMesh& mesh, NodeId self) : mesh(mesh), self(self) {}
 
     bool send_to(const NodeId& peer, std::span<const uint8_t> envelope) override {
-        if (!mesh.nodes.contains(peer) || envelope.size() > constants::kMaxSecurityMessageBytes) {
+        // Like the gossip transport, nothing travels to this node's own
+        // identity: a self-addressed message must take the local path.
+        if (peer == self || !mesh.nodes.contains(peer) ||
+            envelope.size() > constants::kMaxSecurityMessageBytes) {
             return false;
         }
         mesh.queue.push_back({self, peer, {envelope.begin(), envelope.end()}});
@@ -923,6 +926,36 @@ TEST_F(RouterMesh, ActiveEpochActivationOfferIsCurrentMemberOnly) {
                                  mesh.now_ms).dropped,
               DropReason::NotMember);
     EXPECT_EQ(candidate->producer.activation_calls, 1);
+}
+
+TEST_F(RouterMesh, SelfEnrollmentRepliesTakeTheLocalPath) {
+    // Production incident: a member's own final attestation under the SVSM
+    // profile first enrolls its own AK, so this node is observer and subject
+    // at once. The transport refuses its own identity; the activation answer
+    // must still reach this node's verifier, through the local path.
+    bootstrap_epoch_one();
+    Node* member = founders[0];
+    const auto offer = routed_activation_offer(network, member->id, member->id, 2);
+    member->producer.activation_answer = routed_activation_response(offer);
+    const auto message =
+        member->router->compose(SecurityMessageKind::SvsmAkActivationOffer, offer, 1);
+    EXPECT_TRUE(member->router->deliver_local(message, mesh.now_ms).delivered);
+    EXPECT_EQ(member->producer.activation_calls, 1);
+    // The response reached route_activation_response on this node. No live
+    // exchange stands behind this hand-made offer, so the service refuses it
+    // there; before the fix the response vanished in the transport instead.
+    EXPECT_EQ(member->router->drops(DropReason::ServiceRejected), 1u);
+    EXPECT_TRUE(mesh.queue.empty()) << "a self-addressed reply left through the transport";
+
+    // A remote non-member's offer for this node stays a membership drop.
+    const auto hostile = routed_activation_offer(network, outsider->id, member->id, 2);
+    EXPECT_EQ(member->deliver(outsider->id,
+                              encode_security_message(outsider->router->compose(
+                                  SecurityMessageKind::SvsmAkActivationOffer, hostile, 1)),
+                              mesh.now_ms)
+                  .dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(member->producer.activation_calls, 1);
 }
 
 TEST_F(RouterMesh, ActivationOfferWithoutProducerIsNoService) {

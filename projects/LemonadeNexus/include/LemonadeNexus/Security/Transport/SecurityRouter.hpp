@@ -215,6 +215,12 @@ private:
     [[nodiscard]] bool epoch_in_window(const SecurityMessage& message) const;
 
     RouteResult dispatch(SecurityMessage& message, uint64_t now_ms);
+    /// Sends `message` to `to`, or applies it locally when `to` is this node.
+    /// The transport carries nothing to its own identity, and a node that
+    /// attests itself under the SVSM profile runs every enrollment leg (the
+    /// evidence, the activation offer and response, the deferred challenge)
+    /// with this node on both sides.
+    bool reply(const NodeId& to, SecurityMessage message, uint64_t now_ms);
     RouteResult route_proposal(const ProposalMessage& message, const NodeId& from);
     RouteResult route_vote(const Vote& vote);
     RouteResult route_timeout(const TimeoutVote& vote);
@@ -223,16 +229,17 @@ private:
     RouteResult route_share(const FrostShareMessage& message);
     RouteResult route_challenge(const AttestationChallenge& challenge, const NodeId& from,
                                 uint64_t now_ms);
-    RouteResult route_evidence(const AttestationEvidence& evidence);
+    RouteResult route_evidence(const AttestationEvidence& evidence, uint64_t now_ms);
     RouteResult route_evidence_start(const AttestationEvidenceStart& start, uint64_t now_ms);
     RouteResult route_evidence_chunk(const AttestationEvidenceChunk& chunk,
                                      const NodeId& from, uint64_t now_ms);
     RouteResult route_evidence_end(const AttestationEvidenceEnd& end,
                                    const NodeId& from, uint64_t now_ms);
-    RouteResult settle_transfer(EvidenceTransferResult result);
+    RouteResult settle_transfer(EvidenceTransferResult result, uint64_t now_ms);
     RouteResult route_activation_offer(const SvsmAkActivationOfferMessage& offer,
-                                       const NodeId& from);
-    RouteResult route_activation_response(const SvsmAkActivationResponseMessage& response);
+                                       const NodeId& from, uint64_t now_ms);
+    RouteResult route_activation_response(const SvsmAkActivationResponseMessage& response,
+                                          uint64_t now_ms);
     RouteResult route_announcement(const EpochAnnouncement& announcement, const NodeId& from);
     RouteResult route_sync_request(const SyncRequest& request, const NodeId& from);
     RouteResult route_sync_response(const SyncResponse& response, const NodeId& from,
