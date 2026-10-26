@@ -265,6 +265,82 @@ TEST_F(TreeConsensusPath, ARebuiltTreeStackReplaysItsLogAndKeepsFollowing) {
     expect_founders_agree();
 }
 
+// Every Tier 1 member stops at the same moment, tree stack included, and
+// starts again from its directories. Consensus resumes on the stored blocks,
+// and a new op commits on every member to the same tree.
+TEST_F(TreeConsensusPath, TreeOpsCommitAgainAfterTheWholeCommitteeRestarts) {
+    bootstrap();
+    refresh_members();
+    ASSERT_TRUE(stack_of(founders[0]).submitter->submit_async(root_op()).verdict.ok());
+    ASSERT_TRUE(run_until([](TreeStack& s) { return s.tree->get_node("root").has_value(); }));
+    ASSERT_TRUE(stack_of(founders[1]).submitter->submit_async(create_customer("acme"))
+                    .verdict.ok());
+    ASSERT_TRUE(run_until([](TreeStack& s) { return s.tree->get_node("acme").has_value(); }));
+
+    // The stop comes while a tree batch is certified but not committed. The
+    // stored blocks keep headers only, so the batch itself is lost with the
+    // op pools; it must be lost the same way on every member.
+    ASSERT_TRUE(stack_of(founders[3]).submitter->submit_async(create_customer("delta"))
+                    .verdict.ok());
+    const auto batch_in_flight = [&] {
+        return std::all_of(founders.begin(), founders.end(), [](Node* f) {
+            const auto* consensus = f->runtime->consensus();
+            for (const auto& [proposal, justify] : consensus->uncommitted_chain()) {
+                if (consensus->block_payload(nexus::security::proposal_digest(proposal)) !=
+                    nullptr) {
+                    return true;
+                }
+            }
+            return false;
+        });
+    };
+    // Messages go one at a time, so the stop lands between the certificate
+    // over the batch block and its commit.
+    for (int i = 0; i < 200 && !batch_in_flight(); ++i) {
+        mesh.now_ms += 200;
+        for (Node* founder : founders) founder->driver->tick(mesh.now_ms);
+        while (!mesh.queue.empty() && !batch_in_flight()) {
+            Queued item = std::move(mesh.queue.front());
+            mesh.queue.pop_front();
+            mesh.nodes.at(item.to)->deliver(item.from, item.bytes, mesh.now_ms);
+        }
+    }
+    ASSERT_TRUE(batch_in_flight());
+    for (Node* founder : founders) {
+        ASSERT_FALSE(stack_of(founder).tree->get_node("delta").has_value());
+    }
+
+    mesh.queue.clear();
+    for (Node* founder : founders) {
+        auto& stack = stack_of(founder);
+        stack.submitter.reset();
+        stack.consensus.reset();
+        stack.tree->stop();
+        stack.tree.reset();
+        restart_node(*founder);
+    }
+    for (Node* founder : founders) {
+        founder->driver->start(mesh.now_ms);
+        ASSERT_EQ(founder->driver->phase(), DriverPhase::Syncing);
+    }
+    refresh_members();
+
+    ASSERT_TRUE(stack_of(founders[2]).submitter->submit_async(create_customer("gamma"))
+                    .verdict.ok());
+    ASSERT_TRUE(run_until([](TreeStack& s) { return s.tree->get_node("gamma").has_value(); }))
+        << "no tree op committed after the whole committee restarted";
+    expect_founders_agree();
+
+    // The lost op is not stuck: submitted again, it commits.
+    if (!stack_of(founders[0]).tree->get_node("delta").has_value()) {
+        ASSERT_TRUE(stack_of(founders[3]).submitter->submit_async(create_customer("delta"))
+                        .verdict.ok());
+        ASSERT_TRUE(
+            run_until([](TreeStack& s) { return s.tree->get_node("delta").has_value(); }));
+    }
+    expect_founders_agree();
+}
+
 TEST_F(TreeConsensusPath, TheLogHeightContinuesAcrossAnEpochChange) {
     bootstrap();
     refresh_members();

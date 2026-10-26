@@ -74,6 +74,27 @@ the old binary as an invalid baseline.
   paged request as trailing bytes. A replica that is far behind then cannot
   page from that peer; it asks the next leader whose proposal it cannot link.
   Nothing else depends on paging.
+- **Stored consensus blocks.** A Tier 1 server now writes
+  `security/consensus/hotstuff-chain-<epoch>.json` before each vote: the
+  headers and certificates of the uncommitted blocks below its high
+  certificate. An earlier release stored the high certificate but not the
+  block it names, so when every member restarted at once, no member held that
+  block and no leader could propose again. The new file is outside the
+  storage vault: consensus starts before the data key unlocks. It holds no
+  block payload, so a batch in an uncommitted block is lost on every member
+  alike in a full restart, and its ops must be submitted again.
+  - N+1 loads the safety and commit files of N in place. N ignores the new
+    file, so a rollback also loads.
+  - A member that restarts on N+1 without the file takes the blocks from its
+    running peers through restart sync and writes the file with its next
+    vote.
+  - Install order: update the Tier 1 members one at a time, and let each one
+    rejoin and vote before the next one stops (the normal rollout order). Do
+    not restart the whole committee together until every member ran N+1 and
+    voted once. If all members restart together on state from N, no member
+    holds the block. Consensus for that epoch then stays halted: no leader
+    can propose, every member keeps its safety state, and no vote is unsafe.
+    There is no override.
 - **Link token replication.** Gossip type `LinkTokenSync` (0x1B) and the
   catch-up stream `link` are new. A release from before them drops a
   `LinkTokenSync` datagram on the backbone as an unknown type, and ignores a

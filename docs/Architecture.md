@@ -171,6 +171,7 @@ data/
 ├── security/              # Durable security stores
 │   ├── epoch store (bootstrap cert, current epoch, authority history)
 │   ├── hotstuff-safety-<epoch>.json / hotstuff-commit-<epoch>.json
+│   ├── hotstuff-chain-<epoch>.json  # block headers the high certificate names
 │   ├── eligibility store
 │   └── revocation/        # AMD KDS CRL cache
 ├── acl.db                 # SQLite ACL store (application state)

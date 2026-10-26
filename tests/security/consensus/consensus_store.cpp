@@ -19,6 +19,7 @@
 namespace constants = nexus::security::constants;
 namespace fs = std::filesystem;
 using json = nlohmann::json;
+using nexus::security::CertifiedChain;
 using nexus::security::ConsensusCommit;
 using nexus::security::Digest;
 using nexus::security::EpochId;
@@ -27,6 +28,7 @@ using nexus::security::Height;
 using nexus::security::HotStuffState;
 using nexus::security::IConsensusStore;
 using nexus::security::NodeId;
+using nexus::security::Proposal;
 using nexus::security::QcSigner;
 using nexus::security::QuorumCertificate;
 using nexus::security::View;
@@ -486,6 +488,133 @@ TEST_F(ConsensusStoreTest, CommitRoundTripCoversTransitionsDigest) {
     document.erase("transitions_digest");
     write_raw(commit_file(7), document.dump());
     EXPECT_EQ(store.latest_commit(7), std::nullopt);
+}
+
+// --- Stored blocks (hotstuff-chain-<epoch>.json) ----------------------------
+
+[[nodiscard]] CertifiedChain make_chain(EpochId epoch, std::size_t length) {
+    CertifiedChain chain;
+    for (std::size_t i = 0; i < length; ++i) {
+        Proposal proposal{};
+        proposal.security_ruleset = constants::kSecurityRulesetVersion;
+        proposal.consensus_ruleset = constants::kConsensusRulesetVersion;
+        proposal.network_id = filled_digest(0xAA);
+        proposal.epoch = epoch;
+        proposal.height = Height(10 + i);
+        proposal.view = View(20 + i);
+        proposal.leader = filled_node(static_cast<uint8_t>(i + 1));
+        proposal.parent_digest = filled_digest(static_cast<uint8_t>(0x60 + i));
+        proposal.justify_qc_digest = filled_digest(static_cast<uint8_t>(0x70 + i));
+        proposal.previous_state_root = filled_digest(static_cast<uint8_t>(0x80 + i));
+        proposal.proposed_state_root = filled_digest(static_cast<uint8_t>(0x90 + i));
+        proposal.transitions_digest = filled_digest(static_cast<uint8_t>(0xA0 + i));
+        proposal.timestamp_hint = 1000 + i;
+        chain.chain.emplace_back(proposal, make_qc(epoch, View(19 + i), static_cast<uint8_t>(i)));
+    }
+    chain.certifying = make_qc(epoch, View(20 + length), 0x55);
+    return chain;
+}
+
+[[nodiscard]] fs::path chain_file(const fs::path& directory, EpochId epoch) {
+    return directory / ("hotstuff-chain-" + std::to_string(epoch.underlying()) + ".json");
+}
+
+TEST_F(ConsensusStoreTest, ChainRoundTripsEveryBlockAndCertificate) {
+    FileConsensusStore store(directory_);
+    const auto chain = make_chain(7, 3);
+    ASSERT_TRUE(store.store_chain(7, chain));
+
+    const auto result = store.load_chain(7);
+    ASSERT_TRUE(std::holds_alternative<CertifiedChain>(result));
+    const auto& stored = std::get<CertifiedChain>(result);
+    ASSERT_EQ(stored.chain.size(), chain.chain.size());
+    for (std::size_t i = 0; i < chain.chain.size(); ++i) {
+        EXPECT_EQ(nexus::security::proposal_digest(stored.chain[i].first),
+                  nexus::security::proposal_digest(chain.chain[i].first));
+        expect_qc_eq(stored.chain[i].second, chain.chain[i].second);
+    }
+    expect_qc_eq(stored.certifying, chain.certifying);
+
+    // A later chain replaces the record.
+    ASSERT_TRUE(store.store_chain(7, make_chain(7, 1)));
+    const auto replaced = store.load_chain(7);
+    ASSERT_TRUE(std::holds_alternative<CertifiedChain>(replaced));
+    EXPECT_EQ(std::get<CertifiedChain>(replaced).chain.size(), 1u);
+}
+
+// State written by a release that stored no blocks: the safety and commit
+// records load as before, and the missing chain record is Absent, not Corrupt.
+TEST_F(ConsensusStoreTest, StateWithoutAChainRecordStillLoads) {
+    {
+        FileConsensusStore writer(directory_);
+        ASSERT_TRUE(writer.store_before_vote(make_state(7, 5, 4, 3)));
+        ASSERT_TRUE(writer.store_commit(make_commit(7, 2, 3)));
+    }
+    ASSERT_FALSE(fs::exists(chain_file(directory_, 7)));
+
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(std::holds_alternative<HotStuffState>(store.load(7)));
+    EXPECT_TRUE(store.latest_commit(7).has_value());
+    const auto chain = store.load_chain(7);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(chain));
+    EXPECT_EQ(std::get<LoadResult>(chain), LoadResult::Absent);
+
+    // The first vote of the new release adds the record beside them.
+    EXPECT_TRUE(store.store_chain(7, make_chain(7, 2)));
+    EXPECT_TRUE(store.store_before_vote(make_state(7, 6, 5, 4)));
+    EXPECT_TRUE(std::holds_alternative<CertifiedChain>(store.load_chain(7)));
+}
+
+TEST_F(ConsensusStoreTest, ChainOutsideTheBoundsIsRefused) {
+    FileConsensusStore store(directory_);
+    EXPECT_FALSE(store.store_chain(7, CertifiedChain{}));
+    EXPECT_FALSE(store.store_chain(7, make_chain(7, constants::kMaxSyncChainBlocks + 1)));
+    EXPECT_FALSE(fs::exists(chain_file(directory_, 7)));
+    EXPECT_TRUE(store.store_chain(7, make_chain(7, constants::kMaxSyncChainBlocks)));
+
+    // A record that grew past the bound on disk is not read.
+    auto document = json::parse(read_raw(chain_file(directory_, 7)));
+    document["blocks"].push_back(document["blocks"][0]);
+    write_raw(chain_file(directory_, 7), document.dump());
+    const auto result = store.load_chain(7);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
+    EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
+}
+
+TEST_F(ConsensusStoreTest, DamagedChainRecordIsCorrupt) {
+    FileConsensusStore store(directory_);
+    const auto path = chain_file(directory_, 7);
+    const auto expect_corrupt = [&](const std::string& content) {
+        write_raw(path, content);
+        const auto result = store.load_chain(7);
+        ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
+        EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
+    };
+    ASSERT_TRUE(store.store_chain(7, make_chain(7, 2)));
+    const std::string good = read_raw(path);
+
+    std::string flipped = good;
+    flipped[flipped.size() / 2] ^= 0x01;
+    expect_corrupt(flipped);
+    expect_corrupt("{not json");
+
+    auto document = json::parse(good);
+    document["blocks"][0]["proposal"]["view"] = 99;
+    expect_corrupt(document.dump());
+
+    document = json::parse(good);
+    document["extra"] = 1;
+    expect_corrupt(document.dump());
+
+    document = json::parse(good);
+    document["version"] = constants::kConsensusStoreFormatVersion + 1;
+    expect_corrupt(document.dump());
+
+    // A record in another epoch's slot is misplaced.
+    write_raw(chain_file(directory_, 8), good);
+    const auto misplaced = store.load_chain(8);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(misplaced));
+    EXPECT_EQ(std::get<LoadResult>(misplaced), LoadResult::Corrupt);
 }
 
 }  // namespace

@@ -140,6 +140,63 @@ template <typename Tag>
     return commit;
 }
 
+[[nodiscard]] json chain_to_json(EpochId epoch, const CertifiedChain& chain) {
+    json blocks = json::array();
+    for (const auto& [proposal, justify] : chain.chain) {
+        blocks.push_back(json{{"proposal", proposal_to_json(proposal)},
+                              {"justify", quorum_certificate_to_json(justify)}});
+    }
+    return json{{"version", constants::kConsensusStoreFormatVersion},
+                {"epoch", epoch.underlying()},
+                {"blocks", std::move(blocks)},
+                {"certifying", quorum_certificate_to_json(chain.certifying)},
+                {"record_digest", crypto::to_base64(consensus_chain_record_digest(epoch, chain))}};
+}
+
+[[nodiscard]] std::optional<CertifiedChain> chain_from_json(const json& document, EpochId epoch) {
+    if (!document.is_object()) return std::nullopt;
+    if (has_unknown_key(document, {"version", "epoch", "blocks", "certifying", "record_digest"})) {
+        return std::nullopt;
+    }
+    uint64_t version = 0;
+    if (!read_u64(document, "version", version) ||
+        version != constants::kConsensusStoreFormatVersion) {
+        return std::nullopt;
+    }
+    EpochId stored_epoch = 0;
+    if (!read_u64(document, "epoch", stored_epoch) || stored_epoch != epoch) return std::nullopt;
+
+    const auto blocks = document.find("blocks");
+    // The length bound applies before any per-entry work.
+    if (blocks == document.end() || !blocks->is_array() || blocks->empty() ||
+        blocks->size() > constants::kMaxSyncChainBlocks) {
+        return std::nullopt;
+    }
+    CertifiedChain chain;
+    for (const auto& entry : *blocks) {
+        if (!entry.is_object() || has_unknown_key(entry, {"proposal", "justify"}) ||
+            !entry.contains("proposal") || !entry.contains("justify")) {
+            return std::nullopt;
+        }
+        auto proposal = proposal_from_json(entry["proposal"]);
+        auto justify = quorum_certificate_from_json(entry["justify"]);
+        if (!proposal || !justify) return std::nullopt;
+        chain.chain.emplace_back(std::move(*proposal), std::move(*justify));
+    }
+    const auto certifying = document.find("certifying");
+    if (certifying == document.end()) return std::nullopt;
+    auto certificate = quorum_certificate_from_json(*certifying);
+    if (!certificate) return std::nullopt;
+    chain.certifying = std::move(*certificate);
+
+    Digest recorded{};
+    if (!read_digest(document, "record_digest", recorded) ||
+        recorded != consensus_chain_record_digest(epoch, chain)) {
+        return std::nullopt;
+    }
+    return chain;
+}
+
 }  // namespace
 
 FileConsensusStore::FileConsensusStore(fs::path directory) : directory_(std::move(directory)) {
@@ -152,6 +209,10 @@ fs::path FileConsensusStore::safety_path(EpochId epoch) const {
 
 fs::path FileConsensusStore::commit_path(EpochId epoch) const {
     return directory_ / ("hotstuff-commit-" + std::to_string(epoch.underlying()) + ".json");
+}
+
+fs::path FileConsensusStore::chain_path(EpochId epoch) const {
+    return directory_ / ("hotstuff-chain-" + std::to_string(epoch.underlying()) + ".json");
 }
 
 bool FileConsensusStore::store_before_vote(const HotStuffState& state) {
@@ -206,6 +267,25 @@ std::optional<ConsensusCommit> FileConsensusStore::latest_commit(EpochId epoch) 
     auto commit = commit_from_json(*document);
     if (!commit || commit->epoch != epoch) return std::nullopt;
     return commit;
+}
+
+bool FileConsensusStore::store_chain(EpochId epoch, const CertifiedChain& chain) {
+    if (chain.chain.empty() || chain.chain.size() > constants::kMaxSyncChainBlocks) return false;
+    return write_durable(chain_path(epoch), chain_to_json(epoch, chain).dump());
+}
+
+std::variant<CertifiedChain, IConsensusStore::LoadResult> FileConsensusStore::load_chain(
+    EpochId epoch) const {
+    const auto path = chain_path(epoch);
+    std::error_code ec;
+    const bool present = fs::exists(path, ec);
+    if (ec) return LoadResult::Corrupt;
+    if (!present) return LoadResult::Absent;
+    const auto document = parse_file(path);
+    if (!document) return LoadResult::Corrupt;
+    auto chain = chain_from_json(*document, epoch);
+    if (!chain) return LoadResult::Corrupt;
+    return std::move(*chain);
 }
 
 }  // namespace nexus::security

@@ -35,6 +35,10 @@ protected:
         return directory_ / ("hotstuff-safety-" + std::to_string(kEpoch.underlying()) + ".json");
     }
 
+    [[nodiscard]] fs::path chain_file() const {
+        return directory_ / ("hotstuff-chain-" + std::to_string(kEpoch.underlying()) + ".json");
+    }
+
     // Votes at views 1 and 2, then goes away.
     void run_first_incarnation() {
         FileConsensusStore store(directory_);
@@ -99,6 +103,120 @@ TEST_F(HotStuffRestart, RestartRequiresCertifiedSyncBeforeAnyVote) {
     const auto stored = store.load(kEpoch);
     ASSERT_TRUE(std::holds_alternative<HotStuffState>(stored));
     EXPECT_EQ(std::get<HotStuffState>(stored).last_voted_view, 8u);
+}
+
+// Every member restarted at once: no peer holds a block. The block the
+// stored high certificate names comes back from this node's own record, so
+// the leader can propose on it again.
+TEST_F(HotStuffRestart, RestartRestoresTheBlockTheHighCertificateNames) {
+    run_first_incarnation();
+    ASSERT_TRUE(fs::exists(chain_file()));
+    const auto chain = harness.build_chain(2);
+
+    FileConsensusStore store(directory_);
+    HotStuffService second(harness.config_for(0), clone_key(harness.keys[0]), store);
+    EXPECT_TRUE(second.usable());
+    EXPECT_FALSE(second.synced());
+    EXPECT_EQ(second.state().high_qc.proposal_digest, chain[0].digest);
+    EXPECT_NE(second.block(chain[0].digest), nullptr);
+    EXPECT_EQ(second.state().last_voted_view, 2u) << "a restore casts no vote";
+    EXPECT_EQ(second.last_committed_height(), 0u) << "a restore commits nothing";
+
+    // Peers that ask get the restored block in the restart sync reply.
+    const auto served = second.uncommitted_chain();
+    ASSERT_EQ(served.size(), 1u);
+    EXPECT_EQ(nexus::security::proposal_digest(served[0].first), chain[0].digest);
+
+    // View 4 is member 0's. It proposes on the restored block.
+    second.sync_to_certified(3);
+    const auto proposal = second.make_proposal(digest, digest, Digest{});
+    ASSERT_TRUE(std::holds_alternative<Proposal>(proposal));
+    EXPECT_EQ(std::get<Proposal>(proposal).parent_digest, chain[0].digest);
+    EXPECT_EQ(std::get<Proposal>(proposal).height, 2u);
+}
+
+// State from a release that stored no blocks loads in place. Without the
+// record the block comes from a peer through restart sync; while no peer has
+// it, no leader can propose on the certificate, and the replica stays safe.
+TEST_F(HotStuffRestart, StateWithoutAChainRecordRecoversTheBlockFromAPeer) {
+    run_first_incarnation();
+    ASSERT_TRUE(fs::remove(chain_file()));
+    const auto chain = harness.build_chain(2);
+
+    FileConsensusStore store(directory_);
+    HotStuffService second(harness.config_for(0), clone_key(harness.keys[0]), store);
+    EXPECT_TRUE(second.usable());
+    EXPECT_EQ(second.state().last_voted_view, 2u);
+    EXPECT_EQ(second.block(chain[0].digest), nullptr);
+    second.sync_to_certified(3);
+    EXPECT_EQ(std::get<ConsensusFailure>(second.make_proposal(digest, digest, Digest{})),
+              ConsensusFailure::MissingParent);
+
+    std::vector<ConsensusCommit> commits;
+    ASSERT_FALSE(second
+                     .adopt_certified_block(chain[0].proposal, chain[0].justify,
+                                            chain[1].justify, commits)
+                     .has_value());
+    EXPECT_TRUE(std::holds_alternative<Proposal>(second.make_proposal(digest, digest, Digest{})));
+
+    // The next vote stores the record the old release did not write.
+    const Block next = harness.make_block(2, 4, chain[0].digest, chain[1].justify, 0x70);
+    ASSERT_TRUE(second.receive_proposal(next.proposal, next.justify).vote.has_value());
+    EXPECT_TRUE(std::holds_alternative<CertifiedChain>(store.load_chain(kEpoch)));
+}
+
+// The record is read like a sync reply. A damaged file or a certificate that
+// does not validate restores nothing; the safety state still binds.
+TEST_F(HotStuffRestart, ARecordThatDoesNotVerifyRestoresNothing) {
+    run_first_incarnation();
+    const auto chain = harness.build_chain(2);
+    {
+        std::ofstream out(chain_file(), std::ios::trunc);
+        out << "{damaged";
+    }
+    {
+        FileConsensusStore store(directory_);
+        HotStuffService second(harness.config_for(0), clone_key(harness.keys[0]), store);
+        EXPECT_TRUE(second.usable());
+        EXPECT_EQ(second.state().last_voted_view, 2u);
+        EXPECT_EQ(second.block(chain[0].digest), nullptr);
+    }
+
+    // Well formed, but the certificate over the block lacks a quorum.
+    FileConsensusStore store(directory_);
+    CertifiedChain forged;
+    forged.chain.emplace_back(chain[0].proposal, chain[0].justify);
+    forged.certifying = chain[1].justify;
+    forged.certifying.signers.resize(1);
+    ASSERT_TRUE(store.store_chain(kEpoch, forged));
+    HotStuffService third(harness.config_for(0), clone_key(harness.keys[0]), store);
+    EXPECT_TRUE(third.usable());
+    EXPECT_EQ(third.block(chain[0].digest), nullptr);
+    EXPECT_EQ(third.state().high_qc.view, 1u);
+}
+
+// No safety state that names a new high certificate reaches disk before its
+// block: a refused chain record withholds the vote.
+TEST_F(HotStuffRestart, ARefusedChainRecordWithholdsTheVote) {
+    RecordingStore store;
+    HotStuffService replica(harness.config_for(0), clone_key(harness.keys[0]), store);
+    const auto chain = harness.build_chain(2);
+    ASSERT_TRUE(replica.receive_proposal(chain[0].proposal, chain[0].justify).vote.has_value());
+    EXPECT_TRUE(store.chains.empty()) << "nothing certified above genesis yet";
+
+    store.fail_store_chain = true;
+    const auto refused = replica.receive_proposal(chain[1].proposal, chain[1].justify);
+    EXPECT_EQ(refused.rejected, ConsensusFailure::StorageRejected);
+    EXPECT_FALSE(refused.vote.has_value());
+    EXPECT_EQ(store.calls.size(), 1u) << "the safety state was stored anyway";
+
+    store.fail_store_chain = false;
+    const auto retried = replica.receive_proposal(chain[1].proposal, chain[1].justify);
+    ASSERT_TRUE(retried.vote.has_value());
+    ASSERT_EQ(store.chains.size(), 1u);
+    ASSERT_EQ(store.chains[0].chain.size(), 1u);
+    EXPECT_EQ(nexus::security::proposal_digest(store.chains[0].chain[0].first), chain[0].digest);
+    EXPECT_EQ(store.chains[0].certifying.proposal_digest, chain[0].digest);
 }
 
 TEST_F(HotStuffRestart, SyncFloorBelowStoredViewKeepsStoredView) {
