@@ -13,6 +13,10 @@
 //     server runs the release, attested and healthy.
 //   - It proposes, validates, and applies UpgradeProgress records
 //     (UpgradeProgress.hpp) through the driver's payload extension point.
+//   - It keeps every finalized record with the commit proof that finalized
+//     it. A member that lacks a record or a proof asks its peers for it, and
+//     rebuilds a proof that no peer holds from the certified chain that the
+//     peers' consensus still serves. Each proof is verified in full first.
 //   - It answers the local turn gate and health report for nexus-updater
 //     (Core/UpgradeControl.hpp carries them over a root-only socket).
 //
@@ -36,6 +40,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace nexus::security {
@@ -44,6 +49,7 @@ class SecurityDriver;
 class SecurityRouter;
 class SecurityRuntime;
 struct SecurityMessage;
+struct SyncResponse;
 
 struct UpgradeServiceConfig {
     NodeId self{};
@@ -117,6 +123,11 @@ public:
     // --- Inbound (driver sinks) ---
     void on_message(const SecurityMessage& message);
     void on_verdict(const AttestationVerdict& verdict);
+    /// A sync reply (SecurityDriver::set_upgrade_chain_sink). Any three-chain
+    /// in it over a held record that lacks its proof becomes that proof once
+    /// it verifies under the vote keys and quorum of its epoch. Also advances
+    /// this node's own search for such a proof.
+    void on_certified_chain(const SyncResponse& response, const NodeId& from);
 
     // --- Payload handling (through the registered adapter) ---
     [[nodiscard]] std::optional<ProposedPayload> propose(const HotStuffService& consensus);
@@ -162,6 +173,21 @@ public:
 
 private:
     class PayloadAdapter;
+    /// A search of the peers' certified chain for the block that finalized a
+    /// held record whose proof this node lacks.
+    struct ProofSearch {
+        uint64_t sequence = 0;
+        NodeId peer{};
+        /// Exclusive lower bound: the block of the nearest earlier record
+        /// with a proof in this epoch, or zero.
+        uint64_t lower = 0;
+        /// The height the outstanding page request names (SyncRequest).
+        uint64_t after = 0;
+        uint64_t sent_ms = 0;
+        /// The next page, sent on the next tick so that a search stays far
+        /// below the peer's message budget.
+        std::optional<uint64_t> next_after;
+    };
     struct PendingWitness {
         NodeId subject{};
         Digest chain_head{};
@@ -197,6 +223,22 @@ private:
     void handle_observation(const SecurityMessage& message);
     void handle_record_proof(const SecurityMessage& message);
     void handle_record_request(const SecurityMessage& message);
+    /// The epoch that finalized `body` when `proof` verifies for it under that
+    /// epoch's vote keys and quorum; nullopt when it does not verify or this
+    /// node knows no such epoch.
+    [[nodiscard]] std::optional<EpochId> verified_proof_epoch(const std::vector<uint8_t>& body,
+                                                              const CommitProof& proof) const;
+    /// Keeps `proof` for the held record encoded as `body` when that record
+    /// has no proof and the proof verifies. True when it was kept.
+    bool recover_proof(const std::vector<uint8_t>& body, const CommitProof& proof);
+    /// The index in records_ of the first record held without its proof.
+    [[nodiscard]] std::optional<std::size_t> first_unproven() const;
+    /// The heights (exclusive) between which the block of records_[index]
+    /// lies in the current epoch; nullopt when it cannot lie in it.
+    [[nodiscard]] std::optional<std::pair<uint64_t, uint64_t>> search_bounds(
+        std::size_t index) const;
+    void search_proof(std::size_t index, const NodeId& peer);
+    void request_page(uint64_t after);
     void broadcast_approval();
     void send_approval(const NodeId& peer);
     void adopted();
@@ -232,6 +274,7 @@ private:
     std::vector<std::pair<UpgradeRecord, std::optional<CommitProof>>> records_;
     /// Verified finalized records that arrived ahead of a gap, by sequence.
     std::map<uint64_t, std::pair<UpgradeRecord, CommitProof>> pending_records_;
+    std::optional<ProofSearch> proof_search_;
 
     // Local control.
     uint64_t staged_release_ = 0;

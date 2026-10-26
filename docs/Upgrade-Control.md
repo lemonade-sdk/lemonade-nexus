@@ -119,3 +119,14 @@ The release workflow verifies it with `nexus-rollout-check` before it
 publishes ([Releasing](Releasing), Release guards). The server answers 503
 when it lacks a commit proof for any record. Servers keep the commit proofs
 with the records, so a restart does not lose them.
+
+A server that lacks a record or a record's commit proof asks the Tier 1
+members for it on each record sync round. When no member holds the proof, a
+Tier 1 member rebuilds it from the certified block chain that the other
+members' consensus still holds: it requests consensus sync pages in the
+current epoch and takes the three-chain over the block that carries the
+record. Every proof, sent or rebuilt, must verify under the vote keys and
+quorum of the epoch that finalized it before the server keeps it. A member's
+consensus serves only blocks of the current epoch that it committed since its
+last restart, so a proof that no member holds and no running member can
+rebuild stays lost.
