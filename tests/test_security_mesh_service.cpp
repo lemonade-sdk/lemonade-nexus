@@ -15,6 +15,7 @@
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
 #include "support/attestation_fixtures.hpp"
+#include "support/fake_sealer.hpp"
 
 #include <asio.hpp>
 #include <gtest/gtest.h>
@@ -128,12 +129,14 @@ protected:
 
     // The gossip identity exists only after gossip->start(), so the mesh
     // service is built afterwards — the same order main.cpp uses.
-    void make_mesh(Node& node, const crypto::Ed25519PublicKey& genesis_pub) {
+    void make_mesh(Node& node, const crypto::Ed25519PublicKey& genesis_pub,
+                   const std::function<void(security::SecurityMeshConfig&)>& adjust = {}) {
         security::SecurityMeshConfig config;
         config.data_root = node.dir / "mesh";
         config.genesis_public_key = genesis_pub;
         config.identity = node.gossip->keypair();
         config.profile.security_ruleset = security::constants::kSecurityRulesetVersion;
+        if (adjust) adjust(config);
         node.mesh = std::make_unique<security::SecurityMeshService>(io, config, *node.gossip,
                                                                     node.wrapping.get());
         node.mesh->start();
@@ -262,6 +265,50 @@ TEST_F(SecurityMeshServiceTest, StorageKeyRunsOnEveryNode) {
     EXPECT_FALSE(b.mesh->storage_key()->data_keys().data_key().has_value());
 
     b.mesh->stop();
+    a.mesh->stop();
+}
+
+// The vote-key wrapping key joins the boot set when the host can seal, and a
+// host without a backend keeps the machine-bound wrapping and writes nothing
+// under the sealed directory. FakeSealer is a test double, not a TPM.
+TEST_F(SecurityMeshServiceTest, VoteKeysUseTheBootSetSealWhenTheHostCanSeal) {
+    auto& a = make_node("a");
+    seal_test::FakeSealer tpm;
+    std::string boot = "boot-1";
+    const auto sealed_dir = a.dir / "mesh-sealed";
+    const auto with_seal = [&](security::SecurityMeshConfig& config) {
+        config.seal_backend = tpm.backend();
+        config.sealed_directory = sealed_dir;
+        config.boot_id = [&boot] { return boot; };
+    };
+    make_mesh(a, a.pubkey(), with_seal);
+    EXPECT_EQ(a.mesh->vote_key_protection(), security::VoteKeyProtection::SealedPending);
+    EXPECT_TRUE(a.mesh->vote_key_halt_reason().empty());
+    EXPECT_TRUE(fs::exists(sealed_dir / "vote-key-wrap.sealed"));
+    a.mesh->stop();
+
+    boot = "boot-2";
+    make_mesh(a, a.pubkey(), with_seal);
+    EXPECT_EQ(a.mesh->vote_key_protection(), security::VoteKeyProtection::Sealed);
+    a.mesh->stop();
+
+    // After the migration, a lost wrapping key is a reason to stop startup.
+    fs::remove(sealed_dir / "vote-key-wrap.sealed");
+    make_mesh(a, a.pubkey(), with_seal);
+    EXPECT_EQ(a.mesh->vote_key_protection(), security::VoteKeyProtection::Refused);
+    EXPECT_FALSE(a.mesh->vote_key_halt_reason().empty());
+    a.mesh->stop();
+}
+
+TEST_F(SecurityMeshServiceTest, AHostWithoutSealingKeepsMachineBoundVoteKeys) {
+    auto& a = make_node("a");
+    const auto sealed_dir = a.dir / "mesh-sealed";
+    make_mesh(a, a.pubkey(), [&](security::SecurityMeshConfig& config) {
+        config.sealed_directory = sealed_dir;
+    });
+    EXPECT_EQ(a.mesh->vote_key_protection(), security::VoteKeyProtection::MachineBound);
+    EXPECT_TRUE(a.mesh->vote_key_halt_reason().empty());
+    EXPECT_FALSE(fs::exists(sealed_dir));
     a.mesh->stop();
 }
 

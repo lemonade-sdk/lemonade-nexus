@@ -1,7 +1,7 @@
 #pragma once
 
 // Server-side store for sealed blobs. The boot set (B6) lives here: the gossip
-// identity key today, the server's storage share once Phase 5 creates it.
+// identity key, the server's storage share, and the vote-key wrapping key.
 //
 // The store never sees a TPM. A SealBackend reaches nexus-attestd; production
 // wires attestd_seal_backend() from LemonadeNexusAttestd/AttestdClient.hpp,

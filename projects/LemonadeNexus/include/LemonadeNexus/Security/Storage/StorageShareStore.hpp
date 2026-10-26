@@ -85,8 +85,9 @@ public:
 /// One file per domain, `<directory>/<domain>.share`, mode 0600, written
 /// crash-atomically. With a KeyWrappingService the secret is encrypted under a
 /// fresh random key that the wrapping service wraps with the machine binding
-/// (the local secret and /etc/machine-id), like the epoch vote keys. Without
-/// one (tests only) the file holds the plaintext.
+/// (the local secret and /etc/machine-id), like the machine-bound copies of
+/// the epoch vote keys (EpochStore). Without one (tests only) the file holds
+/// the plaintext.
 class FileStorageShareStore final : public IStorageShareStore {
 public:
     /// Not owning: `crypto` and `wrapping` must outlive the store. Pass both

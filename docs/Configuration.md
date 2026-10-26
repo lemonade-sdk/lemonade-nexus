@@ -424,7 +424,8 @@ With the setting on:
   domain `storage-share`: `data/sealed/storage-share.sealed`, with the same
   upgrade staging (`storage-share.next.sealed`). A host that cannot seal keeps
   `data/security/storage/sealed/storage-share.share` (mode 600, under the
-  machine-bound wrapping of the epoch vote keys). A share found in that file
+  machine-bound wrapping that the epoch vote keys use on such a host). A share
+  found in that file
   on a host that can now seal moves into the sealed store after the sealed
   copy unseals to the same bytes. A sealed share that reports Missing,
   PolicyMismatch, or Corrupt is never replaced by the file copy.
@@ -592,6 +593,13 @@ Limits:
   vote keys, and `wrap_local.key`. The vote keys and the file share store are
   read before the unlock, so moving them, or the local secret they depend on,
   under the data key would stop a cold start; `wrap_local.key` therefore stays.
+  A host that can seal protects the vote keys with a sealed wrapping key
+  instead: `data/sealed/vote-key-wrap.sealed`, with the state in
+  `data/sealed/vote-key-wrap.state.json` and each key in
+  `data/security/vote-key-<epoch>.sealed.json`. The machine-bound copies
+  (`vote-key-<epoch>.json`) are removed after the sealed key unseals in a
+  later boot. If the sealed key does not unseal after that, startup stops with
+  a recovery instruction, as for the gossip identity.
 - CLI modes do not unlock the data key. After the migration, CLI modes that
   read the node identity or the tree log (`--enroll-server`, release signing,
   tree merge tools) fail closed.

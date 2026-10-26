@@ -191,6 +191,7 @@ add_nexus_test(test_security_epoch
     security/epoch/transition.cpp
     security/epoch/epoch_manager.cpp
     security/epoch/epoch_store.cpp
+    security/epoch/vote_key_sealing.cpp
     security/epoch/authority_chain.cpp
     security/epoch/tier1_membership.cpp)
 add_nexus_test(test_security_hotstuff
