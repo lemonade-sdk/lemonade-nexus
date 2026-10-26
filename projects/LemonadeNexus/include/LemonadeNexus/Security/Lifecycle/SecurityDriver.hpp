@@ -252,6 +252,13 @@ public:
         upgrade_chain_sink_ = std::move(sink);
     }
 
+    /// Receives the same checked sync replies for the storage key service,
+    /// which rebuilds lost storage record commit proofs from them and verifies
+    /// each one in full. Unset drops them.
+    void set_storage_chain_sink(std::function<void(const SyncResponse&, const NodeId&)> sink) {
+        storage_chain_sink_ = std::move(sink);
+    }
+
     /// Fires when this node finalizes the eligibility state for the next epoch
     /// and its own recomputation reproduces it: `pool` is the frozen eligible
     /// pool and `finalized` the commit that finalized it. A read of finalized
@@ -511,6 +518,7 @@ private:
     std::function<void(const SecurityMessage&)> upgrade_sink_;
     std::function<void(const AttestationVerdict&)> upgrade_verdict_sink_;
     std::function<void(const SyncResponse&, const NodeId&)> upgrade_chain_sink_;
+    std::function<void(const SyncResponse&, const NodeId&)> storage_chain_sink_;
     std::function<void(const FinalizedEligibility&, const Tier1Set&)> on_eligibility_finalized_;
 };
 
