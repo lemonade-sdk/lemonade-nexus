@@ -2315,6 +2315,85 @@ TEST_F(HttpEndpointTest, ACommittedDeleteRunsTheCleanupOnThisServer) {
     EXPECT_EQ(dns_a_answer_count(fqdn), 0u);
 }
 
+// A link join whose op outlasts the commit wait answers 202 and spends the
+// token with the op. The device learns its address by joining again without
+// the token. While the op is pending that repeat waits for it instead of
+// ordering a second op, which would place the device in a group of its own;
+// once the op commits the repeat is a returning-device join and answers 200.
+TEST_F(HttpEndpointTest, ARepeatOfAPendingJoinWaitsForItsOpInsteadOfOrderingAnother) {
+    tree::TreeOpPool pool;
+    std::mutex ops_mtx;
+    std::vector<tree::TreeOp> ops;
+    const auto submitter_key = crypto->ed25519_keygen();
+    tree::TreeOpSubmitter ordered(
+        *tree, *crypto, security::NetworkId{}, submitter_key,
+        [&](tree::TreeOp op) {
+            tree::TreeOpAdmission admission;
+            admission.ticket = std::make_shared<tree::TreeOpTicket>(tree::op_id_hex(op));
+            {
+                std::lock_guard lock(ops_mtx);
+                ops.push_back(op);
+            }
+            (void)pool.add(std::move(op), admission.ticket);
+            return admission;
+        },
+        std::chrono::milliseconds(20));
+    test_api::current().ctx->tree_ops = &ordered;
+    const auto ordered_ops = [&] {
+        std::lock_guard lock(ops_mtx);
+        return ops.size();
+    };
+
+    tree::TreeNode group;
+    group.id = "grp_pending";
+    group.parent_id = "root";
+    group.type = tree::NodeType::Customer;
+    group.mgmt_pubkey = root_pubkey_str;
+    group.assignments = {{root_pubkey_str, {"admin"}}};
+    ASSERT_TRUE(test_support::put_node(*tree, group));
+    const auto minted = auth->mint_link_token("owner", root_pubkey_str, "grp_pending",
+                                              std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+
+    auto kp = crypto->ed25519_keygen();
+    auto first = join_node(kp, minted->first);
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->status, 202) << first->body;
+    const auto op_id = json::parse(first->body).value("op_id", std::string{});
+    const auto node_id = json::parse(first->body).value("node_id", std::string{});
+    ASSERT_EQ(op_id.size(), 64u);
+    ASSERT_FALSE(node_id.empty());
+    ASSERT_EQ(ordered_ops(), 1u);
+    EXPECT_FALSE(auth->consume_link_token(minted->first).has_value());
+
+    // The repeat while the op is pending: the same op, no second one.
+    auto repeat = join_node(kp);
+    ASSERT_NE(repeat, nullptr);
+    ASSERT_EQ(repeat->status, 202) << repeat->body;
+    EXPECT_EQ(json::parse(repeat->body).value("op_id", std::string{}), op_id);
+    EXPECT_EQ(ordered_ops(), 1u);
+    EXPECT_FALSE(tree->get_node(node_id).has_value());
+
+    // The op commits: every replica applies it, then the ticket settles.
+    const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    {
+        std::lock_guard lock(ops_mtx);
+        ASSERT_TRUE(tree->apply_committed_ops({ops.front()}, now).ok());
+    }
+    pool.settle(op_id, {tree::TreeOpStatus::Committed, {}, 1});
+
+    auto joined = join_node(kp);
+    ASSERT_NE(joined, nullptr);
+    ASSERT_EQ(joined->status, 200) << joined->body;
+    EXPECT_EQ(json::parse(joined->body).value("node_id", std::string{}), node_id);
+    EXPECT_FALSE(json::parse(joined->body).value("tunnel_ip", std::string{}).empty());
+    ASSERT_TRUE(tree->get_node(node_id).has_value());
+    EXPECT_EQ(tree->get_node(node_id)->parent_id, "grp_pending");
+    EXPECT_EQ(ordered_ops(), 1u);
+    test_api::current().ctx->tree_ops = nullptr;
+}
+
 // A link token is spent only by a join that places a device with it. A join
 // refused before placement leaves the token usable, and a join that placed a
 // device spends it.

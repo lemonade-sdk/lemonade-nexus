@@ -65,6 +65,9 @@ public:
     /// pending when the wait ends first. Local: validate and apply now.
     [[nodiscard]] TreeOpSubmission submit(TreeOp op);
 
+    /// How long submit() waits for a commit (zero without consensus).
+    [[nodiscard]] std::chrono::milliseconds commit_wait() const { return commit_wait_; }
+
     /// Seal and queue `op` without waiting (consensus), or apply it now
     /// (local, which returns an already settled ticket).
     [[nodiscard]] TreeOpAdmission submit_async(TreeOp op);

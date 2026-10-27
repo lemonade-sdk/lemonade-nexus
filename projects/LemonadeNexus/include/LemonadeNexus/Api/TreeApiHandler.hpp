@@ -2,6 +2,7 @@
 
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -11,6 +12,8 @@ struct TreeNode;
 } // namespace nexus::tree
 
 namespace nexus::api {
+
+class PendingJoins;
 
 /// Handles tree and IPAM endpoints: join (public), node/delta/children (private), IPAM allocate (private).
 class TreeApiHandler : public IRequestHandler<TreeApiHandler> {
@@ -58,6 +61,8 @@ private:
                                       const std::string& stale_peer_key);
 
     ApiContext& ctx_;
+    /// Join operations this server submitted that have not committed yet.
+    std::shared_ptr<PendingJoins> pending_joins_;
 };
 
 } // namespace nexus::api
