@@ -763,5 +763,144 @@ TEST_F(MultiEpochMesh, ATamperedAnchorRecordFailsClosed) {
     EXPECT_EQ(member->driver->phase(), DriverPhase::Failed);
 }
 
+// A member restarted at the boundary — a rolling release — resets its own
+// epoch clock, so by that clock the epoch is young while every other member's
+// says it is due. The aged members commit the eligibility state and the plan
+// without waiting for it. It recognizes both commits from its own persisted
+// facts, holds the plan, votes the readiness set and runs the ceremony. The
+// alternative is what a fleet saw: its silence fails the attempt, its
+// exclusion leaves a five-node pool unable to fill five seats, and the epoch
+// holds for as long as the processes live.
+TEST_F(MultiEpochMesh, AMemberRestartedAtTheBoundaryFollowsTheCommittedStages) {
+    bootstrap();
+    run_until_committed(1);
+    observe(founders, founders, 1);
+
+    mesh.now_ms += constants::kTargetEpochSeconds * 1000;
+    Node* restarted = founders[2];
+    restart_node(*restarted);
+    restarted->driver->start(mesh.now_ms);
+    for (int i = 0; i < 200 && restarted->driver->phase() != DriverPhase::Active; ++i) {
+        step(1);
+    }
+    ASSERT_EQ(restarted->driver->phase(), DriverPhase::Active);
+    ASSERT_EQ(restarted->driver->current_epoch(), 1u);
+
+    const auto planned = [&] {
+        return std::all_of(founders.begin(), founders.end(), [](Node* member) {
+            const auto* transition = member->runtime->epochs()->transition();
+            return transition != nullptr &&
+                   transition->phase != EpochTransitionPhase::Aborted;
+        });
+    };
+    for (int i = 0; i < 2500 && !planned(); ++i) {
+        step(1);
+    }
+    ASSERT_TRUE(planned()) << "the restarted member never recognized the committed stages";
+    const auto selected = selected_nodes(*founders.front());
+    ASSERT_EQ(ids_of(selected), ids_of(founders));
+    EXPECT_EQ(latest_plan().attempt, 0u);
+
+    wait_for_keys(founders, selected, 2);
+    run_to_activation(founders, selected, 2);
+    EXPECT_EQ(restarted->driver->current_epoch(), 2u);
+    EXPECT_TRUE(restarted->driver->is_tier1_member());
+    EXPECT_EQ(latest_plan().attempt, 0u) << "the restart cost no attempt";
+}
+
+// A member the boundary leaves out voted the handoff that ended its epoch.
+// It keeps no state of an epoch it holds no role in: it continues as Tier 2
+// on the verified authority, a restart keeps it there, and the next plan
+// that names it finds a node able to adopt and serve.
+TEST_F(MultiEpochMesh, AMemberLeftOutAtActivationContinuesAsTierTwoAndIsReadmitted) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+
+    // Seven eligible, five seats: selection leaves two online nodes out.
+    std::vector<Node*> pool = founders;
+    pool.push_back(reserves[0]);
+    pool.push_back(reserves[1]);
+    std::vector<Node*> members = rotate(founders, pool, 1);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    Node* left_out = nullptr;
+    for (Node* founder : founders) {
+        if (std::find(members.begin(), members.end(), founder) == members.end()) {
+            left_out = founder;
+            break;
+        }
+    }
+    ASSERT_NE(left_out, nullptr) << "selection kept every founder; the scenario needs one out";
+
+    EXPECT_EQ(left_out->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(left_out->runtime->epochs(), nullptr);
+    EXPECT_EQ(left_out->runtime->consensus(), nullptr);
+    EXPECT_FALSE(left_out->driver->is_tier1_member());
+    ASSERT_NE(left_out->driver->verified_authority(), nullptr);
+    EXPECT_EQ(left_out->driver->verified_authority()->epoch, 2u);
+    EXPECT_EQ(left_out->driver->verified_authority()->members,
+              members.front()->runtime->epochs()->current().tier1_members.members());
+
+    restart_node(*left_out);
+    left_out->driver->start(mesh.now_ms);
+    EXPECT_EQ(left_out->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(left_out->runtime->epochs(), nullptr);
+    ASSERT_NE(left_out->driver->verified_authority(), nullptr);
+    EXPECT_EQ(left_out->driver->verified_authority()->epoch, 2u);
+
+    // Next boundary: one member rests, so the pool is exactly the five seats
+    // and the plan must name the node that was left out.
+    Node* resting = members.back();
+    mesh.offline.insert(resting->id);
+    members.erase(std::remove(members.begin(), members.end(), resting), members.end());
+    for (Node* member : members) member->driver->on_peer(left_out->id, mesh.now_ms);
+    pool = members;
+    pool.push_back(left_out);
+    members = rotate(members, pool, 2);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    EXPECT_EQ(ids_of(members), ids_of(pool));
+    EXPECT_TRUE(left_out->driver->is_tier1_member());
+    EXPECT_EQ(left_out->driver->current_epoch(), 3u);
+    ASSERT_TRUE(left_out->runtime->authority().key_epoch().has_value());
+    EXPECT_EQ(*left_out->runtime->authority().key_epoch(), 3u);
+}
+
+// A stored epoch that names this node in no role — what an earlier release
+// wrote for a node an activation left out — is not resumed. The node starts
+// as Tier 2 on its verified authority, so a plan can name and adopt it.
+TEST_F(MultiEpochMesh, AStoredEpochWithoutARoleRestartsAsTierTwo) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+    const auto members = rotate(founders, founders, 1);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+
+    // The reserve walks the verified chain to the head, so the stored epoch
+    // it is about to hold authenticates against its own proof chain.
+    Node* reserve = reserves[0];
+    for (int i = 0; i < 80; ++i) {
+        step(1, members);
+        reserve->driver->tick(mesh.now_ms);
+        mesh.pump();
+        if (reserve->driver->verified_authority() != nullptr &&
+            reserve->driver->verified_authority()->epoch == 2u) {
+            break;
+        }
+    }
+    ASSERT_NE(reserve->driver->verified_authority(), nullptr);
+    ASSERT_EQ(reserve->driver->verified_authority()->epoch, 2u);
+
+    fs::copy_file(members.front()->store->directory() / "epoch-current.json",
+                  reserve->store->directory() / "epoch-current.json",
+                  fs::copy_options::overwrite_existing);
+    restart_node(*reserve);
+    reserve->driver->start(mesh.now_ms);
+    EXPECT_EQ(reserve->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(reserve->runtime->epochs(), nullptr);
+    EXPECT_FALSE(reserve->driver->is_tier1_member());
+    ASSERT_NE(reserve->driver->verified_authority(), nullptr);
+    EXPECT_EQ(reserve->driver->verified_authority()->epoch, 2u);
+}
+
 }  // namespace
 }  // namespace lifecycle_test

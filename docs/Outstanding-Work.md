@@ -92,6 +92,15 @@ Missing pieces:
   ones. The C++ `StorageOperation` enum has no `Repair`, and nothing calls `repair_share_*`; adding
   it would turn that rotation into a refresh. Blocked on missing session and consensus wiring, not on
   crypto.
+- **A member restarted after the eligibility commit cannot rejoin that boundary.** Finalized
+  eligibility and the committed plan are memory only (`EligibilityService::install` resets
+  `finalized_`; members ignore `NextEpochPlanProof`). A member restarted before the commit now
+  recognizes it from its persisted facts whatever its own epoch clock says, but one restarted after
+  it holds no plan for the rest of the boundary: it answers final attestation but cannot vote
+  readiness or run the DKG. While readiness lacks a quorum the attempts end in budget exhaustion;
+  once readiness commits without its vote, the DKG stalls on its silence and `boundary_failed_`
+  holds it out of the pool until activation. The fix is to re-derive the finalized stages from the
+  certified chain the member syncs on restart, not to clear the failed set.
 - **"Stable enough" has no data source.** Only attestation continuity and mesh participation are
   consensus-verifiable today. A multi-epoch stability streak needs new instrumentation. Rate-limiter
   stats and tree-log lag are locally observable only, so they are spoofable and must not drive authority.

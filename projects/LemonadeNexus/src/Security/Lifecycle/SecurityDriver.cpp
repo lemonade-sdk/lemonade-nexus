@@ -14,6 +14,10 @@ namespace nexus::security {
 
 namespace {
 
+[[nodiscard]] std::string short_id(const NodeId& node) {
+    return crypto::to_hex(std::span<const uint8_t>(node.bytes.data(), 8));
+}
+
 [[nodiscard]] const char* phase_name(DriverPhase p) {
     switch (p) {
         case DriverPhase::Failed:            return "Failed";
@@ -350,6 +354,15 @@ void SecurityDriver::start(uint64_t now_ms) {
         StoredEpoch stored = *stored_epoch;
         const EpochId id = stored.state.id;
         const bool member = stored.state.tier1_members.contains(config_.self);
+        if (!member) {
+            // An earlier release stored the epoch an activation left this
+            // node out of. The epoch holds no role for it, so none of it is
+            // resumed: the node continues as Tier 2 on the verified
+            // authority, the role that lets a later plan name and adopt it.
+            set_phase(DriverPhase::Idle,
+                      "stored epoch holds no role for this node; it continues as Tier 2");
+            return;
+        }
         auto vote_key = store_.load_vote_key(id, config_.self);
         if (vote_key.has_value()) {
             vote_pubs_mine_[id] = vote_key->public_key;
@@ -1382,6 +1395,43 @@ void SecurityDriver::run_epoch_cadence(uint64_t now_ms) {
     // Selection now waits on two commitments in order: the finalized
     // eligibility state, then the finalized plan derived from it. Both travel
     // through maybe_propose; nothing here prepares anything locally.
+    note_boundary_hold();
+}
+
+void SecurityDriver::note_boundary_hold() {
+    // A pool that cannot fill the Tier 1 target after this boundary's
+    // exclusions selects nothing (EpochManager::preview_selection), so
+    // derive_plan yields no plan and nothing is proposed: the epoch holds.
+    // That is the deterministic rule, and nothing else reports it.
+    const EpochManager* epochs = runtime_.epochs();
+    const auto* finalized = eligibility_.finalized();
+    if (epochs == nullptr || finalized == nullptr || plan_.has_value() ||
+        boundary_failed_.empty() || hold_logged_epoch_ == epochs->current().id ||
+        (epochs->transition() != nullptr &&
+         epochs->transition()->phase != EpochTransitionPhase::Aborted)) {
+        return;
+    }
+    const auto pool = eligibility_.frozen_pool(finalized->next_epoch);
+    if (!pool.has_value() ||
+        !epochs->preview_selection(*pool, pool->size(), boundary_failed_).empty()) {
+        return;
+    }
+    hold_logged_epoch_ = epochs->current().id;
+    std::size_t remaining = 0;
+    for (const auto& node : pool->members()) {
+        if (!boundary_failed_.contains(node)) {
+            ++remaining;
+        }
+    }
+    std::string excluded;
+    for (const auto& node : boundary_failed_) {
+        excluded += (excluded.empty() ? "" : ", ") + short_id(node);
+    }
+    spdlog::info("[security] boundary held: {} of {} eligible nodes remain for epoch {} after "
+                 "excluding {} that failed this boundary ({}); the pool cannot fill the Tier 1 "
+                 "target, so no replacement plan is proposed and epoch {} continues",
+                 remaining, pool->size(), finalized->next_epoch.underlying(),
+                 boundary_failed_.size(), excluded, epochs->current().id.underlying());
 }
 
 Digest SecurityDriver::plan_attest_context(const NextEpochPlan& plan, const NodeId& node) {
@@ -1723,12 +1773,9 @@ std::optional<EpochHandoff> SecurityDriver::derive_handoff() const {
     return handoff;
 }
 
-Digest SecurityDriver::pending_plan_digest() const {
+Digest SecurityDriver::plan_stage_digest() const {
     const EpochManager* epochs = runtime_.epochs();
     if (phase_ != DriverPhase::Active || epochs == nullptr || plan_.has_value()) {
-        return Digest{};
-    }
-    if (!epoch_aged(now_ms_)) {
         return Digest{};
     }
     if (epochs->transition() != nullptr &&
@@ -1739,6 +1786,10 @@ Digest SecurityDriver::pending_plan_digest() const {
     return plan.has_value() ? next_epoch_plan_digest(*plan) : Digest{};
 }
 
+Digest SecurityDriver::pending_plan_digest() const {
+    return epoch_aged(now_ms_) ? plan_stage_digest() : Digest{};
+}
+
 Digest SecurityDriver::pending_readiness_digest() const {
     if (readiness_.has_value()) {
         return Digest{};
@@ -1747,14 +1798,14 @@ Digest SecurityDriver::pending_readiness_digest() const {
     return readiness.has_value() ? candidate_readiness_digest(*readiness) : Digest{};
 }
 
-Digest SecurityDriver::pending_eligibility_digest() const {
+Digest SecurityDriver::eligibility_stage_digest() const {
     const EpochManager* epochs = runtime_.epochs();
     if (phase_ != DriverPhase::Active || epochs == nullptr) {
         return Digest{};
     }
-    // Only at a boundary, only before a transition exists, and only once. A
-    // finalized state is not proposed again.
-    if (!epoch_aged(now_ms_) || eligibility_.finalized() != nullptr) {
+    // Only before a transition exists, and only once. A finalized state is
+    // not proposed again.
+    if (eligibility_.finalized() != nullptr) {
         return Digest{};
     }
     if (epochs->transition() != nullptr &&
@@ -1764,14 +1815,24 @@ Digest SecurityDriver::pending_eligibility_digest() const {
     return eligibility_commitment_digest(eligibility_.compute_state(epochs->current().id + 1));
 }
 
+Digest SecurityDriver::pending_eligibility_digest() const {
+    // The age gate paces the proposer only. A restart resets this node's
+    // epoch clock, and a member that is un-aged by its own clock still has to
+    // vote for and recognize the stage the aged members commit, or it misses
+    // the boundary and its silence fails the attempt.
+    return epoch_aged(now_ms_) ? eligibility_stage_digest() : Digest{};
+}
+
 bool SecurityDriver::accepts_transition(const Digest& transitions_digest) const {
     if (transitions_digest == Digest{}) {
         return true;
     }
     // One stage is pending at a time; a replica votes only for the stage it
-    // independently arrived at.
+    // independently arrived at. Its own epoch clock does not gate the vote:
+    // the stage digests are mesh facts, and the leader's clock paced the
+    // proposal.
     for (const Digest pending : {pending_handoff_digest(), pending_readiness_digest(),
-                                 pending_plan_digest(), pending_eligibility_digest()}) {
+                                 plan_stage_digest(), eligibility_stage_digest()}) {
         if (pending != Digest{} && transitions_digest == pending) {
             return true;
         }
@@ -1926,8 +1987,9 @@ void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
         }
         // A committed stage is finalized state. A node that arrived at
         // different facts recognizes nothing here, so it never advances and
-        // never selects — availability, never authority.
-        const Digest eligibility = pending_eligibility_digest();
+        // never selects — availability, never authority. Recognition rests on
+        // the facts alone, never on this node's epoch clock.
+        const Digest eligibility = eligibility_stage_digest();
         if (eligibility != Digest{} && commit.transitions_digest == eligibility) {
             eligibility_.finalize({.commitment = commit.transitions_digest,
                                    .consensus_reference = commit.qc_digest,
@@ -1941,7 +2003,7 @@ void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
             }
             continue;
         }
-        const Digest plan = pending_plan_digest();
+        const Digest plan = plan_stage_digest();
         if (plan != Digest{} && commit.transitions_digest == plan) {
             on_plan_committed(commit);
             continue;
@@ -2155,11 +2217,37 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
     const bool member = std::find(transition->selected_members.begin(),
                                   transition->selected_members.end(),
                                   config_.self) != transition->selected_members.end();
-
-    std::optional<EpochVoteKey> own_key;
-    if (member) {
-        own_key = take_own_vote_key(to_epoch);
+    if (!member) {
+        // The rule follow_finalized_handoff applies to a verified link,
+        // applied to this node's own commit: a node outside the activated set
+        // holds no role in the new epoch, so it keeps no epoch state and
+        // continues as Tier 2 on the verified authority the commit advanced.
+        // Holding the finished epoch's state instead left it unable to adopt
+        // a later plan that named it (on_next_epoch_plan), so every boundary
+        // that selected it lost one attempt to its silence.
+        pending_dkg_.reset();
+        (void)runtime_.leave_epoch();
+        store_.discard_vote_key(old_epoch);
+        vote_keys_mine_.erase(old_epoch);
+        vote_pubs_mine_.erase(old_epoch);
+        clear_boundary_state();
+        for (const auto& [kind, handler] : payload_handlers_) {
+            handler->on_consensus_reset();
+        }
+        behind_since_ms_.reset();
+        epoch_started_ms_ = now_ms_;
+        last_progress_ms_ = now_ms_;
+        last_proposed_view_ = 0;
+        last_committed_root_ = Digest{};
+        last_committed_height_ = 0;
+        spdlog::info("[security] epoch {} activated without this node", to_epoch.underlying());
+        set_phase(DriverPhase::Idle,
+                  "the finalized handoff ended this node's epoch without it; it continues as "
+                  "Tier 2");
+        return;
     }
+
+    std::optional<EpochVoteKey> own_key = take_own_vote_key(to_epoch);
     if (!runtime_.activate_next_epoch(std::move(pending_dkg_), std::move(own_key), checkpoint)) {
         return;
     }
