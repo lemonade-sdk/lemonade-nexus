@@ -265,6 +265,17 @@ protected:
     std::atomic<int>   delete_posts{0};
     std::atomic<Reply> peer_list_reply{Reply::Ok};
     std::atomic<Reply> delete_reply{Reply::Ok};
+
+    // Joins answered 202 pending before one answers 200, and whether each
+    // join request carried a link token.
+    std::atomic<int>  pending_join_replies{0};
+    std::mutex        join_mtx;
+    std::vector<bool> join_had_link_token;
+
+    std::vector<bool> joins_with_link_token() {
+        std::lock_guard lock(join_mtx);
+        return join_had_link_token;
+    }
     std::mutex               heartbeat_mtx;
     std::vector<std::string> heartbeat_endpoints;  // the "endpoint" of each heartbeat
 
@@ -400,6 +411,21 @@ protected:
         });
         pub->Post("/api/join", [this](const httplib::Request& req, httplib::Response& res) {
             const auto body = nlohmann::json::parse(req.body, nullptr, false);
+            {
+                std::lock_guard lock(join_mtx);
+                join_had_link_token.push_back(body.is_object() && body.contains("link_token"));
+            }
+            if (pending_join_replies.load() > 0) {
+                --pending_join_replies;
+                res.status = 202;
+                res.set_content(nlohmann::json{{"success", true},
+                                               {"status", "pending"},
+                                               {"op_id", std::string(64, 'b')},
+                                               {"node_id", kNodeId}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             lnsdk::MeshPeer self;
             self.mesh_pubkey = body.is_object() ? body.value("mesh_pubkey", "") : "";
             self.tunnel_ip   = "10.64.0.3/32";
@@ -451,8 +477,9 @@ protected:
         return res && res->status == 200;
     }
 
-    /// A client that has joined through the stand-in server.
-    std::unique_ptr<lnsdk::LemonadeNexusClient> joined_client() {
+    /// A client that has joined through the stand-in server, with
+    /// `link_token` when one is given.
+    std::unique_ptr<lnsdk::LemonadeNexusClient> joined_client(const std::string& link_token = {}) {
         lnsdk::ServerConfig cfg;
         cfg.servers = {{"localhost", static_cast<uint16_t>(pub_port), true}};
         cfg.auto_discover = false;
@@ -460,6 +487,7 @@ protected:
         EXPECT_TRUE(client->set_genesis_key(
             nexus::crypto::to_base64(chain.genesis.public_key)).ok);
         client->set_session_token("session-token");
+        if (!link_token.empty()) client->set_link_token(link_token);
         auto joined = client->join_network("user", "password");
         EXPECT_TRUE(joined.ok) << joined.error;
         EXPECT_TRUE(client->is_mesh_active());
@@ -479,6 +507,18 @@ protected:
     if (!default_trust_reaches_server())                                            \
     GTEST_SKIP() << "default TLS trust here ignores SSL_CERT_FILE (macOS keychain)"
 #endif
+
+// A link join that the server answers 202 pending has spent its token with
+// the pending op. The client joins again without the token until the committed
+// node answers 200, and the join succeeds in one call.
+TEST_F(SdkMeshPrivateApiTest, APendingJoinIsRepeatedWithoutTheLinkTokenUntilItCommits) {
+    LN_REQUIRE_TEST_TRUST();
+    pending_join_replies = 1;
+    auto client = joined_client("invite-token");
+    ASSERT_TRUE(client->is_mesh_active());
+    EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, false}));
+    EXPECT_EQ(pending_join_replies.load(), 0);
+}
 
 // The node delete travels over the mesh, so leave_network must delete the node
 // before it stops the mesh.

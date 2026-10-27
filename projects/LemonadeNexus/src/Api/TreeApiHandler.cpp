@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <memory>
+#include <mutex>
 
 #include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Acme/AcmeService.hpp>
@@ -123,6 +125,48 @@ void after_commit(const tree::TreeOpSubmission& s, std::function<void()> fn) {
     });
 }
 
+} // namespace
+
+/// The join op each device has in flight, by node id. A device answered 202
+/// learns its tunnel address by joining again, without the link token the
+/// first join spent. That repeat must wait for the op it already has: a
+/// token-less join of a device the tree does not hold yet would order a
+/// second op that places the device in a group of its own.
+class PendingJoins : public std::enable_shared_from_this<PendingJoins> {
+public:
+    /// The ticket of `node_id`'s pending join op, if any.
+    std::shared_ptr<tree::TreeOpTicket> find(const std::string& node_id) {
+        std::lock_guard lock(mutex_);
+        const auto it = tickets_.find(node_id);
+        return it == tickets_.end() ? nullptr : it->second;
+    }
+
+    /// Remember `ticket` as `node_id`'s pending op until it settles.
+    void track(const std::string& node_id, const std::shared_ptr<tree::TreeOpTicket>& ticket) {
+        if (!ticket) return;
+        {
+            std::lock_guard lock(mutex_);
+            tickets_[node_id] = ticket;
+        }
+        ticket->on_settled([weak = weak_from_this(), node_id,
+                            op_id = ticket->op_id()](const tree::TreeOpOutcome&) {
+            const auto self = weak.lock();
+            if (!self) return;
+            std::lock_guard lock(self->mutex_);
+            const auto it = self->tickets_.find(node_id);
+            if (it != self->tickets_.end() && it->second->op_id() == op_id) {
+                self->tickets_.erase(it);
+            }
+        });
+    }
+
+private:
+    std::mutex mutex_;
+    std::map<std::string, std::shared_ptr<tree::TreeOpTicket>> tickets_;
+};
+
+namespace {
+
 /// Current clients send no base version, so a route reads it from the current
 /// tree when it builds the op. A concurrent write between that read and the
 /// commit makes the op stale; rebuilding it from the new state gives
@@ -201,6 +245,7 @@ struct JoinOpResult {
     std::string tunnel_ip;      ///< the committed node's address (Committed)
     api::MeshRekeyPlan rekey;   ///< dataplane changes the join implies
     bool used_link = false;     ///< the op places a new device with the link token
+    bool repeat = false;        ///< Pending again for an op an earlier join submitted
 };
 
 /// A device-link token that POST /api/join consumed. The token is spent only
@@ -341,10 +386,26 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
                               const std::string& norm_pubkey,
                               const std::optional<auth::LinkTokenRecord>& link,
                               const std::string& cpu_id, const std::string& net_mac,
-                              const std::string& node_region, bool is_inference) {
+                              const std::string& node_region, bool is_inference,
+                              PendingJoins& pending) {
     JoinOpResult result;
     auto* submitter = tree_op_submitter(ctx, res);
     if (!submitter) return result;
+
+    // A repeat join while this device's op is pending waits for that op
+    // instead of ordering another one. Once it commits, the join below runs
+    // as a returning-device join of the node it wrote.
+    if (const auto ticket = pending.find(node_id)) {
+        const auto outcome = ticket->wait_for(submitter->commit_wait());
+        if (outcome.status == tree::TreeOpStatus::Pending) {
+            result.state = JoinOpResult::State::Pending;
+            result.repeat = true;
+            result.submission.op_id = ticket->op_id();
+            result.submission.ticket = ticket;
+            result.submission.pending = true;
+            return result;
+        }
+    }
 
     const auto existing = ctx.tree.get_node(node_id);
     if (!existing && link) {
@@ -463,7 +524,8 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
 
 // Applied tree operations call the hook on every server that applies them, so
 // per-server cleanup of a removed node runs everywhere, once.
-TreeApiHandler::TreeApiHandler(ApiContext& ctx) : ctx_(ctx) {
+TreeApiHandler::TreeApiHandler(ApiContext& ctx)
+    : ctx_(ctx), pending_joins_(std::make_shared<PendingJoins>()) {
     ctx_.tree.set_removed_nodes_hook(
         [this](const std::vector<tree::TreeNode>& removed) { cleanup_removed_nodes(removed); });
 }
@@ -722,7 +784,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         }
 
         auto joined = join_via_tree_op(ctx_, res, body, node_id, norm_pubkey, link, cpu_id,
-                                       net_mac, node_region, is_inference);
+                                       net_mac, node_region, is_inference, *pending_joins_);
         if (joined.used_link) {
             if (joined.state == JoinOpResult::State::Pending) {
                 link_claim->settle_with(joined.submission);
@@ -734,17 +796,21 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (joined.state == JoinOpResult::State::Pending) {
             // The tunnel address exists only once the join commits; the
             // client joins again to learn it (a returning-device join).
-            // The dataplane and DNS steps run when the commit arrives.
-            after_commit(joined.submission,
-                         [this, node_id, mesh = body.value("mesh_pubkey", std::string{}),
-                          rekey = joined.rekey] {
-                             const auto node = ctx_.tree.get_node(node_id);
-                             if (node && !node->tunnel_ip.empty()) {
-                                 (void)finish_join_dataplane(node_id, node->tunnel_ip, mesh,
-                                                             rekey.remove_stale_peer,
-                                                             rekey.stale_peer_key);
-                             }
-                         });
+            // The dataplane and DNS steps run when the commit arrives. A
+            // repeat of a pending join registered both on its first answer.
+            if (!joined.repeat) {
+                pending_joins_->track(node_id, joined.submission.ticket);
+                after_commit(joined.submission,
+                             [this, node_id, mesh = body.value("mesh_pubkey", std::string{}),
+                              rekey = joined.rekey] {
+                                 const auto node = ctx_.tree.get_node(node_id);
+                                 if (node && !node->tunnel_ip.empty()) {
+                                     (void)finish_join_dataplane(node_id, node->tunnel_ip,
+                                                                 mesh, rekey.remove_stale_peer,
+                                                                 rekey.stale_peer_key);
+                                 }
+                             });
+            }
             nlohmann::json pending = {{"success", true},
                                       {"status", "pending"},
                                       {"op_id", joined.submission.op_id},
