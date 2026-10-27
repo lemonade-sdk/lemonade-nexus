@@ -182,14 +182,27 @@ public:
     /// arrived at the same one.
     [[nodiscard]] Digest pending_handoff_digest() const;
 
-    /// The eligibility state this node would finalize at this epoch boundary,
-    /// or an empty digest when it is not at one. Finalizing it is what turns
-    /// local observations into the pool every honest node selects from.
+    /// The eligibility state this node would finalize for the next epoch, or
+    /// an empty digest when it can form none: not Active, a transition already
+    /// open, or a state already finalized. Finalizing it is what turns local
+    /// observations into the pool every honest node selects from. This is
+    /// what a proposed or committed stage is matched against, so it does not
+    /// wait on this node's own epoch clock: a member whose clock a restart
+    /// reset recognizes the same finality the others reach.
+    [[nodiscard]] Digest eligibility_stage_digest() const;
+
+    /// eligibility_stage_digest once this node's own epoch clock aged the
+    /// epoch: the stage it proposes when it leads. Pacing only.
     [[nodiscard]] Digest pending_eligibility_digest() const;
 
     /// The next-epoch plan this node derives from the finalized eligibility
-    /// state, or an empty digest outside a boundary. Committing it is what
-    /// authorizes selected candidates to prepare.
+    /// state, or an empty digest when it can derive none. Committing it is
+    /// what authorizes selected candidates to prepare. Like
+    /// eligibility_stage_digest, independent of this node's epoch clock.
+    [[nodiscard]] Digest plan_stage_digest() const;
+
+    /// plan_stage_digest once this node's own epoch clock aged the epoch: the
+    /// stage it proposes when it leads. Pacing only.
     [[nodiscard]] Digest pending_plan_digest() const;
 
     /// The readiness set this node has verified for the committed plan, or an
@@ -198,8 +211,8 @@ public:
     [[nodiscard]] Digest pending_readiness_digest() const;
 
     /// Whether this node independently arrived at the proposed transition. The
-    /// one entry point consensus uses; it accepts a handoff or an eligibility
-    /// commitment and nothing else.
+    /// one entry point consensus uses; it accepts exactly the four boundary
+    /// stages this node derived itself and nothing else.
     [[nodiscard]] bool accepts_transition(const Digest& transitions_digest) const;
 
     /// Adds the handler for one block payload kind (BlockPayload.hpp). The
@@ -318,6 +331,10 @@ private:
     void begin_sync(uint64_t now_ms);
     void finish_sync();
     void run_epoch_cadence(uint64_t now_ms);
+    /// Logs once per epoch when this boundary's exclusions leave the frozen
+    /// pool unable to fill the Tier 1 target, the state in which no plan is
+    /// proposed and the epoch holds. Visibility only; it changes nothing.
+    void note_boundary_hold();
     void attest_self_for(EpochId epoch, const Digest& context);
     [[nodiscard]] bool eligibility_verdict_ok(const AttestationVerdict& verdict) const;
     [[nodiscard]] std::optional<NextEpochPlan> derive_plan() const;
@@ -451,12 +468,15 @@ private:
     EligibilityService eligibility_;
 
     // Member-side boundary pipeline. The committed plan, the freshness clock
-    // for final verdicts, the state-ready and failed sets, and the finalized
-    // readiness. All reset at activation or abandonment.
+    // for final verdicts, the state-ready set, and the finalized readiness
+    // reset at activation or abandonment. The attempt counter and the failed
+    // set span every attempt of one boundary and reset at activation only.
     std::optional<NextEpochPlan> plan_;
     CommitProof plan_proof_;
     uint32_t plans_committed_ = 0;
     std::set<NodeId> boundary_failed_;
+    /// The epoch whose boundary hold note_boundary_hold already logged.
+    std::optional<EpochId> hold_logged_epoch_;
     std::map<NodeId, uint64_t> final_verdict_ms_;
     /// When each selected node was last challenged for the final attestation;
     /// the renewal pass rate-limits itself with this.
