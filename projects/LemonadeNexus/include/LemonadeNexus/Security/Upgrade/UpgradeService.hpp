@@ -17,6 +17,12 @@
 //     it. A member that lacks a record or a proof asks its peers for it, and
 //     rebuilds a proof that no peer holds from the certified chain that the
 //     peers' consensus still serves. Each proof is verified in full first.
+//   - A member that holds a verified later record it cannot apply (a record
+//     before it is lost with its proof) is behind the finalized head. It
+//     proposes and votes for no record of the open rollout, but it judges a
+//     Start that extends the newest such record (start_base()): a Start
+//     resets the state it lacks, and the quorum that finalized that record
+//     vouches for everything before it.
 //   - It answers the local turn gate and health report for nexus-updater
 //     (Core/UpgradeControl.hpp carries them over a root-only socket).
 //
@@ -195,6 +201,14 @@ private:
         uint64_t release_number = 0;
         uint64_t sent_ms = 0;
     };
+    /// The finalized record a Start extends from this node's view: its own
+    /// head, or the newest verified record held ahead of a gap.
+    struct StartBase {
+        uint64_t sequence = 0;
+        Digest head{};
+        /// The record leaves a turn open: a Start is refused.
+        bool turn_open = false;
+    };
 
     [[nodiscard]] std::vector<NodeId> current_members() const;
     [[nodiscard]] EpochId current_epoch() const;
@@ -207,7 +221,15 @@ private:
     /// participants this node would order.
     [[nodiscard]] std::vector<NodeId> tier2_participants(
         const std::vector<NodeId>& members) const;
-    [[nodiscard]] std::optional<UpgradeRecord> derive_start() const;
+    /// The base of the next Start. With no verified record ahead of a gap it
+    /// is this node's own state. Otherwise it is the newest pending record:
+    /// that record's commit proof verified under its epoch's vote keys and
+    /// quorum, so every record before it is finalized too, and only its event
+    /// decides whether a turn is open after it. Whether it is the finalized
+    /// head this node cannot tell; a Start finalizes only when a quorum, which
+    /// includes members at the head, agrees on the same base.
+    [[nodiscard]] StartBase start_base() const;
+    [[nodiscard]] std::optional<UpgradeRecord> derive_start(const StartBase& base) const;
     [[nodiscard]] std::optional<UpgradeRecord> next_record() const;
     [[nodiscard]] bool uncommitted_upgrade_ancestor(const HotStuffService& consensus,
                                                     const Digest& from) const;
@@ -273,6 +295,7 @@ private:
     /// each when this node holds it.
     std::vector<std::pair<UpgradeRecord, std::optional<CommitProof>>> records_;
     /// Verified finalized records that arrived ahead of a gap, by sequence.
+    /// The newest one is the base of a Start while the gap stays (start_base).
     std::map<uint64_t, std::pair<UpgradeRecord, CommitProof>> pending_records_;
     std::optional<ProofSearch> proof_search_;
 

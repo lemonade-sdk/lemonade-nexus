@@ -96,7 +96,11 @@ Tier 2 server is not held to a tree log, even when an older release ran one. A
 2. A Tier 1 leader proposes a Start record when every Tier 1 member reports a
    live status and some server runs an older release. The order is Tier 2
    servers first (those that report a configured attestation collector), then
-   Tier 1, each group by SHA-256 of the release number and the node id.
+   Tier 1, each group by SHA-256 of the release number and the node id. A
+   member that lacks records of the previous rollout, but holds a later
+   record with its commit proof, judges the Start against that record: the
+   records it lacks finalized before it, and the Start replaces them. It
+   votes for no other record while it is behind.
 3. The first server in the order gets a Turn record; its gate says `go`.
 4. It restarts on the new release. When its signed status names the new
    release and the Healthy flag, Tier 1 witnesses challenge it with an
@@ -129,4 +133,6 @@ record. Every proof, sent or rebuilt, must verify under the vote keys and
 quorum of the epoch that finalized it before the server keeps it. A member's
 consensus serves only blocks of the current epoch that it committed since its
 last restart, so a proof that no member holds and no running member can
-rebuild stays lost.
+rebuild stays lost. The members that lack that record then stay behind the
+finalized head of that rollout, but they still vote for the Start of the next
+release (step 2 above), so the lost proof does not block the next release.

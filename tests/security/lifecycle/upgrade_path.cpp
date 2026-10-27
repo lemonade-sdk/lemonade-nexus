@@ -843,6 +843,89 @@ TEST_F(UpgradePath, AMemberThatMissedLaterRecordsCatchesUpWhenNoPeerHeldTheirPro
     EXPECT_EQ(upgrade(behind).state().head, finalized().head);
 }
 
+// Production incident (release 2026102604): two of five Tier 1 members held
+// the Start record of the previous rollout only. Its first Upgraded record had
+// finalized without a commit proof on any member, and after an epoch change
+// and a restart of every member no consensus served its block any more, so
+// no peer could ever send it. The later records arrived with their proofs but
+// did not extend the two members' chains. Every member judged a Start of the
+// next release against its own head only, so no Start got a quorum of four,
+// and every updater waited on "not_started" forever. A member now judges a
+// Start against the newest finalized record it verified, even one it cannot
+// apply.
+TEST_F(UpgradePath, ASplitCommitteeStartsTheNextReleaseFromAVerifiedRecord) {
+    constexpr uint64_t kNext = kN1 + 1;
+    bootstrap();
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(run_until([&] {
+        return std::all_of(reserves.begin(), reserves.end(),
+                           [](Node* r) { return r->driver->verified_authority() != nullptr; });
+    }));
+    ASSERT_EQ(upgrade(founders.front()).offer_approval(
+                  release_approval_bundle_json(signer->approval(kN1, kN))),
+              ReleaseOfferResult::Adopted);
+    ASSERT_TRUE(run_until([&] { return finalized().release_number == kN1; }));
+
+    // Only the first server in the order upgrades: Start, Turn, Upgraded.
+    Node* first = mesh.nodes.at(finalized().order.front().node);
+    upgrade(first).stage(kN1);
+    ASSERT_TRUE(run_until([&] { return upgrade(first).gate(kN1) == UpgradeGate::Go; }));
+    restart_with(*first, kN1, kN);
+    upgrade(first).stage(kN1);
+    const auto all = servers();
+    ASSERT_TRUE(run_until([&] {
+        return finalized().upgraded.contains(first->id) &&
+               std::all_of(all.begin(), all.end(), [&](Node* node) {
+                   return upgrade(node).state().sequence == finalized().sequence;
+               });
+    })) << "the first server did not upgrade";
+    const uint64_t sequence = finalized().sequence;
+    ASSERT_EQ(sequence, 3u);
+
+    // Two members hold the Start record only; every other server holds the
+    // Turn record without its proof. The sync pages that would rebuild that
+    // proof are lost, as on the fleet, so the Turn record never reaches the
+    // two members and the Upgraded record cannot extend their chains.
+    const std::vector<Node*> behind{founders[1], founders[2]};
+    for (Node* node : servers()) {
+        if (std::find(behind.begin(), behind.end(), node) != behind.end()) {
+            rewrite_records(*node, 1, 1);
+        } else {
+            rewrite_records(*node, 1);
+        }
+        ASSERT_FALSE(HasFatalFailure());
+    }
+    mesh.drop_if = [](const Queued&, const SecurityMessage& message) {
+        return std::holds_alternative<SyncResponse>(message.body);
+    };
+    for (Node* node : servers()) build_stack(*node);
+    for (Node* node : behind) ASSERT_EQ(upgrade(node).state().sequence, 1u);
+    EXPECT_FALSE(run_until(
+        [&] { return upgrade(behind[0]).state().sequence > 1; }, 300))
+        << "the lost record came back; the split did not hold";
+
+    // The next release starts on every server, chained to the finalized
+    // Upgraded record that the two members verified but could not apply.
+    ASSERT_EQ(upgrade(founders.front()).offer_approval(
+                  release_approval_bundle_json(signer->approval(kNext, kN1))),
+              ReleaseOfferResult::Adopted);
+    ASSERT_TRUE(run_until([&] {
+        return std::all_of(all.begin(), all.end(), [&](Node* node) {
+            return upgrade(node).state().release_number == kNext;
+        });
+    })) << "the next release did not start; finalized release "
+        << finalized().release_number << " at sequence " << finalized().sequence;
+    for (Node* node : servers()) {
+        EXPECT_EQ(upgrade(node).state().sequence, sequence + 1);
+        EXPECT_EQ(upgrade(node).state().head, finalized().head);
+        EXPECT_FALSE(upgrade(node).state().in_turn.has_value());
+        // Every server is in the new order; its updater waits for a Turn.
+        EXPECT_EQ(upgrade(node).gate(kNext), UpgradeGate::Wait);
+    }
+    // The new rollout proves itself: every record since its Start has a proof.
+    for (Node* node : behind) EXPECT_TRUE(verified_own_proof(node));
+}
+
 // A proof rebuilt from a peer's certified chain is candidate data: it is kept
 // only when it verifies under the epoch's vote keys and quorum and commits the
 // held record's exact bytes.
