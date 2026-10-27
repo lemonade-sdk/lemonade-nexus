@@ -8,8 +8,8 @@
 // UpgradeHealth verdicts are injected into the challenging witness, with the
 // measured hashes of the release the subject runs.
 
-#include "support/lifecycle_mesh.hpp"
 #include "support/release_fixture.hpp"
+#include "support/rotation.hpp"
 
 #include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
 #include <LemonadeNexus/Security/Attestation/ReleaseChain.hpp>
@@ -36,7 +36,7 @@ struct UpgradeStack {
     std::unique_ptr<UpgradeService> service;
 };
 
-class UpgradePath : public DriverMeshBase {
+class UpgradePath : public RotatingMeshBase {
 protected:
     void SetUp() override {
         DriverMeshBase::SetUp();
@@ -207,7 +207,14 @@ protected:
         build_stack(node);
     }
 
-    [[nodiscard]] const UpgradeChainState& finalized() { return upgrade(founders.front()).state(); }
+    /// The finalized chain as a current Tier 1 member holds it. After a
+    /// rotation the first founder may be Tier 2; its copy then only follows.
+    [[nodiscard]] const UpgradeChainState& finalized() {
+        for (Node* node : servers()) {
+            if (node->driver->is_tier1_member()) return upgrade(node).state();
+        }
+        return upgrade(founders.front()).state();
+    }
 
     /// Adopts N+1 and runs until every server holds the Start record and the
     /// record that opens the first turn. Returns that record's sequence.
@@ -464,6 +471,136 @@ TEST_F(UpgradePath, TurnsRunOneAtATimeTier2FirstAndOnlyAfterWitnesses) {
         auto forged = *proof;
         forged.base.clear();
         EXPECT_FALSE(verify_rollout_proof(forged, network, error));
+    }
+}
+
+// Production incident: the first rollout with a Tier 2 participant in the
+// order, in Epoch 3. The participant had been a member until the finalized
+// handoff ended its epoch without it; it continued as Tier 2 in place, with
+// the verified authority of Epoch 3 and no epoch state. Its router dropped
+// every Upgrade message of that epoch as EpochOutOfWindow, so the Start and
+// Turn records that opened its turn never reached it. Its gate stayed
+// NotStarted, and the rollout stood still on an open turn.
+TEST_F(UpgradePath, ADemotedMemberTakesItsTier2TurnInALaterEpoch) {
+    bootstrap();
+    ASSERT_FALSE(HasFatalFailure());
+    run_until_committed(1);
+    introduce_reserves();
+    ASSERT_TRUE(run_until([&] {
+        return std::all_of(reserves.begin(), reserves.end(),
+                           [](Node* r) { return r->driver->verified_authority() != nullptr; });
+    }));
+
+    // Epoch 1 -> 2 with one founder absent from the observed pool: it is not
+    // eligible, so not selected. It restarts inside the boundary, as the
+    // production server had, so its own commit of the handoff cannot move
+    // it: the members' broadcast proof, verified under its own epoch's keys,
+    // ends its epoch in place (follow_finalized_handoff).
+    Node* demoted = founders.back();
+    std::vector<Node*> pool(founders.begin(), founders.end() - 1);
+    pool.push_back(reserves.front());
+    observe(founders, pool, 1);
+    run_to_plan(founders);
+    ASSERT_FALSE(HasFatalFailure());
+    const auto members = selected_nodes(*founders.front());
+    ASSERT_EQ(ids_of(members), ids_of(pool));
+    wait_for_keys(founders, members, 2);
+    ASSERT_FALSE(HasFatalFailure());
+    restart_node(*demoted);
+    demoted->driver->start(mesh.now_ms);
+    run_to_activation(founders, members, 2);
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(run_until([&] { return demoted->runtime->epochs() == nullptr; }))
+        << "the excluded member never left its finished epoch";
+    EXPECT_EQ(demoted->driver->phase(), DriverPhase::Idle);
+    EXPECT_FALSE(demoted->driver->is_tier1_member());
+    ASSERT_NE(demoted->driver->verified_authority(), nullptr);
+    EXPECT_EQ(demoted->driver->verified_authority()->epoch, 2u);
+    // Every server places itself in Epoch 2, then reports a status there
+    // once, so the Start orders all of them.
+    ASSERT_TRUE(run_until([&] {
+        const auto all = servers();
+        return std::all_of(all.begin(), all.end(), [](Node* node) {
+            return node->driver->current_epoch() == 2u ||
+                   (node->driver->verified_authority() != nullptr &&
+                    node->driver->verified_authority()->epoch == 2u);
+        });
+    }));
+    upgrade_step(static_cast<int>(constants::kUpgradeStatusIntervalMs / 200) + 5);
+
+    ASSERT_EQ(upgrade(members.front())
+                  .offer_approval(release_approval_bundle_json(signer->approval(kN1, kN))),
+              ReleaseOfferResult::Adopted);
+    ASSERT_TRUE(run_until([&] { return finalized().release_number == kN1; }))
+        << "no rollout started";
+    const auto order = finalized().order;
+    for (Node* node : servers()) {
+        EXPECT_TRUE(finalized().participant(node->id))
+            << "server " << (node == demoted ? "demoted" : "other") << " "
+            << nexus::crypto::to_hex(std::span<const uint8_t>(node->id.bytes.data(), 4))
+            << " is not in the order";
+    }
+    ASSERT_EQ(order.size(), servers().size());
+    ASSERT_TRUE(finalized().participant(demoted->id));
+    EXPECT_FALSE(order.front().tier1) << "Tier 2 goes first";
+    const auto position_of = [&](const NodeId& node) {
+        return static_cast<std::size_t>(std::distance(
+            order.begin(), std::find_if(order.begin(), order.end(),
+                                        [&](const UpgradeParticipant& e) { return e.node == node; })));
+    };
+    for (Node* member : members) {
+        EXPECT_LT(position_of(demoted->id), position_of(member->id))
+            << "the demoted server is ordered with Tier 2, before every member";
+    }
+
+    // The finalized records reach the demoted server although it holds no
+    // epoch state: its copy follows the members' chain.
+    for (Node* node : servers()) upgrade(node).stage(kN1);
+    ASSERT_TRUE(run_until([&] {
+        return upgrade(demoted).state().sequence == finalized().sequence &&
+               finalized().in_turn.has_value();
+    })) << "the demoted Tier 2 server never received the Start and Turn records";
+    EXPECT_NE(upgrade(demoted).gate(kN1), UpgradeGate::NotStarted);
+
+    std::vector<NodeId> restarted;
+    ASSERT_TRUE(run_until(
+        [&] {
+            std::vector<Node*> go;
+            for (Node* node : servers()) {
+                if (upgrade(node).gate(kN1) == UpgradeGate::Go &&
+                    std::find(restarted.begin(), restarted.end(), node->id) ==
+                        restarted.end()) {
+                    go.push_back(node);
+                }
+            }
+            EXPECT_LE(go.size(), 1u) << "two servers held a turn at once";
+            for (Node* node : go) {
+                restarted.push_back(node->id);
+                if (node->driver->is_tier1_member()) {
+                    swap_upgrade_stack(*node, kN1, kN);
+                } else {
+                    restart_with(*node, kN1, kN);
+                }
+                upgrade(node).stage(kN1);
+            }
+            return finalized().complete();
+        },
+        6000))
+        << "rollout incomplete: " << finalized().upgraded.size() << " of " << order.size();
+    ASSERT_EQ(restarted.size(), order.size());
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        EXPECT_EQ(restarted[i], order[i].node) << "turn " << i << " out of order";
+    }
+    EXPECT_EQ(upgrade(demoted).gate(kN1), UpgradeGate::Done);
+    // The rollout changed no role: the demoted server is still Tier 2 on the
+    // verified chain, and Epoch 2 keeps its members.
+    EXPECT_EQ(demoted->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(demoted->runtime->epochs(), nullptr);
+    ASSERT_NE(demoted->driver->verified_authority(), nullptr);
+    EXPECT_EQ(demoted->driver->verified_authority()->epoch, 2u);
+    for (Node* member : members) {
+        EXPECT_TRUE(member->driver->is_tier1_member());
+        EXPECT_EQ(member->driver->current_epoch(), 2u);
     }
 }
 
