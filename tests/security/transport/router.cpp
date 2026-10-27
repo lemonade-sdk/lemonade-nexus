@@ -61,6 +61,8 @@ struct RecordingEvents : ISecurityEvents {
     void on_vote_sent(const Vote& v, const NodeId& to) override { votes_sent.emplace_back(v, to); }
     std::vector<SecurityMessage> storage_messages;
     void on_storage_message(const SecurityMessage& m) override { storage_messages.push_back(m); }
+    std::vector<SecurityMessage> upgrade_messages;
+    void on_upgrade_message(const SecurityMessage& m) override { upgrade_messages.push_back(m); }
 };
 
 struct Node;
@@ -1032,6 +1034,35 @@ TEST_F(RouterMesh, NodeWithoutEpochStateAnswersItsVerifiedAuthority) {
               DropReason::NotMember);
     EXPECT_EQ(tier2->producer.calls, 1);
     EXPECT_EQ(tier2->producer.activation_calls, 1);
+}
+
+TEST_F(RouterMesh, NodeWithoutEpochStateReceivesUpgradeTraffic) {
+    // Production incident: a server demoted to Tier 2 in Epoch 3 holds no
+    // epoch state, so the pre-epoch window dropped every Upgrade message of
+    // the current epoch as EpochOutOfWindow. It never saw the Start and Turn
+    // records that opened its own turn, and the rollout stood still on it.
+    Node* tier2 = outsider;
+    ASSERT_EQ(tier2->runtime->epochs(), nullptr);
+    Node* member = founders[1];
+    const auto upgrade_at = [&](EpochId epoch) {
+        return encode_security_message(member->router->compose(
+            SecurityMessageKind::Upgrade,
+            UpgradeMsg{UpgradeTopic::RecordRequest, std::vector<uint8_t>(8, 0), std::nullopt},
+            epoch));
+    };
+    EXPECT_TRUE(tier2->deliver(member->id, upgrade_at(3), mesh.now_ms).delivered);
+    ASSERT_EQ(tier2->events.upgrade_messages.size(), 1u);
+    EXPECT_EQ(tier2->events.upgrade_messages.back().epoch, 3u);
+    EXPECT_EQ(tier2->events.upgrade_messages.back().sender, member->id);
+
+    // A node that holds epoch state keeps the window: only the current
+    // epoch's upgrade traffic reaches its service.
+    bootstrap_epoch_one();
+    Node* holder = founders[0];
+    EXPECT_EQ(holder->deliver(member->id, upgrade_at(3), mesh.now_ms).dropped,
+              DropReason::EpochOutOfWindow);
+    EXPECT_TRUE(holder->deliver(member->id, upgrade_at(1), mesh.now_ms).delivered);
+    EXPECT_EQ(holder->events.upgrade_messages.size(), 1u);
 }
 
 TEST_F(RouterMesh, OwnChallengesRollTheProductionWindowOnTheCallersClock) {

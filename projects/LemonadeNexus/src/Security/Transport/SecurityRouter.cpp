@@ -316,7 +316,12 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
         // An announcement is a hint that can prompt a chain request; a node
         // with no epoch state needs to hear it precisely because it cannot
         // place its epoch number. Believing it is not on the table.
-        message.kind == SecurityMessageKind::EpochAnnouncement;
+        message.kind == SecurityMessageKind::EpochAnnouncement ||
+        // A Tier 2 server takes its upgrade turn from finalized records and
+        // holds no epoch state to place their epoch against. The upgrade
+        // service verifies each record's commit proof under the finalizing
+        // epoch's authority, and each status and observation signature.
+        message.kind == SecurityMessageKind::Upgrade;
     const bool bootstrap_kind = message.kind == SecurityMessageKind::GenesisFounding ||
                                 message.kind == SecurityMessageKind::GenesisEligibilityAttest ||
                                 message.kind == SecurityMessageKind::BootstrapCertificate;

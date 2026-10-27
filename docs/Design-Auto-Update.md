@@ -345,6 +345,11 @@ Known limits found during the implementation:
   ([Wire Compatibility](Wire-Compatibility), Baseline).
 - **A participant that never becomes Ready blocks the rollout** until a newer
   release replaces it. A participant that leaves the mesh does the same.
+- **An open turn has no timeout.** A Start record for a newer release is
+  refused while a turn is open (`TurnOpen`). Only an Upgraded record from the
+  witnesses or a Halt from the subject's own `failed` report closes it. A
+  subject that never installs after its turn opened holds the rollout, and a
+  newer release cannot replace it until the turn closes.
 
 ## Tier 2 and the tree
 
