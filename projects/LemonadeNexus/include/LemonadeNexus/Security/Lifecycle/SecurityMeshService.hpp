@@ -153,13 +153,21 @@ public:
         /// The epoch the members belong to; 0 when not known.
         EpochId epoch{0};
         std::vector<NodeId> members;
+        /// The finalized next-epoch plan this member holds, when one is
+        /// committed (SecurityDriver::committed_plan): the epoch it opens and
+        /// the members it names. next_epoch is 0 without a plan. A plan is
+        /// not the next membership: a later attempt can replace it, and only
+        /// the finalized handoff changes who serves.
+        EpochId next_epoch{0};
+        std::vector<NodeId> next_members;
     };
 
     /// The current membership snapshot. Thread-safe; trails a membership
     /// change by at most one tick.
     [[nodiscard]] MembershipSnapshot membership() const {
         std::lock_guard lock(members_mutex_);
-        return MembershipSnapshot{members_known_, current_epoch_, current_members_};
+        return MembershipSnapshot{members_known_, current_epoch_, current_members_, next_epoch_,
+                                  next_members_};
     }
 
     /// The network the pinned Genesis key derives.
@@ -379,11 +387,23 @@ private:
     std::vector<NodeId> current_members_;
     bool members_known_ = false;
     EpochId current_epoch_{0};
+    EpochId next_epoch_{0};
+    std::vector<NodeId> next_members_;
 
     std::function<void()> tick_hook_;
 
     /// Copy the live membership into the snapshot. io thread only.
     void refresh_members();
 };
+
+/// The epoch at which `self`, a current Tier 1 member, leaves Tier 1 by the
+/// finalized next-epoch plan in `snapshot`: the plan opens a later epoch and
+/// does not name `self`. nullopt when the membership is not known, `self` is
+/// not a current member, no plan is committed, or the plan keeps `self`.
+/// Clients receive this as a hint (POST /api/mesh/heartbeat,
+/// "tier1_departure") and verify the membership themselves; it grants
+/// nothing.
+[[nodiscard]] std::optional<EpochId> tier1_departure_epoch(
+    const SecurityMeshService::MembershipSnapshot& snapshot, const NodeId& self);
 
 }  // namespace nexus::security

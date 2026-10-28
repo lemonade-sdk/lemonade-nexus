@@ -276,13 +276,45 @@ protected:
     // epoch: the client verifies it before it sends a tree request. In Epoch 2
     // its node leaves Tier 1 and `next_identity` takes the seat. Once
     // `server_left_tier1` is set, the server serves Epoch 2 and signs its
-    // endpoint proofs as the new member.
+    // endpoint proofs as the new member, and its private API refuses the
+    // session the departed member issued ("session-token") with 421, as the
+    // tree route gate does on a server that no longer holds the tree.
     nexus::crypto::Ed25519Keypair server_identity{};
     nexus::crypto::Ed25519Keypair next_identity{};
     std::atomic<bool>             server_left_tier1{false};
     tier1_chain_test::Chain chain;
 
     std::size_t served_epochs() const { return server_left_tier1.load() ? 2 : 1; }
+
+    // The heartbeat answer carries a departure notice for this next epoch
+    // when set (0: none), as a member that the finalized plan leaves out
+    // sends it.
+    std::atomic<uint64_t> departure_next_epoch{0};
+    // Authority chain pages served: how often a client walked the chain.
+    std::atomic<int> authority_gets{0};
+
+    // A second public server on another port: another verified member of
+    // both epochs (`second_identity`), listed by /api/servers once
+    // `list_second_server` is set. Its joins issue "session-token-3".
+    std::unique_ptr<httplib::SSLServer> pub2;
+    std::thread                         pub2_thread;
+    int                                 pub2_port = 0;
+    nexus::crypto::Ed25519Keypair       second_identity{};
+    std::atomic<bool>                   list_second_server{false};
+    std::atomic<int>                    second_auth_posts{0};
+
+    // The session moves the SDK reported.
+    std::mutex                          moves_mtx;
+    std::vector<lnsdk::SessionMoveEvent> moves_seen;
+
+    std::vector<lnsdk::SessionMoveEvent> moves() {
+        std::lock_guard lock(moves_mtx);
+        return moves_seen;
+    }
+
+    static std::string node_b64(const nexus::crypto::Ed25519Keypair& kp) {
+        return nexus::crypto::to_base64(kp.public_key);
+    }
 
     void SetUp() override {
         ASSERT_GE(sodium_init(), 0);
@@ -339,13 +371,24 @@ protected:
         });
         priv->Post("/api/mesh/heartbeat", [this](const httplib::Request& req,
                                                  httplib::Response& res) {
+            if (server_left_tier1.load() &&
+                req.get_header_value("Authorization") == "Bearer session-token") {
+                res.status = 421;
+                res.set_content(R"({"error":"this server does not hold the tree"})",
+                                "application/json");
+                return;
+            }
             const auto body = nlohmann::json::parse(req.body, nullptr, false);
             {
                 std::lock_guard lock(heartbeat_mtx);
                 heartbeat_endpoints.push_back(
                     body.is_object() ? body.value("endpoint", std::string{"<none>"}) : "<bad>");
             }
-            res.set_content(R"({"success":true})", "application/json");
+            nlohmann::json answer{{"success", true}};
+            if (const auto next_epoch = departure_next_epoch.load(); next_epoch != 0) {
+                answer["tier1_departure"] = {{"next_epoch", next_epoch}};
+            }
+            res.set_content(answer.dump(), "application/json");
         });
         const int priv_port = priv->bind_to_any_port("127.0.0.1");
         ASSERT_GT(priv_port, 0);
@@ -354,23 +397,51 @@ protected:
         ASSERT_TRUE(server_mesh.tcp_ingress(kPrivPort,
                                             "tcp:127.0.0.1:" + std::to_string(priv_port)));
 
-        pub = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
-        ASSERT_TRUE(pub->is_valid());
-        pub->Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(R"({"status":"ok"})", "application/json");
-        });
         server_identity = tier1_chain_test::new_identity();
         next_identity   = tier1_chain_test::new_identity();
-        std::vector<nexus::crypto::Ed25519Keypair> epoch1 = {server_identity};
-        std::vector<nexus::crypto::Ed25519Keypair> epoch2 = {next_identity};
-        for (int i = 0; i < 4; ++i) {
+        second_identity = tier1_chain_test::new_identity();
+        std::vector<nexus::crypto::Ed25519Keypair> epoch1 = {server_identity, second_identity};
+        std::vector<nexus::crypto::Ed25519Keypair> epoch2 = {next_identity, second_identity};
+        for (int i = 0; i < 3; ++i) {
             const auto member = tier1_chain_test::new_identity();
             epoch1.push_back(member);
             epoch2.push_back(member);
         }
         chain = tier1_chain_test::Chain::make({epoch1, epoch2});
-        pub->Get("/api/tier1/authority", [this](const httplib::Request& req,
-                                                httplib::Response& res) {
+
+        pub = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
+        ASSERT_TRUE(pub->is_valid());
+        add_public_routes(*pub, pub_port, nullptr, auth_posts, "session-token");
+        pub_port = pub->bind_to_any_port("127.0.0.1");
+        ASSERT_GT(pub_port, 0);
+        pub_thread = std::thread([this] { pub->listen_after_bind(); });
+        pub->wait_until_ready();
+
+        pub2 = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
+        ASSERT_TRUE(pub2->is_valid());
+        add_public_routes(*pub2, pub2_port, &second_identity, second_auth_posts,
+                          "session-token-3");
+        pub2_port = pub2->bind_to_any_port("127.0.0.1");
+        ASSERT_GT(pub2_port, 0);
+        pub2_thread = std::thread([this] { pub2->listen_after_bind(); });
+        pub2->wait_until_ready();
+    }
+
+    /// The public routes of one stand-in Tier 1 server on `port`. It signs
+    /// endpoint proofs as `fixed_identity`, or, when that is null, as the
+    /// member that holds the first server's seat in the served epoch. Its
+    /// joins issue `join_token`; "session-token" is the token the departed
+    /// member issued, and the first server issues "session-token-2" after it
+    /// left.
+    void add_public_routes(httplib::SSLServer& srv, int& port,
+                           const nexus::crypto::Ed25519Keypair* fixed_identity,
+                           std::atomic<int>& auths, std::string join_token) {
+        srv.Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(R"({"status":"ok"})", "application/json");
+        });
+        srv.Get("/api/tier1/authority", [this](const httplib::Request& req,
+                                               httplib::Response& res) {
+            ++authority_gets;
             const auto page = chain.page_after(std::stoull(req.get_param_value("have_epoch")),
                                                served_epochs());
             if (!page) {
@@ -381,16 +452,23 @@ protected:
             res.set_content(nlohmann::json{{"page", nexus::crypto::to_base64(bytes)}}.dump(),
                             "application/json");
         });
-        pub->Get("/api/servers", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content("[]", "application/json");
+        srv.Get("/api/servers", [this](const httplib::Request&, httplib::Response& res) {
+            nlohmann::json list = nlohmann::json::array();
+            if (list_second_server.load()) {
+                list.push_back({{"fqdn", "localhost"}, {"http_port", pub2_port}});
+            }
+            res.set_content(list.dump(), "application/json");
         });
-        pub->Get("/api/tier1/proof", [this](const httplib::Request& req, httplib::Response& res) {
+        srv.Get("/api/tier1/proof", [this, &port, fixed_identity](const httplib::Request& req,
+                                                                  httplib::Response& res) {
             const auto nonce = nexus::crypto::from_hex(req.get_param_value("nonce"));
             const bool left  = server_left_tier1.load();
             const auto epoch = static_cast<uint64_t>(served_epochs());
+            const auto& signer =
+                fixed_identity ? *fixed_identity : (left ? next_identity : server_identity);
             const auto proof = nexus::security::sign_tier1_endpoint_proof(
                 chain.network, nexus::security::EpochId{epoch}, "localhost",
-                static_cast<uint16_t>(pub_port), nonce, left ? next_identity : server_identity);
+                static_cast<uint16_t>(port), nonce, signer);
             res.set_content(
                 nlohmann::json{{"node_id", nexus::crypto::to_base64(proof.node.bytes)},
                                {"epoch", epoch},
@@ -400,20 +478,21 @@ protected:
                     .dump(),
                 "application/json");
         });
-        pub->Post("/api/auth/challenge", [](const httplib::Request&, httplib::Response& res) {
+        srv.Post("/api/auth/challenge", [](const httplib::Request&, httplib::Response& res) {
             std::array<uint8_t, 32> challenge{};
             randombytes_buf(challenge.data(), challenge.size());
             res.set_content(
                 nlohmann::json{{"challenge", nexus::crypto::to_base64(challenge)}}.dump(),
                 "application/json");
         });
-        pub->Post("/api/auth", [this](const httplib::Request&, httplib::Response& res) {
-            ++auth_posts;
+        srv.Post("/api/auth", [&auths](const httplib::Request&, httplib::Response& res) {
+            ++auths;
             res.set_content(
                 R"({"authenticated":true,"user_id":"user","session_token":"auth-token"})",
                 "application/json");
         });
-        pub->Post("/api/join", [this](const httplib::Request& req, httplib::Response& res) {
+        srv.Post("/api/join", [this, fixed_identity, join_token](const httplib::Request& req,
+                                                                 httplib::Response& res) {
             const auto body = nlohmann::json::parse(req.body, nullptr, false);
             {
                 std::lock_guard lock(join_mtx);
@@ -440,7 +519,8 @@ protected:
             (void)server_mesh.sync_peers({self});
             (void)peer_mesh.sync_peers({self});
             nlohmann::json j;
-            j["token"]               = "session-token";
+            j["token"] = (!fixed_identity && server_left_tier1.load()) ? "session-token-2"
+                                                                        : join_token;
             j["node_id"]             = kNodeId;
             j["tunnel_ip"]           = "10.64.0.3/32";
             j["server_tunnel_ip"]    = "10.64.0.1";
@@ -451,16 +531,14 @@ protected:
             j["tunnel_subnet"]       = "10.64.0.0/10";
             res.set_content(j.dump(), "application/json");
         });
-        pub_port = pub->bind_to_any_port("127.0.0.1");
-        ASSERT_GT(pub_port, 0);
-        pub_thread = std::thread([this] { pub->listen_after_bind(); });
-        pub->wait_until_ready();
     }
 
     void TearDown() override {
         if (pub) pub->stop();
+        if (pub2) pub2->stop();
         if (priv) priv->stop();
         if (pub_thread.joinable()) pub_thread.join();
+        if (pub2_thread.joinable()) pub2_thread.join();
         if (priv_thread.joinable()) priv_thread.join();
         peer_mesh.stop();
         server_mesh.stop();
@@ -494,6 +572,10 @@ protected:
         auto client = std::make_unique<lnsdk::LemonadeNexusClient>(cfg);
         EXPECT_TRUE(client->set_genesis_key(
             nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+        client->set_session_moved_callback([this](const lnsdk::SessionMoveEvent& event) {
+            std::lock_guard lock(moves_mtx);
+            moves_seen.push_back(event);
+        });
         client->set_session_token("session-token");
         if (!link_token.empty()) client->set_link_token(link_token);
         auto joined = client->join_network("user", "password");
@@ -538,16 +620,92 @@ TEST_F(SdkMeshPrivateApiTest, APendingJoinIsRepeatedWithoutTheLinkTokenUntilItCo
 }
 
 // Tier 1 rotates a member out at an epoch boundary. A session bound to that
-// server can no longer carry private calls, so the SDK drops it instead of
-// refusing forever: the next private call is refused and never sent, the
-// token is gone, mesh_status() asks for a re-join, and join_network()
-// authenticates afresh instead of carrying the stale token to the old server.
-TEST_F(SdkMeshPrivateApiTest, ASessionWhoseServerLeftTier1IsDroppedAndJoinedAgain) {
+// server can no longer carry private calls. With an identity the SDK moves
+// the session by itself: the private call that finds the server gone is
+// refused and never sent, then the SDK authenticates with the identity
+// through a current member (never carrying the stale token to the old
+// server), joins again, restarts the mesh orchestrator as it was, and
+// reports the move. The application never sees needs_rejoin.
+TEST_F(SdkMeshPrivateApiTest, ASessionWhoseServerLeftTier1MovesToACurrentMemberByItself) {
     LN_REQUIRE_TEST_TRUST();
     auto client = joined_client();
     lnsdk::Identity identity;
     identity.generate();
     client->set_identity(identity);
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 3600;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return peer_list_gets.load() >= 1; }, std::chrono::seconds(10)));
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    EXPECT_EQ(client->session_token(), "session-token");
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+
+    ASSERT_NO_FATAL_FAILURE(server_leaves_tier1(*client));
+    const auto sent_before = heartbeats().size();
+    const int  peer_gets_before = peer_list_gets.load();
+    EXPECT_FALSE(client->mesh_heartbeat(kNodeId, "").ok);
+    EXPECT_EQ(heartbeats().size(), sent_before);
+
+    ASSERT_TRUE(wait_for([&] { return moves().size() == 1; }, std::chrono::seconds(20)));
+    const auto move = moves().front();
+    EXPECT_TRUE(move.silent) << move.error;
+    EXPECT_EQ(move.from_node_id, node_b64(server_identity));
+    EXPECT_EQ(move.to_node_id, node_b64(next_identity));
+    EXPECT_EQ(move.to_host, "localhost");
+    EXPECT_EQ(move.epoch, 2u);
+    EXPECT_TRUE(move.error.empty());
+    EXPECT_EQ(auth_posts.load(), 1);
+    EXPECT_EQ(join_bearers(), (std::vector<std::string>{"", "Bearer auth-token"}));
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+    EXPECT_EQ(client->session_token(), "session-token-2");
+    EXPECT_EQ(client->node_id(), kNodeId);
+    // The orchestrator came back for the new session.
+    EXPECT_TRUE(wait_for([&] { return peer_list_gets.load() > peer_gets_before; },
+                         std::chrono::seconds(10)));
+    EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    EXPECT_GE(heartbeats().size(), sent_before + 1);
+    client->disable_mesh();
+}
+
+// After the handoff the departed server refuses tree routes (421) on its
+// private API. That refusal alone starts the move: the SDK verifies the
+// membership again, finds the server gone, and moves the session without
+// waiting for its periodic refresh.
+TEST_F(SdkMeshPrivateApiTest, ATreeRefusalFromTheSessionServerStartsTheMove) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    EXPECT_EQ(client->tier1_membership().epoch, 1u);
+
+    server_left_tier1 = true;
+    auto refused = client->mesh_heartbeat(kNodeId, "");
+    EXPECT_FALSE(refused.ok);
+    EXPECT_EQ(refused.http_status, 421);
+
+    ASSERT_TRUE(wait_for([&] { return moves().size() == 1; }, std::chrono::seconds(20)));
+    const auto move = moves().front();
+    EXPECT_TRUE(move.silent) << move.error;
+    EXPECT_EQ(move.from_node_id, node_b64(server_identity));
+    EXPECT_EQ(move.to_node_id, node_b64(next_identity));
+    EXPECT_EQ(move.epoch, 2u);
+    EXPECT_EQ(client->tier1_membership().epoch, 2u);
+    EXPECT_EQ(auth_posts.load(), 1);
+    EXPECT_EQ(client->session_token(), "session-token-2");
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+    EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+}
+
+// Without an identity the SDK cannot authenticate by itself, so it keeps the
+// earlier behavior: the session is dropped, needs_rejoin is set, the move is
+// reported as not silent, and join_network() authenticates afresh instead of
+// carrying the stale token to the old server.
+TEST_F(SdkMeshPrivateApiTest, ASessionWhoseServerLeftTier1IsDroppedWhenNoIdentityCanMoveIt) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
     ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
     EXPECT_EQ(client->session_token(), "session-token");
     EXPECT_FALSE(client->mesh_status().needs_rejoin);
@@ -559,19 +717,99 @@ TEST_F(SdkMeshPrivateApiTest, ASessionWhoseServerLeftTier1IsDroppedAndJoinedAgai
     EXPECT_TRUE(client->session_token().empty());
     EXPECT_TRUE(client->mesh_status().needs_rejoin);
     EXPECT_EQ(auth_posts.load(), 0);
+    ASSERT_EQ(moves().size(), 1u);
+    EXPECT_FALSE(moves().front().silent);
+    EXPECT_EQ(moves().front().from_node_id, node_b64(server_identity));
+    EXPECT_TRUE(moves().front().to_node_id.empty());
+    EXPECT_EQ(moves().front().error, "no identity for a silent re-authentication");
 
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
     auto joined = client->join_network("user", "password");
     ASSERT_TRUE(joined.ok) << joined.error;
     EXPECT_EQ(auth_posts.load(), 1);
     EXPECT_EQ(join_bearers(), (std::vector<std::string>{"", "Bearer auth-token"}));
     EXPECT_FALSE(client->mesh_status().needs_rejoin);
-    EXPECT_EQ(client->session_token(), "session-token");
+    EXPECT_EQ(client->session_token(), "session-token-2");
     EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
     EXPECT_EQ(heartbeats().size(), sent_before + 1);
 }
 
+// Before the handoff, a member that the finalized plan leaves out says so in
+// its heartbeat answers. The SDK verifies the membership and, while the
+// server still serves, moves the session early onto another verified member
+// of the current epoch, chosen from the verified list and not by the server.
+// The same notice again starts no second move.
+TEST_F(SdkMeshPrivateApiTest, ADepartureNoticeMovesTheSessionBeforeTheHandoff) {
+    LN_REQUIRE_TEST_TRUST();
+    list_second_server = true;
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    ASSERT_EQ(client->tier1_membership().servers.size(), 2u);
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+
+    departure_next_epoch = 2;
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    ASSERT_TRUE(wait_for([&] { return moves().size() == 1; }, std::chrono::seconds(20)));
+    const auto move = moves().front();
+    EXPECT_TRUE(move.silent) << move.error;
+    EXPECT_EQ(move.from_node_id, node_b64(server_identity));
+    EXPECT_EQ(move.to_node_id, node_b64(second_identity));
+    EXPECT_EQ(move.epoch, 1u);
+    EXPECT_EQ(second_auth_posts.load(), 1);
+    EXPECT_EQ(auth_posts.load(), 0);
+    EXPECT_EQ(client->session_token(), "session-token-3");
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+
+    const int walks_before = authority_gets.load();
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(moves().size(), 1u);
+    EXPECT_EQ(authority_gets.load(), walks_before);
+    EXPECT_EQ(client->session_token(), "session-token-3");
+}
+
+// A departure notice is a hint. One that names an epoch the SDK cannot verify
+// from the chain, with no other verified server to move to, changes nothing:
+// the SDK verifies, finds its server a current member, and keeps the session.
+// A notice for an epoch at or below the verified one is not even looked up.
+TEST_F(SdkMeshPrivateApiTest, ADepartureNoticeTheClientCannotVerifyChangesNothing) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+
+    int walks_before = authority_gets.load();
+    departure_next_epoch = 2;
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    EXPECT_TRUE(wait_for([&] { return authority_gets.load() > walks_before; },
+                         std::chrono::seconds(10)))
+        << "the notice did not make the SDK verify the membership";
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_TRUE(moves().empty());
+    EXPECT_EQ(auth_posts.load(), 0);
+    EXPECT_EQ(client->session_token(), "session-token");
+    EXPECT_EQ(client->tier1_membership().epoch, 1u);
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+    EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+
+    departure_next_epoch = 1;
+    walks_before = authority_gets.load();
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(authority_gets.load(), walks_before);
+    EXPECT_TRUE(moves().empty());
+    EXPECT_EQ(client->session_token(), "session-token");
+}
+
 // check_health() names the reason once, when it finds the session's server
-// gone. The session is dropped with it, so health itself answers afterwards.
+// gone. Without an identity the session is dropped with it, so health itself
+// answers afterwards.
 TEST_F(SdkMeshPrivateApiTest, HealthReportsTheDepartedSessionServerOnce) {
     LN_REQUIRE_TEST_TRUST();
     auto client = joined_client();

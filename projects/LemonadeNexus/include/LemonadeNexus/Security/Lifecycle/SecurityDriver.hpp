@@ -139,6 +139,15 @@ public:
     /// io thread.
     [[nodiscard]] std::optional<AuthorityChainPage> authority_chain_page(EpochId have_epoch) const;
 
+    /// The finalized next-epoch plan this member holds for the open boundary,
+    /// or nullptr when none is committed. A current member the plan does not
+    /// name leaves Tier 1 when that epoch activates. A read of a finalized
+    /// fact that grants nothing: a later attempt can replace the plan, and
+    /// only the finalized handoff changes the membership. io thread.
+    [[nodiscard]] const NextEpochPlan* committed_plan() const {
+        return plan_.has_value() ? &*plan_ : nullptr;
+    }
+
     // --- ISecurityEvents ---
     void on_vote_sent(const Vote&, const NodeId&) override {}
     void on_certificate(const QuorumCertificate& certificate) override;

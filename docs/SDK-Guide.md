@@ -153,9 +153,21 @@ The SDK refreshes on its own every five minutes and after a server refuses a
 tree route. See [Client SDK — Tier 1 Servers](Client-SDK#tier-1-servers) for
 what it verifies and how it fails closed.
 
-A session belongs to the Tier 1 server that issued it. When that server leaves
-the verified membership (Tier 1 rotates one member out at each epoch
-boundary), the SDK drops the session: `check_health()` reports it once,
+A session belongs to the Tier 1 server that issued it. Tier 1 rotates one
+member out at each epoch boundary. A member that the finalized next-epoch
+plan leaves out says so in its heartbeat answers before the handoff
+(`tier1_departure: {next_epoch}`), and refuses tree routes with `421` after
+it. On either sign, and when a membership refresh finds the server gone, the
+SDK verifies the membership again from the pinned Genesis key and moves the
+session by itself: it authenticates with the device identity through another
+verified Tier 1 server, joins again, and restarts the mesh orchestrator as it
+was. The notice is a hint; the SDK picks the new server from the membership
+it verified, never from the notice. The move is reported through
+`set_session_moved_callback()` / `ln_set_session_moved_callback()` (see
+[Session moves](#session-moves)).
+
+Only when the SDK cannot move the session (no identity set, or the silent
+join failed) does it drop the session: `check_health()` reports it once,
 private-API calls are refused, and `mesh_status().needs_rejoin` stays true
 until `join_network()` succeeds again. That join authenticates through a
 current Tier 1 server instead of reusing the dropped token.
@@ -350,7 +362,7 @@ client.set_mesh_callback([](const lnsdk::MeshTunnelStatus& s) {
 auto status = client.mesh_status();
 // status.is_up, status.peer_count, status.online_count, status.peers...
 // status.needs_rejoin: the session's Tier 1 server left the membership and
-// the SDK dropped the session; call join_network() again.
+// the SDK could not move the session by itself; call join_network() again.
 client.refresh_mesh_peers();
 
 // Publish a local service to mesh peers:
@@ -367,6 +379,43 @@ C ABI equivalents: `ln_mesh_enable`, `ln_mesh_enable_config`,
 `ln_mesh_disable`, `ln_mesh_status`, `ln_mesh_peers`, `ln_mesh_refresh`,
 `ln_mesh_expose_service`, `ln_mesh_open_egress`, plus
 `ln_private_api_call` for generic authenticated private routes.
+
+### Session moves
+
+The SDK moves a session whose Tier 1 server leaves the membership (see
+[Tier 1 Servers](#tier-1-servers)). Nothing is required from the application;
+one callback tells it what happened, so it can inform the user:
+
+```cpp
+client.set_session_moved_callback([](const lnsdk::SessionMoveEvent& e) {
+    // e.from_node_id, e.from_host: the server that issued the old session
+    // e.to_node_id, e.to_host: the server that issued the new one (empty
+    //   when none did)
+    // e.epoch: the Tier 1 epoch the SDK verified for the move
+    // e.silent: true when the SDK re-authenticated and joined by itself;
+    //   false when the application must call join_network() (needs_rejoin
+    //   is set) and e.error says why
+});
+```
+
+The callback runs on an SDK background thread, or on the thread whose call
+found the server gone, outside the client's locks. When
+`set_session_moved_callback()` returns, the previous callback is not running
+and is not called again. Do not call that method, or destroy the client, from
+the callback.
+
+C: `ln_set_session_moved_callback(client, fn, user)` with
+`void fn(char* event_json, void* user)`. `event_json` is
+`{from_node_id, from_host, to_node_id, to_host, epoch, silent, error}`. The
+callback owns `event_json` and releases it with `ln_free()`, during the call
+or later from any thread; this lets a binding hand the event to another
+thread. `fn` NULL clears the callback. No callback runs after `ln_destroy()`
+returns. Dart: `LemonadeNexusSdk.sessionMoves` is a `Stream<SessionMoveEvent>`
+with the same fields.
+
+A silent move issues a new server-bound session token; an application that
+stores the token reads `session_token()` / `ln_get_session_token()` again
+after the event.
 
 ### Mesh port
 

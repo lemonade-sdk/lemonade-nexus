@@ -107,3 +107,30 @@ TEST(SdkCapiMesh, AccountDeletionChecksArgumentsAndNeedsAnIdentity) {
     EXPECT_NE(std::string(out).find("error"), std::string::npos);
     ln_free(out);
 }
+
+namespace {
+void count_session_move(char* event_json, void* user) {
+    ln_free(event_json);
+    ++*static_cast<int*>(user);
+}
+}  // namespace
+
+// The session-move callback: argument checks, and set/clear without a move
+// in flight. Before any join there is no session to move, so the callback
+// never runs.
+TEST(SdkCapiMesh, SessionMovedCallbackIsSetAndCleared) {
+    int calls = 0;
+    EXPECT_EQ(ln_set_session_moved_callback(nullptr, count_session_move, &calls),
+              LN_ERR_NULL_ARG);
+    Client client;
+    ASSERT_NE(client.c, nullptr);
+    EXPECT_EQ(ln_set_session_moved_callback(client.c, count_session_move, &calls), LN_OK);
+    EXPECT_EQ(ln_set_session_moved_callback(client.c, nullptr, nullptr), LN_OK);
+    EXPECT_EQ(ln_set_session_moved_callback(client.c, count_session_move, &calls), LN_OK);
+    char* status = nullptr;
+    ASSERT_EQ(ln_mesh_status(client.c, &status), LN_OK);
+    ASSERT_NE(status, nullptr);
+    EXPECT_NE(std::string(status).find("\"needs_rejoin\":false"), std::string::npos);
+    ln_free(status);
+    EXPECT_EQ(calls, 0);
+}
