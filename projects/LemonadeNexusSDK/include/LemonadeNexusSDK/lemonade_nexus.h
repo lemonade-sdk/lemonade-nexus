@@ -132,7 +132,11 @@ ln_error_t ln_set_identity(ln_client_t* client, const ln_identity_t* identity);
 /* Health                                                              */
 /* ------------------------------------------------------------------ */
 
-/** GET /api/health. Returns JSON via out_json. Caller must ln_free(*out_json). */
+/** GET /api/health. Returns JSON via out_json:
+ *  {"status","service","dns_base_domain","rp_id","ok"} and "error" when not ok.
+ *  "rp_id" is the WebAuthn relying-party id the network's passkeys are bound to
+ *  (empty when the server did not report one); a passkey client must use it,
+ *  not a constant. Caller must ln_free(*out_json). */
 ln_error_t ln_health(ln_client_t* client, char** out_json);
 
 /* ------------------------------------------------------------------ */

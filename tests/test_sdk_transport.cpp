@@ -113,7 +113,7 @@ protected:
                 client_ports.insert(req.remote_port);
                 auth_values.insert(req.get_header_value("Authorization"));
             }
-            res.set_content(R"({"status":"ok","service":"lemonade-nexus"})", "application/json");
+            res.set_content(R"({"status":"ok","service":"lemonade-nexus","rp_id":"lemonade-nexus.local"})", "application/json");
         });
         port = server->bind_to_any_port("127.0.0.1");
         ASSERT_GT(port, 0);
@@ -164,6 +164,7 @@ TEST_F(SdkTransportTest, SequentialCallsReuseOneConnection) {
         auto r = client.check_health();
         ASSERT_TRUE(r.ok) << r.error;
         EXPECT_EQ(r.value.status, "ok");
+        EXPECT_EQ(r.value.rp_id, "lemonade-nexus.local") << "the passkey RP ID reaches the caller";
     }
     std::lock_guard lock(seen_mutex);
     EXPECT_EQ(client_ports.size(), 1u) << "each call opened a new connection";
