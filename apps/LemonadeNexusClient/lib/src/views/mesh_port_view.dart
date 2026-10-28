@@ -175,6 +175,8 @@ class _TlsBadge extends StatelessWidget {
         return const LemonBadge(text: 'TLS active');
       case 'waiting':
         return const LemonBadge(text: 'HTTP: waiting for certificate', color: AppTheme.nodeOrange);
+      case 'activating':
+        return const LemonBadge(text: 'HTTP: TLS starts when open requests finish', color: AppTheme.nodeOrange);
       case 'unsupported_certificate':
         return const LemonBadge(text: 'HTTP: certificate not usable', color: AppTheme.nodeOrange);
       default:

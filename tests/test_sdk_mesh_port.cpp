@@ -13,6 +13,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -119,33 +121,124 @@ lnsdk::MeshPortCertificate wildcard(long serial = 1) {
     return {"*.team.lo.example", pem.certificate, pem.key, 0};
 }
 
-/// A peer lemond reached through mesh egress, and a local service.
+/// The peer's /slow response: six 8-byte chunks, 200 ms apart.
+constexpr size_t kSlowChunks = 6;
+constexpr size_t kSlowChunkSize = 8;
+const std::string kSlowBody = "data: 0\ndata: 1\ndata: 2\ndata: 3\ndata: 4\ndata: 5\n";
+
+/// A GET that runs on its own thread and reports when the first chunk arrives.
+struct Stream {
+    std::thread thread;
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool first{false};
+    bool ok{false};
+    std::string body;
+
+    template <typename HttpClient>
+    void begin(HttpClient& client, const std::string& path) {
+        thread = std::thread([this, &client, path] {
+            auto result = client.Get(path, [this](const char* data, size_t size) {
+                std::lock_guard lock(mutex);
+                body.append(data, size);
+                first = true;
+                changed.notify_all();
+                return true;
+            });
+            std::lock_guard lock(mutex);
+            ok = result && result->status == 200;
+        });
+    }
+    bool wait_first(std::chrono::milliseconds limit) {
+        std::unique_lock lock(mutex);
+        return changed.wait_for(lock, limit, [this] { return first; });
+    }
+    void finish() {
+        if (thread.joinable()) thread.join();
+    }
+    ~Stream() { finish(); }
+};
+
+bool wait_for_tls_state(MeshPort& port, const std::string& state, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (port.status()["tls"]["state"] != state) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return true;
+}
+
+/// A peer lemond reached through mesh egress, and a local service. `slow` and
+/// `guarded` are further peers that a test starts when it needs them.
 class MeshPortTest : public ::testing::Test {
 protected:
     TestServer peer;
     TestServer local;
+    TestServer slow;
+    TestServer guarded;
     std::mutex seen_mutex;
     std::string peer_authorization;
     std::string peer_model;
     std::string local_authorization;
     std::atomic<int> closed_egress{0};
+    std::atomic<int> peer_model_listings{0};
     std::unique_ptr<MeshPort> port;
     uint16_t number = 0;
     std::mutex members_mutex;
     std::vector<MeshPortMember> members = group_members();
+    MeshPort::Options options = [] {
+        MeshPort::Options o;
+        o.refresh_interval = std::chrono::hours(1);
+        return o;
+    }();
 
     void SetUp() override {
         peer.server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"status":"ok","all_models_loaded":[{"model_name":"PeerModel","is_busy":false}]})",
                             "application/json");
         });
-        peer.server.Get("/api/v1/models", [](const httplib::Request&, httplib::Response& res) {
+        peer.server.Get("/api/v1/models", [this](const httplib::Request&, httplib::Response& res) {
+            ++peer_model_listings;
             res.set_content(R"({"object":"list","data":[{"id":"PeerModel"},{"id":"Shared"}]})", "application/json");
         });
         peer.server.Get("/created", [](const httplib::Request&, httplib::Response& res) {
             res.status = 201;
             res.set_content("made", "application/x-mesh-test");
         });
+        peer.server.Get("/slow", [](const httplib::Request&, httplib::Response& res) {
+            res.set_chunked_content_provider("text/event-stream", [](size_t offset, httplib::DataSink& sink) {
+                const auto index = offset / kSlowChunkSize;
+                if (index >= kSlowChunks) {
+                    sink.done();
+                    return true;
+                }
+                if (index > 0) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                const auto chunk = kSlowBody.substr(index * kSlowChunkSize, kSlowChunkSize);
+                sink.write(chunk.data(), chunk.size());
+                return true;
+            });
+        });
+        const auto delayed = [](const char* body) {
+            return [body](const httplib::Request&, httplib::Response& res) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+                res.set_content(body, "application/json");
+            };
+        };
+        slow.server.Get("/api/v1/health", delayed(R"({"status":"ok","all_models_loaded":[]})"));
+        slow.server.Get("/api/v1/models", delayed(R"({"object":"list","data":[{"id":"SlowModel"}]})"));
+        const auto keyed = [](const char* body) {
+            return [body](const httplib::Request& req, httplib::Response& res) {
+                if (req.get_header_value("Authorization") != "Bearer right-key") {
+                    res.status = 401;
+                    res.set_content(R"({"error":"invalid API key"})", "application/json");
+                    return;
+                }
+                res.set_content(body, "application/json");
+            };
+        };
+        guarded.server.Get("/api/v1/health", keyed(R"({"status":"ok","all_models_loaded":[{"model_name":"Guarded","is_busy":false}]})"));
+        guarded.server.Get("/api/v1/models", keyed(R"({"object":"list","data":[{"id":"Guarded"}]})"));
+        guarded.server.Post("/api/v1/chat/completions", keyed(R"({"served_by":"guarded"})"));
         peer.server.Post("/api/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
             const auto body = json::parse(req.body, nullptr, false);
             {
@@ -191,17 +284,27 @@ protected:
         };
         b.self_node_id = [] { return std::string("self"); };
         const auto peer_port = static_cast<uint16_t>(peer.port);
-        b.open_egress = [peer_port](const std::string& ip, uint16_t vport) -> uint16_t {
-            return ip == "10.64.0.3" && vport == lnsdk::kMeshPortPeerServicePort ? peer_port : 0;
+        const auto slow_port = static_cast<uint16_t>(slow.port);
+        const auto guarded_port = static_cast<uint16_t>(guarded.port);
+        b.open_egress = [=](const std::string& ip, uint16_t vport) -> uint16_t {
+            if (vport != lnsdk::kMeshPortPeerServicePort) return 0;
+            if (ip == "10.64.0.3") return peer_port;
+            if (ip == "10.64.0.8") return slow_port;
+            if (ip == "10.64.0.9") return guarded_port;
+            return 0;
         };
         b.close_egress = [this](const std::string&, uint16_t) { ++closed_egress; };
         b.ensure_certificate = std::move(cert);
         return b;
     }
 
+    /// Adds a Tier 3 member at `ip` that a started extra server answers for.
+    void add_member(const std::string& node_id, const std::string& name, const std::string& ip) {
+        std::lock_guard lock(members_mutex);
+        members.push_back({node_id, name, ip + "/32", true, true, true, 5.0});
+    }
+
     void start(bool with_local = true) {
-        MeshPort::Options options;
-        options.refresh_interval = std::chrono::hours(1);
         port = std::make_unique<MeshPort>(backend(), options);
         number = free_port();
         const auto url = with_local ? "http://127.0.0.1:" + std::to_string(local.port) : std::string();
@@ -265,20 +368,36 @@ TEST(MeshPortRules, AutoRouteOrder) {
                                                     {{"model_name", "Both"}, {"is_busy", false}}}),
                 {"Big", "Both"}};
     peers[2] = {"locked", "Locked box", 1, json::array({{{"model_name", "Secret"}, {"is_busy", false}}}), {"Secret"}};
-    const std::vector<std::string> local = {"Small"};
+    const std::vector<std::string> local = {"Small", "org/Small", "GPU tower/Both"};
     const auto route = [&](const std::string& model) { return rules::auto_route(model, members, "self", local, peers); };
     EXPECT_EQ(route("GPU tower/Big").target, "gpu");
     EXPECT_EQ(route("GPU tower/Big").model, "Big");
     EXPECT_EQ(route("fast/Big").target, "fast");
     EXPECT_EQ(route("My Laptop/Small").target, "local");
+    EXPECT_EQ(route("My Laptop/Small").model, "Small");
     EXPECT_EQ(route("Sleeper/Big").status, 409);
     EXPECT_EQ(route("Locked box/Secret").status, 409);
     EXPECT_EQ(route("Small").target, "local");
+    EXPECT_EQ(route("org/Small").target, "local") << "a local ID with '/' is not a device name";
+    EXPECT_EQ(route("org/Small").model, "org/Small") << "the local ID is sent unchanged";
+    EXPECT_EQ(route("GPU tower/Both").target, "local") << "an exact local ID wins over a device prefix";
+    EXPECT_EQ(route("GPU tower/Both").model, "GPU tower/Both");
     EXPECT_EQ(route("Big").target, "gpu") << "an idle loaded peer beats a busy one";
     EXPECT_EQ(route("Both").target, "fast") << "among idle loaded peers the lowest latency wins";
     EXPECT_EQ(route("Spare").target, "gpu") << "a peer that lists the model is the last choice";
     EXPECT_EQ(route("Secret").status, 404) << "a peer without connect permission is never chosen";
     EXPECT_EQ(route("").target, "local");
+
+    auto refused = peers;
+    refused[0].models_status = 401;
+    const auto spare = rules::auto_route("Spare", members, "self", local, refused);
+    EXPECT_EQ(spare.status, 404) << "a peer that refused the peer key offers nothing";
+    EXPECT_EQ(spare.refused, std::vector<std::string>{"GPU tower"});
+    EXPECT_NE(spare.error.find("GPU tower"), std::string::npos) << spare.error;
+    EXPECT_EQ(rules::auto_route("Big", members, "self", local, refused).target, "fast")
+        << "a busy peer that accepts the key beats an idle one that refused it";
+    EXPECT_EQ(rules::auto_route("GPU tower/Big", members, "self", local, refused).target, "gpu")
+        << "an explicit device name is still honored; the peer answers 401 itself";
 
     const auto merged = rules::merge_models({{"object", "list"}, {"data", json::array({{{"id", "Small"}}})}},
                                             {peers[0], peers[1]});
@@ -410,6 +529,62 @@ TEST_F(MeshPortTest, AutoRouter) {
     EXPECT_EQ(ids[1]["id"], "GPU tower/PeerModel");
 }
 
+TEST_F(MeshPortTest, AutoRouterSkipsDevicesThatRefuseTheKey) {
+    guarded.start();
+    add_member("guarded", "Guarded box", "10.64.0.9");
+    start();
+    ASSERT_EQ(port->set_selection("auto", "wrong-key"), 0);
+    httplib::Client client("127.0.0.1", number);
+    auto refused = chat(client, "Guarded");
+    ASSERT_TRUE(refused);
+    EXPECT_EQ(refused->status, 404) << "a device that answers 401 to the peer key is never chosen";
+    EXPECT_NE(refused->body.find("Guarded box"), std::string::npos) << refused->body;
+    auto listing = client.Get("/api/v1/models");
+    ASSERT_TRUE(listing);
+    for (const auto& model : json::parse(listing->body)["data"]) {
+        EXPECT_NE(model["id"], "Guarded box/Guarded") << "a refused device lists no models";
+    }
+    auto still_peer = chat(client, "PeerModel");
+    ASSERT_TRUE(still_peer);
+    EXPECT_EQ(json::parse(still_peer->body)["served_by"], "peer");
+
+    ASSERT_EQ(port->set_selection("auto", "right-key"), 0);
+    auto served = chat(client, "Guarded");
+    ASSERT_TRUE(served);
+    EXPECT_EQ(served->status, 200);
+    EXPECT_EQ(json::parse(served->body)["served_by"], "guarded") << "a new key probes the device again";
+}
+
+TEST_F(MeshPortTest, PeerProbesRunConcurrently) {
+    slow.start();
+    add_member("slow", "Slow box", "10.64.0.8");
+    options.peer_probe_deadline = std::chrono::seconds(1);
+    start();
+    ASSERT_EQ(port->set_selection("auto", ""), 0);
+    httplib::Client client("127.0.0.1", number);
+    client.set_read_timeout(10, 0);
+    const auto timed = [&] {
+        const auto began = std::chrono::steady_clock::now();
+        auto listing = client.Get("/api/v1/models");
+        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began);
+        return std::make_pair(std::move(listing), took);
+    };
+    auto [listing, took] = timed();
+    ASSERT_TRUE(listing);
+    EXPECT_EQ(listing->status, 200);
+    const auto ids = json::parse(listing->body)["data"];
+    ASSERT_EQ(ids.size(), 3u) << listing->body;
+    EXPECT_EQ(ids[1]["id"], "GPU tower/PeerModel") << "the fast peer is listed";
+    EXPECT_LT(took.count(), 2000) << "a slow peer does not delay the listing past the deadline";
+    EXPECT_EQ(peer_model_listings.load(), 1);
+
+    auto [again, took_again] = timed();
+    ASSERT_TRUE(again);
+    EXPECT_EQ(json::parse(again->body)["data"].size(), 3u);
+    EXPECT_LT(took_again.count(), 500) << "a repeated listing is served from the cache";
+    EXPECT_EQ(peer_model_listings.load(), 1) << "the peer is not probed again within the interval";
+}
+
 TEST_F(MeshPortTest, LocalNeedsALocalService) {
     start(false);
     EXPECT_EQ(port->set_selection("local", ""), 409);
@@ -487,8 +662,53 @@ TEST_F(MeshPortTest, TlsReloadsTheCertificateInPlace) {
     };
     ASSERT_TRUE(port->install_certificate(wildcard(11)));
     EXPECT_EQ(serial_seen(), 11);
+
+    auto gpu = secure("gpu-tower.team.lo.example");
+    gpu->set_read_timeout(10, 0);
+    Stream stream;
+    stream.begin(*gpu, "/slow");
+    ASSERT_TRUE(stream.wait_first(std::chrono::seconds(3)));
     ASSERT_TRUE(port->install_certificate(wildcard(12)));
+    EXPECT_EQ(port->status()["tls"]["state"], "active");
     EXPECT_EQ(serial_seen(), 12) << "a renewed certificate applies to new connections";
+    stream.finish();
+    EXPECT_TRUE(stream.ok) << "a stream that spans the renewal is not reset";
+    EXPECT_EQ(stream.body, kSlowBody);
+}
+
+TEST_F(MeshPortTest, TlsActivationWaitsForOpenStreams) {
+    start();
+    ASSERT_EQ(port->set_selection("gpu", ""), 0);
+    httplib::Client plain("127.0.0.1", number);
+    plain.set_read_timeout(10, 0);
+    Stream stream;
+    stream.begin(plain, "/slow");
+    ASSERT_TRUE(stream.wait_first(std::chrono::seconds(3)));
+
+    ASSERT_TRUE(port->install_certificate(wildcard(41)));
+    auto status = port->status();
+    EXPECT_EQ(status["tls"]["state"], "activating") << "the switch waits for the open stream";
+    EXPECT_EQ(status["scheme"], "http");
+    EXPECT_EQ(status["tls"]["domain"], "*.team.lo.example");
+    httplib::Client second("127.0.0.1", number);
+    auto served = second.Get("/created");
+    ASSERT_TRUE(served);
+    EXPECT_EQ(served->status, 201) << "the plain listener keeps serving while it drains";
+
+    stream.finish();
+    EXPECT_TRUE(stream.ok) << "the stream that was open at install time completes";
+    EXPECT_EQ(stream.body, kSlowBody);
+    ASSERT_TRUE(wait_for_tls_state(*port, "active", std::chrono::seconds(5)))
+        << "the switch runs once the last plain request finishes";
+    status = port->status();
+    EXPECT_EQ(status["scheme"], "https");
+    EXPECT_EQ(status["local_domain"], kDomain);
+    auto gpu = secure("gpu-tower.team.lo.example");
+    auto created = gpu->Get("/created");
+    ASSERT_TRUE(created);
+    EXPECT_EQ(created->status, 201);
+    httplib::Client late("127.0.0.1", number);
+    EXPECT_FALSE(late.Get("/created")) << "plain HTTP stops after the switch";
 }
 
 TEST_F(MeshPortTest, RejectsCertificatesItCannotServe) {

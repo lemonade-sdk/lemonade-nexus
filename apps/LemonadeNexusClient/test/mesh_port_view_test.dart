@@ -89,6 +89,8 @@ void main() {
   testWidgets('shows plain HTTP while the certificate is pending', (tester) async {
     await tester.pumpWidget(_host(MeshPortPanel(status: _status(tls: 'waiting'), onSelect: (_) {})));
     expect(find.text('HTTP: waiting for certificate'), findsOneWidget);
+    await tester.pumpWidget(_host(MeshPortPanel(status: _status(tls: 'activating'), onSelect: (_) {})));
+    expect(find.text('HTTP: TLS starts when open requests finish'), findsOneWidget);
   });
 
   testWidgets('shows a port conflict and offers a retry', (tester) async {
