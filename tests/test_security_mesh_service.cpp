@@ -491,3 +491,44 @@ TEST_F(SecurityMeshServiceTest, ServerConfigRoundTripsGenesisPubkey) {
     }
 #endif
 }
+
+// A member the finalized next-epoch plan leaves out reports the epoch at
+// which it departs (the heartbeat's "tier1_departure"). Nothing else is a
+// departure: an unknown membership, a non-member, no committed plan, a plan
+// that keeps the member, or a plan that does not open a later epoch.
+TEST(Tier1Departure, OnlyACurrentMemberThePlanLeavesOutDeparts) {
+    const auto node = [](uint8_t fill) {
+        security::NodeId n{};
+        n.bytes.fill(fill);
+        return n;
+    };
+    const auto self = node(1);
+    const auto other = node(2);
+    using Snapshot = security::SecurityMeshService::MembershipSnapshot;
+
+    Snapshot leaving;
+    leaving.known = true;
+    leaving.epoch = security::EpochId{4};
+    leaving.members = {self, other};
+    leaving.next_epoch = security::EpochId{5};
+    leaving.next_members = {other, node(3)};
+    ASSERT_TRUE(security::tier1_departure_epoch(leaving, self).has_value());
+    EXPECT_EQ(security::tier1_departure_epoch(leaving, self)->underlying(), 5u);
+    // The member the plan keeps stays.
+    EXPECT_FALSE(security::tier1_departure_epoch(leaving, other).has_value());
+    // A node outside the current membership has nothing to depart from.
+    EXPECT_FALSE(security::tier1_departure_epoch(leaving, node(3)).has_value());
+
+    Snapshot unknown = leaving;
+    unknown.known = false;
+    EXPECT_FALSE(security::tier1_departure_epoch(unknown, self).has_value());
+
+    Snapshot no_plan = leaving;
+    no_plan.next_epoch = security::EpochId{0};
+    no_plan.next_members.clear();
+    EXPECT_FALSE(security::tier1_departure_epoch(no_plan, self).has_value());
+
+    Snapshot stale_plan = leaving;
+    stale_plan.next_epoch = security::EpochId{4};
+    EXPECT_FALSE(security::tier1_departure_epoch(stale_plan, self).has_value());
+}

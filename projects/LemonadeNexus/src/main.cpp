@@ -1511,6 +1511,16 @@ int main(int argc, char* argv[]) {
                 identity.epoch = snapshot.epoch.underlying();
                 return identity;
             },
+        // A member the finalized next-epoch plan leaves out tells its clients
+        // in the heartbeat, so they move before its authority ends. A hint
+        // from the snapshot; the client verifies the membership itself.
+        .tier1_departure =
+            [mesh, self_node]() -> std::optional<uint64_t> {
+                const auto departure =
+                    nexus::security::tier1_departure_epoch(mesh->membership(), self_node);
+                if (!departure) return std::nullopt;
+                return departure->underlying();
+            },
         .rollout_proof    = rollout_proof,
     };
 

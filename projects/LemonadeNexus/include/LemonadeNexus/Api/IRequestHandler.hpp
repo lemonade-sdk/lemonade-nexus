@@ -122,6 +122,13 @@ struct ApiContext {
     /// a current Tier 1 member by finalized membership; nullopt otherwise.
     /// Thread-safe. Unset counts as not a member.
     std::function<std::optional<Tier1Identity>()> tier1_identity;
+    /// POST /api/mesh/heartbeat: the epoch at which this server leaves Tier 1
+    /// because the finalized next-epoch plan does not name it, or nullopt
+    /// while it stays. The response carries it as "tier1_departure" so a
+    /// client moves its session before this server's authority ends. A hint:
+    /// the client verifies the new membership itself. Thread-safe. Unset
+    /// means no departure is reported.
+    std::function<std::optional<uint64_t>()> tier1_departure;
     /// Answers GET /api/upgrade/rollout-proof with this server's rollout
     /// proof (Security/Upgrade/RolloutProof.hpp), or nullopt when it holds
     /// none. Public, self-verifying data; unset, the route answers 404.

@@ -320,10 +320,16 @@ void SecurityMeshService::refresh_members() {
     std::vector<NodeId> members;
     bool known = false;
     EpochId epoch{0};
+    EpochId next_epoch{0};
+    std::vector<NodeId> next_members;
     if (const EpochManager* epochs = runtime_.epochs(); epochs != nullptr) {
         members = epochs->current().tier1_members.members();
         epoch = epochs->current().id;
         known = true;
+        if (const NextEpochPlan* plan = driver_.committed_plan(); plan != nullptr) {
+            next_epoch = plan->next_epoch;
+            next_members = plan->selected;
+        }
     } else if (const VerifiedEpochAuthority* authority = driver_.verified_authority();
                authority != nullptr) {
         // Tier 2 path: a non-member has no EpochManager, but it walks the
@@ -338,6 +344,18 @@ void SecurityMeshService::refresh_members() {
     current_members_ = std::move(members);
     members_known_ = known;
     current_epoch_ = epoch;
+    next_epoch_ = next_epoch;
+    next_members_ = std::move(next_members);
+}
+
+std::optional<EpochId> tier1_departure_epoch(
+    const SecurityMeshService::MembershipSnapshot& snapshot, const NodeId& self) {
+    const auto names = [&self](const std::vector<NodeId>& nodes) {
+        return std::find(nodes.begin(), nodes.end(), self) != nodes.end();
+    };
+    if (!snapshot.known || !names(snapshot.members)) return std::nullopt;
+    if (snapshot.next_epoch <= snapshot.epoch || names(snapshot.next_members)) return std::nullopt;
+    return snapshot.next_epoch;
 }
 
 NetworkId SecurityMeshService::network_id() const { return mesh_network_id(config_); }

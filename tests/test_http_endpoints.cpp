@@ -43,11 +43,13 @@
 #include <openssl/evp.h>
 #include <openssl/bn.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -1851,6 +1853,86 @@ TEST_F(HttpEndpointTest, HeartbeatEndpointWritesFollowTheTreeOperationRules) {
     ASSERT_NE(res, nullptr);
     EXPECT_EQ(res->status, 403);
     EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
+    mesh_srv.stop();
+    mesh_thread.join();
+}
+
+// A Tier 1 member that the finalized next-epoch plan leaves out tells its
+// clients in the heartbeat answer ("tier1_departure"), so they move their
+// session before its authority ends. The notice names the epoch and nothing
+// else: no server, no address. A member that stays sends none.
+TEST_F(HttpEndpointTest, HeartbeatCarriesTheTier1DepartureNotice) {
+    auto device_kp = crypto->ed25519_keygen();
+    auto join_res = join_node(device_kp);
+    ASSERT_NE(join_res, nullptr);
+    ASSERT_EQ(join_res->status, 200) << join_res->body;
+    const auto node_id = json::parse(join_res->body).value("node_id", std::string{});
+
+    std::atomic<uint64_t> departs_at{0};
+    test_api::current().ctx->tier1_departure = [&departs_at]() -> std::optional<uint64_t> {
+        const auto epoch = departs_at.load();
+        if (epoch == 0) return std::nullopt;
+        return epoch;
+    };
+
+    httplib::Server mesh_srv;
+    api::MeshApiHandler mesh(*test_api::current().ctx);
+    mesh.register_routes(mesh_srv, mesh_srv);
+    const int bound = mesh_srv.bind_to_any_port("127.0.0.1");
+    ASSERT_GT(bound, 0);
+    const auto mesh_port = static_cast<uint16_t>(bound);
+    std::thread mesh_thread([&] { mesh_srv.listen_after_bind(); });
+    ASSERT_TRUE(wait_http_ready(mesh_port));
+    httplib::Client mesh_cli("127.0.0.1", mesh_port);
+
+    const auto bare = crypto::to_base64(std::span<const uint8_t>(
+        device_kp.public_key.data(), device_kp.public_key.size()));
+    auto now = std::chrono::system_clock::now();
+    const auto token = jwt::create()
+                           .set_issuer("lemonade-nexus")
+                           .set_subject(node_id)
+                           .set_issued_at(now)
+                           .set_expires_at(now + std::chrono::hours{1})
+                           .set_payload_claim("pubkey", jwt::claim(bare))
+                           .sign(jwt::algorithm::hs256{jwt_secret});
+    const httplib::Headers session{{"Authorization", "Bearer " + token}};
+    const json body = {{"node_id", node_id}, {"endpoint", ""}};
+
+    // A member that stays: no notice.
+    auto res = mesh_cli.Post("/api/mesh/heartbeat", session, body.dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_FALSE(json::parse(res->body).contains("tier1_departure"));
+
+    // The plan for epoch 7 leaves this member out.
+    departs_at = 7;
+    res = mesh_cli.Post("/api/mesh/heartbeat", session, body.dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    const auto answer = json::parse(res->body);
+    ASSERT_TRUE(answer.contains("tier1_departure")) << res->body;
+    EXPECT_EQ(answer["tier1_departure"], json({{"next_epoch", 7}}));
+    EXPECT_TRUE(answer.value("success", false));
+
+    // The notice rides only on an accepted heartbeat: a refused one carries
+    // nothing a client could act on.
+    const auto other_kp = crypto->ed25519_keygen();
+    const auto other_bare = crypto::to_base64(std::span<const uint8_t>(
+        other_kp.public_key.data(), other_kp.public_key.size()));
+    const auto other_token = jwt::create()
+                                 .set_issuer("lemonade-nexus")
+                                 .set_subject("someone-else")
+                                 .set_issued_at(now)
+                                 .set_expires_at(now + std::chrono::hours{1})
+                                 .set_payload_claim("pubkey", jwt::claim(other_bare))
+                                 .sign(jwt::algorithm::hs256{jwt_secret});
+    res = mesh_cli.Post("/api/mesh/heartbeat", {{"Authorization", "Bearer " + other_token}},
+                        body.dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 403);
+    EXPECT_FALSE(json::parse(res->body).contains("tier1_departure"));
+
+    test_api::current().ctx->tier1_departure = nullptr;
     mesh_srv.stop();
     mesh_thread.join();
 }

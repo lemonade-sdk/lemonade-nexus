@@ -264,6 +264,10 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // endpoint stays as it is, so a heartbeat never erases a punch target.
     //
     // Body: { "node_id": "...", "endpoint": "ip:port" }
+    // Response: { success, node_id, endpoint, status,
+    //             tier1_departure?: { next_epoch } }
+    // tier1_departure is present while this server is a Tier 1 member that
+    // the finalized next-epoch plan does not name (ApiContext::tier1_departure).
     // ========================================================================
     priv.Post("/api/mesh/heartbeat", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
@@ -359,6 +363,14 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         j["node_id"]  = hb_node_id;
         j["endpoint"] = hb_endpoint.empty() ? current->listen_endpoint : hb_endpoint;
         j["status"]   = status;
+        // A member that the finalized next-epoch plan leaves out says so, so
+        // the client moves its session before this server's authority ends.
+        // The client verifies the new membership itself; this names no server.
+        if (ctx_.tier1_departure) {
+            if (const auto next_epoch = ctx_.tier1_departure()) {
+                j["tier1_departure"] = {{"next_epoch", *next_epoch}};
+            }
+        }
         json_response(res, j);
     }));
 
