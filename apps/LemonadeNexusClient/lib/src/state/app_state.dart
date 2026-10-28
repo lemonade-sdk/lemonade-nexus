@@ -19,6 +19,7 @@ import '../platform/secure_store.dart';
 import '../services/dns_discovery.dart';
 import '../services/passkey_manager.dart';
 import 'cluster_keyring.dart';
+import 'session_policy.dart';
 
 /// Lightweight console logger for connection/state diagnostics.
 /// Mirrors the `[Discovery]`-style tagging used in dns_discovery.dart.
@@ -455,6 +456,12 @@ class AppNotifier extends StateNotifier<AppState> {
   DateTime? _lastRejoinAttempt;
   static const Duration _rejoinCooldown = Duration(seconds: 30);
 
+  // --- Device name ---
+  // True once this session has checked the endpoint's name against the
+  // machine's host name; the check needs the private API, so it waits for
+  // the mesh. Reset at sign-out.
+  bool _deviceNamed = false;
+
   AppNotifier(this._sdk) : super(AppState.initial) {
     _startHealthMonitor();
   }
@@ -627,14 +634,18 @@ class AppNotifier extends StateNotifier<AppState> {
   }
 
   /// Remember the verified Tier 1 epoch, so a later run refuses an older one.
+  /// Reads the SDK's last verified membership (no network I/O) and saves the
+  /// epoch next to the network key when it grows; it never shrinks.
   Future<void> _recordTier1Epoch() async {
     try {
       final membership = await _sdk.tier1Membership();
-      final epoch = (membership['epoch'] as num?)?.toInt() ?? 0;
-      if (epoch > state.settings.tier1MinEpoch) {
+      final stored = state.settings.tier1MinEpoch;
+      final epoch = nextTier1MinEpoch(stored, membership['epoch']);
+      if (epoch != stored) {
         state = state.copyWith(
             settings: state.settings.copyWith(tier1MinEpoch: epoch));
         await _persistSettings();
+        _log('_recordTier1Epoch: Tier 1 epoch floor is now $epoch');
       }
     } catch (e) {
       _log('_recordTier1Epoch: $e');
@@ -738,10 +749,13 @@ class AppNotifier extends StateNotifier<AppState> {
     }
     await _loadIdentity();
     await _recordTier1Epoch();
+    _deviceNamed = false;
     // Cluster operations all ride the private mesh API, so bring it up here.
     if (await _joinNetwork()) {
+      await _recordTier1Epoch();
       await enableMesh();
       await _waitForMesh();
+      await _applyDefaultDeviceName();
     }
     await refreshAllData();
     state = state.copyWith(
@@ -1085,7 +1099,8 @@ class AppNotifier extends StateNotifier<AppState> {
         }
         await _establishPasskeyMeshIdentity(token);
         await _loadIdentity();
-        await _joinNetwork();
+        _deviceNamed = false;
+        if (await _joinNetwork()) await _recordTier1Epoch();
         await refreshAllData();
         // Connection established — reveal the dashboard.
         state = state.copyWith(
@@ -1150,7 +1165,8 @@ class AppNotifier extends StateNotifier<AppState> {
         }
         await _establishPasskeyMeshIdentity(resp.sessionToken);
         await _loadIdentity();
-        await _joinNetwork();
+        _deviceNamed = false;
+        if (await _joinNetwork()) await _recordTier1Epoch();
         await refreshAllData();
         // Connection established — reveal the dashboard.
         state = state.copyWith(
@@ -1203,9 +1219,48 @@ class AppNotifier extends StateNotifier<AppState> {
       }
       return join.success && join.nodeId != null;
     } catch (e) {
+      // ln_join_network answers LnError.auth for every failure, unreachable
+      // servers included, so this is never treated as a refusal: the account
+      // stays and the recovery paths retry.
       _log('joinNetwork: FAILED -> $e');
       addActivity(ActivityLevel.warning, 'Network join failed: $e');
       return false;
+    }
+  }
+
+  /// Names this device's endpoint after the machine while the server still
+  /// shows its generated default ("endpoint-" and the node id prefix). A name
+  /// set earlier, here or in another client, stays. The node is read and
+  /// updated over the private API, so this runs once the mesh is up; it is
+  /// retried by the periodic refresh until it has checked once.
+  Future<void> _applyDefaultDeviceName() async {
+    if (_deviceNamed) return;
+    try {
+      final nodeId = await _sdk.getNodeId();
+      if (nodeId == null || nodeId.isEmpty) return;
+      final node = await callPrivateApi('GET', '/api/tree/node/$nodeId');
+      if (node.containsKey('error')) {
+        _log('applyDefaultDeviceName: node read failed -> ${node['error']}');
+        return;
+      }
+      final name = deviceNameToApply(
+        currentHostname:
+            (node['hostname'] ?? node['data']?['hostname'])?.toString(),
+        nodeId: nodeId,
+        machineName: machineDeviceName(Platform.localHostname),
+      );
+      if (name != null) {
+        final resp = await callPrivateApi(
+            'POST', '/api/tree/node/update/$nodeId',
+            body: {'hostname': name});
+        if (resp['success'] != true) {
+          throw Exception(resp['error'] ?? 'the server refused the name');
+        }
+        addActivity(ActivityLevel.info, 'Named this device "$name"');
+      }
+      _deviceNamed = true;
+    } catch (e) {
+      _log('applyDefaultDeviceName: $e');
     }
   }
 
@@ -1252,6 +1307,7 @@ class AppNotifier extends StateNotifier<AppState> {
   /// Disconnect from the active Cluster and return to the login page. The
   /// keyring is preserved — the Cluster stays listed for a later Connect.
   Future<void> signOut() async {
+    _deviceNamed = false;
     await _secureStore.clear();
     await disconnectFromServer(clearIdentity: true);
     state = state.copyWith(
@@ -1413,6 +1469,7 @@ class AppNotifier extends StateNotifier<AppState> {
       return;
     }
     await _storeSessionToken();
+    await _recordTier1Epoch();
     _log('rejoinAfterServerLeft: joined through a current Tier 1 server');
   }
 
@@ -1837,6 +1894,8 @@ class AppNotifier extends StateNotifier<AppState> {
       await refreshMeshStatus();
       await refreshMeshPortStatus();
       await refreshHealth();
+      await _recordTier1Epoch();
+      if (!_deviceNamed && state.isMeshEnabled) await _applyDefaultDeviceName();
       if (state.isAuthenticated && !state.isServerHealthy) {
         await _recoverConnection();
       }
@@ -1864,11 +1923,19 @@ class AppNotifier extends StateNotifier<AppState> {
       if (_recoveryFailures >= _maxRecoveryFailures) return;
     }
     // A cross-server re-join self-authenticates with the Ed25519 identity; a
-    // password-only session has none, so we can't recover silently — re-login.
+    // password-only session has none, so it cannot re-join silently. A lost
+    // connection is still not a refusal: the account and the client stay, the
+    // health dot shows the outage, and the probe clears it when the server
+    // answers again. Only the server refusing the credentials signs out.
     if (_sdk.identityPubkey == null) {
-      _log('recoverConnection: no identity — forcing re-login');
-      addActivity(ActivityLevel.warning, 'Connection lost — please sign in again');
-      await signOut();
+      _lastRecoveryAttempt = DateTime.now();
+      _recoveryFailures++;
+      _log('recoverConnection: no identity; waiting for the server '
+          '(failures=$_recoveryFailures)');
+      if (_recoveryFailures == 1) {
+        addActivity(ActivityLevel.warning,
+            'Connection lost — waiting for the server; sign in again to reconnect now');
+      }
       return;
     }
 
@@ -1895,12 +1962,22 @@ class AppNotifier extends StateNotifier<AppState> {
       // Persist the new server-issued token so a later restart doesn't replay
       // the dead one.
       await _storeSessionToken();
+      await _recordTier1Epoch();
       await refreshAllData();
       state = state.copyWith(connectionStatus: ConnectionStatus.connected);
       _recoveryFailures = 0;
       addActivity(ActivityLevel.success, 'Reconnected');
       _log('recoverConnection: success');
     } catch (e) {
+      if (isAuthenticationRefusal(e)) {
+        // HTTP 401/403: the network refused this device's credentials, so
+        // retrying cannot help. Every other failure keeps the account.
+        _log('recoverConnection: the server refused the session -> $e');
+        addActivity(ActivityLevel.error,
+            'The server refused this session — please sign in again');
+        await signOut();
+        return;
+      }
       _recoveryFailures++;
       state = state.copyWith(connectionStatus: ConnectionStatus.error);
       _log('recoverConnection: FAILED ($_recoveryFailures) -> $e');
