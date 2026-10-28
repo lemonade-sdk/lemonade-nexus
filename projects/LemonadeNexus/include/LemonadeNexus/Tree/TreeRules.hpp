@@ -63,6 +63,34 @@ using NodeMap = std::unordered_map<std::string, TreeNode>;
                                      const std::string& mesh_pubkey,
                                      const std::string& own_id);
 
+// --- Device names ------------------------------------------------------------
+//
+// The mesh port names a device by device_label(hostname) (DeviceLabel.hpp),
+// so two devices of one group whose names fold to the same label are one
+// name there. A create or a rename that would make that so is refused; a
+// collision that already exists in the tree stays as it is.
+
+/// True when `node` is a device (Endpoint) under `parent_id`, other than
+/// `own_id`, whose name folds to `label`. An empty label never collides.
+[[nodiscard]] bool device_label_collides(const TreeNode& node, std::string_view parent_id,
+                                         std::string_view label, std::string_view own_id);
+
+/// Ids of the devices under `parent_id`, other than `own_id`, whose name
+/// folds to `label`, sorted. Deterministic.
+[[nodiscard]] std::vector<std::string> device_label_conflicts(const NodeMap& nodes,
+                                                              std::string_view parent_id,
+                                                              std::string_view label,
+                                                              std::string_view own_id);
+
+/// Why a device may not take the name `hostname`: a nonempty name folds to
+/// an empty label, or `conflict` (the sibling device with the lowest id whose
+/// name folds to the same label; nullptr when there is none) already holds
+/// it. The reason names the conflicting device and asks for another name.
+/// nullopt when the name is free. An empty `hostname` is an unnamed device:
+/// it has no label, collides with nothing, and is never refused.
+[[nodiscard]] std::optional<std::string> device_name_refusal(std::string_view hostname,
+                                                             const TreeNode* conflict);
+
 /// Content rules a delta must satisfy beyond the operation permission:
 /// an update keeps the node's identity (id, parent, type, management key,
 /// endpoint identifier); only an admin of the node or an ancestor changes

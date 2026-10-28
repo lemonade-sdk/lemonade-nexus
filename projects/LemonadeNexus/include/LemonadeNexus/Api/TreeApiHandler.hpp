@@ -15,7 +15,8 @@ namespace nexus::api {
 
 class PendingJoins;
 
-/// Handles tree and IPAM endpoints: join (public), node/delta/children (private), IPAM allocate (private).
+/// Handles tree and IPAM endpoints: join and the device-name check (public),
+/// node/delta/children (private), IPAM allocate (private).
 class TreeApiHandler : public IRequestHandler<TreeApiHandler> {
     friend class IRequestHandler<TreeApiHandler>;
 

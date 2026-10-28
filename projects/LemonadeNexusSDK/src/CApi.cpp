@@ -1295,6 +1295,36 @@ ln_error_t ln_move_node(ln_client_t* client, const char* node_id, const char* ne
     }
 }
 
+ln_error_t ln_check_device_name(ln_client_t* client, const char* name, const char* group_node_id,
+                                const char* link_token, char** out_json) {
+    if (!client || !name || !out_json) return LN_ERR_NULL_ARG;
+    *out_json = nullptr;
+    const std::string group = group_node_id ? group_node_id : "";
+    const std::string token = link_token ? link_token : "";
+    if (group.empty() && token.empty()) return LN_ERR_NULL_ARG;
+    try {
+        const auto result = client->client.check_device_name(name, group, token);
+        json j;
+        if (result.ok) {
+            json conflicts = json::array();
+            for (const auto& c : result.value.conflicts) {
+                conflicts.push_back({{"node_id", c.node_id}, {"device_name", c.device_name}});
+            }
+            j = {{"label", result.value.label},
+                 {"available", result.value.available},
+                 {"conflicts", std::move(conflicts)},
+                 {"suggestion", result.value.suggestion}};
+        } else {
+            j["error"] = result.error;
+        }
+        *out_json = strdup_json(j);
+        if (!*out_json) return LN_ERR_INTERNAL;
+        return result.ok ? LN_OK : ln_map_error(result.http_status);
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
+}
+
 ln_error_t ln_account_delete(ln_client_t* client, char** out_json) {
     if (!client || !out_json) return LN_ERR_NULL_ARG;
     *out_json = nullptr;

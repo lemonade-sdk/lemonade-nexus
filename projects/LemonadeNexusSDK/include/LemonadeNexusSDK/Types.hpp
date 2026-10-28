@@ -166,6 +166,24 @@ struct DeltaResult {
     std::string error;
 };
 
+/// A device of a group whose name folds to the same mesh-port label as a
+/// name that was checked (LemonadeNexusClient::check_device_name).
+struct DeviceNameConflict {
+    std::string node_id;
+    std::string device_name;
+};
+
+/// The server's answer to a device-name check: the name as a mesh-port label,
+/// whether a device of the group could take it now, the devices it collides
+/// with, and a label that is free (the label itself, or "<label>-2", ...).
+/// Advisory: the join and rename operations enforce the rule.
+struct DeviceNameCheck {
+    std::string                     label;
+    bool                            available{false};
+    std::vector<DeviceNameConflict> conflicts;
+    std::string                     suggestion;
+};
+
 // ---------------------------------------------------------------------------
 // IPAM
 // ---------------------------------------------------------------------------

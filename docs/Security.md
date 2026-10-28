@@ -575,6 +575,33 @@ moved device's key owns no other node, the entries that its old group and old
 sibling devices held for that key (the link-join grants) are removed, as a
 delete removes them.
 
+### Device names
+
+The mesh port names a device by its hostname folded to one DNS label
+(`tree::device_label`, `Tree/DeviceLabel.hpp`: lower case, every run of
+characters other than ASCII letters and digits becomes one hyphen, no leading
+or trailing hyphen, at most 63 characters). "Work PC" and "work-pc" are the
+same name there. The tree therefore keeps labels unique within a group
+(`tree::rules::device_name_refusal`), in the apply step that every Tier 1
+server runs on the committed operation:
+
+- A `Join` that creates a device, a `CreateNode` of a device, and an
+  `UpdateFields` that changes a device's label are refused when another
+  device of the same group folds to the same label, and when a nonempty name
+  folds to no label at all. The HTTP answer is `409` with a message that
+  names the colliding device and asks for another name. A device with no
+  name has no label and is never refused; the mesh port lists it under its
+  node id.
+- A rename that keeps the label, and an edit of other fields, pass. A
+  collision stored before this rule stays as it is; the mesh port lists such
+  devices under their node ids and refuses the ambiguous name.
+- Another group may reuse the label. A move into a group is not checked.
+
+`POST /api/tree/device-name/check` (public API, session required) lets a
+client check a name first. With `group_node_id` the caller needs `read` on
+the group; with `link_token` the invite's target group is checked and the
+token is not spent. The answer is advisory; the operation rule above decides.
+
 ### Invite replication
 
 A token is minted on one Tier 1 server and can be redeemed on any Tier 1

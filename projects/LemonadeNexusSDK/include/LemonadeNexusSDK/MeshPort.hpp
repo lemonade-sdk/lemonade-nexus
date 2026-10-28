@@ -75,7 +75,9 @@ struct MeshPortCertificate {
 namespace mesh_port {
 
 /// A device name as a DNS label: lowercase letters, digits and single hyphens, at
-/// most 63 characters.
+/// most 63 characters. The server's rule (LemonadeNexus/Tree/DeviceLabel.hpp):
+/// the tree refuses a device whose name folds to a sibling's label, so a name
+/// the tree accepted routes to one device here.
 [[nodiscard]] std::string device_label(std::string_view device_name);
 
 /// The local domain of a group wildcard certificate name. "*.<group>.lo.<base>"

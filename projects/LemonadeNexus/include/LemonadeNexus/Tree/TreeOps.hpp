@@ -284,7 +284,9 @@ enum class TreeOpRefusal : uint8_t {
     Forbidden,           ///< principal lacks the required permission or admin rule
     Invalid,             ///< invalid assignment principal or permission name
     ContentRefused,      ///< delta content rules refuse the change
-    Conflict,            ///< identifier, mesh key, tunnel address, or join placement conflict
+    /// Identifier, mesh key, tunnel address, device name
+    /// (rules::device_name_refusal), or join placement conflict.
+    Conflict,
     StorageError,        ///< local persistence failed while applying
     /// This server cannot order the op now: it is not a Tier 1 member, its
     /// tree log is halted, or its pending pool is full. Nothing was queued.
@@ -361,8 +363,10 @@ void sign_tree_op(crypto::SodiumCryptoService& crypto, TreeOp& op,
 /// The node writes `op` makes against `nodes`, without authentication or
 /// permission checks (validate_op performs those). Structural preconditions
 /// that the writes depend on (target present or absent, identifier and mesh
-/// key uniqueness, join placement, a free tunnel address) are checked here, so
-/// a refused plan leaves the tree unchanged. Every written node's version is
+/// key uniqueness, join placement, a free tunnel address, and for a device
+/// that is created or renamed a name no sibling device folds to,
+/// rules::device_name_refusal) are checked here, so a refused plan leaves the
+/// tree unchanged. Every written node's version is
 /// its previous version plus one (1 for a new node). Deterministic.
 [[nodiscard]] TreeOpVerdict plan_op(const TreeOp& op, const TreeState::NodeMap& nodes,
                                     TreeOpEffect& effect);

@@ -5,6 +5,7 @@
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+#include <LemonadeNexus/Tree/TreeOps.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
@@ -574,8 +575,10 @@ protected:
     /// Full Ed25519 challenge-response join; returns the /api/join response.
     /// Uses the same AuthService instance the handler authenticates against,
     /// so the challenge round-trip is exactly what the join route performs.
+    /// A nonempty `hostname` is the device name the join carries.
     httplib::Result join_node(const crypto::Ed25519Keypair& kp,
-                              const std::string& link_token = {}) {
+                              const std::string& link_token = {},
+                              const std::string& hostname = {}) {
         const auto bare = crypto::to_base64(
             std::span<const uint8_t>(kp.public_key.data(),
                                      kp.public_key.size()));
@@ -592,6 +595,7 @@ protected:
             {"signature", crypto::to_base64(sig)},
         };
         if (!link_token.empty()) body["link_token"] = link_token;
+        if (!hostname.empty()) body["hostname"] = hostname;
         return make_client().Post("/api/join", body.dump(), "application/json");
     }
 
@@ -2503,13 +2507,13 @@ protected:
         HttpEndpointTest::TearDown();
     }
 
-    /// Join a new device, optionally with a link token.
-    Member join(const std::string& link_token = {}) {
+    /// Join a new device, optionally with a link token and a device name.
+    Member join(const std::string& link_token = {}, const std::string& hostname = {}) {
         Member m;
         m.kp = crypto->ed25519_keygen();
         m.b64 = crypto::to_base64(
             std::span<const uint8_t>(m.kp.public_key.data(), m.kp.public_key.size()));
-        auto res = join_node(m.kp, link_token);
+        auto res = join_node(m.kp, link_token, hostname);
         EXPECT_NE(res, nullptr);
         if (!res) return m;
         EXPECT_EQ(res->status, 200) << res->body;
@@ -2846,6 +2850,147 @@ TEST_F(InviteHttpTest, ALinkedDeviceAndTheOwnersFirstDeviceListEachOther) {
     const auto bob = join();
     EXPECT_FALSE(peers(bob).count(device.node_id));
     EXPECT_FALSE(peers(device).count(bob.node_id));
+}
+
+// Device names fold to one mesh-port label. A join or a rename that gives a
+// device the label a sibling holds is refused with 409 and a message that
+// names the sibling; another group may reuse the label.
+TEST_F(InviteHttpTest, DeviceNamesAreUniqueWithinAGroup) {
+    const auto alice = join();
+    const auto work_pc = join(invite_token(alice), "Work PC");
+    ASSERT_EQ(work_pc.group, alice.group);
+    ASSERT_EQ(tree->get_node(work_pc.node_id)->hostname, "Work PC");
+
+    // A join whose name folds to a sibling's label is refused and does not
+    // spend the invite: the same token places the device under another name.
+    const auto token = invite_token(alice);
+    Member second;
+    second.kp = crypto->ed25519_keygen();
+    second.b64 = crypto::to_base64(
+        std::span<const uint8_t>(second.kp.public_key.data(), second.kp.public_key.size()));
+    second.node_id = tree::derive_join_node_id(*crypto, "ed25519:" + second.b64);
+    auto refused = join_node(second.kp, token, "work-pc");
+    ASSERT_NE(refused, nullptr);
+    EXPECT_EQ(refused->status, 409) << refused->body;
+    const auto reason = json::parse(refused->body).value("error", std::string{});
+    EXPECT_NE(reason.find("'Work PC'"), std::string::npos) << reason;
+    EXPECT_NE(reason.find(work_pc.node_id), std::string::npos) << reason;
+    EXPECT_NE(reason.find("pick another name"), std::string::npos) << reason;
+    EXPECT_FALSE(tree->get_node(second.node_id).has_value());
+    auto blank = join_node(second.kp, token, "***");
+    ASSERT_NE(blank, nullptr);
+    EXPECT_EQ(blank->status, 409) << blank->body;
+    auto placed = join_node(second.kp, token, "Work PC 2");
+    ASSERT_NE(placed, nullptr);
+    ASSERT_EQ(placed->status, 200) << placed->body;
+    second.group = tree->get_node(second.node_id)->parent_id;
+    ASSERT_EQ(second.group, alice.group);
+
+    // A rename to a sibling's label is refused with the same message; an
+    // edit that keeps the name passes, and so does a rename to a free label.
+    auto renamed = post(second, "/api/tree/node/update/" + second.node_id,
+                        {{"hostname", "WORK  PC!"}});
+    ASSERT_NE(renamed, nullptr);
+    EXPECT_EQ(renamed->status, 409) << renamed->body;
+    EXPECT_NE(json::parse(renamed->body).value("error", std::string{}).find(work_pc.node_id),
+              std::string::npos);
+    EXPECT_EQ(tree->get_node(second.node_id)->hostname, "Work PC 2");
+    auto edited = post(second, "/api/tree/node/update/" + second.node_id, {{"region", "eu-west"}});
+    ASSERT_NE(edited, nullptr);
+    EXPECT_EQ(edited->status, 200) << edited->body;
+    auto emptied = post(second, "/api/tree/node/update/" + second.node_id, {{"hostname", "--"}});
+    ASSERT_NE(emptied, nullptr);
+    EXPECT_EQ(emptied->status, 409) << emptied->body;
+    auto freed = post(second, "/api/tree/node/update/" + second.node_id, {{"hostname", "Printer"}});
+    ASSERT_NE(freed, nullptr);
+    EXPECT_EQ(freed->status, 200) << freed->body;
+    EXPECT_EQ(tree->get_node(second.node_id)->hostname, "Printer");
+
+    // The owner's own first device is a sibling too.
+    auto owner = post(alice, "/api/tree/node/update/" + alice.node_id, {{"hostname", "work pc"}});
+    ASSERT_NE(owner, nullptr);
+    EXPECT_EQ(owner->status, 409) << owner->body;
+
+    // Another group reuses the label.
+    const auto bob = join();
+    auto other = post(bob, "/api/tree/node/update/" + bob.node_id, {{"hostname", "Work PC"}});
+    ASSERT_NE(other, nullptr);
+    EXPECT_EQ(other->status, 200) << other->body;
+}
+
+// POST /api/tree/device-name/check reports the label, the colliding devices,
+// and a free label, for a group the caller reads or for an invite's group.
+// It is advisory and spends nothing.
+TEST_F(InviteHttpTest, TheDeviceNameCheckIsAdvisoryAndSpendsNoInvite) {
+    const auto alice = join();
+    const auto work_pc = join(invite_token(alice), "Work PC");
+    const auto bob = join();
+    const auto check = "/api/tree/device-name/check";
+
+    // The group form needs read on the group.
+    auto taken = post(alice, check, {{"name", "work pc"}, {"group_node_id", alice.group}});
+    ASSERT_NE(taken, nullptr);
+    ASSERT_EQ(taken->status, 200) << taken->body;
+    auto body = json::parse(taken->body);
+    EXPECT_EQ(body["label"], "work-pc");
+    EXPECT_EQ(body["available"], false);
+    ASSERT_EQ(body["conflicts"].size(), 1u);
+    EXPECT_EQ(body["conflicts"][0]["node_id"], work_pc.node_id);
+    EXPECT_EQ(body["conflicts"][0]["device_name"], "Work PC");
+    EXPECT_EQ(body["suggestion"], "work-pc-2");
+
+    auto free = post(alice, check, {{"name", "Printer"}, {"group_node_id", alice.group}});
+    ASSERT_NE(free, nullptr);
+    ASSERT_EQ(free->status, 200) << free->body;
+    body = json::parse(free->body);
+    EXPECT_EQ(body["label"], "printer");
+    EXPECT_EQ(body["available"], true);
+    EXPECT_TRUE(body["conflicts"].empty());
+    EXPECT_EQ(body["suggestion"], "printer");
+
+    auto blank = post(alice, check, {{"name", "***"}, {"group_node_id", alice.group}});
+    ASSERT_NE(blank, nullptr);
+    ASSERT_EQ(blank->status, 200) << blank->body;
+    body = json::parse(blank->body);
+    EXPECT_EQ(body["label"], "");
+    EXPECT_EQ(body["available"], false);
+    EXPECT_EQ(body["suggestion"], "device");
+
+    // A device checking its own rename is not its own conflict.
+    auto own = post(alice, check, {{"name", "work pc"}, {"group_node_id", alice.group},
+                                   {"node_id", work_pc.node_id}});
+    ASSERT_NE(own, nullptr);
+    ASSERT_EQ(own->status, 200) << own->body;
+    EXPECT_EQ(json::parse(own->body)["available"], true);
+
+    auto no_read = post(bob, check, {{"name", "Printer"}, {"group_node_id", alice.group}});
+    ASSERT_NE(no_read, nullptr);
+    EXPECT_EQ(no_read->status, 403) << no_read->body;
+    auto no_name = post(alice, check, {{"group_node_id", alice.group}});
+    ASSERT_NE(no_name, nullptr);
+    EXPECT_EQ(no_name->status, 400) << no_name->body;
+    auto no_scope = post(alice, check, {{"name", "Printer"}});
+    ASSERT_NE(no_scope, nullptr);
+    EXPECT_EQ(no_scope->status, 400) << no_scope->body;
+
+    // The invite form needs no read on the group and does not spend the
+    // invite: a join with the token still places a device afterwards.
+    const auto token = invite_token(alice);
+    auto invited = post(bob, check, {{"name", "Work-PC"}, {"link_token", token}});
+    ASSERT_NE(invited, nullptr);
+    ASSERT_EQ(invited->status, 200) << invited->body;
+    body = json::parse(invited->body);
+    EXPECT_EQ(body["label"], "work-pc");
+    EXPECT_EQ(body["available"], false);
+    ASSERT_EQ(body["conflicts"].size(), 1u);
+    EXPECT_EQ(body["conflicts"][0]["node_id"], work_pc.node_id);
+    EXPECT_EQ(body["suggestion"], "work-pc-2");
+    auto bad_token = post(bob, check, {{"name", "Work-PC"}, {"link_token", "no-such-token"}});
+    ASSERT_NE(bad_token, nullptr);
+    EXPECT_EQ(bad_token->status, 403) << bad_token->body;
+    const auto placed = join(token, "work-pc-2");
+    EXPECT_EQ(placed.group, alice.group);
+    EXPECT_EQ(tree->get_node(placed.node_id)->hostname, "work-pc-2");
 }
 
 // --- Account deletion ---

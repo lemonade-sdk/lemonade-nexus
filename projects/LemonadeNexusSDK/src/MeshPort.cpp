@@ -2,6 +2,8 @@
 #include <LemonadeNexusSDK/CertRenewal.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 
+#include <LemonadeNexus/Tree/DeviceLabel.hpp>
+
 #include <httplib.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -381,15 +383,10 @@ int64_t epoch_seconds() {
 namespace mesh_port {
 
 std::string device_label(std::string_view device_name) {
-    std::string label;
-    for (const unsigned char c : device_name) {
-        if (std::isalnum(c)) label += static_cast<char>(std::tolower(c));
-        else if (!label.empty() && label.back() != '-') label += '-';
-    }
-    while (!label.empty() && label.back() == '-') label.pop_back();
-    if (label.size() > 63) label.resize(63);
-    while (!label.empty() && label.back() == '-') label.pop_back();
-    return label;
+    // The server validates device names with the same function, so a name the
+    // tree accepted routes here and two names that route the same are refused
+    // there.
+    return nexus::tree::device_label(device_name);
 }
 
 std::string local_domain_from_certificate(std::string_view domain) {
