@@ -4,6 +4,7 @@
 // wrong hostname, and a missing CA must all be rejected.
 
 #include <LemonadeNexus/Network/HttpServer.hpp>
+#include <LemonadeNexusSDK/ServerDiscovery.hpp>
 
 #include <gtest/gtest.h>
 #include <httplib.h>
@@ -15,6 +16,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
 #ifdef _WIN32
@@ -189,4 +191,84 @@ TEST(TlsInMemoryKey, ServesTlsFromInMemoryKey) {
 
     srv.stop();
     fs::remove_all(tmp);
+}
+
+// ---------------------------------------------------------------------------
+// First-connect server discovery: the certificate name is the candidate.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct TlsEcho {
+    fs::path tmp;
+    std::unique_ptr<network::HttpServer> srv;
+    uint16_t port{0};
+
+    TlsEcho(const std::string& cn, uint16_t p) : port(p) {
+        tmp = fs::temp_directory_path() / ("nexus_discovery_" + std::to_string(getpid()) + "_" + std::to_string(p));
+        fs::create_directories(tmp);
+        const auto cert = tmp / "cert.pem";
+        const auto key  = tmp / "key.pem";
+        if (!make_self_signed(cn, cert, key)) return;
+        srv = std::make_unique<network::HttpServer>(port, "127.0.0.1");
+        if (!srv->enable_tls_from_paths(cert.string(), key.string())) { srv.reset(); return; }
+        srv->server().Get("/api/health", [](const httplib::Request&, httplib::Response& r) {
+            r.set_content("{}", "application/json");
+        });
+        srv->start();
+        std::this_thread::sleep_for(300ms);
+    }
+    ~TlsEcho() {
+        if (srv) srv->stop();
+        std::error_code ec;
+        fs::remove_all(tmp, ec);
+    }
+};
+
+}  // namespace
+
+TEST(ServerDiscovery, DomainRulesKeepOnlyHostnamesBelowTheDomain) {
+    using lnsdk::discovered_name_in_domain;
+    EXPECT_TRUE(discovered_name_in_domain("sn01.us-west.seip.lemonade-nexus.io", "lemonade-nexus.io"));
+    EXPECT_TRUE(discovered_name_in_domain("SN01.US-West.seip.Lemonade-Nexus.IO.", "lemonade-nexus.io"))
+        << "case and a trailing dot do not matter";
+    EXPECT_FALSE(discovered_name_in_domain("lemonade-nexus.io", "lemonade-nexus.io")) << "the apex is not a server";
+    EXPECT_FALSE(discovered_name_in_domain("evil-lemonade-nexus.io", "lemonade-nexus.io"))
+        << "a suffix without a dot is outside the domain";
+    EXPECT_FALSE(discovered_name_in_domain("*.lemonade-nexus.io", "lemonade-nexus.io")) << "a wildcard is refused";
+    EXPECT_FALSE(discovered_name_in_domain("a b.lemonade-nexus.io", "lemonade-nexus.io"));
+    EXPECT_FALSE(discovered_name_in_domain("sn01.lemonade-nexus.io", "")) << "an empty domain matches nothing";
+}
+
+TEST(ServerDiscovery, KeepsTheCertificateNameBelowTheDomainAndDropsTheRest) {
+    const uint16_t base = static_cast<uint16_t>(19000 + (getpid() % 1000));
+    TlsEcho inside("sn01.us-west.seip.lemonade-nexus.io", base);
+    TlsEcho apex("lemonade-nexus.io", static_cast<uint16_t>(base + 1));
+    ASSERT_TRUE(inside.srv && apex.srv);
+
+    auto found = lnsdk::discover_servers_at({"127.0.0.1"}, "lemonade-nexus.io", inside.port);
+    ASSERT_TRUE(found.ok) << found.error;
+    ASSERT_EQ(found.value.size(), 1u);
+    EXPECT_EQ(found.value[0].host, "sn01.us-west.seip.lemonade-nexus.io");
+    EXPECT_EQ(found.value[0].port, inside.port);
+    EXPECT_EQ(found.value[0].address, "127.0.0.1");
+
+    auto twice = lnsdk::discover_servers_at({"127.0.0.1", "127.0.0.1"}, "lemonade-nexus.io", inside.port);
+    ASSERT_TRUE(twice.ok);
+    EXPECT_EQ(twice.value.size(), 1u) << "the same name is reported once";
+
+    EXPECT_FALSE(lnsdk::discover_servers_at({"127.0.0.1"}, "lemonade-nexus.io", apex.port).ok)
+        << "the apex certificate is not a server";
+    EXPECT_FALSE(lnsdk::discover_servers_at({"127.0.0.1"}, "other.example", inside.port).ok)
+        << "a name outside the domain is dropped";
+    const auto closed = lnsdk::discover_servers_at({"127.0.0.1"}, "lemonade-nexus.io", static_cast<uint16_t>(base + 2));
+    EXPECT_FALSE(closed.ok) << "a closed port finds nothing";
+    EXPECT_EQ(closed.http_status, 0);
+}
+
+TEST(ServerDiscovery, RefusesNamesThatAreNotHostnameLabels) {
+    EXPECT_FALSE(lnsdk::discover_servers("lemonade-nexus.io", "us west").ok);
+    EXPECT_FALSE(lnsdk::discover_servers("lemonade-nexus.io", "us.west").ok) << "a region is one label";
+    EXPECT_FALSE(lnsdk::discover_servers("", "us-west").ok);
+    EXPECT_FALSE(lnsdk::discover_servers_at({"127.0.0.1"}, "lemonade-nexus.io", 0).ok);
 }
