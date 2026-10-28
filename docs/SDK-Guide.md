@@ -390,8 +390,20 @@ ln_mesh_port_stop(client);
 
 - The port serves plain HTTP until the group loopback certificate
   `*.<group-label>.lo.<base>` is in the certificate directory, then TLS. The
-  SDK certificate renewer keeps the certificate current, and the port reloads
-  each renewed certificate for new connections.
+  first certificate replaces the plain listener with a TLS listener on the same
+  port. That switch waits until no plain request is open, so a running stream
+  is never cut: `tls.state` reports `activating` while the plain listener
+  drains and keeps serving, then `active`. A request that arrives during the
+  few milliseconds of the switch itself gets 503 with `Retry-After`. The SDK
+  certificate renewer keeps the certificate current, and the port reloads each
+  renewed certificate in place: the TLS listener and its connections stay up
+  and each new handshake presents the new certificate.
+- With the `auto` selection, `/api/v1/models` merges the local models with
+  `<device>/<model>` entries from each reachable Tier 3 device. The devices are
+  probed concurrently with a 3 s deadline and the result is cached for a few
+  seconds. A model name that matches a local model ID exactly stays local, even
+  when it contains `/`; otherwise `<device>/<model>` names that device. A
+  device that answers 401 or 403 to the peer key is never chosen by `auto`.
 - The TLS server name and the `Host` header must name the same host, otherwise
   the answer is 421. Another device's `<device>.<group-label>.lo.<base>` is
   forwarded over mesh egress to its lemond on mesh port 13305. That device must

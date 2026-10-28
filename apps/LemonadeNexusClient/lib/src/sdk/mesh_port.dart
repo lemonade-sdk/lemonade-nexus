@@ -58,7 +58,9 @@ class MeshPortStatus {
   final String? selection;
   final bool peerKeySet;
 
-  /// "off", "waiting", "active", "unsupported_certificate" or "error".
+  /// "off", "waiting", "activating" (the certificate is installed and TLS starts
+  /// when the open plain requests finish), "active", "unsupported_certificate" or
+  /// "error".
   final String tlsState;
   final String tlsDomain;
   final String tlsError;

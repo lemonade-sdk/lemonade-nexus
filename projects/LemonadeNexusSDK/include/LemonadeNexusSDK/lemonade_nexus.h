@@ -948,12 +948,15 @@ ln_error_t ln_mesh_port_set_selection(ln_client_t* client, const char* target,
 /** Get the mesh port state as JSON:
  *  {running, port, scheme ("http" | "https"), local_domain, local_service,
  *   error, selection: {target (null | "local" | "auto" | node ID), peer_key_set},
- *   tls: {state ("off" | "waiting" | "active" | "unsupported_certificate" |
- *   "error"), domain, expires_at, error},
+ *   tls: {state ("off" | "waiting" | "activating" | "active" |
+ *   "unsupported_certificate" | "error"), domain, expires_at, error},
  *   urls: [{node_id, device_name, url, self}],
  *   devices: [{node_id, device_name, is_online}]}.
- *  `urls` lists this device and each online Tier 3 device that this device may
- *  connect to. Before TLS is active, only "http://127.0.0.1:<port>" is listed.
+ *  "activating" means the first certificate is installed and the port switches
+ *  to TLS as soon as the open plain HTTP requests finish; a running stream is
+ *  never cut. `urls` lists this device and each online Tier 3 device that this
+ *  device may connect to. Before TLS is active, only "http://127.0.0.1:<port>"
+ *  is listed.
  *  `devices` lists the Tier 3 devices that can be selected. The peer key is
  *  never included. Caller must ln_free(*out_json). Returns LN_ERR_NULL_ARG for a
  *  NULL argument. Thread-safe. */
