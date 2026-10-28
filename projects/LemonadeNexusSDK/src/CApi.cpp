@@ -235,6 +235,7 @@ ln_error_t ln_health(ln_client_t* client, char** out_json) {
     j["status"]          = result.value.status;
     j["service"]         = result.value.service;
     j["dns_base_domain"] = result.value.dns_base_domain;
+    j["rp_id"]           = result.value.rp_id;
     j["ok"]              = result.ok;
     if (!result.ok) j["error"] = result.error;
 

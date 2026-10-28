@@ -61,6 +61,7 @@ struct HealthStatus {
     std::string status;
     std::string service;
     std::string dns_base_domain;
+    std::string rp_id;  ///< WebAuthn relying-party id the network's passkeys are bound to; empty when the server did not report one
 };
 
 // ---------------------------------------------------------------------------

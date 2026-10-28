@@ -1250,6 +1250,7 @@ Result<HealthStatus> LemonadeNexusClient::check_health() {
     result.value.status          = resp->value("status", "");
     result.value.service         = resp->value("service", "");
     result.value.dns_base_domain = resp->value("dns_base_domain", "");
+    result.value.rp_id           = resp->value("rp_id", "");
 
     // Auto-discover additional servers after first successful health check
     if (result.ok && impl_->config.auto_discover && !impl_->discovered()) {
