@@ -88,7 +88,10 @@ namespace mesh_port {
 /// otherwise the result is 421. Loopback names and this device's
 /// "<label><local_domain>" return {0, "local"}; another member's
 /// "<label><local_domain>" returns {0, its node ID}; an unknown label returns 404
-/// and a name outside `local_domain` returns 421. `local_domain` starts with a dot.
+/// and a name outside `local_domain` returns 421. A label that is a member's node id
+/// always names that member. A label that several device names fold to ("Work PC" and
+/// "work-pc") returns 409 and names the devices: the caller must use a node id.
+/// `local_domain` starts with a dot.
 [[nodiscard]] std::pair<int, std::string> host_target(
     std::string_view host, std::string_view sni, std::string_view local_domain,
     const std::vector<MeshPortMember>& members, std::string_view self_node_id);
@@ -117,7 +120,9 @@ namespace mesh_port {
 
 /// [{node_id, device_name, url, self}] for this device and each online Tier 3 member
 /// that this device may connect to. Without a local domain, only this device's
-/// "http://127.0.0.1:<port>" is listed.
+/// "http://127.0.0.1:<port>" is listed. A device whose name folds to the same label
+/// as another member's, or to no label at all, is listed under its node id, so every
+/// URL routes to exactly one device.
 [[nodiscard]] nlohmann::json device_urls(const std::vector<MeshPortMember>& members,
                                          std::string_view self_node_id,
                                          std::string_view local_domain, int port, bool tls);

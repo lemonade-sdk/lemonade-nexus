@@ -245,6 +245,27 @@ TEST(MeshPortRules, HostRouting) {
     EXPECT_EQ(rules::host_target("gpu-tower.team.lo.example", "", "", members, "self").first, 421);
 }
 
+TEST(MeshPortRules, AmbiguousNamesRouteToNoDeviceAndGetNodeIdUrls) {
+    auto members = group_members();
+    members.push_back({"work1", "Work PC", "10.64.0.8/32", true, true, true, 3.0});
+    members.push_back({"work2", "work-pc", "10.64.0.9/32", true, true, true, 4.0});
+    const auto host = [&](const std::string& h) { return rules::host_target(h, "", kDomain, members, "self"); };
+    const auto ambiguous = host("work-pc.team.lo.example");
+    EXPECT_EQ(ambiguous.first, 409);
+    EXPECT_NE(ambiguous.second.find("work1"), std::string::npos);
+    EXPECT_NE(ambiguous.second.find("work2"), std::string::npos);
+    EXPECT_EQ(host("work1.team.lo.example"), std::make_pair(0, std::string("work1")));
+    EXPECT_EQ(host("work2.team.lo.example"), std::make_pair(0, std::string("work2")));
+    EXPECT_EQ(host("gpu-tower.team.lo.example"), std::make_pair(0, std::string("gpu")))
+        << "a unique name still routes";
+
+    const auto urls = rules::device_urls(members, "self", kDomain, 13306, true);
+    ASSERT_EQ(urls.size(), 5u);
+    EXPECT_EQ(urls[3]["url"], "https://work1.team.lo.example:13306") << "a colliding name gets its node id";
+    EXPECT_EQ(urls[4]["url"], "https://work2.team.lo.example:13306");
+    EXPECT_EQ(urls[1]["url"], "https://gpu-tower.team.lo.example:13306");
+}
+
 TEST(MeshPortRules, ForwardTargetNeedsOnlineTier3AndConnect) {
     const auto members = group_members();
     EXPECT_EQ(rules::forward_target(members, "self", "gpu"), std::make_pair(0, std::string("10.64.0.3")));
