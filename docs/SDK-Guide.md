@@ -152,8 +152,12 @@ The SDK refreshes on its own every five minutes and after a server refuses a
 tree route. See [Client SDK — Tier 1 Servers](Client-SDK#tier-1-servers) for
 what it verifies and how it fails closed.
 
-`check_health()` also fails when the session's server is no longer a verified
-Tier 1 server; join again, and the SDK picks another one.
+A session belongs to the Tier 1 server that issued it. When that server leaves
+the verified membership (Tier 1 rotates one member out at each epoch
+boundary), the SDK drops the session: `check_health()` reports it once,
+private-API calls are refused, and `mesh_status().needs_rejoin` stays true
+until `join_network()` succeeds again. That join authenticates through a
+current Tier 1 server instead of reusing the dropped token.
 
 ## Identity Management
 
@@ -330,6 +334,9 @@ client.set_mesh_callback([](const lnsdk::MeshTunnelStatus& s) {
 });
 
 auto status = client.mesh_status();
+// status.is_up, status.peer_count, status.online_count, status.peers...
+// status.needs_rejoin: the session's Tier 1 server left the membership and
+// the SDK dropped the session; call join_network() again.
 client.refresh_mesh_peers();
 
 // Publish a local service to mesh peers:

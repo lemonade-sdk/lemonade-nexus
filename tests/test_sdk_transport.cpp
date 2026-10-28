@@ -26,6 +26,7 @@
 #include <openssl/x509v3.h>
 #include <sodium.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -284,6 +285,17 @@ protected:
         return heartbeat_endpoints;
     }
 
+    // POST /api/auth answers, and the Authorization header of each join
+    // request ("" when it carried none).
+    std::atomic<int>         auth_posts{0};
+    std::mutex               bearer_mtx;
+    std::vector<std::string> join_bearers_seen;
+
+    std::vector<std::string> join_bearers() {
+        std::lock_guard lock(bearer_mtx);
+        return join_bearers_seen;
+    }
+
     // The tunnel address the peer list gives the other endpoint.
     std::mutex  listed_peer_mtx;
     std::string listed_peer_ip{"10.64.0.4/32"};
@@ -297,10 +309,17 @@ protected:
         return listed_peer_ip;
     }
 
-    // The stand-in server is the one Tier 1 member of a four-member epoch:
-    // the client verifies it before it sends a tree request.
+    // The stand-in server is the one reachable Tier 1 member of a five-member
+    // epoch: the client verifies it before it sends a tree request. In Epoch 2
+    // its node leaves Tier 1 and `next_identity` takes the seat. Once
+    // `server_left_tier1` is set, the server serves Epoch 2 and signs its
+    // endpoint proofs as the new member.
     nexus::crypto::Ed25519Keypair server_identity{};
+    nexus::crypto::Ed25519Keypair next_identity{};
+    std::atomic<bool>             server_left_tier1{false};
     tier1_chain_test::Chain chain;
+
+    std::size_t served_epochs() const { return server_left_tier1.load() ? 2 : 1; }
 
     void SetUp() override {
         ASSERT_GE(sodium_init(), 0);
@@ -378,12 +397,19 @@ protected:
             res.set_content(R"({"status":"ok"})", "application/json");
         });
         server_identity = tier1_chain_test::new_identity();
-        chain = tier1_chain_test::Chain::make(
-            {{server_identity, tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
-              tier1_chain_test::new_identity()}});
+        next_identity   = tier1_chain_test::new_identity();
+        std::vector<nexus::crypto::Ed25519Keypair> epoch1 = {server_identity};
+        std::vector<nexus::crypto::Ed25519Keypair> epoch2 = {next_identity};
+        for (int i = 0; i < 4; ++i) {
+            const auto member = tier1_chain_test::new_identity();
+            epoch1.push_back(member);
+            epoch2.push_back(member);
+        }
+        chain = tier1_chain_test::Chain::make({epoch1, epoch2});
         pub->Get("/api/tier1/authority", [this](const httplib::Request& req,
                                                 httplib::Response& res) {
-            const auto page = chain.page_after(std::stoull(req.get_param_value("have_epoch")));
+            const auto page = chain.page_after(std::stoull(req.get_param_value("have_epoch")),
+                                               served_epochs());
             if (!page) {
                 res.status = 404;
                 return;
@@ -397,16 +423,31 @@ protected:
         });
         pub->Get("/api/tier1/proof", [this](const httplib::Request& req, httplib::Response& res) {
             const auto nonce = nexus::crypto::from_hex(req.get_param_value("nonce"));
+            const bool left  = server_left_tier1.load();
+            const auto epoch = static_cast<uint64_t>(served_epochs());
             const auto proof = nexus::security::sign_tier1_endpoint_proof(
-                chain.network, nexus::security::EpochId{1}, "localhost",
-                static_cast<uint16_t>(pub_port), nonce, server_identity);
+                chain.network, nexus::security::EpochId{epoch}, "localhost",
+                static_cast<uint16_t>(pub_port), nonce, left ? next_identity : server_identity);
             res.set_content(
                 nlohmann::json{{"node_id", nexus::crypto::to_base64(proof.node.bytes)},
-                               {"epoch", 1},
+                               {"epoch", epoch},
                                {"host", proof.host},
                                {"port", proof.port},
                                {"signature", nexus::crypto::to_base64(proof.signature)}}
                     .dump(),
+                "application/json");
+        });
+        pub->Post("/api/auth/challenge", [](const httplib::Request&, httplib::Response& res) {
+            std::array<uint8_t, 32> challenge{};
+            randombytes_buf(challenge.data(), challenge.size());
+            res.set_content(
+                nlohmann::json{{"challenge", nexus::crypto::to_base64(challenge)}}.dump(),
+                "application/json");
+        });
+        pub->Post("/api/auth", [this](const httplib::Request&, httplib::Response& res) {
+            ++auth_posts;
+            res.set_content(
+                R"({"authenticated":true,"user_id":"user","session_token":"auth-token"})",
                 "application/json");
         });
         pub->Post("/api/join", [this](const httplib::Request& req, httplib::Response& res) {
@@ -414,6 +455,10 @@ protected:
             {
                 std::lock_guard lock(join_mtx);
                 join_had_link_token.push_back(body.is_object() && body.contains("link_token"));
+            }
+            {
+                std::lock_guard lock(bearer_mtx);
+                join_bearers_seen.push_back(req.get_header_value("Authorization"));
             }
             if (pending_join_replies.load() > 0) {
                 --pending_join_replies;
@@ -493,6 +538,15 @@ protected:
         EXPECT_TRUE(client->is_mesh_active());
         return client;
     }
+
+    /// Epoch 2 takes effect: the server's node is no longer a member, and the
+    /// client verifies the membership again, as it does every five minutes.
+    void server_leaves_tier1(lnsdk::LemonadeNexusClient& client) {
+        server_left_tier1 = true;
+        auto refreshed = client.refresh_tier1();
+        ASSERT_TRUE(refreshed.ok) << refreshed.error;
+        ASSERT_EQ(refreshed.value.epoch, 2u);
+    }
 };
 
 }  // namespace
@@ -518,6 +572,56 @@ TEST_F(SdkMeshPrivateApiTest, APendingJoinIsRepeatedWithoutTheLinkTokenUntilItCo
     ASSERT_TRUE(client->is_mesh_active());
     EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, false}));
     EXPECT_EQ(pending_join_replies.load(), 0);
+}
+
+// Tier 1 rotates a member out at an epoch boundary. A session bound to that
+// server can no longer carry private calls, so the SDK drops it instead of
+// refusing forever: the next private call is refused and never sent, the
+// token is gone, mesh_status() asks for a re-join, and join_network()
+// authenticates afresh instead of carrying the stale token to the old server.
+TEST_F(SdkMeshPrivateApiTest, ASessionWhoseServerLeftTier1IsDroppedAndJoinedAgain) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    EXPECT_EQ(client->session_token(), "session-token");
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+
+    ASSERT_NO_FATAL_FAILURE(server_leaves_tier1(*client));
+    const auto sent_before = heartbeats().size();
+    EXPECT_FALSE(client->mesh_heartbeat(kNodeId, "").ok);
+    EXPECT_EQ(heartbeats().size(), sent_before);
+    EXPECT_TRUE(client->session_token().empty());
+    EXPECT_TRUE(client->mesh_status().needs_rejoin);
+    EXPECT_EQ(auth_posts.load(), 0);
+
+    auto joined = client->join_network("user", "password");
+    ASSERT_TRUE(joined.ok) << joined.error;
+    EXPECT_EQ(auth_posts.load(), 1);
+    EXPECT_EQ(join_bearers(), (std::vector<std::string>{"", "Bearer auth-token"}));
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+    EXPECT_EQ(client->session_token(), "session-token");
+    EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    EXPECT_EQ(heartbeats().size(), sent_before + 1);
+}
+
+// check_health() names the reason once, when it finds the session's server
+// gone. The session is dropped with it, so health itself answers afterwards.
+TEST_F(SdkMeshPrivateApiTest, HealthReportsTheDepartedSessionServerOnce) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    ASSERT_TRUE(client->check_health().ok);
+
+    ASSERT_NO_FATAL_FAILURE(server_leaves_tier1(*client));
+    auto health = client->check_health();
+    EXPECT_FALSE(health.ok);
+    EXPECT_EQ(health.error,
+              "the session's server is no longer a verified Tier 1 server: join again");
+    EXPECT_TRUE(client->session_token().empty());
+    EXPECT_TRUE(client->mesh_status().needs_rejoin);
+    EXPECT_TRUE(client->check_health().ok);
 }
 
 // The node delete travels over the mesh, so leave_network must delete the node

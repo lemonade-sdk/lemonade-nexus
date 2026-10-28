@@ -448,6 +448,13 @@ class AppNotifier extends StateNotifier<AppState> {
   static const Duration _healthInterval = Duration(seconds: 5);
   static const int _maxRecoveryFailures = 3;
 
+  // --- Session re-join ---
+  // The SDK drops a session whose Tier 1 server left the membership at an
+  // epoch boundary. The mesh stays up, but every private call is refused until
+  // the device joins again, so refreshMeshStatus re-joins when the SDK says so.
+  DateTime? _lastRejoinAttempt;
+  static const Duration _rejoinCooldown = Duration(seconds: 30);
+
   AppNotifier(this._sdk) : super(AppState.initial) {
     _startHealthMonitor();
   }
@@ -1351,8 +1358,10 @@ class AppNotifier extends StateNotifier<AppState> {
 
   /// Refresh mesh status
   Future<void> refreshMeshStatus() async {
+    var needsRejoin = false;
     try {
       final meshStatus = await _sdk.getMeshStatus();
+      needsRejoin = meshStatus.needsRejoin;
       final meshPeers = await _sdk.getMeshPeers();
       final unchanged =
           _sameJson(state.peerState.meshStatus?.toJson(), meshStatus.toJson()) &&
@@ -1381,6 +1390,42 @@ class AppNotifier extends StateNotifier<AppState> {
       );
       _log('refreshMeshStatus: FAILED -> $e');
     }
+    if (needsRejoin) await _rejoinAfterServerLeft();
+  }
+
+  /// Joins again when the SDK reports that the session's Tier 1 server left
+  /// the membership. The SDK has already dropped the token, so [_joinNetwork]
+  /// authenticates with the Ed25519 identity through a current server. A
+  /// password-only session has no identity to do that with and is left to
+  /// the health monitor. At most one attempt per [_rejoinCooldown].
+  Future<void> _rejoinAfterServerLeft() async {
+    if (_isRecovering || !state.isAuthenticated) return;
+    if (_sdk.identityPubkey == null || state.sessionToken == null) return;
+    final last = _lastRejoinAttempt;
+    if (last != null && DateTime.now().difference(last) < _rejoinCooldown) {
+      return;
+    }
+    _lastRejoinAttempt = DateTime.now();
+    _log('rejoinAfterServerLeft: the session server left Tier 1; joining again');
+    if (!await _joinNetwork()) {
+      _log('rejoinAfterServerLeft: join failed; next attempt after '
+          '${_rejoinCooldown.inSeconds}s');
+      return;
+    }
+    await _storeSessionToken();
+    _log('rejoinAfterServerLeft: joined through a current Tier 1 server');
+  }
+
+  /// Persists the SDK's current server-issued token so a later restart does
+  /// not replay one that no longer names a Tier 1 server.
+  Future<void> _storeSessionToken() async {
+    final token = await _sdk.getSessionToken();
+    if (token == null) return;
+    state = state.copyWith(
+      authState: state.authState.copyWith(sessionToken: token),
+    );
+    await _secureStore.saveSession(StoredSession(
+        token: token, username: state.username ?? '', userId: state.userId));
   }
 
   /// Generic authenticated call to a private-mesh API route, for views that
@@ -1849,16 +1894,7 @@ class AppNotifier extends StateNotifier<AppState> {
       }
       // Persist the new server-issued token so a later restart doesn't replay
       // the dead one.
-      final token = await _sdk.getSessionToken();
-      if (token != null) {
-        state = state.copyWith(
-          authState: state.authState.copyWith(sessionToken: token),
-        );
-        await _secureStore.saveSession(StoredSession(
-            token: token,
-            username: state.username ?? '',
-            userId: state.userId));
-      }
+      await _storeSessionToken();
       await refreshAllData();
       state = state.copyWith(connectionStatus: ConnectionStatus.connected);
       _recoveryFailures = 0;

@@ -312,6 +312,7 @@ MeshStatus _$MeshStatusFromJson(Map<String, dynamic> json) => MeshStatus(
       peers: (json['peers'] as List<dynamic>)
           .map((e) => MeshPeer.fromJson(e as Map<String, dynamic>))
           .toList(),
+      needsRejoin: json['needs_rejoin'] as bool? ?? false,
     );
 
 Map<String, dynamic> _$MeshStatusToJson(MeshStatus instance) =>
@@ -323,6 +324,7 @@ Map<String, dynamic> _$MeshStatusToJson(MeshStatus instance) =>
       'total_rx_bytes': instance.totalRxBytes,
       'total_tx_bytes': instance.totalTxBytes,
       'peers': instance.peers,
+      'needs_rejoin': instance.needsRejoin,
     };
 
 ServiceStats _$ServiceStatsFromJson(Map<String, dynamic> json) => ServiceStats(

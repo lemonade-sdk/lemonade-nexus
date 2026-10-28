@@ -492,6 +492,11 @@ class MeshStatus {
   final int totalTxBytes;
   final List<MeshPeer> peers;
 
+  /// True when the SDK dropped the session because the Tier 1 server that
+  /// issued it left the verified membership. Private-API calls are refused
+  /// until a join succeeds again, which clears it.
+  final bool needsRejoin;
+
   MeshStatus({
     required this.isUp,
     this.tunnelIp,
@@ -500,6 +505,7 @@ class MeshStatus {
     required this.totalRxBytes,
     required this.totalTxBytes,
     required this.peers,
+    this.needsRejoin = false,
   });
 
   /// Parses the SDK's mesh status output (macOS `SDKMeshStatus`).
@@ -518,6 +524,7 @@ class MeshStatus {
                 .map(MeshPeer.fromJson)
                 .toList() ??
             const [],
+        needsRejoin: (json['needs_rejoin'] as bool?) ?? false,
       );
 
   Map<String, dynamic> toJson() => _$MeshStatusToJson(this);
