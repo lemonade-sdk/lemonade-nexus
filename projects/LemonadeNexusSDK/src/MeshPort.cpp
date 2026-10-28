@@ -2,6 +2,8 @@
 #include <LemonadeNexusSDK/CertRenewal.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 
+#include <LemonadeNexus/Tree/DeviceLabel.hpp>
+
 #include <httplib.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -15,6 +17,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <random>
 
 #ifndef _WIN32
@@ -380,15 +383,10 @@ int64_t epoch_seconds() {
 namespace mesh_port {
 
 std::string device_label(std::string_view device_name) {
-    std::string label;
-    for (const unsigned char c : device_name) {
-        if (std::isalnum(c)) label += static_cast<char>(std::tolower(c));
-        else if (!label.empty() && label.back() != '-') label += '-';
-    }
-    while (!label.empty() && label.back() == '-') label.pop_back();
-    if (label.size() > 63) label.resize(63);
-    while (!label.empty() && label.back() == '-') label.pop_back();
-    return label;
+    // The server validates device names with the same function, so a name the
+    // tree accepted routes here and two names that route the same are refused
+    // there.
+    return nexus::tree::device_label(device_name);
 }
 
 std::string local_domain_from_certificate(std::string_view domain) {
@@ -424,11 +422,30 @@ std::pair<int, std::string> host_target(std::string_view host, std::string_view 
     }
     const auto label = name.substr(0, name.size() - domain.size());
     if (label.find('.') != std::string::npos) return {404, "No device in your group is named " + name};
+    const auto target = [&](const MeshPortMember& member) {
+        return member.node_id == self_node_id ? std::string("local") : member.node_id;
+    };
+    // A node id is unique, so it always names exactly one device.
     for (const auto& member : members) {
-        if (label != lower(member.node_id) && label != device_label(member.device_name)) continue;
-        return {0, member.node_id == self_node_id ? std::string("local") : member.node_id};
+        if (label == lower(member.node_id)) return {0, target(member)};
     }
-    return {404, "No device in your group is named " + name};
+    // Device names fold to DNS labels ("Work PC" and "work-pc" collide), so a
+    // label that fits several devices routes to none of them: the caller must
+    // use a node id. Picking the first match would send traffic to a device the
+    // caller did not name.
+    const MeshPortMember* found = nullptr;
+    std::string others;
+    for (const auto& member : members) {
+        if (label != device_label(member.device_name)) continue;
+        if (!found) { found = &member; continue; }
+        others += (others.empty() ? "" : ", ") + member.device_name + " (" + member.node_id + ")";
+    }
+    if (!found) return {404, "No device in your group is named " + name};
+    if (!others.empty()) {
+        return {409, "The name " + name + " fits several devices: " + found->device_name + " (" + found->node_id +
+                         "), " + others + ". Use the device id as the host name."};
+    }
+    return {0, target(*found)};
 }
 
 std::pair<int, std::string> forward_target(const std::vector<MeshPortMember>& members, std::string_view self_node_id,
@@ -514,11 +531,16 @@ json device_urls(const std::vector<MeshPortMember>& members, std::string_view se
     }
     const auto suffix = std::string(local_domain) + ":" + std::to_string(port);
     const std::string scheme = tls ? "https://" : "http://";
+    // Count every member's label, not only the listed ones: host_target() matches
+    // against the whole group, so a name that collides anywhere is ambiguous.
+    std::map<std::string, int> label_count;
+    for (const auto& member : members) ++label_count[device_label(member.device_name)];
     for (const auto& member : members) {
         const bool self = member.node_id == self_node_id;
         if (!self && !reachable_peer(member, self_node_id)) continue;
-        const auto label = member.device_name.empty() ? lower(member.node_id) : device_label(member.device_name);
-        if (label.empty()) continue;
+        auto label = device_label(member.device_name);
+        // An ambiguous or empty label gets the node id, which always routes.
+        if (label.empty() || label_count[label] > 1) label = lower(member.node_id);
         urls.push_back({{"node_id", member.node_id}, {"device_name", member.device_name},
             {"url", scheme + label + suffix}, {"self", self}});
     }

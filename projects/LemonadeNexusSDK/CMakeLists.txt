@@ -54,6 +54,11 @@ list(APPEND LN_TRUST_SRC "${LN_SERVER_SRC}/Relay/RelayWire.cpp")
 # StunService, so both sides encode the same bytes. No dependencies.
 list(APPEND LN_TRUST_SRC "${LN_SERVER_SRC}/Network/StunWire.cpp")
 
+# The mesh port (MeshPort.cpp) folds device names to DNS labels with the
+# server's rule, the one the tree applies when it refuses two devices of a
+# group that fold to the same label. No dependencies.
+list(APPEND LN_TRUST_SRC "${LN_SERVER_SRC}/Tree/DeviceLabel.cpp")
+
 if(TARGET LemonadeNexusSDK)
     target_sources(LemonadeNexusSDK PRIVATE "${LN_DATAPLANE_SRC}" ${LN_TRUST_SRC})
     target_include_directories(LemonadeNexusSDK PRIVATE "${LN_SERVER_INCLUDE}")

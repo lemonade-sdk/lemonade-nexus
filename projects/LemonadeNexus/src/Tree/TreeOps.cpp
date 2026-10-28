@@ -3,6 +3,7 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
 #include <LemonadeNexus/Security/CanonicalEncoding.hpp>
+#include <LemonadeNexus/Tree/DeviceLabel.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -335,6 +336,24 @@ public:
         return taken;
     }
 
+    /// Why the device `own_id` under `parent_id` may not take the name
+    /// `hostname` (rules::device_name_refusal); nullopt when the name is
+    /// free. The conflicting device with the lowest id names the refusal, so
+    /// every replica gives the same reason.
+    [[nodiscard]] std::optional<std::string> device_name_refusal(
+            const std::string& parent_id, const std::string& hostname,
+            const std::string& own_id) const {
+        const auto label = device_label(hostname);
+        const TreeNode* conflict = nullptr;
+        for_each([&](const TreeNode& n) {
+            if (rules::device_label_collides(n, parent_id, label, own_id) &&
+                (!conflict || n.id < conflict->id)) {
+                conflict = &n;
+            }
+        });
+        return rules::device_name_refusal(hostname, conflict);
+    }
+
     /// The tunnel address a join assigns to `node_id` against this view.
     [[nodiscard]] std::string free_tunnel_address(std::string_view node_id) const {
         std::unordered_set<uint32_t> used;
@@ -490,6 +509,9 @@ TreeOpVerdict plan_join(const TreeOp& op, Overlay& overlay) {
             overlay.identifier_taken(endpoint.endpoint_identifier, node_id) ||
             overlay.mesh_taken(endpoint.mesh_pubkey, node_id)) {
             return refuse(TreeOpRefusal::Conflict, "endpoint identifier conflict");
+        }
+        if (auto r = overlay.device_name_refusal(customer_id, endpoint.hostname, node_id)) {
+            return refuse(TreeOpRefusal::Conflict, *r);
         }
         overlay.put(endpoint);
 
@@ -1159,15 +1181,30 @@ TreeOpVerdict plan_op(const TreeOp& op, const TreeState::NodeMap& nodes,
             if (overlay.mesh_taken(node.mesh_pubkey, id)) {
                 return refuse(R::Conflict, "mesh public key already bound to another node");
             }
+            if (node.type == NodeType::Endpoint) {
+                if (auto r = overlay.device_name_refusal(node.parent_id, node.hostname, id)) {
+                    return refuse(R::Conflict, *r);
+                }
+            }
             overlay.put(std::move(node));
             break;
         }
         case TreeOpKind::UpdateFields: {
-            if (!overlay.find(id)) return refuse(R::NotFound, "node not found");
+            const TreeNode* before = overlay.find(id);
+            if (!before) return refuse(R::NotFound, "node not found");
             TreeNode node = body.source == TreeOpSource::Delta ? body.delta.node_data : body.node;
             node.id = id;
             if (overlay.mesh_taken(node.mesh_pubkey, id)) {
                 return refuse(R::Conflict, "mesh public key already bound to another node");
+            }
+            // A device rename to a new label follows the device-name rule. A
+            // name that keeps its label, and a collision that already exists
+            // in the tree, are left as they are.
+            if (before->type == NodeType::Endpoint &&
+                device_label(node.hostname) != device_label(before->hostname)) {
+                if (auto r = overlay.device_name_refusal(before->parent_id, node.hostname, id)) {
+                    return refuse(R::Conflict, *r);
+                }
             }
             overlay.put(std::move(node));
             break;

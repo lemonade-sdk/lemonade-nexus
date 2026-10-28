@@ -248,6 +248,7 @@ auto sub = client.create_link_token(600, "group-id",            // chosen group
 | `list_memberships()` | `ln_memberships_list(client, &json)` | Groups this identity belongs to |
 | `leave_membership(group)` | `ln_membership_leave(client, group, &json)` | Leave a group joined by invite |
 | `move_node(node, parent)` | `ln_move_node(client, node, parent, &json)` | Move a device or subgroup |
+| `check_device_name(name, group, code)` | `ln_check_device_name(client, name, group_or_NULL, code_or_NULL, &json)` | Check a device name before a join or rename |
 
 - A code works on any Tier 1 server, not only on the server that created
   it, so the client can redeem it through whichever server it reaches. A code
@@ -264,6 +265,18 @@ auto sub = client.create_link_token(600, "group-id",            // chosen group
 - An invite never grants `admin`, `edit_node`, or `delete_node`, and never
   grants more than the inviter holds. The server checks the inviter's
   authority again when the code is used.
+- **Device names are unique within a group.** The mesh port folds a device
+  name to one DNS label ("Work PC" and "work-pc" are both `work-pc`), so a
+  join or a rename (`update_node` with `hostname`) whose label another device
+  of the same group holds is refused with HTTP 409 and an error that names
+  that device; so is a name with no letter or digit. Check a name first:
+  `check_device_name(name, group_node_id, "")` for a group you can read, or
+  `check_device_name(name, "", code)` for the group an invite targets (the
+  code is not spent). The answer is `{label, available, conflicts:
+  [{node_id, device_name}], suggestion}`; `suggestion` is a free label such
+  as `work-pc-2`. It is advisory: the server decides when the name is used.
+  The call needs a session and a verified Tier 1 server, not a mesh session,
+  so a new device can check the name it will join with.
 - Every C function writes a caller-owned JSON string to `out_json` (also on
   most failures, with an `"error"` field). Release it with `ln_free()`. Input
   strings are not retained.
@@ -312,7 +325,7 @@ child.type = lnsdk::NodeType::Endpoint;
 auto created = client.create_child_node("parent-id", child);
 
 nlohmann::json updates;
-updates["hostname"] = "new-name";
+updates["hostname"] = "new-name";  // 409 when a sibling device folds to the same label
 auto updated = client.update_node("node-id", updates);
 auto deleted = client.delete_node("node-id");
 ```

@@ -209,6 +209,11 @@ runs the merge once, after every server runs a release with tree operations.
   `POST /api/ipam/allocate` writes no tree node. It refuses a `tunnel` block
   with `409`, because the join operation assigns tunnel addresses; `private`
   and `shared` blocks do not change.
+  A `Join`, a `CreateNode`, or an `UpdateFields` that gives a device a name
+  whose mesh-port label another device of the same group holds is refused
+  with `409` (see [Security](Security#device-names)).
+  `POST /api/tree/device-name/check` (public API, session required) answers
+  that question in advance and writes nothing.
 - **Start.** A server that has no tree log starts a new log on the empty base.
   With an empty tree it runs normally and requests the `EstablishRoot`
   operation for `root_pubkey`, so Tier 1 reaches height 1 with the

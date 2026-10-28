@@ -4,11 +4,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 
 #include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Acme/AcmeService.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
+#include <LemonadeNexus/Tree/DeviceLabel.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeOpSubmitter.hpp>
 #include <LemonadeNexus/Tree/TreeOps.hpp>
@@ -70,6 +72,26 @@ std::string client_ep_fqdn(const std::string& node_id, const std::string& base_d
 template <typename T>
 void apply_optional_field(const nlohmann::json& body, const char* key, T& dst) {
     if (body.contains(key)) dst = body[key].get<T>();
+}
+
+/// A device label that no label in `taken` holds, for a device whose name
+/// folds to `label`: the label itself, else "<label>-2", "<label>-3", ...
+/// with the label shortened so the result fits tree::kDeviceLabelMaxLength.
+/// An empty label (a name with no letter or digit) counts from "device".
+/// Empty when the first 998 numbered labels are all taken.
+std::string suggest_device_label(const std::string& label, const std::set<std::string>& taken) {
+    const std::string base = label.empty() ? std::string{"device"} : label;
+    if (!taken.contains(base)) return base;
+    for (int n = 2; n < 1000; ++n) {
+        const std::string suffix = "-" + std::to_string(n);
+        std::string stem = base;
+        if (stem.size() + suffix.size() > tree::kDeviceLabelMaxLength) {
+            stem.resize(tree::kDeviceLabelMaxLength - suffix.size());
+            while (!stem.empty() && stem.back() == '-') stem.pop_back();
+        }
+        if (const auto candidate = stem + suffix; !taken.contains(candidate)) return candidate;
+    }
+    return {};
 }
 
 // --- Tree operations ---
@@ -877,6 +899,79 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     });
 
     // ========================================================================
+    // POST /api/tree/device-name/check (PUBLIC, auth required)
+    // Body: {"name", "group_node_id"} or {"name", "link_token"}, with an
+    // optional "node_id" (the device being renamed, left out of the
+    // conflicts). Advisory: reports whether a device named `name` could be
+    // created or renamed in the group now. The Join and UpdateFields
+    // operations enforce the rule on every Tier 1 server
+    // (rules::device_name_refusal). Public, so a device can ask before it
+    // joins with an invite; the link token is looked up, never spent.
+    // ========================================================================
+    pub.Post("/api/tree/device-name/check", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        const auto& body = *body_opt;
+        if (!body.contains("name") || !body["name"].is_string()) {
+            error_response(res, "name required");
+            return;
+        }
+        const auto name = body["name"].get<std::string>();
+        const auto group_node_id = body.value("group_node_id", std::string{});
+        const auto link_token = body.value("link_token", std::string{});
+        const auto own_id = body.value("node_id", std::string{});
+
+        std::string group_id;
+        if (!group_node_id.empty()) {
+            // The same gate as a tree read of the group.
+            const auto caller = normalize_pubkey(claims.pubkey);
+            if (!ctx_.tree.administers(caller, group_node_id) &&
+                !ctx_.tree.check_permission(caller, group_node_id, acl::Permission::Read)) {
+                error_response(res, "no read permission", 403);
+                return;
+            }
+            group_id = group_node_id;
+        } else if (!link_token.empty()) {
+            // An invite names its target group; the holder may ask about it
+            // without reading it. verify_link_token does not spend the token.
+            const auto link = ctx_.auth.verify_link_token(link_token);
+            if (!link) {
+                error_response(res, "invalid or expired link token", 403);
+                return;
+            }
+            group_id = link->group_node_id;
+        } else {
+            error_response(res, "group_node_id or link_token required");
+            return;
+        }
+
+        const auto nodes = ctx_.tree.nodes_snapshot();
+        const auto group = nodes.find(group_id);
+        if (group == nodes.end() || group->second.type != tree::NodeType::Customer) {
+            error_response(res, "group not found", 404);
+            return;
+        }
+
+        const auto label = tree::device_label(name);
+        std::set<std::string> taken;
+        for (const auto& [id, n] : nodes) {
+            if (n.type == tree::NodeType::Endpoint && n.parent_id == group_id && id != own_id) {
+                taken.insert(tree::device_label(n.hostname));
+            }
+        }
+        nlohmann::json conflicts = nlohmann::json::array();
+        for (const auto& id : tree::rules::device_label_conflicts(nodes, group_id, label, own_id)) {
+            conflicts.push_back({{"node_id", id}, {"device_name", nodes.at(id).hostname}});
+        }
+        json_response(res, {{"label", label},
+                            {"available", !label.empty() && conflicts.empty()},
+                            {"conflicts", std::move(conflicts)},
+                            {"suggestion", suggest_device_label(label, taken)}});
+    }));
+
+    // ========================================================================
     // GET /api/tree/node/{id} (PRIVATE, auth required)
     // ========================================================================
     priv.Get(R"(/api/tree/node/(.+))", require_auth(ctx_.auth,
@@ -1043,9 +1138,13 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         const auto s = submitter->submit(std::move(op));
         if (answer_unfinished(res, s)) return;
         const auto& v = s.verdict;
-        // An existing node counts as success.
+        // An existing node counts as success. A conflict (a device name a
+        // sibling already folds to) carries the operation's reason.
         if (!v.ok() && v.refusal != tree::TreeOpRefusal::AlreadyExists) {
-            error_response(res, "node creation failed", 409);
+            error_response(res,
+                           v.refusal == tree::TreeOpRefusal::Conflict ? v.reason
+                                                                      : "node creation failed",
+                           409);
             return;
         }
 
@@ -1156,6 +1255,12 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         const auto& v = s.verdict;
         if (v.refusal == tree::TreeOpRefusal::NotFound) {
             error_response(res, "node not found", 404);
+            return;
+        }
+        // A conflict (a device name a sibling already folds to, or a mesh key
+        // another node holds) carries the operation's reason.
+        if (v.refusal == tree::TreeOpRefusal::Conflict) {
+            error_response(res, v.reason, 409);
             return;
         }
         if (!v.ok()) {

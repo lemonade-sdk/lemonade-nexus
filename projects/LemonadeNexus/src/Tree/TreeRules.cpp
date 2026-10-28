@@ -1,5 +1,7 @@
 #include <LemonadeNexus/Tree/TreeRules.hpp>
 
+#include <LemonadeNexus/Tree/DeviceLabel.hpp>
+
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
@@ -104,6 +106,37 @@ bool mesh_pubkey_taken(const NodeMap& nodes, const std::string& mesh_pubkey,
         if (id != own_id && node.mesh_pubkey == mesh_pubkey) return true;
     }
     return false;
+}
+
+bool device_label_collides(const TreeNode& node, std::string_view parent_id,
+                           std::string_view label, std::string_view own_id) {
+    if (label.empty()) return false;
+    return node.type == NodeType::Endpoint && node.parent_id == parent_id && node.id != own_id &&
+           device_label(node.hostname) == label;
+}
+
+std::vector<std::string> device_label_conflicts(const NodeMap& nodes, std::string_view parent_id,
+                                                std::string_view label, std::string_view own_id) {
+    std::vector<std::string> ids;
+    for (const auto& [id, node] : nodes) {
+        if (device_label_collides(node, parent_id, label, own_id)) ids.push_back(id);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+std::optional<std::string> device_name_refusal(std::string_view hostname,
+                                               const TreeNode* conflict) {
+    if (hostname.empty()) return std::nullopt;
+    if (device_label(hostname).empty()) {
+        return "device name '" + std::string(hostname) +
+               "' has no letter or digit; pick another name";
+    }
+    if (conflict) {
+        return "device name '" + std::string(hostname) + "' is the same as device '" +
+               conflict->hostname + "' (" + conflict->id + ") on the mesh port; pick another name";
+    }
+    return std::nullopt;
 }
 
 namespace {

@@ -216,10 +216,11 @@ protected:
         return op;
     }
 
-    /// A Join op for `device`, with a fresh challenge the device signed.
+    /// A Join op for `device`, with a fresh challenge the device signed. A
+    /// nonempty `hostname` is the device name the join carries.
     TreeOp join_op(const crypto::Ed25519Keypair& device,
                    const std::string& link_group = {}, const std::string& link_owner = {},
-                   const std::string& mesh_pubkey = {}) {
+                   const std::string& mesh_pubkey = {}, const std::string& hostname = {}) {
         std::array<uint8_t, 32> challenge{};
         crypto_svc->random_bytes(std::span<uint8_t>(challenge));
         const auto sig = crypto_svc->ed25519_sign(device.private_key,
@@ -239,9 +240,25 @@ protected:
         js.net_mac = "mac";
         js.mesh_pubkey_present = !mesh_pubkey.empty();
         js.mesh_pubkey = mesh_pubkey;
+        js.hostname_present = !hostname.empty();
+        js.hostname = hostname;
         js.link_group_id = link_group;
         js.link_owner_pubkey = link_owner;
         return op;
+    }
+
+    /// A device node stored under `parent` with `hostname`, owned and
+    /// editable by the root key, as a record from before a rule existed.
+    tree::TreeNode stored_device(const std::string& id, const std::string& parent,
+                                 const std::string& hostname) {
+        tree::TreeNode n;
+        n.id = id;
+        n.parent_id = parent;
+        n.type = tree::NodeType::Endpoint;
+        n.hostname = hostname;
+        n.mgmt_pubkey = root_pk;
+        n.assignments = {{root_pk, {"read", "edit_node"}}};
+        return n;
     }
 
     tree::TreeNode customer(const std::string& id, const std::string& owner) {
@@ -439,6 +456,91 @@ TEST_F(TreeOpsTest, ReturningJoinRecordsAddressAndRotatedKey) {
     // Nothing changed: no write, no version increment.
     ASSERT_TRUE(submit(seal(join_op(device, {}, {}, "meshB"))).ok());
     EXPECT_EQ(version_of(node_id), 2u);
+}
+
+// Device names fold to one mesh-port label (tree::device_label). A join, a
+// create, or a rename that gives a device the label a sibling holds, or no
+// label at all, is refused in the apply step, so every replica refuses it.
+TEST_F(TreeOpsTest, DeviceNamesFoldToOneLabelPerGroup) {
+    ASSERT_TRUE(submit(seal(create_op(customer("acme", root_pk), root_pk))).ok());
+    ASSERT_TRUE(submit(seal(create_op(customer("beta", root_pk), root_pk))).ok());
+    auto first = crypto_svc->ed25519_keygen();
+    auto v = submit(seal(join_op(first, "acme", root_pk, {}, "Work PC")));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    const auto first_id = tree::derive_join_node_id(*crypto_svc, principal_of(first));
+    EXPECT_EQ(tree_svc->get_node(first_id)->hostname, "Work PC");
+
+    // A sibling whose name folds to the same label is refused; the reason
+    // names the device that holds the label.
+    auto second = crypto_svc->ed25519_keygen();
+    const auto second_id = tree::derive_join_node_id(*crypto_svc, principal_of(second));
+    auto refused = submit(seal(join_op(second, "acme", root_pk, {}, "work-pc")));
+    EXPECT_EQ(refused.refusal, TreeOpRefusal::Conflict);
+    EXPECT_NE(refused.reason.find("'Work PC'"), std::string::npos) << refused.reason;
+    EXPECT_NE(refused.reason.find(first_id), std::string::npos) << refused.reason;
+    EXPECT_NE(refused.reason.find("pick another name"), std::string::npos) << refused.reason;
+    EXPECT_FALSE(tree_svc->get_node(second_id).has_value());
+
+    // A name with no letter or digit folds to nothing and is refused.
+    auto blank = submit(seal(join_op(second, "acme", root_pk, {}, "***")));
+    EXPECT_EQ(blank.refusal, TreeOpRefusal::Conflict);
+    EXPECT_NE(blank.reason.find("pick another name"), std::string::npos) << blank.reason;
+
+    // Another label joins the group; another group reuses the label.
+    v = submit(seal(join_op(second, "acme", root_pk, {}, "Work PC 2")));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    auto third = crypto_svc->ed25519_keygen();
+    v = submit(seal(join_op(third, "beta", root_pk, {}, "work pc")));
+    ASSERT_TRUE(v.ok()) << v.reason;
+
+    // A rename to a sibling's label is refused; a rename that keeps the
+    // label, with other fields changed, passes.
+    auto node = *tree_svc->get_node(second_id);
+    node.hostname = "WORK_PC";
+    auto renamed = submit(seal(update_op(node, principal_of(second), node.version)));
+    EXPECT_EQ(renamed.refusal, TreeOpRefusal::Conflict);
+    EXPECT_NE(renamed.reason.find(first_id), std::string::npos) << renamed.reason;
+    EXPECT_EQ(tree_svc->get_node(second_id)->hostname, "Work PC 2");
+    node.hostname = "work pc 2";
+    node.region = "eu-west";
+    v = submit(seal(update_op(node, principal_of(second), node.version)));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    EXPECT_EQ(tree_svc->get_node(second_id)->hostname, "work pc 2");
+    node = *tree_svc->get_node(second_id);
+    node.hostname = "!!";
+    EXPECT_EQ(submit(seal(update_op(node, principal_of(second), node.version))).refusal,
+              TreeOpRefusal::Conflict);
+
+    // A session create of a device follows the same rule.
+    auto extra = stored_device("node-extra", "acme", "work-pc");
+    auto created = submit(seal(create_op(extra, root_pk)));
+    EXPECT_EQ(created.refusal, TreeOpRefusal::Conflict);
+    EXPECT_FALSE(tree_svc->get_node("node-extra").has_value());
+    extra.hostname = "Printer";
+    v = submit(seal(create_op(extra, root_pk)));
+    ASSERT_TRUE(v.ok()) << v.reason;
+}
+
+// A collision stored before the rule stays as it is: the devices keep their
+// names and stay editable. Only a change of label is judged.
+TEST_F(TreeOpsTest, AStoredNameCollisionStaysEditable) {
+    ASSERT_TRUE(submit(seal(create_op(customer("acme", root_pk), root_pk))).ok());
+    ASSERT_TRUE(test_support::put_node(*tree_svc, stored_device("node-a", "acme", "Work PC")));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, stored_device("node-b", "acme", "work-pc")));
+
+    auto node = *tree_svc->get_node("node-b");
+    node.region = "eu-west";
+    auto v = submit(seal(update_op(node, root_pk, node.version)));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    node = *tree_svc->get_node("node-b");
+    node.hostname = "Work  PC";  // the same label as before
+    v = submit(seal(update_op(node, root_pk, node.version)));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    EXPECT_EQ(tree_svc->get_node("node-a")->hostname, "Work PC");
+
+    // A third device still cannot take the label.
+    EXPECT_EQ(submit(seal(create_op(stored_device("node-c", "acme", "WORK PC"), root_pk))).refusal,
+              TreeOpRefusal::Conflict);
 }
 
 // =========================================================================
