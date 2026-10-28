@@ -14,14 +14,8 @@
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
 #include <sodium.h>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -40,6 +34,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -686,101 +681,12 @@ std::string data_body(const std::string& run_id) {
 }
 
 // ---------------------------------------------------------------------------
-// Discovery: the region's SEIP A records, then each server's certificate name
-// (the same steps as the client app's DNS discovery). The certificate name is
-// only a candidate: ln_discover_genesis_key then requires verified HTTPS to
-// that name and agreement of at least three servers in the DNS domain.
+// Discovery: ln_discover_servers resolves the region's SEIP A records and reads
+// each server's certificate name (the same steps as the client app's DNS
+// discovery). The certificate name is only a candidate: ln_discover_genesis_key
+// then requires verified HTTPS to that name and agreement of at least three
+// servers in the DNS domain.
 // ---------------------------------------------------------------------------
-
-std::vector<std::string> resolve_ipv4_all(const std::string& name) {
-    std::vector<std::string> out;
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    if (getaddrinfo(name.c_str(), nullptr, &hints, &res) != 0) return out;
-    for (auto* p = res; p; p = p->ai_next) {
-        char buf[INET_ADDRSTRLEN] = {};
-        auto* sin = reinterpret_cast<sockaddr_in*>(p->ai_addr);
-        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof buf)) {
-            if (std::find(out.begin(), out.end(), buf) == out.end()) out.emplace_back(buf);
-        }
-    }
-    freeaddrinfo(res);
-    return out;
-}
-
-int connect_with_timeout(const std::string& ip, uint16_t port, int timeout_ms) {
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) return -1;
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    const int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr);
-    if (rc != 0 && errno == EINPROGRESS) {
-        pollfd pfd{fd, POLLOUT, 0};
-        rc = ::poll(&pfd, 1, timeout_ms) == 1 ? 0 : -1;
-        int soerr = 0;
-        socklen_t len = sizeof soerr;
-        if (rc == 0 && (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &len) != 0 || soerr != 0)) {
-            rc = -1;
-        }
-    }
-    if (rc != 0) {
-        ::close(fd);
-        return -1;
-    }
-    ::fcntl(fd, F_SETFL, flags);
-    timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    return fd;
-}
-
-/// The subject common name of the server's leaf certificate, or "".
-std::string certificate_name(const std::string& ip, uint16_t port) {
-    int fd = connect_with_timeout(ip, port, 5000);
-    if (fd < 0) return {};
-    std::string name;
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-    SSL* ssl = ctx ? SSL_new(ctx) : nullptr;
-    if (ssl) {
-        // No verification here: the name is a candidate, and the SDK verifies
-        // HTTPS to it before it trusts anything the server says.
-        SSL_set_verify(ssl, SSL_VERIFY_NONE, nullptr);
-        SSL_set_fd(ssl, fd);
-        if (SSL_connect(ssl) == 1) {
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
-            X509* cert = SSL_get1_peer_certificate(ssl);
-#else
-            X509* cert = SSL_get_peer_certificate(ssl);
-#endif
-            if (cert) {
-                char buf[256] = {};
-                if (X509_NAME_get_text_by_NID(X509_get_subject_name(cert), NID_commonName, buf,
-                                              sizeof buf) > 0) {
-                    name = buf;
-                }
-                X509_free(cert);
-            }
-            SSL_shutdown(ssl);
-        }
-        SSL_free(ssl);
-    }
-    if (ctx) SSL_CTX_free(ctx);
-    ::close(fd);
-    return name;
-}
-
-bool name_in_domain(const std::string& name, const std::string& domain) {
-    if (name.size() <= domain.size() + 1) return false;
-    if (name.compare(name.size() - domain.size(), domain.size(), domain) != 0) return false;
-    if (name[name.size() - domain.size() - 1] != '.') return false;
-    return parse_endpoint(name).has_value() && name.find('*') == std::string::npos;
-}
 
 std::vector<Endpoint> discover_seeds(const Options& o, Report& report) {
     if (!o.seeds.empty()) {
@@ -789,25 +695,23 @@ std::vector<Endpoint> discover_seeds(const Options& o, Report& report) {
         return o.seeds;
     }
     const auto region_name = o.region + ".seip." + o.domain;
-    const auto ips = resolve_ipv4_all(region_name);
+    char* out = nullptr;
+    const auto code = ln_discover_servers(o.domain.c_str(), o.region.c_str(), kDefaultApiPort, &out);
+    std::unique_ptr<char, decltype(&ln_free)> owned(out, ln_free);
+    const auto parsed = out ? json::parse(out, nullptr, false) : json();
     std::vector<Endpoint> seeds;
-    for (const auto& ip : ips) {
-        auto name = certificate_name(ip, kDefaultApiPort);
-        if (name_in_domain(name, o.domain)) {
-            if (std::none_of(seeds.begin(), seeds.end(),
-                             [&](const Endpoint& e) { return e.host == name; })) {
-                seeds.push_back({name, kDefaultApiPort});
-            }
-        } else {
-            warn("server " + ip + " gave no certificate name in " + o.domain);
+    if (code == LN_OK && parsed.is_object()) {
+        for (const auto& s : parsed.value("servers", json::array())) {
+            seeds.push_back({s.value("host", std::string{}),
+                             static_cast<uint16_t>(s.value("port", unsigned{kDefaultApiPort}))});
         }
     }
     std::string names;
     for (const auto& s : seeds) names += (names.empty() ? "" : ", ") + s.host;
     if (seeds.empty()) {
         report.add("discovery", Outcome::Fail,
-                   "no server found from " + region_name + " (" + std::to_string(ips.size()) +
-                       " address(es))");
+                   "no server found from " + region_name +
+                       (parsed.is_object() ? ": " + parsed.value("error", std::string{}) : ""));
     } else {
         report.add("discovery", Outcome::Pass,
                    std::to_string(seeds.size()) + " server(s) from " + region_name + ": " + names);
@@ -1772,14 +1676,6 @@ int cmd_self_test() {
                    .has_value(),
                "an unknown role is refused");
     }
-
-    // Domain matching for discovered certificate names.
-    expect(name_in_domain("sn01.us-west.seip.lemonade-nexus.io", "lemonade-nexus.io"),
-           "a SEIP name is inside the domain");
-    expect(!name_in_domain("lemonade-nexus.io", "lemonade-nexus.io"), "the apex is not a server");
-    expect(!name_in_domain("evil-lemonade-nexus.io", "lemonade-nexus.io"),
-           "a suffix without a dot is outside the domain");
-    expect(!name_in_domain("*.lemonade-nexus.io", "lemonade-nexus.io"), "a wildcard is refused");
 
     // Bundle sealing with throwaway identities (never saved).
     {

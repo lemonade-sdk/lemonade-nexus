@@ -93,7 +93,7 @@ add_nexus_test(test_genesis_anchor    test_genesis_anchor.cpp)
 # Uses httplib SSLClient/SSLServer + OpenSSL X509 directly for the TLS transport test.
 add_nexus_test(test_tls_transport     test_tls_transport.cpp)
 target_compile_definitions(test_tls_transport PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-target_link_libraries(test_tls_transport PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(test_tls_transport PRIVATE LemonadeNexusSDK OpenSSL::SSL OpenSSL::Crypto)
 
 # Drives the SNP evidence chain against a real attestation blob + VCEK captured from
 # the live Azure genesis, so it runs with no confidential-compute hardware present.
