@@ -449,10 +449,14 @@ class AppNotifier extends StateNotifier<AppState> {
   static const Duration _healthInterval = Duration(seconds: 5);
   static const int _maxRecoveryFailures = 3;
 
-  // --- Session re-join ---
-  // The SDK drops a session whose Tier 1 server left the membership at an
-  // epoch boundary. The mesh stays up, but every private call is refused until
-  // the device joins again, so refreshMeshStatus re-joins when the SDK says so.
+  // --- Session moves and re-join ---
+  // When the session's Tier 1 server leaves the membership at an epoch
+  // boundary the SDK moves the session to another verified server by itself
+  // and reports it on [LemonadeNexusSdk.sessionMoves]. Only when it cannot
+  // (no identity, or the silent join failed) does it drop the session: every
+  // private call is then refused until the device joins again, so the event
+  // handler and refreshMeshStatus re-join when the SDK says so.
+  StreamSubscription<SessionMoveEvent>? _sessionMoves;
   DateTime? _lastRejoinAttempt;
   static const Duration _rejoinCooldown = Duration(seconds: 30);
 
@@ -463,6 +467,7 @@ class AppNotifier extends StateNotifier<AppState> {
   bool _deviceNamed = false;
 
   AppNotifier(this._sdk) : super(AppState.initial) {
+    _sessionMoves = _sdk.sessionMoves.listen(_onSessionMoved);
     _startHealthMonitor();
   }
 
@@ -1449,11 +1454,33 @@ class AppNotifier extends StateNotifier<AppState> {
     if (needsRejoin) await _rejoinAfterServerLeft();
   }
 
+  /// The SDK moved the session, or could not. A silent move changed the
+  /// server-issued token and may have advanced the Tier 1 epoch, so both are
+  /// recorded; the user sees one activity line. A move that is not silent
+  /// left no session, so the device joins again.
+  Future<void> _onSessionMoved(SessionMoveEvent event) async {
+    if (event.silent) {
+      _log('sessionMoved: ${event.fromHost} -> ${event.toHost} '
+          '(epoch ${event.epoch})');
+      addActivity(ActivityLevel.info,
+          'Moved to Tier 1 server ${event.toHost} (epoch ${event.epoch})');
+      await _storeSessionToken();
+      await _recordTier1Epoch();
+      await refreshMeshStatus();
+      return;
+    }
+    _log('sessionMoved: not silent (${event.error}); joining again');
+    addActivity(ActivityLevel.warning,
+        'The session server left Tier 1 (${event.error}); joining again');
+    await _rejoinAfterServerLeft();
+  }
+
   /// Joins again when the SDK reports that the session's Tier 1 server left
-  /// the membership. The SDK has already dropped the token, so [_joinNetwork]
-  /// authenticates with the Ed25519 identity through a current server. A
-  /// password-only session has no identity to do that with and is left to
-  /// the health monitor. At most one attempt per [_rejoinCooldown].
+  /// the membership and it could not move the session by itself. The SDK
+  /// has already dropped the token, so [_joinNetwork] authenticates with the
+  /// Ed25519 identity through a current server. A password-only session has
+  /// no identity to do that with and is left to the health monitor. At most
+  /// one attempt per [_rejoinCooldown].
   Future<void> _rejoinAfterServerLeft() async {
     if (_isRecovering || !state.isAuthenticated) return;
     if (_sdk.identityPubkey == null || state.sessionToken == null) return;
@@ -2019,6 +2046,7 @@ class AppNotifier extends StateNotifier<AppState> {
   @override
   void dispose() {
     _healthTimer?.cancel();
+    _sessionMoves?.cancel();
     try {
       _sdk.dispose();
     } catch (e) {

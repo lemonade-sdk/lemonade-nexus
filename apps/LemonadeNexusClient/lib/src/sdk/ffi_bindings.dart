@@ -186,6 +186,23 @@ typedef _LnSetLinkTokenDart = int Function(
   LnClientHandle client,
   ffi.Pointer<ffi.Char> token,
 );
+
+/// `ln_session_moved_fn`: the SDK calls it from a background thread with a
+/// JSON string the callback owns and must release with `ln_free`.
+typedef LnSessionMovedNative = ffi.Void Function(
+  ffi.Pointer<ffi.Char> eventJson,
+  ffi.Pointer<ffi.Void> user,
+);
+typedef _LnSetSessionMovedCallback = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.NativeFunction<LnSessionMovedNative>> fn,
+  ffi.Pointer<ffi.Void> user,
+);
+typedef _LnSetSessionMovedCallbackDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.NativeFunction<LnSessionMovedNative>> fn,
+  ffi.Pointer<ffi.Void> user,
+);
 typedef _LnLinkTokenCreate = ffi.Int32 Function(
   LnClientHandle client,
   ffi.Uint32 ttlSec,
@@ -841,6 +858,8 @@ class LemonadeNexusFfi {
       _LnGroupKeyUnwrapDart>('ln_group_key_unwrap');
   late final _lnSetLinkToken =
       _lib.lookupFunction<_LnSetLinkToken, _LnSetLinkTokenDart>('ln_set_link_token');
+  late final _lnSetSessionMovedCallback = _lib.lookupFunction<_LnSetSessionMovedCallback,
+      _LnSetSessionMovedCallbackDart>('ln_set_session_moved_callback');
   late final _lnSetGenesisKey =
       _lib.lookupFunction<_LnSetGenesisKey, _LnSetGenesisKeyDart>('ln_set_genesis_key');
   late final _lnTier1Refresh =
@@ -1026,6 +1045,7 @@ class LemonadeNexusFfi {
     'ln_tier1_refresh',
     'ln_tier1_membership',
     'ln_discover_genesis_key',
+    'ln_set_session_moved_callback',
   ];
 
   /// Required symbols absent from the loaded native library (empty when the
@@ -1246,6 +1266,18 @@ class LemonadeNexusFfi {
     final result = _lnSetLinkToken(client, t);
     malloc.free(t);
     return LnError.fromCode(result);
+  }
+
+  /// Sets (or, with [fn] null, clears) the session-move callback. The SDK
+  /// calls [fn] from a background thread with a JSON string the callback
+  /// owns ([toStringAndFree] releases it). When this returns, the previous
+  /// callback is not running and is not called again.
+  LnError setSessionMovedCallback(
+    LnClientHandle client,
+    ffi.Pointer<ffi.NativeFunction<LnSessionMovedNative>> fn,
+    ffi.Pointer<ffi.Void> user,
+  ) {
+    return LnError.fromCode(_lnSetSessionMovedCallback(client, fn, user));
   }
 
   /// Mint a link token so another device can join this account. On success

@@ -66,6 +66,53 @@ class LemonadeNexusSdk {
   /// Kept so a worker isolate can load the same library (see [_privateApiRaw]).
   final String? _libraryPath;
 
+  /// Session moves the SDK made (or could not make) because the Tier 1
+  /// server that issued the session left the membership. See
+  /// [SessionMoveEvent]; a silent move needs nothing from the application,
+  /// and a move that is not silent means [joinNetwork] must run again.
+  Stream<SessionMoveEvent> get sessionMoves => _sessionMoves.stream;
+
+  final StreamController<SessionMoveEvent> _sessionMoves =
+      StreamController<SessionMoveEvent>.broadcast();
+
+  /// The native callback behind [sessionMoves]. A listener callable may be
+  /// called from any thread; it posts the event to this isolate. The SDK
+  /// hands over the JSON text, so it is still valid when the event arrives.
+  ffi.NativeCallable<LnSessionMovedNative>? _sessionMovedCallable;
+
+  void _installSessionMovedCallback() {
+    final client = _client;
+    if (client == null) return;
+    final callable =
+        ffi.NativeCallable<LnSessionMovedNative>.listener(_onSessionMoved)
+          ..keepIsolateAlive = false;
+    _sessionMovedCallable = callable;
+    _ffi.setSessionMovedCallback(client, callable.nativeFunction, ffi.nullptr);
+  }
+
+  void _onSessionMoved(ffi.Pointer<ffi.Char> eventJson, ffi.Pointer<ffi.Void> user) {
+    final text = _ffi.toStringAndFree(eventJson);
+    if (text == null || _sessionMoves.isClosed) return;
+    try {
+      _sessionMoves.add(
+          SessionMoveEvent.fromJson(jsonDecode(text) as Map<String, dynamic>));
+    } catch (_) {
+      // A malformed event is dropped; the mesh status still reports the
+      // outcome through needsRejoin.
+    }
+  }
+
+  /// Clears the native callback before [client] is destroyed: when the SDK
+  /// returns, the callback is not running and is not called again, so the
+  /// callable can be closed.
+  void _removeSessionMovedCallback(ffi.Pointer<ffi.Void> client) {
+    final callable = _sessionMovedCallable;
+    if (callable == null) return;
+    _sessionMovedCallable = null;
+    _ffi.setSessionMovedCallback(client, ffi.nullptr, ffi.nullptr);
+    callable.close();
+  }
+
   /// Checks if the SDK is disposed.
   void _checkDisposed() {
     if (_isDisposed) {
@@ -168,6 +215,7 @@ class LemonadeNexusSdk {
     if (_client == ffi.nullptr) {
       throw SdkException(LnError.connect, message: 'Failed to create client');
     }
+    _installSessionMovedCallback();
   }
 
   /// Connects to a Lemonade Nexus server via TLS.
@@ -182,6 +230,7 @@ class LemonadeNexusSdk {
     if (_client == ffi.nullptr) {
       throw SdkException(LnError.connect, message: 'Failed to create client');
     }
+    _installSessionMovedCallback();
   }
 
   /// Tears down the active client (and, optionally, the identity) while keeping
@@ -206,6 +255,7 @@ class LemonadeNexusSdk {
     final client = _client;
     if (client == null) return;
     _client = null;
+    _removeSessionMovedCallback(client);
     if ((_inFlight[client.address] ?? 0) > 0) {
       _destroyPending.add(client.address);
     } else {
@@ -231,6 +281,7 @@ class LemonadeNexusSdk {
     _isDisposed = true;
     _destroyIdentity();
     _destroyClient();
+    _sessionMoves.close();
   }
 
   // =========================================================================

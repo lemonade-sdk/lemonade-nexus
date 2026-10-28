@@ -530,6 +530,64 @@ class MeshStatus {
   Map<String, dynamic> toJson() => _$MeshStatusToJson(this);
 }
 
+/// One session move, as `ln_set_session_moved_callback` reports it: the
+/// Tier 1 server that issued the session left the verified membership (or
+/// leaves at the next epoch) and the SDK bound the session to another
+/// verified Tier 1 server.
+class SessionMoveEvent {
+  /// Base64 node id of the server that issued the old session.
+  final String fromNodeId;
+
+  /// Its certificate FQDN, when it was still verified.
+  final String fromHost;
+
+  /// The server that issued the new session; empty when none did.
+  final String toNodeId;
+  final String toHost;
+
+  /// The Tier 1 epoch the SDK verified when it moved the session.
+  final int epoch;
+
+  /// True when the SDK authenticated with the device identity and joined
+  /// again by itself. False when the application must join again: the
+  /// session was dropped and [MeshStatus.needsRejoin] is set.
+  final bool silent;
+
+  /// Why no silent move happened; empty when [silent] is true.
+  final String error;
+
+  const SessionMoveEvent({
+    required this.fromNodeId,
+    required this.fromHost,
+    required this.toNodeId,
+    required this.toHost,
+    required this.epoch,
+    required this.silent,
+    required this.error,
+  });
+
+  factory SessionMoveEvent.fromJson(Map<String, dynamic> json) =>
+      SessionMoveEvent(
+        fromNodeId: json['from_node_id']?.toString() ?? '',
+        fromHost: json['from_host']?.toString() ?? '',
+        toNodeId: json['to_node_id']?.toString() ?? '',
+        toHost: json['to_host']?.toString() ?? '',
+        epoch: (json['epoch'] as num?)?.toInt() ?? 0,
+        silent: (json['silent'] as bool?) ?? false,
+        error: json['error']?.toString() ?? '',
+      );
+
+  Map<String, dynamic> toJson() => {
+        'from_node_id': fromNodeId,
+        'from_host': fromHost,
+        'to_node_id': toNodeId,
+        'to_host': toHost,
+        'epoch': epoch,
+        'silent': silent,
+        'error': error,
+      };
+}
+
 // =========================================================================
 // Stats Models
 // =========================================================================
