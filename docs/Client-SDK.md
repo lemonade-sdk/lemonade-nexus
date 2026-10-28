@@ -99,7 +99,12 @@ The SDK then:
    servers. It starts with the server that answered last and fails over to
    the next one when a server does not answer or answers `421`. A session is
    bound to the server that issued it; private-API calls go only to that
-   server, and only while it is still a verified Tier 1 server.
+   server, and only while it is still a verified Tier 1 server. When that
+   server leaves the membership (it announces the next epoch in its heartbeat
+   answers before the handoff and answers `421` after it), the SDK verifies
+   the membership again and moves the session to another verified server
+   with the device identity; the announcement itself chooses nothing (see
+   [SDK Guide — Session moves](SDK-Guide#session-moves)).
 
 It verifies again every five minutes and after a server refuses a tree route.
 `refresh_tier1()` / `ln_tier1_refresh()` verifies now, and
