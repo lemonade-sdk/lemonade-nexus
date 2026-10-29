@@ -1,6 +1,7 @@
 /// Secure credential storage (Keychain on macOS, DPAPI-backed locker on Windows)
 /// for the session token and the authenticated user's identity metadata. The
-/// Ed25519 private key itself stays in the SDK's identity file (see AppPaths).
+/// Ed25519 device identity is never kept here: the SDK's per-user identity
+/// store holds it behind the OS keystore (see `device_identity.dart`).
 ///
 /// All operations are best-effort: persistence is a convenience (auto-login on
 /// relaunch), so a Keychain failure (e.g. a missing entitlement -> errSecMissing-

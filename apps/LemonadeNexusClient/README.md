@@ -16,6 +16,39 @@ Authentication note: password login is a **deprecated server stub** (always
 fails). The supported paths are the Ed25519 identity and passkeys; the login
 UI's password field exists only for compatibility.
 
+## Device identity
+
+The client is its own mesh node and has one Ed25519 device identity per
+signed-in OS user. The SDK owns it: the per-user identity store
+(`ln_identity_user_*`, see [SDK Guide: Identity Storage](../../docs/SDK-Guide.md#identity-storage))
+wraps the seed under a key held by the OS keystore (macOS login Keychain,
+Windows DPAPI, Secret Service on Linux) and keeps the wrapped file in the
+user's own directory. The app never generates a key of its own and keeps no
+seed in `flutter_secure_storage`.
+
+- On start, and before any register, join, connect, or passkey flow, the app
+  loads the stored identity (`lib/src/state/app_state.dart`,
+  `prepareDeviceIdentity`); when none is stored it creates one.
+- There is no fallback. When no keystore is usable, the keystore is locked,
+  or the store directory cannot be written, the identity is unavailable, the
+  action fails with the reason, and Settings > Identity shows the key store,
+  the store state, the directory, and a Retry button.
+- One-time migration: a legacy per-Cluster seed in the keyring or an
+  `identity.json` in the app support directory is imported into the store
+  (most recently used first), the store's public key is checked against it,
+  and the legacy copy is deleted. When the store already holds a different
+  identity the legacy copy is kept, reported in the activity log, and never
+  used; such a Cluster card refuses to connect until it is forgotten and
+  joined again with an invitation.
+- `flutter_secure_storage` still holds the session token and user metadata
+  (`lib/src/platform/secure_store.dart`) and the Cluster keyring: group keys,
+  membership metadata, and server addresses (`lib/src/state/cluster_keyring.dart`).
+- After a confirmed account deletion the server has revoked the key, so the
+  app removes the stored identity and creates a new one.
+
+The decision logic lives in `lib/src/state/device_identity.dart` and is unit
+tested without the native library.
+
 ## Architecture
 
 ```

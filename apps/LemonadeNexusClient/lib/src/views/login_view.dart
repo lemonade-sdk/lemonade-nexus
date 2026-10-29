@@ -260,8 +260,8 @@ class _LoginViewState extends ConsumerState<LoginView> {
             side: BorderSide(color: scheme.outline)),
         title: const Text('Forget Cluster'),
         content: Text(
-          'Remove "${cluster.name}" from this device. Its key is deleted here, '
-          'so you would need a new invitation code to come back'
+          'Remove "${cluster.name}" from this device. Its account key is '
+          'deleted here, so you would need a new invitation code to come back'
           '${cluster.isOwner ? ' — and this device owns the Cluster' : ''}.',
           style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
         ),

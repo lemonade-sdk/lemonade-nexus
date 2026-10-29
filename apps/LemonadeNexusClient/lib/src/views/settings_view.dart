@@ -16,6 +16,7 @@ import 'dart:io';
 import '../sdk/sdk.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
+import '../state/device_identity.dart';
 import '../windows/windows_integration.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
@@ -199,6 +200,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                   _buildIdentityRow('User ID', appState.userId!),
                   const SizedBox(height: 12),
                 ],
+                ..._buildIdentityStoreRows(appState.deviceIdentity, notifier),
                 Row(
                   children: [
                     Expanded(
@@ -394,6 +396,47 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
         ),
       ],
     );
+  }
+
+  /// The SDK's per-user identity store: which keystore protects the device
+  /// identity, whether one is stored and unlocked, where the file lives, and
+  /// why the identity is unavailable when it is.
+  List<Widget> _buildIdentityStoreRows(DeviceIdentityState identity, AppNotifier notifier) {
+    final status = identity.status;
+    final error = identity.error;
+    return [
+      _buildIdentityRow('Key store',
+          status == null ? 'Not read yet' : identityBackendLabel(status.backend)),
+      const SizedBox(height: 12),
+      if (status != null) ...[
+        _buildIdentityRow('Store state', describeIdentityStore(status)),
+        const SizedBox(height: 12),
+        if (status.dir.isNotEmpty) ...[
+          _buildIdentityRow('Directory', status.dir),
+          const SizedBox(height: 12),
+        ],
+      ],
+      if (error != null) ...[
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.error_outline, color: AppTheme.errorColor, size: 16),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(error,
+                  key: const Key('identity-store-error'),
+                  style: const TextStyle(color: AppTheme.errorColor, fontSize: 12)),
+            ),
+            TextButton.icon(
+              onPressed: notifier.prepareDeviceIdentity,
+              icon: const Icon(Icons.refresh, size: 16),
+              label: const Text('Retry'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+      ],
+    ];
   }
 
   Widget _buildPreferenceToggle(String title, String description, bool value, ValueChanged<bool> onChanged) {
