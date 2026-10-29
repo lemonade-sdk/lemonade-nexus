@@ -617,7 +617,7 @@ protected:
 TEST_F(SdkMeshPrivateApiTest, APendingJoinIsRepeatedWithoutTheLinkTokenUntilItCommits) {
     LN_REQUIRE_TEST_TRUST();
     pending_join_replies = 1;
-    auto client = joined_client("invite-token");
+    auto client = joined_client("12345678");  // an invite code takes the link-token path
     ASSERT_TRUE(client->is_mesh_active());
     EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, false}));
     EXPECT_EQ(pending_join_replies.load(), 0);

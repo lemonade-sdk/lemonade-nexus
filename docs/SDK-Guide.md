@@ -342,16 +342,27 @@ over the mesh to the server's private API.
 
 ## Invites and Other Networks
 
-An invite is a single-use code for one group. One call creates it: without a
+An invite is single use and names one group. One call creates it: without a
 target it is for your own top-level group, with a target it is for that group
-(a subgroup, or another user's group where you hold `add_child`).
+(a subgroup, or another user's group where you hold `add_child`). The answer
+carries the invite in two forms that name the same invite: `code`, 8 decimal
+digits to read out or type, and `link_token`, the full token (`lnk_` and 64
+hex digits) for a link or a QR code.
 
 ```cpp
 auto own = client.create_link_token(600);                       // own group
 auto sub = client.create_link_token(600, "group-id",            // chosen group
                                     {"read", "connect_private"});
-// sub.value["link_token"] is the code to share.
+// sub.value["code"] is the 8-digit code to share; sub.value["link_token"]
+// is the full token. Both are returned once.
 ```
+
+Everywhere below, `code` is either form: the SDK passes it through
+unchanged, and the server treats exactly 8 digits as a code. The SDK refuses
+any other shape (`invite_format_error`) before it sends a request. The code
+works for at most 10 minutes (`code_expires_at`), the token until
+`expires_at`. A server refuses a code after 5 wrong code attempts made while
+it is live; the token still works then.
 
 | C++ | C | Purpose |
 |-----|---|---------|

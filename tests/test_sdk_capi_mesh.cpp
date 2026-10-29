@@ -70,10 +70,29 @@ TEST(SdkCapiMesh, InviteCallsWithoutAMeshFailAndReturnAnError) {
     EXPECT_NE(std::string(out).find("error"), std::string::npos);
     ln_free(out);
     out = nullptr;
-    EXPECT_EQ(ln_invite_accept(client.c, "lnk_x", &out), LN_ERR_CONNECT);
+    const std::string token = "lnk_" + std::string(64, 'a');
+    EXPECT_EQ(ln_invite_accept(client.c, token.c_str(), &out), LN_ERR_CONNECT);
     ASSERT_NE(out, nullptr);
     ln_free(out);
     out = nullptr;
+    EXPECT_EQ(ln_invite_accept(client.c, "12345678", &out), LN_ERR_CONNECT)
+        << "an 8-digit code goes to the server as the invite";
+    ASSERT_NE(out, nullptr);
+    ln_free(out);
+    out = nullptr;
+    // Neither a code nor a token: refused before any request, with the reason.
+    for (const char* malformed : {"lnk_x", "1234567", "123456789", "1234567a", ""}) {
+        EXPECT_EQ(ln_invite_accept(client.c, malformed, &out), LN_ERR_REJECTED) << malformed;
+        ASSERT_NE(out, nullptr);
+        EXPECT_NE(std::string(out).find("error"), std::string::npos);
+        ln_free(out);
+        out = nullptr;
+    }
+    EXPECT_EQ(ln_set_link_token(client.c, "12345678"), LN_OK);
+    EXPECT_EQ(ln_set_link_token(client.c, token.c_str()), LN_OK);
+    EXPECT_EQ(ln_set_link_token(client.c, ""), LN_OK);
+    EXPECT_EQ(ln_set_link_token(client.c, "1234-5678"), LN_ERR_REJECTED);
+    EXPECT_EQ(ln_set_link_token(client.c, "lnk_x"), LN_ERR_REJECTED);
     EXPECT_EQ(ln_memberships_list(client.c, &out), LN_ERR_CONNECT);
     ASSERT_NE(out, nullptr);
     ln_free(out);
