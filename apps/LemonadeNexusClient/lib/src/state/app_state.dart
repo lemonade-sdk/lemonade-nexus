@@ -19,6 +19,7 @@ import '../platform/secure_store.dart';
 import '../services/dns_discovery.dart';
 import '../services/passkey_manager.dart';
 import 'cluster_keyring.dart';
+import 'device_identity.dart';
 import 'session_policy.dart';
 
 /// Lightweight console logger for connection/state diagnostics.
@@ -311,6 +312,9 @@ class AppState {
   /// The loopback mesh port that serves group devices by name.
   final MeshPortStatus meshPortStatus;
 
+  /// This OS user's device identity in the SDK's per-user store.
+  final DeviceIdentityState deviceIdentity;
+
   const AppState({
     this.connectionStatus = ConnectionStatus.disconnected,
     this.authState = AuthState.initial,
@@ -337,6 +341,7 @@ class AppState {
     this.clusters = const [],
     this.activeClusterId,
     this.meshPortStatus = MeshPortStatus.stopped,
+    this.deviceIdentity = DeviceIdentityState.unknown,
   });
 
   AppState copyWith({
@@ -365,6 +370,7 @@ class AppState {
     List<ClusterEntry>? clusters,
     String? activeClusterId,
     MeshPortStatus? meshPortStatus,
+    DeviceIdentityState? deviceIdentity,
     // copyWith can't null a field via the ?? pattern; sign-out needs to.
     bool clearActiveCluster = false,
   }) {
@@ -395,6 +401,7 @@ class AppState {
       activeClusterId:
           clearActiveCluster ? null : (activeClusterId ?? this.activeClusterId),
       meshPortStatus: meshPortStatus ?? this.meshPortStatus,
+      deviceIdentity: deviceIdentity ?? this.deviceIdentity,
     );
   }
 
@@ -489,12 +496,13 @@ class AppNotifier extends StateNotifier<AppState> {
     } catch (_) {}
   }
 
-  /// Load persisted preferences + the Cluster keyring, then optionally
-  /// reconnect to the last-used Cluster.
+  /// Load persisted preferences + the Cluster keyring, bring up the device
+  /// identity, then optionally reconnect to the last-used Cluster.
   Future<void> _loadPreferences() async {
     final settings = await _settingsStore.load();
     state = state.copyWith(settings: settings);
     await loadClusters();
+    await prepareDeviceIdentity();
     await _restoreSession();
   }
 
@@ -677,8 +685,9 @@ class AppNotifier extends StateNotifier<AppState> {
   }
 
   // =========================================================================
-  // Clusters (accounts). A membership is a device Ed25519 key in the keyring —
-  // no passwords. Register (new), Join (invite code), Connect (already held).
+  // Clusters (accounts). A membership is this user's device identity (SDK
+  // store) plus the group key in the keyring — no passwords. Register (new),
+  // Join (invite code), Connect (already held).
   // =========================================================================
 
   /// Load the keyring into state; the login page renders this list.
@@ -693,10 +702,172 @@ class AppNotifier extends StateNotifier<AppState> {
     return base64Encode(List<int>.generate(byteCount, (_) => rng.nextInt(256)));
   }
 
-  /// Make [seedB64]'s keypair the active device identity.
-  Future<void> _activateIdentity(String seedB64) async {
-    final seed = Uint8List.fromList(base64Decode(base64.normalize(seedB64)));
-    await _sdk.createIdentityFromSeed(seed);
+  // ---- device identity --------------------------------------------------------
+  //
+  // One identity per signed-in OS user, kept by the SDK's per-user store
+  // behind the OS keystore (ln_identity_user_*). The app never generates a
+  // key of its own and never keeps a seed in secure storage: when the store
+  // is unavailable or locked the identity is missing and join/register say
+  // why. Legacy seeds (per-Cluster, in the keyring) and identity.json move
+  // into the store once, then the legacy copy is deleted.
+
+  /// Read the store, run the one-time migration, and load (or create) the
+  /// user's identity into the SDK. Safe to call again from the settings view
+  /// after the user fixes the keystore.
+  Future<void> prepareDeviceIdentity() async {
+    IdentityStoreStatus? status;
+    try {
+      status = await _sdk.identityStoreStatus();
+      _log('prepareDeviceIdentity: backend=${status.backend} '
+          'present=${status.present} unlocked=${status.unlocked}');
+      await _migrateLegacyIdentities(status);
+      await _ensureIdentityLoaded();
+      status = await _sdk.identityStoreStatus();
+      state = state.copyWith(deviceIdentity: DeviceIdentityState(status: status));
+      await _loadIdentity();
+    } on SdkException catch (e) {
+      final why = explainIdentityStoreFailure(e.error, status: status);
+      _log('prepareDeviceIdentity: ${e.error.name} -> $why');
+      state = state.copyWith(
+          deviceIdentity: DeviceIdentityState(status: status, error: why));
+      addActivity(ActivityLevel.error, 'Device identity unavailable: $why');
+    } catch (e) {
+      _log('prepareDeviceIdentity: FAILED -> $e');
+      state = state.copyWith(
+          deviceIdentity: DeviceIdentityState(status: status, error: '$e'));
+      addActivity(ActivityLevel.error, 'Device identity unavailable: $e');
+    }
+  }
+
+  /// Load the stored identity into the SDK when none is loaded; create one
+  /// when the store is empty. Throws [SdkException] when the store cannot
+  /// give one (no keystore, locked, or a damaged file).
+  Future<void> _ensureIdentityLoaded() async {
+    if (_sdk.identityPubkey != null) return;
+    try {
+      await _sdk.loadUserIdentity();
+      _log('ensureIdentityLoaded: loaded the stored identity');
+    } on SdkException catch (e) {
+      if (e.error != LnError.notFound) rethrow;
+      final created = await _sdk.createUserIdentity();
+      _log('ensureIdentityLoaded: created ${created.pubkey}');
+      addActivity(ActivityLevel.success, 'Created this device\'s identity');
+    }
+  }
+
+  /// Move legacy identity copies into the store. Imports the most recently
+  /// used copy when the store is empty, verifies the store then holds that
+  /// key, and deletes the legacy copies of the stored identity. A copy with
+  /// a different key is kept and reported; neither side is overwritten.
+  Future<void> _migrateLegacyIdentities(IdentityStoreStatus status) async {
+    final legacy = <LegacyIdentity>[];
+    for (final c in state.clusters) {
+      // Keyring order is most recently used first.
+      if (!c.hasLegacySeed) continue;
+      final seed = _decodeSeed(c.legacySeedB64!);
+      final pubkey = seed == null ? null : _sdk.publicKeyOfSeed(seed);
+      if (pubkey == null) {
+        addActivity(ActivityLevel.warning,
+            'The stored key of Cluster "${c.name}" is not valid and was left alone');
+        continue;
+      }
+      legacy.add(LegacyIdentity(
+          source: LegacyIdentitySource.keyring,
+          localId: c.localId,
+          name: 'Cluster "${c.name}"',
+          publicKey: pubkey));
+    }
+    final file = File(await AppPaths.identityFilePath());
+    String? fileText;
+    if (await file.exists()) {
+      fileText = await file.readAsString();
+      final pubkey = _sdk.publicKeyOfIdentityJson(fileText);
+      if (pubkey == null) {
+        addActivity(ActivityLevel.warning,
+            'The identity file ${file.path} is not valid and was left alone');
+      } else {
+        legacy.add(LegacyIdentity(
+            source: LegacyIdentitySource.identityFile,
+            name: file.path,
+            publicKey: pubkey));
+      }
+    }
+    if (legacy.isEmpty) return;
+
+    final plan = planIdentityMigration(
+        storePublicKey: status.present ? status.publicKey : null, legacy: legacy);
+    final toImport = plan.import;
+    if (toImport != null) {
+      final imported = toImport.source == LegacyIdentitySource.keyring
+          ? await _sdk.importUserIdentityFromSeed(
+              _decodeSeed(_clusterById(toImport.localId!)!.legacySeedB64!)!)
+          : await _sdk.importUserIdentityFromJson(fileText!);
+      final after = await _sdk.identityStoreStatus();
+      if (!after.present ||
+          after.publicKey == null ||
+          !sameIdentityKey(after.publicKey!, imported) ||
+          !sameIdentityKey(imported, toImport.publicKey)) {
+        // The store does not hold what was imported; keep the legacy copy.
+        throw SdkException(LnError.rejected,
+            message: 'the imported identity does not match the store');
+      }
+      await _deleteLegacyIdentity(toImport, file);
+      addActivity(ActivityLevel.success,
+          'Moved the device identity of ${toImport.name} into the user identity store');
+    }
+    for (final copy in plan.remove) {
+      await _deleteLegacyIdentity(copy, file);
+    }
+    for (final copy in plan.conflicts) {
+      addActivity(ActivityLevel.warning,
+          '${copy.name} uses a different device identity than the one stored for '
+          'this user; it was left in place and cannot connect. Forget it and '
+          'join again with an invitation code.');
+    }
+  }
+
+  Future<void> _deleteLegacyIdentity(LegacyIdentity copy, File identityFile) async {
+    switch (copy.source) {
+      case LegacyIdentitySource.keyring:
+        final entry = _clusterById(copy.localId!);
+        if (entry == null) return;
+        final clusters = await _keyring.upsert(entry.copyWith(clearLegacySeed: true));
+        state = state.copyWith(clusters: clusters);
+      case LegacyIdentitySource.identityFile:
+        if (await identityFile.exists()) await identityFile.delete();
+    }
+  }
+
+  ClusterEntry? _clusterById(String localId) {
+    for (final c in state.clusters) {
+      if (c.localId == localId) return c;
+    }
+    return null;
+  }
+
+  Uint8List? _decodeSeed(String seedB64) {
+    try {
+      final seed = Uint8List.fromList(base64Decode(base64.normalize(seedB64)));
+      return seed.length == 32 ? seed : null;
+    } on FormatException {
+      return null;
+    }
+  }
+
+  /// Bind this user's device identity to the connected client. Loads it from
+  /// the store first when needed; a store failure surfaces as the reason the
+  /// join or register cannot proceed.
+  Future<void> _activateIdentity() async {
+    try {
+      await _ensureIdentityLoaded();
+    } on SdkException catch (e) {
+      final why = explainIdentityStoreFailure(e.error,
+          status: state.deviceIdentity.status);
+      state = state.copyWith(
+          deviceIdentity: DeviceIdentityState(
+              status: state.deviceIdentity.status, error: why));
+      throw DeviceIdentityUnavailable(why);
+    }
     await _sdk.setIdentity();
   }
 
@@ -795,8 +966,7 @@ class AppNotifier extends StateNotifier<AppState> {
     try {
       if (!await _ensureServerConnection()) return false;
 
-      final seedB64 = _randomBase64(32);
-      await _activateIdentity(seedB64);
+      await _activateIdentity();
       if (!await _authJoinAndLoad(name)) return false;
 
       String? groupKey;
@@ -813,7 +983,6 @@ class AppNotifier extends StateNotifier<AppState> {
         localId: _randomBase64(8),
         name: name,
         role: 'owner',
-        seedB64: seedB64,
         groupKeyB64: groupKey,
         userId: state.userId,
         serverHost: s.serverHost,
@@ -838,8 +1007,7 @@ class AppNotifier extends StateNotifier<AppState> {
     try {
       if (!await _ensureServerConnection()) return false;
 
-      final seedB64 = _randomBase64(32);
-      await _activateIdentity(seedB64);
+      await _activateIdentity();
       _sdk.setLinkToken(inviteCode.trim());
       if (!await _authJoinAndLoad(name)) return false;
 
@@ -849,7 +1017,6 @@ class AppNotifier extends StateNotifier<AppState> {
         localId: _randomBase64(8),
         name: name,
         role: 'member',
-        seedB64: seedB64,
         groupKeyB64: groupKey,
         userId: state.userId,
         serverHost: s.serverHost,
@@ -875,6 +1042,17 @@ class AppNotifier extends StateNotifier<AppState> {
     state = state.copyWith(isLoading: true, errorMessage: null);
     _log('connectToCluster: "${entry.name}" (${entry.role})');
     try {
+      if (entry.hasLegacySeed) {
+        // Its key was not moved into the store because the store holds a
+        // different identity; the server knows this membership by that key.
+        state = state.copyWith(
+          errorMessage: '"${entry.name}" was registered with a different device '
+              'identity than the one stored for this user. Forget it on this '
+              'device and join again with an invitation code.',
+          isLoading: false,
+        );
+        return false;
+      }
       if (!await _ensureServerConnection(
           host: entry.serverHost.isEmpty ? null : entry.serverHost,
           port: entry.serverPort == 0 ? null : entry.serverPort,
@@ -882,7 +1060,7 @@ class AppNotifier extends StateNotifier<AppState> {
         return false;
       }
 
-      await _activateIdentity(entry.seedB64);
+      await _activateIdentity();
       if (!await _authJoinAndLoad(entry.name)) return false;
 
       // Pick up the group key if an owner provisioned it since last time.
@@ -913,8 +1091,9 @@ class AppNotifier extends StateNotifier<AppState> {
   /// the account's groups and devices, its memberships and account data, and
   /// revokes its key (ln_account_delete); the application root stays. After a
   /// confirmed deletion this device removes its own copy: the Cluster keyring
-  /// entry (identity seed and group key), the stored session, and the group
-  /// loopback certificates, then signs out. Returns the server answer. With
+  /// entry (group key), the stored session, the group loopback certificates,
+  /// and the revoked device identity in the user identity store (a new one is
+  /// created in its place), then signs out. Returns the server answer. With
   /// status "pending" Tier 1 has not committed the deletion yet, and nothing
   /// local is removed. Throws SdkException when the server refuses.
   Future<Map<String, dynamic>> deleteAccount() async {
@@ -934,6 +1113,18 @@ class AppNotifier extends StateNotifier<AppState> {
     }
     if (localId != null) await forgetCluster(localId);
     await signOut();
+    // The server revoked this key: every membership of the identity is gone,
+    // so a fresh identity replaces it in the store.
+    try {
+      await _sdk.removeUserIdentity();
+      addActivity(ActivityLevel.info, 'Removed the revoked device identity');
+    } on SdkException catch (e) {
+      _log('deleteAccount: could not remove the stored identity: ${e.error.name}');
+      addActivity(ActivityLevel.warning,
+          'The revoked device identity is still stored: '
+          '${explainIdentityStoreFailure(e.error, status: state.deviceIdentity.status)}');
+    }
+    await prepareDeviceIdentity();
     addActivity(ActivityLevel.warning, 'Account deleted');
     return result;
   }
@@ -1272,16 +1463,13 @@ class AppNotifier extends StateNotifier<AppState> {
   /// Establishes the Ed25519 mesh identity for a passkey session.
   ///
   /// Passkey auth (Secure Enclave P-256) is auth-only; mesh node creation needs
-  /// a separate Ed25519 identity. Generate + set one, register it via an Ed25519
-  /// challenge so the server grants node-creation permission, then restore the
-  /// passkey session token (Ed25519 auth returns its own). Mirrors the macOS
-  /// passkey flow (generateIdentity -> authenticateEd25519 -> re-set token).
+  /// a separate Ed25519 identity. Bind this user's stored device identity,
+  /// register it via an Ed25519 challenge so the server grants node-creation
+  /// permission, then restore the passkey session token (Ed25519 auth returns
+  /// its own).
   Future<void> _establishPasskeyMeshIdentity(String? passkeyToken) async {
     try {
-      await _sdk.generateIdentity();
-      // Flutter's generateIdentity() (unlike macOS) does not set the identity on
-      // the client — do it explicitly so join/tree ops can sign.
-      await _sdk.setIdentity();
+      await _activateIdentity();
       try {
         await _sdk.authEd25519();
         _log('establishPasskeyMeshIdentity: Ed25519 key registered');
@@ -1293,6 +1481,8 @@ class AppNotifier extends StateNotifier<AppState> {
       if (passkeyToken != null) await _sdk.setSessionToken(passkeyToken);
     } catch (e) {
       _log('establishPasskeyMeshIdentity: FAILED -> $e');
+      addActivity(ActivityLevel.error,
+          'This session has no device identity; mesh operations will fail: $e');
     }
   }
 

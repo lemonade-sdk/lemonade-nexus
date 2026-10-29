@@ -14,7 +14,9 @@ class AppPaths {
     return dir;
   }
 
-  /// File holding the Ed25519 identity (written via the SDK's ln_identity_save).
+  /// The legacy plaintext identity file (`ln_identity_save` format). The
+  /// device identity now lives in the SDK's per-user identity store; a file
+  /// found here is imported once and deleted (see `device_identity.dart`).
   static Future<String> identityFilePath() async {
     final dir = await supportDir();
     return p.join(dir.path, 'identity.json');

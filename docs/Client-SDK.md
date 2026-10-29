@@ -217,8 +217,10 @@ deletes:
 - the certificate directory (the `ln_mesh_port_set_cert_dir` path);
 - any stored copy of the session token or node id.
 
-The Flutter client removes the account's keyring entry (seed and group key),
-the stored session, and the group loopback certificates, and then signs out.
+The Flutter client removes the account's keyring entry (group key), the
+stored session, and the group loopback certificates, signs out, and then
+removes the revoked device identity from the per-user identity store and
+creates a new one (see the client README, "Device identity").
 
 ## Linking
 

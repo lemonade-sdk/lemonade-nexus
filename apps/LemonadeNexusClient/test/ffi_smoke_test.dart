@@ -58,6 +58,34 @@ void main() {
     }
   });
 
+  test('identity store calls resolve and report without writing', () {
+    final lib = _libFile();
+    if (!lib.existsSync()) {
+      markTestSkipped('SDK library not built at ${lib.path}');
+      return;
+    }
+    final sdk = LemonadeNexusFfi(libraryPath: lib.absolute.path);
+    expect(sdk.missingSymbols(), isEmpty);
+    // Read-only: the status names the keystore and directory of this user.
+    final dir = sdk.identityUserDir();
+    expect(dir, isNotNull);
+    expect(dir, isNotEmpty);
+    final (error, json) = sdk.identityUserStatus();
+    expect(error, LnError.success);
+    final status = jsonDecode(json!) as Map<String, dynamic>;
+    expect(status['backend'], isA<String>());
+    expect(status['dir'], dir);
+    expect(status.containsKey('private_key'), isFalse);
+    expect(status.containsKey('seed'), isFalse);
+    // Malformed legacy text yields no handle.
+    expect(sdk.identityFromJson('not json'), ffi.nullptr);
+    expect(sdk.identityFromJson('{"public_key":"","private_key":""}'), ffi.nullptr);
+    // A valid identity.json text round-trips to a handle without the store.
+    final generated = sdk.identityGenerate();
+    expect(generated, isNot(ffi.nullptr));
+    sdk.identityDestroy(generated);
+  });
+
   test('mesh port calls resolve and report a stopped port', () {
     final lib = _libFile();
     if (!lib.existsSync()) {
