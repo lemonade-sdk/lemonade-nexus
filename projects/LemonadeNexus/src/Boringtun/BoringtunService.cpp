@@ -256,7 +256,8 @@ std::vector<BoringtunPeer> BoringtunService::do_get_peers() {
 // Peer sync from tree (composes the verbs above)
 // ---------------------------------------------------------------------------
 
-int BoringtunService::do_sync_peers_from_tree(const std::vector<TreeNodePeer>& desired_peers) {
+int BoringtunService::do_sync_peers_from_tree(const std::vector<TreeNodePeer>& desired_peers,
+                                              bool remove_stale) {
     for (const auto& dp : desired_peers) {
         if (!is_valid_pubkey(dp.public_key)) {
             spdlog::error("[{}] sync: invalid pubkey '{}'", name(), dp.public_key);
@@ -299,9 +300,15 @@ int BoringtunService::do_sync_peers_from_tree(const std::vector<TreeNodePeer>& d
         }
     }
 
-    for (const auto& cp : current_peers) {
-        if (!desired_keys.count(cp.public_key)) {
-            if (do_remove_peer(cp.public_key)) ++changes;
+    // Additive reconcile (remove_stale == false) leaves peers not in the
+    // desired set in place. The startup restore uses it: the tree lists only
+    // the client endpoints, not the server-to-server backbone peers that
+    // GossipService adds, so a full reconcile would drop those.
+    if (remove_stale) {
+        for (const auto& cp : current_peers) {
+            if (!desired_keys.count(cp.public_key)) {
+                if (do_remove_peer(cp.public_key)) ++changes;
+            }
         }
     }
 
