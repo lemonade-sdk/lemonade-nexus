@@ -294,6 +294,10 @@ void MeshOrchestrator::do_peer_refresh() {
                 peer.last_handshake = std::max(peer.last_handshake, old.last_handshake);
                 peer.last_rx        = std::max(peer.last_rx, old.last_rx);
                 peer.is_online      = old.is_online;
+                // The server does not know the relay path; the next monitor
+                // pass corrects it. Without this the path read "" between a
+                // refresh and that pass, and the mesh port saw a path change.
+                if (peer.relay_endpoint.empty()) peer.relay_endpoint = old.relay_endpoint;
                 break;
             }
         }
@@ -415,8 +419,14 @@ void MeshOrchestrator::do_monitor() {
                         peer.last_handshake = tp.last_handshake;
                     }
                     if (tp.last_rx > peer.last_rx) peer.last_rx = tp.last_rx;
-                    // A relayed peer reports the relay it goes through.
-                    if (!tp.relay_endpoint.empty()) peer.relay_endpoint = tp.relay_endpoint;
+                    // A relayed peer reports the relay it goes through. A
+                    // peer the dataplane now reaches at another address left
+                    // its relay; a listed relay node keeps its endpoint.
+                    if (!tp.relay_endpoint.empty()) {
+                        peer.relay_endpoint = tp.relay_endpoint;
+                    } else if (!tp.endpoint.empty() && peer.relay_endpoint != tp.endpoint) {
+                        peer.relay_endpoint.clear();
+                    }
                     break;
                 }
             }

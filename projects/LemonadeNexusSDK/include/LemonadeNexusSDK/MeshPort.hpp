@@ -42,6 +42,9 @@ struct MeshPortMember {
     /// This device's key holds connect_private, connect_shared or admin on the node.
     bool        can_connect{false};
     double      latency_ms{0.0};      ///< Mesh latency; 0 when unknown.
+    /// "ip:port" of the relay the mesh reaches the device through; empty on a
+    /// direct path. A change closes the device's egress bridge.
+    std::string relay_endpoint;
 };
 
 /// What a device's SDK answers at GET /.nexus/catalog: the app that registered

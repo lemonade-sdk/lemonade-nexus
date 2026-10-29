@@ -700,6 +700,14 @@ ln_mesh_port_stop(client);
   be online and Tier 3 (409 otherwise), and this device must hold
   `connect_private`, `connect_shared` or `admin` on it (403 otherwise). An
   unknown name answers 404.
+- The port closes its loopback bridge to a device when the device's mesh
+  address or its relay path changes (it moves onto a relay, onto a new relay
+  allocation, or back to a direct path), so the next request opens a fresh
+  bridge. A forwarded request whose bridge answers nothing within 10 s gets a
+  new bridge and is sent once more; a request that reached the device and
+  failed before its first response byte can therefore run twice. An
+  application that holds a port from `ln_mesh_open_egress` should call it
+  again before each connection.
 - This device's own name and the loopback names serve the selection: `local`
   (the local service URL given to `ln_mesh_port_start`), `auto`, or one node ID.
   Without a selection, or when the selected device is offline, the answer is

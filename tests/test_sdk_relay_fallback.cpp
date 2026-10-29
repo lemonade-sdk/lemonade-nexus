@@ -222,6 +222,34 @@ TEST_F(SdkRelayFallbackTest, RelayIsNeededOnlyWithoutAWorkingDirectPath) {
     EXPECT_TRUE(F::relay_needed(true, now - 10, now, 0ms, false, t));
 }
 
+// A working relay stays: once it carried traffic, a pass that reads no
+// handshake (an idle session renegotiating after REJECT_AFTER_TIME) or only
+// keepalives (a session that predates the pairing) keeps it. Re-allocating
+// then blamed a working relay, and the two sides chose different relays.
+TEST_F(SdkRelayFallbackTest, AWorkingRelayIsKeptWhileItsSessionRenegotiates) {
+    using F = lnsdk::RelayFallback;
+    using A = F::PairedAction;
+    const F::Timing t;
+    const int64_t now = 1'000'000;
+    // Paired, nothing yet: wait for the grace period, then blame the relay.
+    EXPECT_EQ(F::paired_action(0, 0, now, 5s, false, t), A::Wait);
+    EXPECT_EQ(F::paired_action(0, 0, now, t.handshake_grace + 1s, false, t), A::AbandonUnproven);
+    // Keepalives through the relay prove it without a new handshake.
+    EXPECT_EQ(F::paired_action(now - 2, 0, now, 90s, false, t), A::Working);
+    // A handshake seen 179 s ago, and the dataplane reads none now while the
+    // session renegotiates: the relay is kept.
+    EXPECT_EQ(F::paired_action(now - 179, 0, now, 600s, false, t), A::Working);
+    EXPECT_EQ(F::paired_action(now - 200, 0, now, 600s, false, t), A::Working);
+    // Nothing through the relay for longer than the session lifetime and the
+    // grace period: abandon it without blame.
+    const int64_t grace = std::chrono::duration_cast<std::chrono::seconds>(t.handshake_grace).count();
+    EXPECT_EQ(F::paired_action(now - t.handshake_fresh_sec - grace - 1, 0, now, 600s, false, t),
+              A::AbandonStale);
+    // A direct path that answered with a fresh handshake replaces the relay.
+    EXPECT_EQ(F::paired_action(now - 2, now - 1, now, 60s, true, t), A::PromoteDirect);
+    EXPECT_EQ(F::paired_action(now - 2, 0, now, 60s, true, t), A::Working);
+}
+
 TEST_F(SdkRelayFallbackTest, BothRendezvousSidesMatch) {
     const auto window = relay::relay_rendezvous_window(now_s());
     const auto a = alice.relay_rendezvous(bob_keys.second, "relay-1", window);
