@@ -4,8 +4,8 @@ Documentation=https://github.com/lemonade-sdk/lemonade-nexus/blob/main/docs/Rele
 # Started by nexus-updater.path (the server touched the wake marker) and by
 # nexus-updater.timer. One run is one cycle: verify the latest release, stage
 # it, and install it only when the server grants the upgrade turn. A cycle
-# that finds another server in its turn asks the local gate again for up to
-# 20 minutes before it ends. See docs/Design-Auto-Update.md, Phase 4.
+# that has staged a release and finds no turn yet asks the local gate again
+# for up to 20 minutes before it ends. See docs/Design-Auto-Update.md, Phase 4.
 After=network-online.target lemonade-nexus.service
 Wants=network-online.target
 

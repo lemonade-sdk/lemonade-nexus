@@ -421,10 +421,13 @@ not started). Two things start a cycle:
   up to one minute of jitter) after the last cycle. It is the fallback for a
   missed path change and the way the first server discovers a release.
 
-A cycle that finds the rollout open with another server in its turn stays
-alive and asks the local turn gate again every 10 seconds, for up to 20
-minutes, without GitHub traffic. A cycle never installs on a wake alone: the
-same gate, witness attestation, health gate, and signed release checks apply.
+A cycle that has staged a release and finds no turn yet (no rollout started,
+or another server in its turn) stays alive and asks the local turn gate again
+every 10 seconds, for up to 20 minutes in all, without GitHub traffic. A
+server that staged before the Start is already waiting when the Start lands
+and takes its turn in the same cycle. A cycle never installs on a wake alone:
+the same gate, witness attestation, health gate, and signed release checks
+apply.
 
 Expected timing: one server takes about the install and restart (one to two
 minutes) plus the witness attestation of its new release. A rollout over six

@@ -93,10 +93,11 @@ Tier 2 server is not held to a tree log, even when an older release ran one. A
 
 1. Every server polls the releases, verifies, and stages. Its updater sends
    `offer_approval` (a refusal stops the cycle), then `stage`, then `turn`.
-   On `wait` the cycle asks `turn` again every 10 seconds for up to 20
-   minutes; on `not_started` it ends, and the server's wake marker
+   On `not_started` or `wait` the cycle asks `turn` again every 10 seconds
+   for up to 20 minutes in all, so a server that staged before the Start is
+   waiting when it finalizes. When no cycle runs, the server's wake marker
    (`/run/lemonade-nexus/updater-wake`, watched by `nexus-updater.path`)
-   starts the next cycle when a Start it takes part in finalizes.
+   starts one when a Start it takes part in finalizes.
 2. A Tier 1 leader proposes a Start record when every Tier 1 member reports a
    live status and some server runs an older release. The order is Tier 2
    servers first (those that report a configured attestation collector), then

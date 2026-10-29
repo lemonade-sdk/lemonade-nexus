@@ -1093,23 +1093,57 @@ TEST(UpdaterCycle, AHaltDuringTheLocalWaitEndsTheCycleAtOnce) {
     EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
 }
 
-TEST(UpdaterCycle, NoLocalWaitBeforeARolloutStarts) {
+TEST(UpdaterCycle, AStartAndThenTheTurnDuringTheLocalWaitAreTakenInOneCycle) {
     Host h;
     h.turn_gate = "not_started";
+    int asked = 0;
+    h.on_turn = [&] {
+        ++asked;
+        if (asked == 3) h.turn_gate = "wait";
+        if (asked == 5) h.turn_gate = "go";
+    };
     auto u = h.updater();
     const auto started = h.clock;
-    EXPECT_EQ(u.run_once().outcome, CycleOutcome::Waiting);
-    // The wake marker restarts the cycle when the Start finalizes; the cycle
-    // does not hold the service open until then.
-    EXPECT_EQ(std::count(h.ops.begin(), h.ops.end(), "turn"), 1);
-    EXPECT_EQ(h.clock, started);
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_EQ(asked, 5);
+    EXPECT_EQ(h.clock - started, 4 * h.turn_poll);
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-new");
+    EXPECT_EQ(h.reports, std::vector<std::string>{"upgraded"});
+}
+
+TEST(UpdaterCycle, TheLocalWaitWindowIsSharedAcrossNotStartedAndWait) {
+    Host h;
+    h.turn_gate = "not_started";
+    const auto polls = static_cast<int>(h.turn_wait / h.turn_poll);
+    int asked = 0;
+    h.on_turn = [&] {
+        // The rollout starts halfway through the window; the turn never opens.
+        if (++asked == polls / 2) h.turn_gate = "wait";
+    };
+    auto u = h.updater();
+    const auto started = h.clock;
+    const auto r = u.run_once();
+    EXPECT_EQ(r.outcome, CycleOutcome::Waiting) << r.detail;
+    EXPECT_NE(r.detail.find("wait"), std::string::npos) << r.detail;
+    EXPECT_EQ(asked, 1 + polls);
+    EXPECT_EQ(h.clock - started, h.turn_wait);
+    EXPECT_FALSE(h.ran({"systemctl", "stop"}));
 }
 
 TEST(UpdaterCycle, WaitsWhenNoRolloutStartedForTheRelease) {
     Host h;
     h.turn_gate = "not_started";
     auto u = h.updater();
-    EXPECT_EQ(u.run_once().outcome, CycleOutcome::Waiting);
+    const auto started = h.clock;
+    const auto r = u.run_once();
+    EXPECT_EQ(r.outcome, CycleOutcome::Waiting) << r.detail;
+    EXPECT_NE(r.detail.find("not_started"), std::string::npos) << r.detail;
+    // The cycle stays and asks the gate through the window, so a Start that
+    // lands meanwhile is seen without a new cycle.
+    const auto polls = static_cast<std::size_t>(h.turn_wait / h.turn_poll);
+    EXPECT_EQ(std::count(h.ops.begin(), h.ops.end(), "turn"), static_cast<long>(1 + polls));
+    EXPECT_EQ(h.clock - started, h.turn_wait);
     EXPECT_FALSE(h.ran({"systemctl", "stop"}));
 }
 

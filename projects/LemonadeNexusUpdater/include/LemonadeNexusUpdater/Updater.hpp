@@ -12,11 +12,13 @@
 //      provenance of every consumed asset. Any failure stops the cycle.
 //   4. Stage the verified files under the state directory.
 //   5. Offer the approval to the server (its release chain must accept it),
-//      report the staged release, and ask for the upgrade turn. On "wait"
-//      (the rollout is open, another server holds the turn) ask the local
-//      gate again every kTurnPollInterval for up to kTurnWaitWindow, with no
-//      GitHub traffic. Without "go" at the end, stop and wait; on "halted",
-//      halt this release.
+//      report the staged release, and ask for the upgrade turn. On
+//      "not_started" (no rollout yet) or "wait" (another server holds the
+//      turn) ask the local gate again every kTurnPollInterval for up to
+//      kTurnWaitWindow in all, with no GitHub traffic, so that a server that
+//      staged before the Start sees the Start, then its turn, in one cycle.
+//      Without "go" at the end, stop and wait; on "halted", halt this
+//      release.
 //   6. Take a health baseline. Plan the OS packages and decide whether the
 //      boot chain changes. For a reboot, have the server stage the sealed
 //      boot set for the new PCRs first.
@@ -62,8 +64,9 @@ inline constexpr std::string_view kProvenanceSuffix = ".sigstore.json";
 inline constexpr std::string_view kServerUnit = "lemonade-nexus.service";
 inline constexpr std::string_view kAttestdUnit = "nexus-attestd.service";
 
-/// How often a cycle asks the local turn gate again after "wait", and for how
-/// long at most. The server touches the wake marker when the turn opens and
+/// How often a cycle with a staged release asks the local turn gate again
+/// after "not_started" or "wait", and for how long at most. The server
+/// touches the wake marker when a rollout starts and when the turn opens, and
 /// nexus-updater.path starts a cycle then; this wait inside a cycle covers a
 /// wake that arrives while the cycle runs, and keeps the lag after a missed
 /// change to one interval. A cycle that sees no turn within the window ends as
@@ -94,8 +97,8 @@ struct UpdaterConfig {
     ReleaseTrust trust;
     std::chrono::seconds health_timeout{std::chrono::minutes(15)};
     std::chrono::seconds health_poll{std::chrono::seconds(10)};
-    /// The local wait after a "wait" gate answer (kTurnPollInterval,
-    /// kTurnWaitWindow); tests shorten them.
+    /// The local wait after a "not_started" or "wait" gate answer
+    /// (kTurnPollInterval, kTurnWaitWindow); tests shorten them.
     std::chrono::seconds turn_poll{kTurnPollInterval};
     std::chrono::seconds turn_wait{kTurnWaitWindow};
     std::size_t max_asset_bytes{256u * 1024 * 1024};
@@ -155,10 +158,13 @@ private:
 
     /// One turn request; nullopt when the gate did not answer.
     std::optional<TurnGate> ask_turn(uint64_t release_number);
-    /// After "wait": asks the gate again every config.turn_poll until it
-    /// answers something else or config.turn_wait has passed. A missing
-    /// answer inside the window counts as "wait" (the server may be busy).
-    TurnGate await_turn(uint64_t release_number, const std::string& tag);
+    /// "not_started" or "wait": the cycle keeps asking.
+    [[nodiscard]] static bool turn_pending(TurnGate gate);
+    /// After a pending answer `last`: asks the gate again every
+    /// config.turn_poll until it answers something else or config.turn_wait
+    /// has passed, and then returns the last pending answer. A missing answer
+    /// inside the window counts as pending (the server may be busy).
+    TurnGate await_turn(uint64_t release_number, TurnGate last, const std::string& tag);
     std::optional<Release> fetch_and_verify(const State& state, std::string& error);
     std::optional<std::string> fetch_asset(const std::string& tag, const std::string& name,
                                            const std::string& url, std::string& error);
