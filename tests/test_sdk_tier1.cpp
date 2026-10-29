@@ -300,6 +300,36 @@ TEST_F(SdkTier1Test, ASessionIsPinnedToTheServerThatIssuedIt) {
     EXPECT_TRUE(log.hosts.empty());
 }
 
+// Without a pin, no avoided member's server is tried; with every member
+// avoided, nothing is sent. A pin is not affected by the avoid set.
+TEST_F(SdkTier1Test, AvoidedMembersAreNotTried) {
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    ASSERT_TRUE(dir.refresh(seed("t2.example")).ok);
+    AttemptLog log;
+    std::string error;
+    lnsdk::Tier1Server answered;
+    const auto t1b = b64(epoch2[2].public_key);
+    std::string t1a;
+    for (const auto& server : dir.membership().servers) {
+        if (server.node_id != t1b) t1a = server.node_id;
+    }
+    ASSERT_FALSE(t1a.empty());
+
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(dir.send(log.attempt(), "", &answered, error, {t1a}).has_value()) << error;
+    }
+    EXPECT_EQ(log.hosts, (std::vector<std::string>{"t1b.example", "t1b.example", "t1b.example"}));
+
+    log.hosts.clear();
+    EXPECT_FALSE(dir.send(log.attempt(), "", &answered, error, {t1a, t1b}).has_value());
+    EXPECT_TRUE(log.hosts.empty());
+    EXPECT_FALSE(error.empty());
+
+    ASSERT_TRUE(dir.send(log.attempt(), t1b, &answered, error, {t1a, t1b}).has_value()) << error;
+    EXPECT_EQ(log.hosts, std::vector<std::string>{"t1b.example"});
+}
+
 TEST_F(SdkTier1Test, AForgedMembershipIsRefused) {
     // Another Genesis key signs a chain that names the hostile servers.
     auto forged = Chain::make({{new_identity(), new_identity(), new_identity(), new_identity()}});

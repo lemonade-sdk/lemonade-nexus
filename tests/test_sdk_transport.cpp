@@ -316,9 +316,23 @@ protected:
     std::atomic<bool>                   list_second_server{false};
     std::atomic<int>                    second_auth_posts{0};
     // A server that has not received an invite's mint refuses the invite as
-    // unknown: /api/join with a link token answers 403 there.
+    // unknown: /api/join with a link token answers 403 there. The refusals
+    // each server sent are counted.
     std::atomic<bool>                   first_server_lacks_invites{false};
     std::atomic<bool>                   second_server_lacks_invites{false};
+    std::atomic<int>                    first_invite_refusals{0};
+    std::atomic<int>                    second_invite_refusals{0};
+
+    // A third public server: another verified member of both epochs
+    // (`third_identity`), listed by /api/servers once `list_third_server` is
+    // set. It answers every challenge 421, so no join is ever pinned to it:
+    // the failover in Tier1Directory::send passes over it to another member.
+    std::unique_ptr<httplib::SSLServer> pub3;
+    std::thread                         pub3_thread;
+    int                                 pub3_port = 0;
+    nexus::crypto::Ed25519Keypair       third_identity{};
+    std::atomic<bool>                   list_third_server{false};
+    std::atomic<int>                    third_auth_posts{0};
 
     // The session moves the SDK reported.
     std::mutex                          moves_mtx;
@@ -364,7 +378,10 @@ protected:
         second_identity = tier1_chain_test::new_identity();
         std::vector<nexus::crypto::Ed25519Keypair> epoch1 = {server_identity, second_identity};
         std::vector<nexus::crypto::Ed25519Keypair> epoch2 = {next_identity, second_identity};
-        for (int i = 0; i < 3; ++i) {
+        third_identity = tier1_chain_test::new_identity();
+        epoch1.push_back(third_identity);
+        epoch2.push_back(third_identity);
+        for (int i = 0; i < 2; ++i) {
             const auto member = tier1_chain_test::new_identity();
             epoch1.push_back(member);
             epoch2.push_back(member);
@@ -381,6 +398,15 @@ protected:
         ASSERT_GT(pub2_port, 0);
         pub2_thread = std::thread([this] { pub2->listen_after_bind(); });
         pub2->wait_until_ready();
+
+        pub3 = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
+        ASSERT_TRUE(pub3->is_valid());
+        add_public_routes(*pub3, pub3_port, &third_identity, third_auth_posts,
+                          "session-token-4");
+        pub3_port = pub3->bind_to_any_port("127.0.0.1");
+        ASSERT_GT(pub3_port, 0);
+        pub3_thread = std::thread([this] { pub3->listen_after_bind(); });
+        pub3->wait_until_ready();
     }
 
     /// Serve the first server's public API on `pub_port` (any free port the
@@ -519,6 +545,9 @@ protected:
             if (list_second_server.load()) {
                 list.push_back({{"fqdn", "localhost"}, {"http_port", pub2_port}});
             }
+            if (list_third_server.load()) {
+                list.push_back({{"fqdn", "localhost"}, {"http_port", pub3_port}});
+            }
             res.set_content(list.dump(), "application/json");
         });
         srv.Get("/api/tier1/proof", [this, &port, fixed_identity](const httplib::Request& req,
@@ -540,7 +569,14 @@ protected:
                     .dump(),
                 "application/json");
         });
-        srv.Post("/api/auth/challenge", [](const httplib::Request&, httplib::Response& res) {
+        srv.Post("/api/auth/challenge", [this, fixed_identity](const httplib::Request&,
+                                                               httplib::Response& res) {
+            if (fixed_identity == &third_identity) {
+                res.status = 421;
+                res.set_content(R"({"error":"this server does not hold the tree"})",
+                                "application/json");
+                return;
+            }
             std::array<uint8_t, 32> challenge{};
             randombytes_buf(challenge.data(), challenge.size());
             res.set_content(
@@ -564,9 +600,12 @@ protected:
                 std::lock_guard lock(bearer_mtx);
                 join_bearers_seen.push_back(req.get_header_value("Authorization"));
             }
-            const bool lacks_invites =
-                fixed_identity ? second_server_lacks_invites.load() : first_server_lacks_invites.load();
+            const bool second = fixed_identity == &second_identity;
+            const bool lacks_invites = fixed_identity == &third_identity ? false
+                                       : second ? second_server_lacks_invites.load()
+                                                : first_server_lacks_invites.load();
             if (lacks_invites && body.is_object() && body.contains("link_token")) {
+                ++(second ? second_invite_refusals : first_invite_refusals);
                 res.status = 403;
                 res.set_content(R"({"error":"invalid or expired link token"})", "application/json");
                 return;
@@ -609,9 +648,11 @@ protected:
     void TearDown() override {
         if (pub) pub->stop();
         if (pub2) pub2->stop();
+        if (pub3) pub3->stop();
         if (priv) priv->stop();
         if (pub_thread.joinable()) pub_thread.join();
         if (pub2_thread.joinable()) pub2_thread.join();
+        if (pub3_thread.joinable()) pub3_thread.join();
         if (priv_thread.joinable()) priv_thread.join();
         peer_mesh.stop();
         server_mesh.stop();
@@ -1337,5 +1378,81 @@ TEST_F(SdkMeshPrivateApiTest, AnInviteEveryMemberRefusesIsReportedInvalidOnce) {
     EXPECT_EQ(joined.http_status, 403);
     EXPECT_EQ(joined.error, "invalid or expired link token");
     EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, true}));
+    EXPECT_FALSE(client.is_mesh_active());
+}
+
+// A join waits before it asks another member, so a mint seconds old can
+// replicate there: the hop does not follow the refusal at once.
+TEST_F(SdkMeshPrivateApiTest, AnInviteHopWaitsForReplicationFirst) {
+    LN_REQUIRE_TEST_TRUST();
+    list_second_server = true;
+    first_server_lacks_invites = true;
+
+    lnsdk::ServerConfig cfg;
+    cfg.servers = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    lnsdk::Identity identity;
+    identity.generate();
+    client.set_identity(identity);
+    client.set_session_token("session-token");
+    ASSERT_TRUE(client.set_link_token("12345678"));
+    constexpr std::chrono::milliseconds kDelay{800};
+    client.set_invite_hop_delay(kDelay);
+    const auto refreshed = client.refresh_tier1();
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    ASSERT_EQ(client.tier1_membership().servers.size(), 2u);
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto joined = client.join_network("user", "password");
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    ASSERT_TRUE(joined.ok) << joined.error;
+    EXPECT_GE(elapsed, kDelay);
+    EXPECT_EQ(first_invite_refusals.load(), 1);
+    EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, true}));
+    EXPECT_EQ(client.session_token(), "session-token-3");
+}
+
+// Two members refuse the invite while a third verified member takes no
+// challenge, so the challenge failover keeps landing on the two that refused.
+// The join asks each of them once, makes at most three attempts, and reports
+// the refusal; it does not alternate between them.
+TEST_F(SdkMeshPrivateApiTest, MembersThatRefusedAnInviteAreNotAskedAgain) {
+    LN_REQUIRE_TEST_TRUST();
+    list_second_server = true;
+    list_third_server = true;
+    first_server_lacks_invites = true;
+    second_server_lacks_invites = true;
+
+    lnsdk::ServerConfig cfg;
+    cfg.servers = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    lnsdk::Identity identity;
+    identity.generate();
+    client.set_identity(identity);
+    client.set_session_token("session-token");
+    ASSERT_TRUE(client.set_link_token("12345678"));
+    constexpr std::chrono::milliseconds kDelay{200};
+    client.set_invite_hop_delay(kDelay);
+    const auto refreshed = client.refresh_tier1();
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    ASSERT_EQ(client.tier1_membership().servers.size(), 3u);
+
+    auto pending = std::async(std::launch::async,
+                              [&client] { return client.join_network("user", "password"); });
+    ASSERT_EQ(pending.wait_for(std::chrono::seconds(30)), std::future_status::ready)
+        << "the join kept asking the members that refused";
+    const auto joined = pending.get();
+    EXPECT_FALSE(joined.ok);
+    EXPECT_EQ(joined.http_status, 403);
+    EXPECT_EQ(joined.error, "invalid or expired link token");
+    EXPECT_EQ(first_invite_refusals.load(), 1);
+    EXPECT_EQ(second_invite_refusals.load(), 1);
+    EXPECT_LE(joins_with_link_token().size(), 3u);
+    EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, true}));
+    EXPECT_EQ(third_auth_posts.load(), 0);
     EXPECT_FALSE(client.is_mesh_active());
 }
