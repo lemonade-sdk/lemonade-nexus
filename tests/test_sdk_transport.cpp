@@ -315,6 +315,10 @@ protected:
     nexus::crypto::Ed25519Keypair       second_identity{};
     std::atomic<bool>                   list_second_server{false};
     std::atomic<int>                    second_auth_posts{0};
+    // A server that has not received an invite's mint refuses the invite as
+    // unknown: /api/join with a link token answers 403 there.
+    std::atomic<bool>                   first_server_lacks_invites{false};
+    std::atomic<bool>                   second_server_lacks_invites{false};
 
     // The session moves the SDK reported.
     std::mutex                          moves_mtx;
@@ -559,6 +563,13 @@ protected:
             {
                 std::lock_guard lock(bearer_mtx);
                 join_bearers_seen.push_back(req.get_header_value("Authorization"));
+            }
+            const bool lacks_invites =
+                fixed_identity ? second_server_lacks_invites.load() : first_server_lacks_invites.load();
+            if (lacks_invites && body.is_object() && body.contains("link_token")) {
+                res.status = 403;
+                res.set_content(R"({"error":"invalid or expired link token"})", "application/json");
+                return;
             }
             if (pending_join_replies.load() > 0) {
                 --pending_join_replies;
@@ -1261,4 +1272,70 @@ TEST_F(SdkMeshPrivateApiTest, HeartbeatWithoutStunSendsAnEmptyEndpoint) {
     ASSERT_TRUE(wait_for([&] { return heartbeats().size() >= 2; }, std::chrono::seconds(10)));
     client->disable_mesh();
     for (const auto& endpoint : heartbeats()) EXPECT_EQ(endpoint, "");
+}
+
+// An invite is minted on the inviter's session server and replicates to the
+// other Tier 1 members over the backbone. A member that has not received the
+// mint (one that restarted minutes ago and has no backbone peers yet, or any
+// member within the replication delay) refuses the invite as unknown, with
+// the same answer as an expired one. The join is pinned to the member that
+// issued its challenge, so the SDK asks another verified member, challenge
+// and join, before it reports the invite invalid.
+TEST_F(SdkMeshPrivateApiTest, AnInviteUnknownToOneMemberIsRedeemedThroughAnother) {
+    LN_REQUIRE_TEST_TRUST();
+    list_second_server = true;
+    first_server_lacks_invites = true;
+
+    lnsdk::ServerConfig cfg;
+    cfg.servers = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    lnsdk::Identity identity;
+    identity.generate();
+    client.set_identity(identity);
+    client.set_session_token("session-token");
+    ASSERT_TRUE(client.set_link_token("12345678"));
+    const auto refreshed = client.refresh_tier1();
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    ASSERT_EQ(client.tier1_membership().servers.size(), 2u);
+
+    const auto joined = client.join_network("user", "password");
+    ASSERT_TRUE(joined.ok) << joined.error;
+    // The first member refused the invite; the second redeemed it and issued
+    // the session, so the session is bound to the second member.
+    EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, true}));
+    EXPECT_EQ(client.session_token(), "session-token-3");
+    EXPECT_EQ(client.node_id(), kNodeId);
+    EXPECT_TRUE(client.is_mesh_active());
+}
+
+// When every verified member refuses the invite, the refusal is final: each
+// member was asked once, and the error names the invite.
+TEST_F(SdkMeshPrivateApiTest, AnInviteEveryMemberRefusesIsReportedInvalidOnce) {
+    LN_REQUIRE_TEST_TRUST();
+    list_second_server = true;
+    first_server_lacks_invites = true;
+    second_server_lacks_invites = true;
+
+    lnsdk::ServerConfig cfg;
+    cfg.servers = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    lnsdk::Identity identity;
+    identity.generate();
+    client.set_identity(identity);
+    client.set_session_token("session-token");
+    ASSERT_TRUE(client.set_link_token("12345678"));
+    const auto refreshed = client.refresh_tier1();
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    ASSERT_EQ(client.tier1_membership().servers.size(), 2u);
+
+    const auto joined = client.join_network("user", "password");
+    EXPECT_FALSE(joined.ok);
+    EXPECT_EQ(joined.http_status, 403);
+    EXPECT_EQ(joined.error, "invalid or expired link token");
+    EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, true}));
+    EXPECT_FALSE(client.is_mesh_active());
 }
