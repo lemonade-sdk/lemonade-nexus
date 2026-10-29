@@ -17,5 +17,13 @@
 	<array>
 		<string>$(AppIdentifierPrefix)com.lemonade.nexus.client</string>
 	</array>
+	<!-- The SDK keeps the per-user device identity in
+	     ~/Library/Application Support/LemonadeNexus/, shared with lemond and
+	     the Lemonade tray. The sandbox redirects HOME into the app container,
+	     so that one folder needs an explicit read-write exception. -->
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
+	<array>
+		<string>/Library/Application Support/LemonadeNexus/</string>
+	</array>
 </dict>
 </plist>
