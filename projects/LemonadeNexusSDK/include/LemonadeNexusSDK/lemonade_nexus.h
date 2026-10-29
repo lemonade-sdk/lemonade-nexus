@@ -357,7 +357,10 @@ ln_error_t ln_join_group(ln_client_t* client,
 /* High-level operations                                               */
 /* ------------------------------------------------------------------ */
 
-/** Authenticate + create node + allocate IP. Returns JSON via out_json. */
+/** Authenticate + create node + allocate IP. Returns JSON via out_json:
+ *  {success, node_id, tunnel_ip, private_subnet, mesh_pubkey, error (on
+ *  failure), device_name_refused and device_name_suggestion (when the name
+ *  from ln_set_device_name was taken; see there)}. */
 ln_error_t ln_join_network(ln_client_t* client,
                             const char* username,
                             const char* password,
@@ -747,6 +750,20 @@ ln_error_t ln_set_link_token(ln_client_t* client, const char* token);
  *  default). Applies to the next ln_join_network; the server records it when it
  *  creates this device's endpoint. */
 ln_error_t ln_set_inference_node(ln_client_t* client, int inference);
+
+/** Set the device name for the next ln_join_network that creates this
+ *  device's node (a device that already joined keeps its stored name; rename
+ *  it with ln_update_node). NULL or "" clears it, and the server then names
+ *  the device "endpoint-<8 hex digits>". The username argument of
+ *  ln_join_network is not a device name. When the name folds to a mesh-port
+ *  label that another device of the target group holds, the join still
+ *  succeeds under the server's default name, and its JSON carries
+ *  device_name_refused: true and device_name_suggestion (a free name, or ""
+ *  when unknown) for a rename. Returns LN_ERR_NULL_ARG when client is NULL,
+ *  and LN_ERR_REJECTED, with nothing stored, for a name longer than 64 bytes,
+ *  with a control character or one of ;|&$`(){}<>'"\, or without a letter or
+ *  digit. */
+ln_error_t ln_set_device_name(ln_client_t* client, const char* name);
 
 /** Mint a device link token for adding another device to this account's group.
  *  Same as ln_invite_create(client, NULL, NULL, ttl_sec, out_json).

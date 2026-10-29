@@ -944,6 +944,10 @@ ln_error_t ln_join_network(ln_client_t* client,
     j["tunnel_ip"]      = result.value.tunnel_ip;
     j["private_subnet"] = result.value.private_subnet;
     j["mesh_pubkey"]    = result.value.mesh_pubkey;
+    if (result.value.device_name_refused) {
+        j["device_name_refused"]    = true;
+        j["device_name_suggestion"] = result.value.device_name_suggestion;
+    }
     if (!result.ok) j["error"] = result.error;
 
     *out_json = strdup_json(j);
@@ -1453,6 +1457,11 @@ ln_error_t ln_set_inference_node(ln_client_t* client, int inference) {
     if (!client) return LN_ERR_NULL_ARG;
     client->client.set_inference_node(inference != 0);
     return LN_OK;
+}
+
+ln_error_t ln_set_device_name(ln_client_t* client, const char* name) {
+    if (!client) return LN_ERR_NULL_ARG;
+    return client->client.set_device_name(name ? name : "") ? LN_OK : LN_ERR_REJECTED;
 }
 
 ln_error_t ln_link_token_create(ln_client_t* client, uint32_t ttl_sec, char** out_json) {

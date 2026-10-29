@@ -353,6 +353,21 @@ Join is composite — one call does everything:
 After joining, private API calls (tree, IPAM, mesh, routing, certs) route
 over the mesh to the server's private API.
 
+**Device name.** Call `client.set_device_name("Work PC")` (C ABI:
+`ln_set_device_name`) before the join that creates the device's node; the
+join sends it as `hostname`. Without a name the server names the device
+`endpoint-<8 hex digits>`. The `username` argument of `join_network` is not a
+device name. A device that already has its node keeps its stored name; rename
+it with `update_node`. When the name folds to a mesh-port label that another
+device of the target group holds (see `ln_check_device_name`), the server
+refuses that name and the SDK joins again under the server's default name: the
+join succeeds and reports `device_name_refused` with `device_name_suggestion`,
+a free name taken from a device-name check of the invite. A name longer than
+64 bytes, with a control character or one of ``;|&$`(){}<>'"\``, or without a
+letter or digit is refused before any request (peers drop a listed device
+whose name carries those characters). When the join creates a new group (no
+invite), the server also gives the group that name.
+
 ## Invites and Other Networks
 
 An invite is single use and names one group. One call creates it: without a
