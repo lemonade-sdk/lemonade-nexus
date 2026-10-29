@@ -67,7 +67,8 @@ public:
     [[nodiscard]] bool do_setup_interface(const BoringtunInterfaceConfig& config,
                                           const std::vector<BoringtunPeer>& peers);
     [[nodiscard]] bool do_teardown_interface();
-    [[nodiscard]] int do_sync_peers_from_tree(const std::vector<TreeNodePeer>& desired_peers);
+    [[nodiscard]] int do_sync_peers_from_tree(const std::vector<TreeNodePeer>& desired_peers,
+                                              bool remove_stale = true);
     [[nodiscard]] bool do_add_address(const std::string& address_cidr);
     [[nodiscard]] bool do_save_config(const std::string& config_contents);
     [[nodiscard]] std::string do_load_config();

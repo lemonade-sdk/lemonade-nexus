@@ -57,6 +57,7 @@
 #include <LemonadeNexus/Api/CertApiHandler.hpp>
 #include <LemonadeNexus/Api/AdminApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshApiHandler.hpp>
+#include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Api/OnboardApiHandler.hpp>
 #include <LemonadeNexus/Api/AccountDataApiHandler.hpp>
 #include <LemonadeNexus/Api/RoutingApiHandler.hpp>
@@ -1339,6 +1340,35 @@ int main(int argc, char* argv[]) {
             [&] {
                 storage.ensure_tree_directories();
                 tree.start();
+                // Restore the client mesh peers from the finalized tree. The
+                // dataplane peer table lives only in memory, so an in-place
+                // restart (a rolling self-update restarts every server) would
+                // otherwise leave each already-connected endpoint unknown: the
+                // endpoint keeps its tunnel session, but this server drops its
+                // handshake as an unknown initiator, so every private(mesh)
+                // call fails with "SSL connection failed" until the endpoint
+                // re-joins. The tree holds each endpoint's finalized
+                // mesh_pubkey and tunnel_ip (written through consensus at
+                // join), so re-adding them is authority that follows finalized
+                // state, like the IPAM and DNS restores. Additive only: the
+                // server-to-server backbone peers are not tree nodes and must
+                // not be removed.
+                {
+                    std::vector<nexus::boringtun::TreeNodePeer> endpoints;
+                    for (const auto& [id, node] : tree.nodes_snapshot()) {
+                        if (node.mesh_pubkey.empty() || node.tunnel_ip.empty()) continue;
+                        nexus::boringtun::TreeNodePeer peer;
+                        peer.public_key = nexus::api::normalize_mesh_pubkey(node.mesh_pubkey);
+                        peer.tunnel_ip = node.tunnel_ip;
+                        peer.private_subnet = node.private_subnet;
+                        endpoints.push_back(std::move(peer));
+                    }
+                    const int restored =
+                        boringtun_service.sync_peers_from_tree(endpoints, /*remove_stale=*/false);
+                    if (restored > 0)
+                        spdlog::info("[tree-role] restored {} client mesh peer(s) from the tree",
+                                     restored);
+                }
                 // The root is an EstablishRoot op that Tier 1 commits
                 // (TreeConsensus::set_root_request), or it comes with the
                 // tree merge commit.
