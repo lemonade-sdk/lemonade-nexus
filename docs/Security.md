@@ -245,10 +245,17 @@ cryptography is involved, and a punch grants no authority:
   the endpoint only for the caller's own node, as a `SetEndpoint` tree
   operation when tree operations are on. It refuses IPv4 addresses that are
   not unicast. An empty endpoint keeps the stored one.
+- **A change notice adds no peer.** The heartbeat answer's `peers_revision`
+  is an opaque hash, present only when the caller holds Read on its node. A
+  changed value only makes the SDK fetch the verified peer list sooner; it
+  names no peer and no address.
 - **Probes are rate limited.** At most 16 probes go out per pass and passes
   are at least 250 ms apart. A peer gets a burst of five probes, then two
   probes per 15-second slot, or per 60-second slot while it is relayed. A peer
-  with a fresh direct handshake gets none.
+  with a fresh direct handshake gets none. A new burst starts only when the
+  peer's listed endpoint changes, the peer comes back online at the server,
+  the application requests a refresh, the peer list changes at the server,
+  or the device resumes from a suspension.
 
 Endpoints, the devices that join a group, come in two roles. Neither holds any
 server or authority role:
