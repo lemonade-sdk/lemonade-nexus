@@ -2864,8 +2864,9 @@ TEST_F(InviteHttpTest, AnInviteCodeWorksWhereverTheTokenDoes) {
     ASSERT_NE(spent, nullptr);
     EXPECT_EQ(spent->status, 403) << spent->body;
 
-    // Five wrong code attempts lock the live codes on this server; the token
-    // still redeems.
+    // Five wrong code attempts from one address (every request here comes
+    // from 127.0.0.1) lock that address's code attempts; the token still
+    // redeems.
     res = invite(alice);
     ASSERT_NE(res, nullptr);
     ASSERT_EQ(res->status, 200) << res->body;
@@ -2873,7 +2874,7 @@ TEST_F(InviteHttpTest, AnInviteCodeWorksWhereverTheTokenDoes) {
     const auto locked_code = minted["code"].get<std::string>();
     wrong = locked_code;
     wrong.back() = wrong.back() == '9' ? '0' : static_cast<char>(wrong.back() + 1);
-    for (uint32_t i = 0; i < auth::kLinkCodeMaxFailures; ++i) {
+    for (uint32_t i = 0; i < auth::kLinkCodeMaxFailuresPerSource; ++i) {
         auto attempt = post(carol, "/api/link/accept", {{"link_token", wrong}});
         ASSERT_NE(attempt, nullptr);
         EXPECT_EQ(attempt->status, 403);

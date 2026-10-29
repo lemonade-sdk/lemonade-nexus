@@ -76,12 +76,15 @@ public:
 
     /// Look up a link token, or the token an invite code names, without
     /// consuming it. nullopt when it is unknown, expired, spent, or refused
-    /// (see TokenLinkAuthProvider::verify).
-    [[nodiscard]] std::optional<LinkTokenRecord> verify_link_token(std::string_view token_or_code);
+    /// (see TokenLinkAuthProvider::verify). `source` is the requester's
+    /// address for the wrong-code limits; empty when unknown.
+    [[nodiscard]] std::optional<LinkTokenRecord> verify_link_token(std::string_view token_or_code,
+                                                                   std::string_view source = {});
 
     /// Verify and burn a device-link token (single use), presented as the
-    /// token or as its invite code.
-    [[nodiscard]] std::optional<LinkTokenRecord> consume_link_token(std::string_view token_or_code);
+    /// token or as its invite code. `source` as in verify_link_token.
+    [[nodiscard]] std::optional<LinkTokenRecord> consume_link_token(std::string_view token_or_code,
+                                                                    std::string_view source = {});
 
     /// Restore a link token that a join consumed but did not use (see
     /// TokenLinkAuthProvider::refund). False when nothing was restored.

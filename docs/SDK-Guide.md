@@ -361,8 +361,9 @@ Everywhere below, `code` is either form: the SDK passes it through
 unchanged, and the server treats exactly 8 digits as a code. The SDK refuses
 any other shape (`invite_format_error`) before it sends a request. The code
 works for at most 10 minutes (`code_expires_at`), the token until
-`expires_at`. A server refuses a code after 5 wrong code attempts made while
-it is live; the token still works then.
+`expires_at`. A server refuses code attempts from an address after 5 wrong
+codes within 10 minutes, and all codes after 100 wrong codes from anywhere
+within 10 minutes; the token still works then.
 
 | C++ | C | Purpose |
 |-----|---|---------|

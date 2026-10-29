@@ -334,29 +334,90 @@ TEST_F(AuthTest, AnInviteCodeSpendsTheSameGenerationAsTheToken) {
     EXPECT_EQ(again->generation, 2u);
 }
 
-// Every wrong code attempt counts against every code live on this server.
-// After kLinkCodeMaxFailures of them a live code is refused for good; its
-// token still works, and a code minted afterwards starts fresh.
-TEST_F(AuthTest, WrongCodeAttemptsLockTheLiveCodes) {
+// An address that makes kLinkCodeMaxFailuresPerSource wrong code attempts
+// within the window has its code attempts refused for the window: right or
+// wrong, verify or consume. Other addresses and the token are not affected,
+// and the lock ends with the window.
+TEST_F(AuthTest, WrongCodeAttemptsLockTheSourceAddress) {
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
+    auth->set_link_token_clock_for_testing([now] { return now; });
     auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
                                         std::chrono::seconds{600});
     ASSERT_TRUE(minted.has_value());
     const auto bad = wrong_code(minted->code);
-    for (uint32_t i = 0; i + 1 < auth::kLinkCodeMaxFailures; ++i) {
-        EXPECT_FALSE(auth->consume_link_token(bad).has_value());
+    for (uint32_t i = 0; i + 1 < auth::kLinkCodeMaxFailuresPerSource; ++i) {
+        EXPECT_FALSE(auth->consume_link_token(bad, "10.0.0.1").has_value());
     }
-    EXPECT_TRUE(auth->verify_link_token(minted->code).has_value()) << "one attempt left";
-    EXPECT_FALSE(auth->verify_link_token(bad).has_value()) << "a wrong verify counts too";
-    EXPECT_FALSE(auth->verify_link_token(minted->code).has_value()) << "locked";
-    EXPECT_FALSE(auth->consume_link_token(minted->code).has_value()) << "locked";
-    EXPECT_TRUE(auth->verify_link_token(minted->token).has_value()) << "the token is not locked";
+    EXPECT_TRUE(auth->verify_link_token(minted->code, "10.0.0.1").has_value())
+        << "one attempt left; a right code counts nothing";
+    EXPECT_FALSE(auth->verify_link_token(bad, "10.0.0.1").has_value()) << "a wrong verify counts";
+    EXPECT_FALSE(auth->verify_link_token(minted->code, "10.0.0.1").has_value()) << "locked";
+    EXPECT_FALSE(auth->consume_link_token(minted->code, "10.0.0.1").has_value()) << "locked";
+    EXPECT_TRUE(auth->verify_link_token(minted->token, "10.0.0.1").has_value())
+        << "the token is never locked";
+    EXPECT_TRUE(auth->verify_link_token(minted->code, "10.0.0.2").has_value())
+        << "another address is not affected";
 
+    // The lock ends with the window, which is as long as a code lives: the
+    // locked code is gone by then, and a new one redeems from the address.
+    auth->set_link_token_clock_for_testing(
+        [now] { return now + auth::kLinkCodeFailureWindowSec; });
     auto later = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
                                        std::chrono::seconds{600});
     ASSERT_TRUE(later.has_value());
-    EXPECT_TRUE(auth->consume_link_token(later->code).has_value())
-        << "earlier attempts do not count against a code minted later";
-    EXPECT_TRUE(auth->consume_link_token(minted->token).has_value());
+    EXPECT_FALSE(auth->verify_link_token(minted->code, "10.0.0.2").has_value()) << "expired";
+    EXPECT_TRUE(auth->verify_link_token(later->code, "10.0.0.1").has_value());
+    EXPECT_FALSE(auth->consume_link_token(wrong_code(later->code), "10.0.0.1").has_value());
+    EXPECT_TRUE(auth->consume_link_token(later->code, "10.0.0.1").has_value());
+}
+
+// After kLinkCodeMaxFailuresPerServer wrong code attempts from any addresses
+// within the window the server refuses every code until the window passes.
+// Attempts from a locked address count toward neither limit, so one address
+// cannot reach the ceiling.
+TEST_F(AuthTest, AServerCeilingOnWrongCodeAttemptsRefusesCodesUntilTheWindowPasses) {
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
+    auth->set_link_token_clock_for_testing([now] { return now; });
+    auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                        std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+    const auto bad = wrong_code(minted->code);
+
+    // One address, locked after its share: many more attempts change nothing.
+    for (uint32_t i = 0; i < 3 * auth::kLinkCodeMaxFailuresPerServer; ++i) {
+        EXPECT_FALSE(auth->consume_link_token(bad, "10.0.0.1").has_value());
+    }
+    EXPECT_TRUE(auth->verify_link_token(minted->code, "10.0.0.2").has_value())
+        << "a locked address does not count toward the server ceiling";
+
+    // Enough addresses reach the ceiling, with one attempt to spare. The
+    // first address's share already counts.
+    const auto per_source = auth::kLinkCodeMaxFailuresPerSource;
+    uint32_t wrong = per_source;
+    for (uint32_t addr = 0; wrong + 1 < auth::kLinkCodeMaxFailuresPerServer; ++addr) {
+        const auto source = "10.1.0." + std::to_string(addr);
+        for (uint32_t i = 0; i < per_source && wrong + 1 < auth::kLinkCodeMaxFailuresPerServer;
+             ++i, ++wrong) {
+            EXPECT_FALSE(auth->consume_link_token(bad, source).has_value());
+        }
+    }
+    EXPECT_TRUE(auth->verify_link_token(minted->code, "10.0.0.2").has_value())
+        << "below the ceiling another address still redeems";
+    EXPECT_FALSE(auth->consume_link_token(bad, "10.0.0.3").has_value()) << "the ceiling";
+    EXPECT_FALSE(auth->verify_link_token(minted->code, "10.0.0.2").has_value())
+        << "every code is refused on this server";
+    EXPECT_FALSE(auth->consume_link_token(minted->code, "10.0.0.4").has_value());
+    EXPECT_TRUE(auth->verify_link_token(minted->token, "10.0.0.2").has_value())
+        << "tokens are never refused by the ceiling";
+
+    // The window passes: codes work again (the earlier code has expired by
+    // then; a new one redeems).
+    auth->set_link_token_clock_for_testing(
+        [now] { return now + auth::kLinkCodeFailureWindowSec; });
+    auto later = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                       std::chrono::seconds{600});
+    ASSERT_TRUE(later.has_value());
+    EXPECT_TRUE(auth->consume_link_token(later->code, "10.0.0.2").has_value());
 }
 
 // A code lives at most kLinkCodeMaxTtlSec; a longer token outlives it. A

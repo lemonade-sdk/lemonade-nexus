@@ -201,31 +201,55 @@ void TokenLinkAuthProvider::author_locked(LinkTokenEvent& e, bool sign) {
 }
 
 std::optional<LinkTokenLedger::Live> TokenLinkAuthProvider::live_by_code_locked(
-        std::string_view code, uint64_t now) {
+        std::string_view code, std::string_view source, uint64_t now) {
+    // The hash and the lookup run before any limit is consulted, so a refused
+    // attempt costs what a wrong code costs.
     const auto code_hash = link_code_hash_hex(code);
-    std::optional<LinkTokenLedger::Live> live;
-    const auto seen = code_seen_.find(code_hash);
-    const bool locked =
-        seen != code_seen_.end() && code_failures_ - seen->second >= kLinkCodeMaxFailures;
-    if (!locked) live = ledger_.live_by_code(code_hash, now);
+    auto live = ledger_.live_by_code(code_hash, now);
+
+    const auto window_open = [now](const CodeFailures& f) {
+        return f.count > 0 && now < f.window_start + kLinkCodeFailureWindowSec;
+    };
+    const auto note_failure = [now, &window_open](CodeFailures& f) {
+        if (!window_open(f)) {
+            f.window_start = now;
+            f.count = 0;
+        }
+        ++f.count;
+    };
+
+    // Entries whose window and lockout both passed carry nothing.
+    std::erase_if(code_failures_by_source_, [&](const auto& kv) {
+        return !window_open(kv.second) && now >= kv.second.locked_until;
+    });
+    auto by_source = code_failures_by_source_.find(source);
+    if (by_source == code_failures_by_source_.end()) {
+        if (code_failures_by_source_.size() >= kLinkCodeMaxSources) {
+            spdlog::debug("[token-link] invite code refused: source table full");
+            return std::nullopt;
+        }
+        by_source = code_failures_by_source_.emplace(std::string(source), CodeFailures{}).first;
+    }
+    const bool source_locked = now < by_source->second.locked_until;
+    const bool server_locked = window_open(code_failures_all_) &&
+                               code_failures_all_.count >= kLinkCodeMaxFailuresPerServer;
+    if (source_locked || server_locked) {
+        // Refused outright, right or wrong; a refused attempt counts toward
+        // neither limit, so a locked address cannot close codes for everyone.
+        spdlog::debug("[token-link] invite code refused: {} limit", source_locked ? "source" : "server");
+        return std::nullopt;
+    }
     if (!live) {
-        // Unknown, expired, spent, shared, or locked: one wrong attempt
-        // against every code live here. The code is not logged.
-        ++code_failures_;
+        // Unknown, expired, spent, or shared: one wrong attempt for this
+        // address and for the server. The code is not logged.
+        note_failure(by_source->second);
+        if (by_source->second.count >= kLinkCodeMaxFailuresPerSource) {
+            by_source->second.locked_until = now + kLinkCodeFailureWindowSec;
+        }
+        note_failure(code_failures_all_);
         spdlog::debug("[token-link] invite code refused");
     }
     return live;
-}
-
-void TokenLinkAuthProvider::track_code_locked(const LinkTokenEvent& e) {
-    if (e.kind == LinkTokenEventKind::Mint && !e.code_hash.empty()) {
-        code_seen_.try_emplace(e.code_hash, code_failures_);
-    }
-}
-
-void TokenLinkAuthProvider::prune_locked(uint64_t now) {
-    if (ledger_.prune(now) == 0) return;
-    std::erase_if(code_seen_, [&](const auto& kv) { return !ledger_.holds_code(kv.first); });
 }
 
 bool TokenLinkAuthProvider::save_locked() {
@@ -259,10 +283,7 @@ void TokenLinkAuthProvider::load() {
         if (e->origin_pubkey == kLinkTokenLocalOrigin) {
             local_seq_ = std::max(local_seq_, e->origin_seq);
         }
-        if (ledger_.add(*e, now) == LinkTokenLedger::AddResult::Added) {
-            ++held;
-            track_code_locked(*e);
-        }
+        if (ledger_.add(*e, now) == LinkTokenLedger::AddResult::Added) ++held;
     }
     spdlog::info("[token-link] restored {} link token event(s)", held);
 }
@@ -300,7 +321,7 @@ TokenLinkAuthProvider::mint(const std::string& owner_user_id,
     {
         std::lock_guard lock(mutex_);
         const auto now = now_sec();
-        prune_locked(now);
+        ledger_.prune(now);
         if (ledger_.live_count_for_owner(owner_user_id, now) >= kLinkTokenMaxPerOwner) {
             spdlog::warn("[token-link] owner {} holds {} live link tokens; refusing another",
                          owner_user_id, kLinkTokenMaxPerOwner);
@@ -334,7 +355,6 @@ TokenLinkAuthProvider::mint(const std::string& owner_user_id,
             spdlog::error("[token-link] could not record a new link token");
             return std::nullopt;
         }
-        track_code_locked(mint);
         publisher = publisher_;
     }
     if (publisher && !mint.signature.empty()) (void)publisher(mint);
@@ -344,13 +364,14 @@ TokenLinkAuthProvider::mint(const std::string& owner_user_id,
     return MintedLinkToken{std::move(token), std::move(code), record_from_grant(mint)};
 }
 
-std::optional<LinkTokenRecord> TokenLinkAuthProvider::verify(std::string_view token_or_code) {
+std::optional<LinkTokenRecord> TokenLinkAuthProvider::verify(std::string_view token_or_code,
+                                                             std::string_view source) {
     if (token_or_code.empty()) return std::nullopt;
     {
         std::lock_guard lock(mutex_);
         const auto now = now_sec();
         const auto live = is_link_code(token_or_code)
-                              ? live_by_code_locked(token_or_code, now)
+                              ? live_by_code_locked(token_or_code, source, now)
                               : ledger_.live(link_token_hash_hex(token_or_code), now);
         if (live) {
             auto record = record_from_grant(live->mint);
@@ -363,7 +384,8 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::verify(std::string_view to
     return legacy_verify(token_or_code);
 }
 
-std::optional<LinkTokenRecord> TokenLinkAuthProvider::consume(std::string_view token_or_code) {
+std::optional<LinkTokenRecord> TokenLinkAuthProvider::consume(std::string_view token_or_code,
+                                                              std::string_view source) {
     if (token_or_code.empty()) return std::nullopt;
     const bool by_code = is_link_code(token_or_code);
     std::string hash = by_code ? std::string{} : link_token_hash_hex(token_or_code);
@@ -376,7 +398,7 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::consume(std::string_view t
         const auto now = now_sec();
         std::optional<LinkTokenLedger::Live> live;
         if (by_code) {
-            live = live_by_code_locked(token_or_code, now);
+            live = live_by_code_locked(token_or_code, source, now);
             if (!live) return std::nullopt;
             hash = live->mint.token_hash;
         } else {
@@ -468,11 +490,10 @@ bool TokenLinkAuthProvider::apply_replicated(const LinkTokenEvent& event) {
     if (event.signature.empty() || event.origin_pubkey == kLinkTokenLocalOrigin) return false;
     std::lock_guard lock(mutex_);
     const auto now = now_sec();
-    prune_locked(now);
+    ledger_.prune(now);
     const auto result = ledger_.add(event, now);
     if (result == LinkTokenLedger::AddResult::Duplicate) return true;
     if (result != LinkTokenLedger::AddResult::Added) return false;
-    track_code_locked(event);
     if (event.kind == LinkTokenEventKind::Spend && !self_origin_.empty() &&
         event.origin_pubkey != self_origin_) {
         // A second redemption of one generation: only one server's spend
@@ -497,7 +518,6 @@ bool TokenLinkAuthProvider::apply_replicated(const LinkTokenEvent& event) {
 void TokenLinkAuthProvider::purge() {
     std::lock_guard lock(mutex_);
     ledger_.clear();
-    code_seen_.clear();
     for (const auto& name : storage_.list_files(kLedgerCategory)) {
         (void)storage_.delete_file(kLedgerCategory, name + ".json");
     }
@@ -583,7 +603,7 @@ std::size_t TokenLinkAuthProvider::revoke_where(
     {
         std::lock_guard lock(mutex_);
         const auto now = now_sec();
-        prune_locked(now);
+        ledger_.prune(now);
         for (const auto& mint : ledger_.mints()) {
             if (ledger_.revoked(mint.token_hash) || !match(record_from_grant(mint))) continue;
             LinkTokenEvent revoke;

@@ -52,9 +52,18 @@ inline constexpr std::size_t kLinkCodeDigits = 8;
 /// Longest life of an invite code, from the mint's created_at. A code whose
 /// token lives longer stops working at this bound; the token goes on.
 inline constexpr uint64_t kLinkCodeMaxTtlSec = 600;
-/// Wrong code attempts a server tolerates while a code is live; from the
-/// next one on that code is refused for the rest of its life on that server.
-inline constexpr uint32_t kLinkCodeMaxFailures = 5;
+/// Window of the wrong-code limits, and the lockout a source address gets.
+inline constexpr uint64_t kLinkCodeFailureWindowSec = 600;
+/// Wrong code attempts one source address may make within the window; from
+/// the next one on, that address's code attempts are refused for the window.
+inline constexpr uint32_t kLinkCodeMaxFailuresPerSource = 5;
+/// Wrong code attempts a server accepts from all addresses within the
+/// window; from the next one on, codes are refused on that server until the
+/// window passes.
+inline constexpr uint32_t kLinkCodeMaxFailuresPerServer = 100;
+/// Source addresses a server tracks at once; beyond it, a new address's code
+/// attempts are refused until an entry expires.
+inline constexpr std::size_t kLinkCodeMaxSources = 4096;
 /// Records stay this long after expiry, so a late copy of a mint cannot
 /// outlive the spend that consumed it on a server with a slower clock.
 inline constexpr uint64_t kLinkTokenRetentionSec = 600;

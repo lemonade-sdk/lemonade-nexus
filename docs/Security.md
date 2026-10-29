@@ -724,16 +724,24 @@ invite:
 - **Lifetime.** A code works until `min(expires_at, created_at + 600 s)`
   (`code_expires_at` in the mint response); the token works until
   `expires_at`.
-- **Attempt limit.** Each Tier 1 server counts wrong code attempts: a code
+- **Attempt limits.** Each Tier 1 server counts wrong code attempts: a code
   that resolves to no live token on that server (unknown, expired, spent,
-  shared, or locked). Every wrong attempt counts against every code live on
-  that server, and after 5 of them a code is refused there for the rest of
-  its life; its token still works. An attacker therefore gets at most 5
-  guesses per code per server, and a wrong code costs the same work as a
-  wrong token (one hash and one lookup; neither reveals how close the guess
-  was). The counter is per server and in memory: a restart or another
-  server starts it again. A deliberate flood of wrong codes can make codes
-  unusable; it never makes a wrong code right.
+  or shared). Two limits apply, both over a 10-minute window:
+  - *Per source address:* after 5 wrong attempts from one address within
+    the window, that address's code attempts are refused for 10 minutes.
+  - *Per server:* after 100 wrong attempts from any addresses within the
+    window, the server refuses codes until the window passes.
+
+  A refused attempt counts toward neither limit, so an address that is
+  locked out cannot close codes for everyone, and tokens are never
+  refused by either limit. An attacker with N addresses gets at most
+  min(5N, 100) guesses per 10 minutes per server against a space of 10^8
+  codes that each live at most 10 minutes. The hash and the lookup run
+  before the limits are consulted, so a refused or wrong code costs the
+  same work as a wrong token (neither reveals how close the guess was).
+  The counters are per server and in memory: a restart or another server
+  starts them again. A server tracks at most 4096 addresses; beyond that a
+  new address's code attempts are refused until an entry expires.
 - **Uniqueness and collisions.** The minting server draws a code that no
   unexpired code in its own ledger uses (a bounded number of draws; a mint
   fails when none is free). Two servers can still mint the same code in the

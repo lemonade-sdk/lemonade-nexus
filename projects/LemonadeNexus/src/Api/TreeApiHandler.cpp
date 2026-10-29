@@ -767,7 +767,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         std::optional<auth::LinkTokenRecord> link;
         std::optional<LinkTokenClaim> link_claim;
         if (!link_token.empty()) {
-            link = ctx_.auth.consume_link_token(link_token);
+            link = ctx_.auth.consume_link_token(link_token, req.remote_addr);
             if (!link) {
                 error_response(res, "invalid or expired link token", 403);
                 return;
@@ -941,7 +941,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         } else if (!link_token.empty()) {
             // An invite names its target group; the holder may ask about it
             // without reading it. verify_link_token does not spend the token.
-            const auto link = ctx_.auth.verify_link_token(link_token);
+            const auto link = ctx_.auth.verify_link_token(link_token, req.remote_addr);
             if (!link) {
                 error_response(res, "invalid or expired link token", 403);
                 return;
@@ -1367,7 +1367,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 "through /api/join", 409);
             return;
         }
-        auto link = ctx_.auth.consume_link_token(token);
+        auto link = ctx_.auth.consume_link_token(token, req.remote_addr);
         if (!link) {
             error_response(res, "invalid or expired link token", 403);
             return;

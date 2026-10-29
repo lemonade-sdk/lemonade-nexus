@@ -57,12 +57,14 @@ AuthService::mint_link_token(const std::string& owner_user_id,
                                      std::move(permissions));
 }
 
-std::optional<LinkTokenRecord> AuthService::verify_link_token(std::string_view token_or_code) {
-    return token_link_provider_.verify(token_or_code);
+std::optional<LinkTokenRecord> AuthService::verify_link_token(std::string_view token_or_code,
+                                                              std::string_view source) {
+    return token_link_provider_.verify(token_or_code, source);
 }
 
-std::optional<LinkTokenRecord> AuthService::consume_link_token(std::string_view token_or_code) {
-    return token_link_provider_.consume(token_or_code);
+std::optional<LinkTokenRecord> AuthService::consume_link_token(std::string_view token_or_code,
+                                                               std::string_view source) {
+    return token_link_provider_.consume(token_or_code, source);
 }
 
 bool AuthService::refund_link_token(std::string_view token_or_code,

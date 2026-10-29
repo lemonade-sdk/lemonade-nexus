@@ -774,9 +774,11 @@ ln_error_t ln_link_token_create(ln_client_t* client, uint32_t ttl_sec, char** ou
  *  On success *out_json is {link_token, code, group_node_id, target_node_id,
  *  permissions, expires_at, code_expires_at}. link_token is "lnk_" and 64
  *  hex digits and works until expires_at. code is 8 decimal digits, works
- *  until code_expires_at (at most 10 minutes after minting), and is refused
- *  by a server after 5 wrong code attempts made while it is live; the token
- *  still works then. Both are returned once and are never stored in clear.
+ *  until code_expires_at (at most 10 minutes after minting). A server
+ *  refuses code attempts from an address after 5 wrong codes within 10
+ *  minutes, and all codes after 100 wrong codes from anywhere within 10
+ *  minutes; the token still works then. Both are returned once and are
+ *  never stored in clear.
  *  On failure *out_json carries "error" when the server answered. The
  *  strings passed in are not retained. The caller owns
  *  *out_json and must release it with ln_free(). Returns LN_ERR_NULL_ARG when
