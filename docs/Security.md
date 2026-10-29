@@ -271,6 +271,16 @@ itself. `admin` includes both connect permissions. A grant on the group does
 not count, because permissions are not inherited. Relays in the group are
 listed with `read`.
 
+Each peer entry in the list carries `mgmt_pubkey`, the peer node's management
+public key as the tree stores it, and `peer_permissions`: the sorted,
+de-duplicated names that this key holds on the requesting device and on its
+ancestor groups, plus `admin` when the peer administers the device
+(`tree::rules::peer_permissions`). The two fields let the device attribute a
+connecting peer to its key and tell the device what that peer may do on it,
+including service permissions (see "Service permissions" below), without
+reading group entries it cannot see. The fields report; they add no peer to
+the list and grant nothing on the server.
+
 A client's server peer covers the whole tunnel plane, so the server's
 dataplane sees traffic that one endpoint sends to another. The server forwards
 it only when the source endpoint's key may connect to the destination
@@ -490,6 +500,29 @@ rule gain `admin` for their owner on the owner's next join.
 
 On load, a node file whose record names a different node is refused.
 
+### Service permissions
+
+A service permission is a name of the form `svc:<family>`. The family has 1
+to 63 bytes: the first is a lowercase letter or a digit, and the rest are
+lowercase letters, digits, `_`, `.`, or `-`. Examples: `svc:inference`,
+`svc:files.read`. The assignment route and invites accept a well-formed
+service permission and refuse every other unknown name
+(`tree::rules::permission_name_known`).
+
+The server is opaque to a service permission. It stores and replicates the
+name like any other assignment name and attaches no permission bit to it. A
+key that holds only `svc:` names cannot read, edit, delete, or connect to
+anything, and it administers nothing. The device that a peer connects to
+enforces the service permission in its SDK.
+
+A service permission on a group applies to every device beneath that group,
+in the same shape as membership reach. `admin` on a device or on an ancestor
+implies every service permission. The mesh peer list reports this effective
+set to each device in `peer_permissions` (`tree::rules::peer_permissions`;
+see "Direct paths" above). An invite grants a service permission only when
+the inviter's own entry on the target group names it, or the inviter
+administers the target.
+
 ### Invites and group membership
 
 An invite is a single-use link token for a target group
@@ -502,11 +535,11 @@ a target, the target is the caller's own group. The rules
   on the target or administers it (`admin` on the target or an ancestor).
 - **An invite never grants more than the inviter holds.** Each permission is
   one of `read`, `write`, `add_child`, `connect_private`, and
-  `connect_shared`, and the inviter holds it on the target or administers the
-  target. `admin`, `edit_node`, and `delete_node` are never granted by an
-  invite, so neither side gains control over the other's group. Without
-  `permissions`, the invite carries `read` and `connect_private`, reduced to
-  what the inviter holds.
+  `connect_shared`, or a service permission, and the inviter holds it on the
+  target or administers the target. `admin`, `edit_node`, and `delete_node`
+  are never granted by an invite, so neither side gains control over the
+  other's group. Without `permissions`, the invite carries `read` and
+  `connect_private`, reduced to what the inviter holds.
 
 A new device uses the token in `POST /api/join` and is placed under the
 target, as before. An identity that already joined uses the token in

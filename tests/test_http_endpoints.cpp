@@ -50,6 +50,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <map>
 #include <set>
 #include <string>
 #include <thread>
@@ -2217,13 +2218,14 @@ protected:
         return "ed25519:" + crypto::to_base64(crypto->ed25519_keygen().public_key);
     }
 
+    /// Store a node; its management key is the root key unless `mgmt` names one.
     void add(const std::string& id, const std::string& parent, tree::NodeType type,
-             std::vector<tree::Assignment> assignments) {
+             std::vector<tree::Assignment> assignments, const std::string& mgmt = {}) {
         tree::TreeNode n;
         n.id = id;
         n.parent_id = parent;
         n.type = type;
-        n.mgmt_pubkey = root_pubkey_str;
+        n.mgmt_pubkey = mgmt.empty() ? root_pubkey_str : mgmt;
         n.assignments = std::move(assignments);
         if (type == tree::NodeType::Endpoint || type == tree::NodeType::Relay) {
             n.mesh_pubkey = "mesh-" + id;
@@ -2304,6 +2306,62 @@ TEST_F(MeshPeersConnectTest, ServerPeerAndRelayAreUnchanged) {
     EXPECT_EQ(body["server_peer"]["node_id"], "server");
     EXPECT_EQ(body["server_peer"]["is_server"], true);
     EXPECT_EQ(status_peer_count(), 1u);
+}
+
+// peer_permissions tells the requesting device what each listed peer's key
+// holds toward it: the names on the device itself and on its ancestor groups,
+// plus admin when the peer administers the device. The field reports; it
+// never widens the list.
+TEST_F(MeshPeersConnectTest, PeerPermissionsNameWhatThePeerHoldsTowardTheCaller) {
+    const auto a = principal(), b = principal(), c = principal(), d = principal();
+    auto group = tree->get_node("mc_group");
+    ASSERT_TRUE(group.has_value());
+    group->assignments = {{a, {"read", "svc:inference"}}, {b, {"admin"}}, {d, {"svc:unlisted"}}};
+    ASSERT_TRUE(test_support::put_node(*tree, *group));
+    auto self = tree->get_node("mc_self");
+    ASSERT_TRUE(self.has_value());
+    self->assignments = {{caller, {"read"}},
+                         {a, {"connect_private", "svc:inference"}},
+                         {c, {"svc:files"}}};
+    ASSERT_TRUE(test_support::put_node(*tree, *self));
+    // The caller holds connect_private on each device it may list.
+    add("mc_a", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}}, a);
+    add("mc_b", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}}, b);
+    add("mc_c", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}}, c);
+    add("mc_none", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}},
+        principal());
+    add("mc_d", "mc_group", tree::NodeType::Endpoint, {{caller, {"read"}}}, d);
+    // A relay with its own key; one owned by the root key would report
+    // the root admin's "admin".
+    add("mc_relay", "mc_group", tree::NodeType::Relay, {{caller, {"read"}}}, principal());
+
+    json body;
+    const auto ids = listed(&body);
+    std::map<std::string, json> perms;
+    std::map<std::string, std::string> keys;
+    for (const auto& p : body["peers"]) {
+        ASSERT_TRUE(p.contains("peer_permissions")) << p.dump();
+        ASSERT_TRUE(p.contains("mgmt_pubkey")) << p.dump();
+        perms[p["node_id"].get<std::string>()] = p["peer_permissions"];
+        keys[p["node_id"].get<std::string>()] = p["mgmt_pubkey"].get<std::string>();
+    }
+    // Each entry names the key the permissions belong to, as the tree stores it.
+    EXPECT_EQ(keys["mc_a"], a);
+    EXPECT_EQ(keys["mc_b"], b);
+    EXPECT_EQ(keys["mc_c"], c);
+    EXPECT_EQ(keys["mc_relay"], tree->get_node("mc_relay")->mgmt_pubkey);
+    // Group names and device names, sorted and de-duplicated.
+    EXPECT_EQ(perms["mc_a"], json::array({"connect_private", "read", "svc:inference"}));
+    // Admin on the group.
+    EXPECT_EQ(perms["mc_b"], json::array({"admin"}));
+    // A per-device entry only.
+    EXPECT_EQ(perms["mc_c"], json::array({"svc:files"}));
+    // A listed peer with no entry toward the caller.
+    EXPECT_EQ(perms["mc_none"], json::array());
+    EXPECT_EQ(perms["mc_relay"], json::array());
+    // A service permission on the group lists nothing by itself.
+    EXPECT_FALSE(ids.count("mc_d")) << "a service permission widened the peer list";
+    EXPECT_EQ(status_peer_count(), 5u);
 }
 
 // --- Review fixes: server-assigned fields, delete cleanup, link tokens, IPAM ---
@@ -2694,6 +2752,66 @@ TEST_F(InviteHttpTest, AnInviteIsBoundedByTheInvitersAuthority) {
     EXPECT_EQ(status_of(alice, {{"target_node_id", alice.node_id}}), 400) << "not a group";
     EXPECT_EQ(status_of(alice, {{"target_node_id", "no-such-group"}}), 404);
     EXPECT_EQ(status_of(alice, {{"target_node_id", "root"}}), 400);
+}
+
+// A service permission travels with an invite and shows up in the peer list
+// of the device the member connects to.
+TEST_F(InviteHttpTest, AnInviteCarriesAServicePermissionToThePeerList) {
+    const auto alice = join();
+    const auto bob = join();
+    const auto carol = join();
+    const auto pb = "ed25519:" + bob.b64;
+    auto status_of = [&](const Member& m, const json& body) {
+        auto res = invite(m, body);
+        return res ? res->status : -1;
+    };
+    EXPECT_EQ(status_of(alice, {{"permissions", {"read", "svc:Inference"}}}), 400);
+    EXPECT_EQ(status_of(alice, {{"permissions", {"read", "svc:"}}}), 400);
+    EXPECT_EQ(status_of(alice, {{"permissions", {"read", "made_up"}}}), 400);
+
+    const auto token = invite_token(
+        alice, {{"permissions", {"read", "connect_private", "add_child", "svc:inference"}}});
+    auto res = post(bob, "/api/link/accept", {{"link_token", token}});
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_FALSE(tree->check_permission(pb, alice.group, acl::Permission::Write));
+    EXPECT_FALSE(tree->check_permission(pb, alice.group, acl::Permission::EditNode));
+
+    // Alice's device lists bob's device with what bob holds toward it.
+    auto peers_res = get(alice, "/api/mesh/peers/" + alice.node_id);
+    ASSERT_NE(peers_res, nullptr);
+    ASSERT_EQ(peers_res->status, 200) << peers_res->body;
+    json bob_entry;
+    const auto alice_view = json::parse(peers_res->body);
+    for (const auto& p : alice_view["peers"]) {
+        if (p["node_id"] == bob.node_id) bob_entry = p;
+    }
+    ASSERT_FALSE(bob_entry.is_null()) << peers_res->body;
+    EXPECT_EQ(bob_entry["peer_permissions"],
+              json::array({"add_child", "connect_private", "read", "svc:inference"}));
+    EXPECT_EQ(bob_entry["mgmt_pubkey"], tree->get_node(bob.node_id)->mgmt_pubkey);
+    EXPECT_EQ(tree::canonical_principal(bob_entry["mgmt_pubkey"].get<std::string>()),
+              tree::canonical_principal(pb));
+    // Alice holds nothing toward bob's device: her admin covers her own group.
+    peers_res = get(bob, "/api/mesh/peers/" + bob.node_id);
+    ASSERT_NE(peers_res, nullptr);
+    ASSERT_EQ(peers_res->status, 200) << peers_res->body;
+    json alice_entry;
+    const auto bob_view = json::parse(peers_res->body);
+    for (const auto& p : bob_view["peers"]) {
+        if (p["node_id"] == alice.node_id) alice_entry = p;
+    }
+    ASSERT_FALSE(alice_entry.is_null()) << peers_res->body;
+    EXPECT_EQ(alice_entry["peer_permissions"], json::array());
+
+    // Bob passes on the service permission he holds and no other.
+    EXPECT_EQ(status_of(bob, {{"target_node_id", alice.group},
+                              {"permissions", {"read", "svc:other"}}}), 403);
+    const auto bob_token = invite_token(
+        bob, {{"target_node_id", alice.group}, {"permissions", {"read", "svc:inference"}}});
+    res = post(carol, "/api/link/accept", {{"link_token", bob_token}});
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 200) << res->body;
 }
 
 TEST_F(InviteHttpTest, AnExistingUserJoinsAnotherNetworkWithoutMoving) {
