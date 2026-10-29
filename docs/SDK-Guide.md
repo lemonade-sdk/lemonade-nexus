@@ -11,6 +11,7 @@ title: SDK Guide
 - [Quick Start (C API)](#quick-start-c-api)
 - [Tier 1 Servers](#tier-1-servers)
 - [Identity Management](#identity-management)
+- [Identity Storage](#identity-storage)
 - [Authentication](#authentication)
 - [Joining the Network](#joining-the-network)
 - [Invites and Other Networks](#invites-and-other-networks)
@@ -196,6 +197,105 @@ client.set_identity(identity);
 
 The client's mesh keypair is derived from this identity (identity-bound
 X25519), so possession of the identity is what the server checks.
+
+## Identity Storage
+
+`identity.json` holds the private key in the clear, protected by file
+permissions only. The per-user identity store keeps one identity for the
+OS user and protects it with the OS keystore. Use the store for desktop
+applications and the hand-off to move the identity to a daemon.
+
+### Per-user store
+
+The store wraps the 32-byte Ed25519 seed with a random 32-byte
+key-encryption key (KEK) using libsodium `crypto_secretbox`. The KEK lives in
+the OS keystore. The identity file holds the public key, the wrapped seed,
+and a reference to the KEK. The file alone yields nothing secret.
+
+| Platform | Keystore (`backend`) | Store directory |
+|---|---|---|
+| macOS | Login keychain, generic password, service `ai.lemonadeserver.nexus`, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, no iCloud sync (`keychain`) | `~/Library/Application Support/LemonadeNexus/identity/` |
+| Windows | DPAPI, user scope, `CRYPTPROTECT_UI_FORBIDDEN`, fixed optional entropy; the protected blob is kept in the file (`dpapi`) | `%LOCALAPPDATA%\LemonadeNexus\identity\` |
+| Linux | Secret Service through `libsecret-1.so.0`, loaded at run time (`libsecret`) | `${XDG_DATA_HOME:-~/.local/share}/lemonade-nexus/identity/` |
+
+The directory is created with mode 0700 and the file `identity.v2.json`
+with mode 0600. The home directory is that of the effective user
+(`getpwuid(geteuid())` or the known folder of the process token). `SUDO_USER`
+is never used: a process started with `sudo` is root and gets root's store.
+`HOME` is used only when the account database has no directory for the
+user.
+
+There is no fallback. When no keystore is usable (no libsecret, no session
+bus, no Secret Service, a daemon without a user session) the calls return
+`LN_ERR_UNSUPPORTED` and write nothing. When the keystore is locked or
+refuses access the calls return `LN_ERR_AUTH`.
+
+```c
+char* status = NULL;
+ln_identity_user_status(&status);   /* {present, backend, unlocked, public_key?, dir} */
+ln_free(status);
+
+ln_error_t err;
+ln_identity_t* id = ln_identity_user_load(&err);
+if (!id && err == LN_ERR_NOT_FOUND) {
+    id = ln_identity_user_create(&err);
+}
+if (!id) {
+    /* LN_ERR_UNSUPPORTED: no keystore; LN_ERR_AUTH: locked or denied;
+       LN_ERR_REJECTED: the stored file failed verification. */
+}
+
+/* One-time migration from identity.json (text already in memory) */
+ln_identity_t* old = ln_identity_from_json(text);
+err = ln_identity_user_import(old);     /* LN_ERR_REJECTED when one is present */
+ln_identity_destroy(old);
+
+ln_identity_user_remove();              /* keystore item first, then the file */
+```
+
+`ln_identity_user_create` and `ln_identity_user_import` refuse when a file
+is present; call `ln_identity_user_remove` first to replace an identity. The
+C++ interface is `lnsdk::IdentityStore` in `IdentityStore.hpp`.
+
+### Hand-off to another process
+
+A daemon that runs outside the user's session cannot open the user's
+keystore. The hand-off moves the identity from the user's process to the
+daemon over a local channel without plaintext on the wire.
+
+1. Receiver: `ln_identity_handoff_begin(&request)` creates an ephemeral
+   X25519 key and the request `{alg:"x25519-sealedbox-v1", pubkey, nonce,
+   expires_at}`. The request is valid for 60 s.
+2. Sender: `ln_identity_handoff_seal(identity, request)` seals
+   `nonce || seed` to the ephemeral key with a libsodium sealed box and
+   returns `{alg, nonce, sealed}`.
+3. Receiver: `ln_identity_handoff_open(handle, envelope, &err)` opens the
+   envelope once and returns the identity.
+
+The first `open` on a handle wipes the ephemeral secret whatever the
+result. A second `open`, an expired request, a wrong `alg`, or an envelope
+for another request returns `LN_ERR_REJECTED`; an envelope that does not
+open for the request returns `LN_ERR_AUTH`; a malformed envelope returns
+`LN_ERR_PARSE`. Destroy the handle with `ln_identity_handoff_destroy`. The
+C++ interface is `lnsdk::IdentityHandoff` in `IdentityHandoff.hpp`.
+
+### What is and is not protected
+
+- Reading the identity file, a backup of it, or the directory listing does
+  not reveal the key. The wrapped seed needs the KEK from the keystore.
+- Another OS user on the same machine cannot read the file (mode 0600) and
+  cannot use the keystore item (keychain ACL, DPAPI user scope, Secret
+  Service session).
+- An attacker who runs code in the user's session with access to the
+  user's keystore can read the KEK and therefore the key. The keystore
+  binds the key to the user, not to one application.
+- A root or administrator who reads process memory can read the key of a
+  process that holds it. This is unchanged from `identity.json`.
+- The envelope of a hand-off carries ciphertext only. A captured envelope
+  cannot be opened again because the ephemeral key is consumed.
+- Seeds, KEKs, and sealed-box plaintext live in guarded memory
+  (`SecureBuffer`) and are wiped after use. `lnsdk::Identity` wipes its
+  private key when it is destroyed or moved from.
 
 ## Authentication
 

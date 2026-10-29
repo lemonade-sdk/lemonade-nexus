@@ -59,15 +59,27 @@ list(APPEND LN_TRUST_SRC "${LN_SERVER_SRC}/Network/StunWire.cpp")
 # group that fold to the same label. No dependencies.
 list(APPEND LN_TRUST_SRC "${LN_SERVER_SRC}/Tree/DeviceLabel.cpp")
 
+# The per-user identity store (IdentityStore_<os>.cpp) keeps its key in the
+# OS keystore: the login keychain on macOS (Security and CoreFoundation),
+# DPAPI on Windows (crypt32), and libsecret on Linux, which is loaded at run
+# time with dlopen so there is no build-time or package dependency on it.
+if(APPLE)
+    set(LN_KEYSTORE_LIBS "-framework Security" "-framework CoreFoundation")
+elseif(WIN32)
+    set(LN_KEYSTORE_LIBS crypt32)
+else()
+    set(LN_KEYSTORE_LIBS ${CMAKE_DL_LIBS})
+endif()
+
 if(TARGET LemonadeNexusSDK)
     target_sources(LemonadeNexusSDK PRIVATE "${LN_DATAPLANE_SRC}" ${LN_TRUST_SRC})
     target_include_directories(LemonadeNexusSDK PRIVATE "${LN_SERVER_INCLUDE}")
-    target_link_libraries(LemonadeNexusSDK PUBLIC virtual-netstack)
+    target_link_libraries(LemonadeNexusSDK PUBLIC virtual-netstack ${LN_KEYSTORE_LIBS})
 endif()
 if(TARGET LemonadeNexusSDKApp)
     target_sources(LemonadeNexusSDKApp PRIVATE "${LN_DATAPLANE_SRC}" ${LN_TRUST_SRC})
     target_include_directories(LemonadeNexusSDKApp PRIVATE "${LN_SERVER_INCLUDE}")
-    target_link_libraries(LemonadeNexusSDKApp PUBLIC virtual-netstack)
+    target_link_libraries(LemonadeNexusSDKApp PUBLIC virtual-netstack ${LN_KEYSTORE_LIBS})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -100,7 +112,8 @@ if(BUILD_SDK_SHARED)
             OpenSSL::SSL
             OpenSSL::Crypto
             boringtun-ffi
-            virtual-netstack)
+            virtual-netstack
+            ${LN_KEYSTORE_LIBS})
 
     # Tells the header which build this is (used for __declspec on MSVC if ever needed).
     target_compile_definitions(LemonadeNexusSDKShared PRIVATE LN_BUILD_SHARED)
