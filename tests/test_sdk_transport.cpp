@@ -507,6 +507,17 @@ protected:
                 break;
             }
         });
+        srv.Post("/api/account/delete/challenge",
+                 [](const httplib::Request&, httplib::Response& res) {
+            const std::vector<uint8_t> challenge(32, 0x5a);
+            res.set_content(nlohmann::json{{"challenge", lnsdk::Identity::to_base64(challenge)}}
+                                .dump(),
+                            "application/json");
+        });
+        srv.Post("/api/account/delete", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(R"({"success":true,"status":"deleted","account_id":"node-self"})",
+                            "application/json");
+        });
         srv.Post("/api/mesh/heartbeat", [this](const httplib::Request& req,
                                                httplib::Response& res) {
             if (server_left_tier1.load() &&
@@ -1176,6 +1187,48 @@ TEST_F(SdkMeshPrivateApiTest, LeaveDeletesTheNodeBeforeItStopsTheMesh) {
     EXPECT_EQ(delete_posts.load(), 1);
     EXPECT_FALSE(client->is_mesh_active());
     EXPECT_TRUE(client->node_id().empty());
+    // The session belonged to the removed device; a later join starts afresh.
+    EXPECT_TRUE(client->session_token().empty());
+}
+
+// A device that left keeps no session bound to its former server. When that
+// server later leaves Tier 1, a private-path check starts no session move,
+// so nothing joins the device again.
+TEST_F(SdkMeshPrivateApiTest, LeavingEndsTheSessionSoNoMoveJoinsTheDeviceAgain) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    auto left = client->leave_network();
+    ASSERT_TRUE(left.ok) << left.error;
+
+    ASSERT_NO_FATAL_FAILURE(server_leaves_tier1(*client));
+    EXPECT_TRUE(client->check_health().ok);
+    EXPECT_FALSE(wait_for([&] { return !moves().empty(); }, std::chrono::seconds(2)));
+    EXPECT_EQ(auth_posts.load(), 0);
+    EXPECT_EQ(join_bearers().size(), 1u);
+    EXPECT_TRUE(client->node_id().empty());
+}
+
+// The same holds after an account deletion: the session ends with its
+// server binding, so no session move joins the deleted account again.
+TEST_F(SdkMeshPrivateApiTest, DeletingTheAccountEndsTheSessionSoNoMoveJoinsAgain) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    auto deleted = client->delete_account();
+    ASSERT_TRUE(deleted.ok) << deleted.error;
+    EXPECT_TRUE(client->session_token().empty());
+    EXPECT_TRUE(client->node_id().empty());
+
+    ASSERT_NO_FATAL_FAILURE(server_leaves_tier1(*client));
+    EXPECT_TRUE(client->check_health().ok);
+    EXPECT_FALSE(wait_for([&] { return !moves().empty(); }, std::chrono::seconds(2)));
+    EXPECT_EQ(auth_posts.load(), 0);
+    EXPECT_EQ(join_bearers().size(), 1u);
 }
 
 // A rejected delete leaves the node joined: the mesh stays up so the caller can
@@ -1187,9 +1240,14 @@ TEST_F(SdkMeshPrivateApiTest, LeaveKeepsTheMeshUpWhenTheDeleteFails) {
     auto left = client->leave_network();
     EXPECT_FALSE(left.ok);
     EXPECT_EQ(left.http_status, 403);
+    // The error says what failed: the node, the status, and the server's reason.
+    EXPECT_NE(left.error.find(kNodeId), std::string::npos) << left.error;
+    EXPECT_NE(left.error.find("HTTP 403"), std::string::npos) << left.error;
+    EXPECT_NE(left.error.find("denied"), std::string::npos) << left.error;
     EXPECT_EQ(delete_posts.load(), 1);
     EXPECT_TRUE(client->is_mesh_active());
     EXPECT_EQ(client->node_id(), kNodeId);
+    EXPECT_EQ(client->session_token(), "session-token");
 }
 
 // The server can apply a POST and then lose the response. The client must not

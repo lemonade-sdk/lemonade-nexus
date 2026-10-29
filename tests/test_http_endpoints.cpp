@@ -3011,6 +3011,92 @@ TEST_F(InviteHttpTest, TheOwnerRemovesAMemberAndAMemberLeaves) {
     EXPECT_FALSE(peers(bob).count(alice.node_id));
 }
 
+// A device that joined with an invite leaves the network: it deletes its own
+// node, though it holds no delete_node there. It deletes no sibling and not
+// the group, and the inviter still removes the devices it invited.
+TEST_F(InviteHttpTest, AnInvitedDeviceLeavesByDeletingOnlyItsOwnNode) {
+    const auto alice = join();
+    const auto device = join(invite_token(alice));
+    const auto sibling = join(invite_token(alice));
+    const auto other = join(invite_token(alice));
+    ASSERT_EQ(device.group, alice.group);
+    ASSERT_FALSE(tree->check_permission("ed25519:" + device.b64, device.node_id,
+                                        acl::Permission::DeleteNode));
+
+    EXPECT_EQ(post(device, "/api/tree/node/delete/" + sibling.node_id, json::object())->status,
+              403);
+    EXPECT_EQ(post(device, "/api/tree/node/delete/" + alice.group, json::object())->status, 403);
+    EXPECT_EQ(post(device, "/api/tree/node/delete/" + alice.node_id, json::object())->status,
+              403);
+    EXPECT_TRUE(tree->get_node(sibling.node_id).has_value());
+    EXPECT_TRUE(tree->get_node(alice.group).has_value());
+
+    auto left = post(device, "/api/tree/node/delete/" + device.node_id, json::object());
+    ASSERT_NE(left, nullptr);
+    ASSERT_EQ(left->status, 200) << left->body;
+    EXPECT_TRUE(json::parse(left->body).value("success", false));
+    EXPECT_FALSE(tree->get_node(device.node_id).has_value());
+    EXPECT_FALSE(peers(alice).count(device.node_id));
+    EXPECT_FALSE(peers(sibling).count(device.node_id));
+
+    auto removed = post(alice, "/api/tree/node/delete/" + other.node_id, json::object());
+    ASSERT_NE(removed, nullptr);
+    EXPECT_EQ(removed->status, 200) << removed->body;
+    EXPECT_FALSE(tree->get_node(other.node_id).has_value());
+    EXPECT_TRUE(tree->get_node(sibling.node_id).has_value());
+}
+
+// A device that leaves on its own keeps its key: it joins again later with a
+// new invite and the same identity. A device that an admin removes loses its
+// key: the server refuses its next join.
+TEST_F(InviteHttpTest, ADeviceThatLeftJoinsAgainButARemovedDeviceIsRevoked) {
+    const auto alice = join();
+    const auto device = join(invite_token(alice));
+    const auto removed = join(invite_token(alice));
+
+    auto left = post(device, "/api/tree/node/delete/" + device.node_id, json::object());
+    ASSERT_NE(left, nullptr);
+    ASSERT_EQ(left->status, 200) << left->body;
+    ASSERT_FALSE(tree->get_node(device.node_id).has_value());
+    EXPECT_TRUE(auth->validate_session_claims(make_jwt(device.b64)).has_value());
+
+    auto again = join_node(device.kp, invite_token(alice));
+    ASSERT_NE(again, nullptr);
+    ASSERT_EQ(again->status, 200) << again->body;
+    EXPECT_EQ(json::parse(again->body).value("node_id", std::string{}), device.node_id);
+    const auto rejoined = tree->get_node(device.node_id);
+    ASSERT_TRUE(rejoined.has_value());
+    EXPECT_EQ(rejoined->parent_id, alice.group);
+    EXPECT_TRUE(peers(alice).count(device.node_id));
+
+    auto by_admin = post(alice, "/api/tree/node/delete/" + removed.node_id, json::object());
+    ASSERT_NE(by_admin, nullptr);
+    ASSERT_EQ(by_admin->status, 200) << by_admin->body;
+    EXPECT_FALSE(auth->validate_session_claims(make_jwt(removed.b64)).has_value());
+    auto refused = join_node(removed.kp, invite_token(alice));
+    ASSERT_NE(refused, nullptr);
+    EXPECT_EQ(refused->status, 401) << refused->body;
+    EXPECT_FALSE(tree->get_node(removed.node_id).has_value());
+    // The SDK authenticates before it joins; that answer names the reason.
+    const auto challenge_b64 =
+        auth->issue_ed25519_challenge(removed.b64).value("challenge", std::string{});
+    const auto sig = crypto->ed25519_sign(
+        removed.kp.private_key, std::span<const uint8_t>(crypto::from_base64(challenge_b64)));
+    httplib::Client cli("127.0.0.1", port);
+    auto login = cli.Post("/api/auth",
+                          json{{"method", "ed25519"},
+                               {"pubkey", removed.b64},
+                               {"challenge", challenge_b64},
+                               {"signature", crypto::to_base64(sig)}}
+                              .dump(),
+                          "application/json");
+    ASSERT_NE(login, nullptr);
+    EXPECT_EQ(login->status, 401);
+    EXPECT_EQ(json::parse(login->body).value("error", std::string{}),
+              "This identity has been revoked")
+        << login->body;
+}
+
 TEST_F(InviteHttpTest, MembershipsListHomeAndMemberGroups) {
     const auto alice = join();
     const auto bob = join();
@@ -3418,6 +3504,21 @@ TEST_F(AccountDeleteHttpTest, DeletingAnAccountRemovesItsNetworkMembershipsAndSt
     auto stale = get(alice, "/api/tree/memberships");
     ASSERT_NE(stale, nullptr);
     EXPECT_EQ(stale->status, 401) << stale->body;
+}
+
+// Account deletion still revokes the key, also for a device that joined
+// through an invite: deleting an account is not leaving a network.
+TEST_F(AccountDeleteHttpTest, AnInvitedDeviceThatDeletesItsAccountIsRevoked) {
+    const auto alice = join();
+    const auto device = join(invite_token(alice));
+    ASSERT_TRUE(fresh_login_works(device));
+
+    auto res = delete_account(device);
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_FALSE(tree->get_node(device.node_id).has_value());
+    EXPECT_FALSE(fresh_login_works(device));
+    EXPECT_TRUE(fresh_login_works(alice));
 }
 
 TEST_F(AccountDeleteHttpTest, ASessionAloneCannotDeleteAnAccount) {

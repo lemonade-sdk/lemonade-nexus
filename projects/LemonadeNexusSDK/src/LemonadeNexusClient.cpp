@@ -1491,9 +1491,13 @@ Result<nlohmann::json> LemonadeNexusClient::delete_account() {
         // the session and the mesh session end here.
         disable_mesh();
         impl_->meshplane.stop();
-        std::lock_guard lock(impl_->mutex);
-        impl_->node_id.clear();
-        impl_->set_token({});
+        {
+            std::lock_guard lock(impl_->mutex);
+            impl_->node_id.clear();
+        }
+        // Drop the token with its server binding, so no session move joins
+        // the deleted account again.
+        set_session_token({});
         spdlog::info("[LemonadeNexusClient] deleted account {}",
                      result.value.value("account_id", std::string{}));
     }
@@ -2904,7 +2908,12 @@ StatusResult LemonadeNexusClient::leave_network() {
     // so the caller can retry.
     auto del = delete_node(current_node_id);
     if (!del) {
-        result.error = "leave failed: " + del.error;
+        result.error = "leave failed: deleting this device's node " + current_node_id +
+                       (del.http_status > 0
+                            ? " was refused (HTTP " + std::to_string(del.http_status) + ")"
+                            : std::string(" did not reach the server")) +
+                       ": " + (del.error.empty() ? "no reason given" : del.error) +
+                       "; the mesh stays up";
         result.http_status = del.http_status;
         return result;
     }
@@ -2915,6 +2924,10 @@ StatusResult LemonadeNexusClient::leave_network() {
         std::lock_guard lock(impl_->mutex);
         impl_->node_id.clear();
     }
+    // The session belonged to the removed device. Its server may also have
+    // revoked the key, so a later join authenticates afresh, and no session
+    // move re-joins this device on its own.
+    set_session_token({});
 
     result.ok = true;
     spdlog::info("[LemonadeNexusClient] left network (was node {})", current_node_id);

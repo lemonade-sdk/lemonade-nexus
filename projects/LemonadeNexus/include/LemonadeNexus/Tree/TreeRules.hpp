@@ -178,6 +178,17 @@ bool grant_link_peer_access(TreeNode& node, std::string_view principal);
 [[nodiscard]] bool holds_or_administers(const NodeMap& nodes, std::string_view node_id,
                                         std::string_view signer, acl::Permission perm);
 
+/// True when `principal` may remove `node_id` as its own device without
+/// holding delete_node: the node is the device (Endpoint) that the key joined
+/// as, and nothing lies beneath it. `joined_as` is the principal's join node
+/// id (derive_join_node_id in TreeOps.hpp); the node must have that id and
+/// the principal as its management key. A device that joined through an
+/// invite holds no delete_node on its own node, and this rule lets it leave.
+/// It never covers another node, a group, or a node with children, so it
+/// only reduces the principal's own presence. Deterministic.
+[[nodiscard]] bool removes_own_device(const NodeMap& nodes, std::string_view node_id,
+                                      std::string_view principal, std::string_view joined_as);
+
 // --- Invites (link tokens that target a group) ------------------------------
 
 /// The permission names an invite may grant. `admin`, `edit_node`, and

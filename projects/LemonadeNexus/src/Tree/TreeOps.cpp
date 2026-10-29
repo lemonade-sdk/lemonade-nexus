@@ -828,6 +828,11 @@ std::string derive_join_node_id(crypto::SodiumCryptoService& crypto,
     return crypto::to_hex(std::span<const uint8_t>(hash.data(), hash.size())).substr(0, 32);
 }
 
+bool is_own_device_removal(crypto::SodiumCryptoService& crypto, const TreeOp& op) {
+    return op.kind == TreeOpKind::DeleteNode && op.body.source != TreeOpSource::Delta &&
+           !op.target.empty() && op.target == derive_join_node_id(crypto, op.principal);
+}
+
 // --- Validation -------------------------------------------------------------
 
 namespace {
@@ -1080,12 +1085,17 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             break;
         }
         case TreeOpKind::DeleteNode: {
-            // A group admin removes the group's devices through the API. A
-            // signed delta keeps the stricter
-            // delta rule: delete_node on the node itself.
-            const bool admin_removal = body.source != TreeOpSource::Delta &&
-                                       rules::admin_anchor(nodes, op.target, op.principal);
-            if (!admin_removal &&
+            // A group admin removes the group's devices through the API, and
+            // a device removes its own node (it leaves the network). A
+            // signed delta keeps the stricter delta rule: delete_node on the
+            // node itself.
+            const bool session_op = body.source != TreeOpSource::Delta;
+            const bool admin_removal =
+                session_op && rules::admin_anchor(nodes, op.target, op.principal);
+            const bool own_device_removal =
+                session_op && rules::removes_own_device(nodes, op.target, op.principal,
+                                                        derive_join_node_id(crypto, op.principal));
+            if (!admin_removal && !own_device_removal &&
                 !rules::signer_has_permission(*target, op.principal,
                                               acl::Permission::DeleteNode)) {
                 return refuse(R::Forbidden, "no delete_node permission");

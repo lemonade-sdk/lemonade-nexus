@@ -491,6 +491,24 @@ An admin of a group also administers the group's devices without an entry on
 each one: it reads a device's full assignment list and removes the device. No
 caller removes the root node through the API.
 
+A device also removes its own node through the API (it leaves the network),
+even when it joined through an invite and holds no `delete_node` there. The
+rule covers only the device node that the caller's key joined as: an
+`Endpoint` whose id is the key's join node id and whose management key is
+the caller, with no node beneath it. It never covers another device, a
+group, or a signed delta, and it only removes the caller's own presence.
+
+When a node is deleted, every server that applies the delete runs the
+removed-nodes cascade (`TreeApiHandler::cascade_node_cleanup`). The cascade
+revokes the node's management key when no remaining node owns it, so the key
+can no longer authenticate. A device's own leave is the exception: its key
+stays valid, and the device can join again later with a new invite and the
+same identity. The exception follows from the committed op alone
+(`tree::is_own_device_removal`: a `DeleteNode` session op whose target is the
+signer's join node id, on a node whose management key is the signer), so
+every replica decides the same. An admin's removal of a device and an account
+deletion still revoke the key.
+
 Clients change assignments through `POST /api/tree/node/assignments/{id}`
 with `{"pubkey", "permissions"}`. The server sets exactly that list for the
 key, replacing its entry, and an empty list removes it. The same admin and

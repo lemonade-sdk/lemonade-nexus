@@ -417,6 +417,12 @@ within 10 minutes; the token still works then.
 - An invite never grants `admin`, `edit_node`, or `delete_node`, and never
   grants more than the inviter holds. The server checks the inviter's
   authority again when the code is used.
+- A device that joined with an invite still leaves with `leave_network()`
+  (`ln_leave_network`): the server lets a device delete its own node, and
+  nothing else, without `delete_node`. The device key stays valid, so the
+  device can join again later with a new invite and the same identity. When
+  an admin removes the device instead, or the account is deleted, the
+  server revokes the key, and a later join needs a new identity.
 - **Device names are unique within a group.** The mesh port folds a device
   name to one DNS label ("Work PC" and "work-pc" are both `work-pc`), so a
   join or a rename (`update_node` with `hostname`) whose label another device

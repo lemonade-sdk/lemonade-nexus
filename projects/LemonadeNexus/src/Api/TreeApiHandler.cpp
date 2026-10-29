@@ -554,21 +554,22 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
 TreeApiHandler::TreeApiHandler(ApiContext& ctx)
     : ctx_(ctx), pending_joins_(std::make_shared<PendingJoins>()) {
     ctx_.tree.set_removed_nodes_hook(
-        [this](const std::vector<tree::TreeNode>& removed) { cleanup_removed_nodes(removed); });
+        [this](const std::vector<tree::RemovedNode>& removed) { cleanup_removed_nodes(removed); });
 }
 
 TreeApiHandler::~TreeApiHandler() {
     ctx_.tree.set_removed_nodes_hook({});
 }
 
-void TreeApiHandler::cleanup_removed_nodes(const std::vector<tree::TreeNode>& removed) {
-    for (const auto& node : removed) cascade_node_cleanup(node.id, node);
+void TreeApiHandler::cleanup_removed_nodes(const std::vector<tree::RemovedNode>& removed) {
+    for (const auto& r : removed) cascade_node_cleanup(r.node.id, r.node, !r.own_device_left);
 }
 
 // Post-delete cascade, run by the committed-removal hook. IPAM release results
 // are ignored, and peer/DNS removal is logged on success only.
 void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
-                                          const std::optional<tree::TreeNode>& doomed) {
+                                          const std::optional<tree::TreeNode>& doomed,
+                                          bool revoke_key) {
     if (!doomed) return;
     // 1. Revoke the device's Ed25519 credential so a deleted device
     //    cannot silently auto-re-register (node_id is key-deterministic).
@@ -576,8 +577,11 @@ void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
     //    customer group AND every sibling endpoint, so deleting ONE of
     //    their own devices must NOT blocklist that shared key. Only revoke
     //    a key that no surviving node still owns — i.e. a linked-device
-    //    key, which owns only the endpoint just deleted.
-    if (!doomed->mgmt_pubkey.empty() &&
+    //    key, which owns only the endpoint just deleted. A device that left
+    //    on its own keeps its key (revoke_key is false), so it can join
+    //    again with a new invite; the committed op decides that, not this
+    //    server's state.
+    if (revoke_key && !doomed->mgmt_pubkey.empty() &&
         !ctx_.tree.is_mgmt_pubkey_in_use(doomed->mgmt_pubkey)) {
         ctx_.auth.revoke_ed25519(
             std::string(strip_ed25519_prefix(doomed->mgmt_pubkey)));
@@ -1498,16 +1502,18 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                const SessionClaims& claims) {
         auto node_id = req.matches[1].str();
 
-        // DeleteNode on the node itself, or an admin of the node or an ancestor
-        // group (a group admin removes the group's devices). The root is never
-        // removed through the API.
+        // DeleteNode on the node itself, an admin of the node or an ancestor
+        // group (a group admin removes the group's devices), or the device
+        // that the caller's key joined as (a device leaves the network). The
+        // root is never removed through the API.
         const auto caller = normalize_pubkey(claims.pubkey);
         if (auto target = ctx_.tree.get_node(node_id); target && target->parent_id.empty()) {
             error_response(res, "the root node cannot be deleted", 403);
             return;
         }
         if (!ctx_.tree.check_permission(caller, node_id, acl::Permission::DeleteNode) &&
-            !ctx_.tree.administers(caller, node_id)) {
+            !ctx_.tree.administers(caller, node_id) &&
+            !ctx_.tree.removes_own_device(caller, node_id)) {
             error_response(res, "no delete_node permission", 403);
             return;
         }
@@ -1528,7 +1534,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         });
         if (answer_unfinished(res, s)) return;
         if (!s.verdict.ok()) {
-            error_response(res, "node not found or delete failed", 404);
+            error_response(res, s.verdict.reason, status_for_refusal(s.verdict.refusal));
             return;
         }
 

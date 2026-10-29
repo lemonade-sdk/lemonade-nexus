@@ -362,6 +362,23 @@ bool holds_or_administers(const NodeMap& nodes, std::string_view node_id,
            admin_anchor(nodes, node_id, signer).has_value();
 }
 
+bool removes_own_device(const NodeMap& nodes, std::string_view node_id,
+                        std::string_view principal, std::string_view joined_as) {
+    if (node_id.empty() || node_id != joined_as) return false;
+    auto it = nodes.find(std::string(node_id));
+    if (it == nodes.end()) return false;
+    const TreeNode& node = it->second;
+    const auto principal_canon = canonical_principal(principal);
+    if (node.type != NodeType::Endpoint || principal_canon.empty() ||
+        canonical_principal(node.mgmt_pubkey) != principal_canon) {
+        return false;
+    }
+    // A delete removes only the named node. A node beneath the device can
+    // belong to another key, so this rule never removes a node with children.
+    return std::none_of(nodes.begin(), nodes.end(),
+                        [&](const auto& entry) { return entry.second.parent_id == node_id; });
+}
+
 namespace {
 
 /// True when `node_id` is `ancestor_id` or lies beneath it. A parent loop or

@@ -349,6 +349,14 @@ void sign_tree_op(crypto::SodiumCryptoService& crypto, TreeOp& op,
 [[nodiscard]] std::string derive_join_node_id(crypto::SodiumCryptoService& crypto,
                                               std::string_view device_pubkey);
 
+/// True when `op` is a device leaving the network: a DeleteNode session op
+/// (not a signed delta) whose target is the principal's own join node
+/// (derive_join_node_id). It reads only the op, so every replica that applies
+/// the committed op decides the same. validate_op authorizes such an op
+/// through rules::removes_own_device; the post-delete cleanup keeps the
+/// device key valid for it, so the device can join again later.
+[[nodiscard]] bool is_own_device_removal(crypto::SodiumCryptoService& crypto, const TreeOp& op);
+
 /// Decide whether `op` is acceptable against `state` at `block_time_sec`.
 /// Checks, in order: format and kind/source pair, network, size, op id,
 /// trusted submitter and signature, freshness against the block time, replay
