@@ -167,6 +167,19 @@ it verified, never from the notice. The move is reported through
 `set_session_moved_callback()` / `ln_set_session_moved_callback()` (see
 [Session moves](#session-moves)).
 
+A fourth sign is a dead private path. A Tier 1 server that restarts in place
+keeps its seat and its public API but forgets the client's dataplane peer, so
+every private-API request fails before the handshake completes while the
+membership still lists the server. When such requests have gone unanswered
+at the connect or handshake level for 30 s (an HTTP error status is an
+answer; one lost handshake does not count, the window starts at the first
+failure and any answer resets it), the SDK verifies the membership again
+over the public API and, when the server is still a member that answered,
+moves the session anyway: it authenticates through a verified member, the
+same server included, and the fresh join adds the peer back. When nothing
+can be verified, the device itself lost the network: the session stays, and
+the SDK waits for the next window. One move starts per window.
+
 Only when the SDK cannot move the session (no identity set, or the silent
 join failed) does it drop the session: `check_health()` reports it once,
 private-API calls are refused, and `mesh_status().needs_rejoin` stays true
@@ -595,7 +608,8 @@ under `catalog`.
 
 ### Session moves
 
-The SDK moves a session whose Tier 1 server leaves the membership (see
+The SDK moves a session whose Tier 1 server leaves the membership, or stops
+answering over the mesh while its public API still answers (see
 [Tier 1 Servers](#tier-1-servers)). Nothing is required from the application;
 one callback tells it what happened, so it can inform the user:
 
