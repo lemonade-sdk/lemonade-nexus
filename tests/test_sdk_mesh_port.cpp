@@ -19,6 +19,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -427,6 +428,25 @@ TEST(MeshPortRules, AutoRouteOrder) {
     EXPECT_EQ(merged["data"][4]["id"], "Fast box/Big");
 }
 
+// Every model a device lists appears in the merged listing with a loaded flag
+// from its health all_models_loaded, so a client can badge loaded models.
+TEST(MeshPortRules, MergedModelsCarryALoadedFlag) {
+    lnsdk::MeshPortPeerModels gpu{"gpu", "GPU tower", 20,
+                                  json::array({{{"model_name", "Big"}, {"is_busy", true}}, "junk", {{"other", 1}}}),
+                                  {"Big", "Spare"}};
+    lnsdk::MeshPortPeerModels quiet{"fast", "Fast box", 2, json(), {"Idle"}};  // health gave no list
+    const auto merged = rules::merge_models({{"object", "list"}, {"data", json::array({{{"id", "Small"}}})}},
+                                            {gpu, quiet});
+    ASSERT_EQ(merged["data"].size(), 4u);
+    EXPECT_FALSE(merged["data"][0].contains("loaded")) << "local entries pass through unchanged";
+    EXPECT_EQ(merged["data"][1]["id"], "GPU tower/Big");
+    EXPECT_EQ(merged["data"][1]["loaded"], true);
+    EXPECT_EQ(merged["data"][2]["id"], "GPU tower/Spare");
+    EXPECT_EQ(merged["data"][2]["loaded"], false);
+    EXPECT_EQ(merged["data"][3]["loaded"], false);
+    EXPECT_EQ(rules::loaded_model_names(gpu), (std::set<std::string>{"Big"}));
+}
+
 TEST(MeshPortRules, UrlsDomainsAndLocalService) {
     const auto members = group_members();
     const auto urls = rules::device_urls(members, "self", kDomain, 13306, true);
@@ -548,6 +568,21 @@ TEST_F(MeshPortTest, AutoRouter) {
     ASSERT_EQ(ids.size(), 3u);
     EXPECT_EQ(ids[0]["id"], "LocalModel");
     EXPECT_EQ(ids[1]["id"], "GPU tower/PeerModel");
+    EXPECT_EQ(ids[1]["loaded"], true);
+    EXPECT_EQ(ids[2]["id"], "GPU tower/Shared");
+    EXPECT_EQ(ids[2]["loaded"], false);
+    // The status counts what that probe found; it sends no request itself.
+    const int listings = peer_model_listings.load();
+    bool found = false;
+    const auto status = port->status();
+    for (const auto& device : status["devices"]) {
+        if (device["node_id"] != "gpu") continue;
+        found = true;
+        EXPECT_EQ(device["models_count"], 2);
+        EXPECT_EQ(device["loaded_count"], 1);
+    }
+    EXPECT_TRUE(found);
+    EXPECT_EQ(peer_model_listings.load(), listings);
 }
 
 TEST_F(MeshPortTest, AutoRouterSkipsDevicesThatRefuseTheKey) {

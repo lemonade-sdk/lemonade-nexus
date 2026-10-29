@@ -1202,7 +1202,7 @@ ln_error_t ln_mesh_port_set_selection(ln_client_t* client, const char* target,
  *   "unsupported_certificate" | "error"), domain, expires_at, error},
  *   urls: [{node_id, device_name, url, self}],
  *   devices: [{node_id, device_name, is_online, app: {name, version},
- *              families: [...], catalog_status}],
+ *              families: [...], catalog_status, models_count, loaded_count}],
  *   catalog: {...}}.
  *  "activating" means the first certificate is installed and the port switches
  *  to TLS as soon as the open plain HTTP requests finish; a running stream is
@@ -1213,7 +1213,12 @@ ln_error_t ln_mesh_port_set_selection(ln_client_t* client, const char* target,
  *  GET /.nexus/catalog last answered: the app name and version and the family
  *  names of its service catalog, and catalog_status (the HTTP status of that
  *  probe; 0 when the device has not answered yet, 404 when its SDK has no
- *  catalog). A device that reports no catalog shows empty strings. `catalog`
+ *  catalog). A device that reports no catalog shows empty strings.
+ *  models_count and loaded_count are the models its last model probe listed
+ *  (/api/v1/models) and reported loaded (/api/v1/health all_models_loaded);
+ *  both are 0 before the first probe. The `auto` model listing marks each
+ *  "<device>/<model>" entry with "loaded": true or false from the same
+ *  probe. `catalog`
  *  is the catalog this client registered for mesh port 13305
  *  (ln_mesh_service_set_catalog), or {}. The peer key is never included.
  *  Caller must ln_free(*out_json). Returns LN_ERR_NULL_ARG for a NULL
