@@ -5,10 +5,11 @@ name: Mobile SDK
 # scripts/build-sdk-mobile.sh, checks that only the ln_* API is exported, and
 # analyzes and tests the Flutter plugin in packages/lemonade_nexus_sdk.
 #
-# With a release tag (manual run), uploads the plugin archives
-# lemonade_nexus_sdk-{ios,android}-<VERSION>.zip to that release and prints
-# their SHA-256 values for packages/lemonade_nexus_sdk/native/manifest.json.
-# The tag must match the manifest's base_url (mobile-sdk-v<VERSION>).
+# With a release tag mobile-sdk-v<version> (manual run), uploads the plugin
+# archives lemonade_nexus_sdk-{ios,android}-<version>.zip to that release and
+# prints their SHA-256 values for packages/lemonade_nexus_sdk/native/manifest.json.
+# <version> is VERSION, or a rebuild of it such as 0.9.8.1 (MOBILE_SDK_VERSION
+# in scripts/build-sdk-mobile.sh); it must match the manifest's base_url.
 #
 # OpenSSL comes from the pinned mobile archives (deps-openssl-mobile.yml);
 # the build fails with instructions until they are published and pinned.
@@ -49,7 +50,9 @@ jobs:
           brew install ninja
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
       - name: Build
-        run: scripts/build-sdk-mobile.sh ios-arm64 iossimulator-arm64 iossimulator-x86_64
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then export MOBILE_SDK_VERSION="${RELEASE_TAG#mobile-sdk-v}"; fi
+          scripts/build-sdk-mobile.sh ios-arm64 iossimulator-arm64 iossimulator-x86_64
       - name: Verify exports
         run: |
           xc=build/mobile/dist/ios/lemonade_nexus_sdk.xcframework
@@ -75,7 +78,9 @@ jobs:
           echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_VERSION}" >/dev/null
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
       - name: Build
-        run: scripts/build-sdk-mobile.sh android-arm64-v8a android-armeabi-v7a android-x86_64
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then export MOBILE_SDK_VERSION="${RELEASE_TAG#mobile-sdk-v}"; fi
+          scripts/build-sdk-mobile.sh android-arm64-v8a android-armeabi-v7a android-x86_64
       - name: Verify exports and dependencies
         run: |
           bin="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/darwin-x86_64/bin"

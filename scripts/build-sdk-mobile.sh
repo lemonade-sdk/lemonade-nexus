@@ -22,6 +22,9 @@
 #   IOS_DEPLOYMENT_TARGET  minimum iOS version (default 15.0)
 #   ANDROID_NDK_ROOT       Android NDK (required for android-*)
 #   ANDROID_API            minimum Android API level (default 24)
+#   MOBILE_SDK_VERSION     version in the archive names (default: VERSION).
+#                          A rebuild of the same VERSION needs its own, such as
+#                          0.9.8.1, so it gets its own release and SHA-256.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root="$PWD"
@@ -128,7 +131,7 @@ done
 # --- Install into the Flutter plugin and pack the release archives ---------
 # The archives are what packages/lemonade_nexus_sdk/native/manifest.json pins.
 PKG="$root/packages/lemonade_nexus_sdk"
-version="$(cat "$root/VERSION")"
+version="${MOBILE_SDK_VERSION:-$(cat "$root/VERSION")}"
 if [[ -d "$DIST/ios/lemonade_nexus_sdk.xcframework" ]]; then
   rm -rf "$PKG/ios/Frameworks"
   mkdir -p "$PKG/ios/Frameworks"
