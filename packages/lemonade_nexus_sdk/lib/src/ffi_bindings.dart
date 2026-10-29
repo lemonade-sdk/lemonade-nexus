@@ -261,6 +261,20 @@ typedef _LnInviteCreateDart = int Function(
   int ttlSec,
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
+typedef _LnCheckDeviceName = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> name,
+  ffi.Pointer<ffi.Char> groupNodeId,
+  ffi.Pointer<ffi.Char> linkToken,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnCheckDeviceNameDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> name,
+  ffi.Pointer<ffi.Char> groupNodeId,
+  ffi.Pointer<ffi.Char> linkToken,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
 typedef _LnStringJson = ffi.Int32 Function(
   LnClientHandle client,
   ffi.Pointer<ffi.Char> arg,
@@ -926,6 +940,8 @@ class LemonadeNexusFfi {
       _LnLinkTokenCreateDart>('ln_link_token_create');
   late final _lnInviteCreate =
       _lib.lookupFunction<_LnInviteCreate, _LnInviteCreateDart>('ln_invite_create');
+  late final _lnCheckDeviceName = _lib
+      .lookupFunction<_LnCheckDeviceName, _LnCheckDeviceNameDart>('ln_check_device_name');
   late final _lnInviteAccept =
       _lib.lookupFunction<_LnStringJson, _LnStringJsonDart>('ln_invite_accept');
   late final _lnMembershipsList =
@@ -1082,6 +1098,7 @@ class LemonadeNexusFfi {
     'ln_set_link_token',
     'ln_link_token_create',
     'ln_invite_create',
+    'ln_check_device_name',
     'ln_invite_accept',
     'ln_memberships_list',
     'ln_membership_leave',
@@ -1444,6 +1461,24 @@ class LemonadeNexusFfi {
     } finally {
       if (target != ffi.nullptr) malloc.free(target);
       if (perms != ffi.nullptr) malloc.free(perms);
+    }
+  }
+
+  /// Check a device name in a group (by [groupNodeId] or an invite's
+  /// [linkToken]) before a join or a rename. See ln_check_device_name.
+  (LnError, String?) checkDeviceName(
+      LnClientHandle client, String name, String? groupNodeId, String? linkToken) {
+    ffi.Pointer<ffi.Char> utf8(String? v) =>
+        v == null ? ffi.nullptr.cast<ffi.Char>() : v.toNativeUtf8().cast<ffi.Char>();
+    final namePtr = utf8(name);
+    final group = utf8(groupNodeId);
+    final token = utf8(linkToken);
+    try {
+      return _jsonOut((out) => _lnCheckDeviceName(client, namePtr, group, token, out));
+    } finally {
+      for (final p in [namePtr, group, token]) {
+        if (p != ffi.nullptr) malloc.free(p);
+      }
     }
   }
 

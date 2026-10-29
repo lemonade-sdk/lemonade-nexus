@@ -617,6 +617,20 @@ class LemonadeNexusSdk {
     return _tier1Result(error, json, 'Failed to create the invite');
   }
 
+  /// Checks [name] as a device name in a group, given by [groupNodeId] or by
+  /// an invite's [linkToken] (the token is not spent). Names fold to one
+  /// label ("Work PC" and "work-pc" collide), and the tree refuses a join or
+  /// a hostname update whose label another device of the group holds.
+  /// Returns `{label, available, conflicts, suggestion}`. Advisory only.
+  Future<Map<String, dynamic>> checkDeviceName(String name,
+      {String? groupNodeId, String? linkToken}) async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread(
+        (f, c) => f.checkDeviceName(c, name, groupNodeId, linkToken));
+    return _tier1Result(error, json, 'Failed to check the device name');
+  }
+
   /// Accept an invite as an account that already joined: this identity
   /// becomes a member of the invite's group. Nothing it owns moves. Returns
   /// `{success, node_id, permissions, status}`.

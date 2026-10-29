@@ -18,6 +18,7 @@ import 'dart:async';
 import 'dart:isolate';
 
 import 'lemonade_nexus_sdk.dart';
+import 'models.dart' show SessionMoveEvent;
 
 class NexusWorker {
   NexusWorker._(this._isolate, this._commands, this._responses);
@@ -26,6 +27,8 @@ class NexusWorker {
   final SendPort _commands;
   final ReceivePort _responses;
   final Map<int, Completer<Object?>> _pending = {};
+  final StreamController<SessionMoveEvent> _sessionMoves =
+      StreamController<SessionMoveEvent>.broadcast();
   int _nextId = 0;
   bool _closed = false;
 
@@ -51,6 +54,10 @@ class NexusWorker {
     worker = NexusWorker._(isolate, await ready.future, responses);
     return worker;
   }
+
+  /// [LemonadeNexusSdk.sessionMoves] of the worker's SDK, delivered on this
+  /// isolate.
+  Stream<SessionMoveEvent> get sessionMoves => _sessionMoves.stream;
 
   /// Runs [task] with the worker's SDK on the worker isolate and returns its
   /// result. Tasks run in the order they were submitted.
@@ -100,6 +107,7 @@ class NexusWorker {
     _commands.send(null);
     await done.future;
     _responses.close();
+    await _sessionMoves.close();
     for (final pending in _pending.values) {
       pending.completeError(StateError('NexusWorker closed'));
     }
@@ -107,6 +115,10 @@ class NexusWorker {
   }
 
   void _onResponse(Object? message) {
+    if (message is SessionMoveEvent) {
+      if (!_sessionMoves.isClosed) _sessionMoves.add(message);
+      return;
+    }
     final (id, ok, value, stack) = message as (int, bool, Object?, String?);
     final completer = _pending.remove(id);
     if (completer == null) return;
@@ -134,6 +146,7 @@ void _workerMain((SendPort, String?) args) {
   Object? loadError;
   try {
     sdk = LemonadeNexusSdk(libraryPath: libraryPath);
+    sdk.sessionMoves.listen(out.send);
   } catch (e) {
     loadError = e;
   }
