@@ -64,8 +64,14 @@ class _NetworksDialogState extends ConsumerState<NetworksDialog> {
       });
 
   Future<void> _join() async {
-    final code = _codeController.text.trim();
-    if (code.isEmpty) return;
+    // An 8-digit code or the full token, passed through as typed; the SDK
+    // and the server decide. Only the shape is checked here.
+    final code = normalizeInvite(_codeController.text);
+    final malformed = inviteFormatError(code);
+    if (malformed != null) {
+      setState(() => _error = malformed);
+      return;
+    }
     await _run(() async {
       final result = await ref.read(appNotifierProvider.notifier).acceptInvite(code);
       _codeController.clear();
@@ -117,6 +123,7 @@ class _NetworksDialogState extends ConsumerState<NetworksDialog> {
                     enabled: !_busy,
                     decoration: const InputDecoration(
                       labelText: 'Invitation code',
+                      hintText: inviteInputHint,
                       contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                     ),
                     style: const TextStyle(fontSize: 13, fontFamily: 'monospace'),

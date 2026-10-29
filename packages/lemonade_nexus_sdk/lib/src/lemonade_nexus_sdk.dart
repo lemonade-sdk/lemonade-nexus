@@ -574,7 +574,10 @@ class LemonadeNexusSdk {
     return _parseJson<Map<String, dynamic>>(json, (m) => m);
   }
 
-  /// Set the single-use device-link token injected into the next joinNetwork.
+  /// Set the single-use invite injected into the next joinNetwork: the
+  /// 8-digit invite code or the full link token (see [inviteFormatError]).
+  /// Throws [SdkException] with [LnError.rejected] for any other value; no
+  /// request is sent.
   void setLinkToken(String token) {
     _checkDisposed();
     _checkConnected();
@@ -585,7 +588,9 @@ class LemonadeNexusSdk {
   }
 
   /// Mint a link token so another device can join this account's Cluster.
-  /// Returns `{link_token, group_node_id, expires_at}`. Requires the mesh up.
+  /// Returns `{link_token, code, group_node_id, target_node_id, permissions,
+  /// expires_at, code_expires_at}` (see [Invite.fromJson]). Requires the
+  /// mesh up.
   Future<Map<String, dynamic>> createLinkToken({int ttlSec = 600}) async {
     _checkDisposed();
     _checkConnected();
@@ -605,8 +610,12 @@ class LemonadeNexusSdk {
 
   /// Mint an invite into [targetNodeId], or into this account's own
   /// top-level group when it is null. [permissions] null lets the server
-  /// choose the default. Returns `{link_token, group_node_id, target_node_id,
-  /// permissions, expires_at}`. Requires the mesh up.
+  /// choose the default. Returns `{link_token, code, group_node_id,
+  /// target_node_id, permissions, expires_at, code_expires_at}`: `code` is
+  /// the 8-digit invite code that names the same invite as `link_token`
+  /// and works until `code_expires_at` (at most ten minutes); a server that
+  /// predates invite codes omits it. [Invite.fromJson] types the map.
+  /// Requires the mesh up.
   Future<Map<String, dynamic>> createInvite(
       {String? targetNodeId, List<String>? permissions, int ttlSec = 600}) async {
     _checkDisposed();
@@ -618,7 +627,8 @@ class LemonadeNexusSdk {
   }
 
   /// Checks [name] as a device name in a group, given by [groupNodeId] or by
-  /// an invite's [linkToken] (the token is not spent). Names fold to one
+  /// an invite's [linkToken] (its 8-digit code or full token; the invite is
+  /// not spent). Names fold to one
   /// label ("Work PC" and "work-pc" collide), and the tree refuses a join or
   /// a hostname update whose label another device of the group holds.
   /// Returns `{label, available, conflicts, suggestion}`. Advisory only.
@@ -632,7 +642,8 @@ class LemonadeNexusSdk {
   }
 
   /// Accept an invite as an account that already joined: this identity
-  /// becomes a member of the invite's group. Nothing it owns moves. Returns
+  /// becomes a member of the invite's group. Nothing it owns moves.
+  /// [linkToken] is the 8-digit invite code or the full link token. Returns
   /// `{success, node_id, permissions, status}`.
   Future<Map<String, dynamic>> acceptInvite(String linkToken) async {
     _checkDisposed();

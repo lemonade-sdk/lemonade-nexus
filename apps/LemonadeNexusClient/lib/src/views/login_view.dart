@@ -12,6 +12,7 @@ import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../state/cluster_keyring.dart';
 import 'package:lemonade_nexus_sdk/dns_discovery.dart';
+import 'package:lemonade_nexus_sdk/lemonade_nexus_sdk.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
 
@@ -528,6 +529,7 @@ class _JoinDialog extends StatefulWidget {
 class _JoinDialogState extends State<_JoinDialog> {
   final _codeController = TextEditingController();
   final _nameController = TextEditingController();
+  String? _codeError;
 
   @override
   void dispose() {
@@ -537,8 +539,14 @@ class _JoinDialogState extends State<_JoinDialog> {
   }
 
   void _submit() {
-    final code = _codeController.text.trim();
-    if (code.isEmpty) return;
+    // The code or token goes to the SDK as typed (spaces in a code aside);
+    // the server decides what it is. Only the shape is checked here.
+    final code = normalizeInvite(_codeController.text);
+    final error = inviteFormatError(code);
+    if (error != null) {
+      setState(() => _codeError = error);
+      return;
+    }
     final name = _nameController.text.trim();
     Navigator.pop(context, _JoinRequest(code, name.isEmpty ? 'Cluster' : name));
   }
@@ -565,10 +573,15 @@ class _JoinDialogState extends State<_JoinDialog> {
           TextField(
             controller: _codeController,
             autofocus: true,
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               labelText: 'Invitation code',
-              hintText: 'lnk_…',
+              hintText: inviteInputHint,
+              helperText: inviteInputHint,
+              errorText: _codeError,
             ),
+            onChanged: (_) {
+              if (_codeError != null) setState(() => _codeError = null);
+            },
           ),
           const SizedBox(height: 12),
           TextField(

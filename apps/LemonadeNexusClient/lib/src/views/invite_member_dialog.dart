@@ -1,9 +1,12 @@
 /// @title Invite Member dialog
-/// @description Mints a single-use invitation code (POST /api/link/token over
-/// the private mesh API) so another person or device can join this Cluster's
+/// @description Mints a single-use invite (POST /api/link/token over the
+/// private mesh API) so another person or device can join this Cluster's
 /// group, or a chosen group when the dialog is opened from a group's context
-/// menu. Shows the code with copy, a live expiry countdown and regeneration.
-/// When this device cannot mint codes yet it says why instead of failing
+/// menu. Shows the 8-digit invitation code large and grouped, with copy of
+/// the plain digits, the full invite token under a secondary copy action, a
+/// live expiry countdown and regeneration. A server that predates invite
+/// codes returns only the token, which is then shown in the code's place.
+/// When this device cannot mint invites yet it says why instead of failing
 /// silently.
 library;
 
@@ -39,7 +42,7 @@ class InviteMemberDialog extends ConsumerStatefulWidget {
 class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
   static const _ttlSec = 600;
 
-  String? _code;
+  Invite? _invite;
   DateTime? _expiresAt;
   String? _error;
   bool _busy = false;
@@ -49,7 +52,7 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
   void initState() {
     super.initState();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted && _code != null) setState(() {});
+      if (mounted && _invite != null) setState(() {});
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_blocker() == null) _generate();
@@ -81,17 +84,20 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
       _error = null;
     });
     try {
-      final invite = await ref
+      final json = await ref
           .read(appNotifierProvider.notifier)
           .createDeviceInvite(ttlSec: _ttlSec, targetNodeId: widget.targetNodeId);
-      final code = invite['link_token']?.toString() ?? '';
-      if (code.isEmpty) {
+      final invite = Invite.fromJson(json);
+      if (invite.linkToken.isEmpty) {
         throw SdkException(LnError.internal,
-            message: invite['error']?.toString() ?? 'The server returned no code');
+            message: json['error']?.toString() ?? 'The server returned no code');
       }
-      final expiresSec = (invite['expires_at'] as num?)?.toInt();
+      // The code's expiry bounds the countdown: the code is what is shown.
+      final expiresSec = invite.hasCode
+          ? (invite.codeExpiresAt ?? invite.expiresAt)
+          : invite.expiresAt;
       setState(() {
-        _code = code;
+        _invite = invite;
         _expiresAt = expiresSec != null
             ? DateTime.fromMillisecondsSinceEpoch(expiresSec * 1000)
             : DateTime.now().add(const Duration(seconds: _ttlSec));
@@ -118,12 +124,10 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
     return '$m:${s.toString().padLeft(2, '0')}';
   }
 
-  void _copy() {
-    final code = _code;
-    if (code == null) return;
-    Clipboard.setData(ClipboardData(text: code));
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-      content: Text('Invitation code copied'),
+  void _copy(String text, String what) {
+    Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('$what copied'),
       backgroundColor: AppTheme.lemonGreen,
     ));
   }
@@ -132,7 +136,8 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final blocker = _blocker();
-    final expired = _code != null && _remaining == Duration.zero;
+    final invite = _invite;
+    final expired = invite != null && _remaining == Duration.zero;
 
     return AlertDialog(
       backgroundColor: scheme.surface,
@@ -171,13 +176,19 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
                 style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
               ),
               const SizedBox(height: 16),
-              if (_busy && _code == null)
+              if (_busy && invite == null)
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 24),
                   child: Center(child: CircularProgressIndicator()),
                 )
-              else if (_code != null)
-                _codeBox(context, expired),
+              else if (invite != null)
+                InviteCodeBox(
+                  invite: invite,
+                  expired: expired,
+                  remaining: _formatRemaining(_remaining),
+                  onCopyCode: () => _copy(invite.primary, 'Invitation code'),
+                  onCopyToken: () => _copy(invite.linkToken, 'Invite token'),
+                ),
               if (_error != null) ...[
                 const SizedBox(height: 12),
                 _notice(context, Icons.error_outline,
@@ -199,11 +210,11 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
           TextButton.icon(
             onPressed: _busy ? null : _generate,
             icon: const Icon(Icons.refresh, size: 16),
-            label: Text(_code == null ? 'Try again' : 'New code'),
+            label: Text(invite == null ? 'Try again' : 'New code'),
           ),
-        if (blocker == null && _code != null && !expired)
+        if (blocker == null && invite != null && !expired)
           TextButton.icon(
-            onPressed: _copy,
+            onPressed: () => _copy(invite.primary, 'Invitation code'),
             icon: const Icon(Icons.copy, size: 16),
             label: const Text('Copy'),
           ),
@@ -215,8 +226,44 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
     );
   }
 
-  Widget _codeBox(BuildContext context, bool expired) {
+  Widget _notice(BuildContext context, IconData icon, String text, Color color) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 18, color: color),
+        const SizedBox(width: 8),
+        Expanded(child: Text(text, style: TextStyle(fontSize: 13, color: color))),
+      ],
+    );
+  }
+}
+
+/// The minted invite: the 8-digit code large and grouped ("1234 5678") with
+/// copy of the plain digits, the full token under a secondary copy action,
+/// and the countdown. Without a code (an older server) the token takes the
+/// code's place.
+class InviteCodeBox extends StatelessWidget {
+  final Invite invite;
+  final bool expired;
+
+  /// The countdown text, "m:ss".
+  final String remaining;
+  final VoidCallback onCopyCode;
+  final VoidCallback onCopyToken;
+
+  const InviteCodeBox({
+    super.key,
+    required this.invite,
+    required this.expired,
+    required this.remaining,
+    required this.onCopyCode,
+    required this.onCopyToken,
+  });
+
+  @override
+  Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final muted = expired ? scheme.onSurfaceVariant : scheme.onSurface;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(14),
@@ -230,16 +277,39 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SelectableText(
-            _code!,
-            style: TextStyle(
-              fontSize: 14,
-              fontFamily: 'monospace',
-              letterSpacing: 0.5,
-              color: expired ? scheme.onSurfaceVariant : scheme.onSurface,
-              decoration: expired ? TextDecoration.lineThrough : null,
-            ),
+          Row(
+            children: [
+              Expanded(
+                child: SelectableText(
+                  invite.hasCode ? formatInviteCode(invite.code!) : invite.linkToken,
+                  key: const Key('invite-code'),
+                  style: TextStyle(
+                    fontSize: invite.hasCode ? 32 : 14,
+                    fontWeight: invite.hasCode ? FontWeight.w600 : FontWeight.normal,
+                    fontFamily: 'monospace',
+                    letterSpacing: invite.hasCode ? 4 : 0.5,
+                    color: muted,
+                    decoration: expired ? TextDecoration.lineThrough : null,
+                  ),
+                ),
+              ),
+              if (!expired)
+                IconButton(
+                  key: const Key('copy-invite-code'),
+                  tooltip: 'Copy invitation code',
+                  onPressed: onCopyCode,
+                  icon: const Icon(Icons.copy, size: 18),
+                ),
+            ],
           ),
+          if (invite.hasCode) ...[
+            const SizedBox(height: 4),
+            Text(
+              'Type this code on the joining device. It works once and for '
+              'up to ten minutes.',
+              style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+            ),
+          ],
           const SizedBox(height: 10),
           Row(
             children: [
@@ -248,28 +318,24 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
                   color: expired ? AppTheme.errorColor : scheme.onSurfaceVariant),
               const SizedBox(width: 6),
               Text(
-                expired
-                    ? 'Expired. Create a new code.'
-                    : 'Expires in ${_formatRemaining(_remaining)}',
+                expired ? 'Expired. Create a new code.' : 'Expires in $remaining',
                 style: TextStyle(
                     fontSize: 12,
                     color: expired ? AppTheme.errorColor : scheme.onSurfaceVariant),
               ),
+              const Spacer(),
+              if (invite.hasCode && !expired)
+                TextButton.icon(
+                  key: const Key('copy-invite-token'),
+                  onPressed: onCopyToken,
+                  icon: const Icon(Icons.link, size: 14),
+                  label: const Text('Copy full invite token',
+                      style: TextStyle(fontSize: 12)),
+                ),
             ],
           ),
         ],
       ),
-    );
-  }
-
-  Widget _notice(BuildContext context, IconData icon, String text, Color color) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Icon(icon, size: 18, color: color),
-        const SizedBox(width: 8),
-        Expanded(child: Text(text, style: TextStyle(fontSize: 13, color: color))),
-      ],
     );
   }
 }
