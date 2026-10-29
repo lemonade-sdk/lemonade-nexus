@@ -11,7 +11,11 @@
 
 #include <spdlog/spdlog.h>
 
+#define XXH_INLINE_ALL
+#include <xxhash/xxhash.h>
+
 #include <algorithm>
+#include <cstdio>
 #include <regex>
 #include <unordered_map>
 #include <unordered_set>
@@ -84,6 +88,52 @@ std::vector<tree::TreeNode> connectable_endpoints(const tree::rules::NodeMap& no
               [](const tree::TreeNode& a, const tree::TreeNode& b) { return a.id < b.id; });
     out.insert(out.end(), std::make_move_iterator(members.begin()),
                std::make_move_iterator(members.end()));
+    return out;
+}
+
+/// A server handshake younger than this means the server holds a live session
+/// with the peer: BoringTun's REJECT_AFTER_TIME (180 s), one retry, and
+/// jitter. peers_revision uses it, not is_online (a handshake within
+/// kStaleThresholdSec): a working session renews its handshake only about
+/// every two minutes, so is_online flips twice per rekey without any change
+/// in reachability, and each flip would make every client fetch its peers.
+constexpr uint64_t kSessionLiveSec = 200;
+
+/// The peers_revision of a heartbeat answer: an opaque value that changes
+/// when the peer list that GET /api/mesh/peers gives the caller changes in a
+/// way that matters for a path: a peer added or removed, or a listed peer's
+/// mesh key, tunnel address, private subnet, endpoint, hostname, or live
+/// session state (kSessionLiveSec) changed. `endpoints` and `relays` are the
+/// listed peers in list order. XXH3 over length-prefixed fields; a change
+/// detector, not a security value.
+std::string peers_revision(const std::vector<tree::TreeNode>& endpoints,
+                           const std::vector<const tree::TreeNode*>& relays,
+                           const std::unordered_map<std::string, uint64_t>& handshakes,
+                           uint64_t now) {
+    std::string buf;
+    const auto field = [&buf](std::string_view text) {
+        buf += std::to_string(text.size());
+        buf += ':';
+        buf += text;
+    };
+    const auto peer = [&](const tree::TreeNode& n, char kind, bool live) {
+        buf += kind;
+        field(n.id);
+        field(n.mesh_pubkey);
+        field(n.tunnel_ip);
+        field(n.private_subnet);
+        field(n.listen_endpoint);
+        field(n.hostname);
+        buf += live ? '1' : '0';
+    };
+    for (const auto& n : endpoints) {
+        const auto it = handshakes.find(strip_cidr(n.tunnel_ip));
+        peer(n, 'E', it != handshakes.end() && now - it->second < kSessionLiveSec);
+    }
+    for (const auto* n : relays) peer(*n, 'R', true);
+    char out[17];
+    std::snprintf(out, sizeof out, "%016llx",
+                  static_cast<unsigned long long>(XXH3_64bits(buf.data(), buf.size())));
     return out;
 }
 
@@ -283,8 +333,17 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // endpoint stays as it is, so a heartbeat never erases a punch target.
     //
     // Body: { "node_id": "...", "endpoint": "ip:port" }
-    // Response: { success, node_id, endpoint, status,
+    // Response: { success, node_id, endpoint, status, peers_revision?,
     //             tier1_departure?: { next_epoch } }
+    // peers_revision is an opaque string that changes when the caller's peer
+    // list (GET /api/mesh/peers) gains or loses a peer, or when a listed
+    // peer's mesh key, tunnel address, private subnet, endpoint, hostname, or
+    // live session with this server changes (peers_revision()). It is
+    // present when the caller holds Read on its node, as the peer list
+    // requires. A client compares it with the previous answer and fetches
+    // its peers at once on a change, so a peer that joined or moved is seen
+    // within one heartbeat instead of one peer refresh interval. It carries
+    // no peer data: the peer list stays the only source of peers.
     // tier1_departure is present while this server is a Tier 1 member that
     // the finalized next-epoch plan does not name (ApiContext::tier1_departure).
     // ========================================================================
@@ -382,6 +441,25 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         j["node_id"]  = hb_node_id;
         j["endpoint"] = hb_endpoint.empty() ? current->listen_endpoint : hb_endpoint;
         j["status"]   = status;
+        const auto caller_pubkey = normalize_pubkey(claims.pubkey);
+        if (ctx_.tree.check_permission(caller_pubkey, hb_node_id, acl::Permission::Read)) {
+            std::vector<tree::TreeNode> endpoints;
+            std::vector<tree::TreeNode> reachable;
+            std::vector<const tree::TreeNode*> relays;
+            if (!current->parent_id.empty()) {
+                reachable = ctx_.tree.collect_subtree(current->parent_id);
+                endpoints = connectable_endpoints(ctx_.tree.nodes_snapshot(), caller_pubkey,
+                                                  *current, reachable);
+                for (const auto& n : reachable) {
+                    if (n.type == tree::NodeType::Relay &&
+                        mesh_peer_listed(ctx_.tree, caller_pubkey, n)) {
+                        relays.push_back(&n);
+                    }
+                }
+            }
+            j["peers_revision"] = peers_revision(
+                endpoints, relays, build_mesh_handshake_map(ctx_.boringtun), epoch_seconds());
+        }
         // A member that the finalized next-epoch plan leaves out says so, so
         // the client moves its session before this server's authority ends.
         // The client verifies the new membership itself; this names no server.

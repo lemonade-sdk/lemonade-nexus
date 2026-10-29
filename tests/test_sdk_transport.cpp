@@ -8,6 +8,8 @@
 
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
+#include <LemonadeNexusSDK/MeshOrchestrator.hpp>
+#include <LemonadeNexusSDK/RelayFallback.hpp>
 #include <LemonadeNexusSDK/lemonade_nexus.h>
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
@@ -19,6 +21,7 @@
 #include "support/localhost_cert.hpp"
 #include "support/tier1_chain.hpp"
 
+#include <asio.hpp>
 #include <gtest/gtest.h>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -202,6 +205,43 @@ void cut_after_headers(httplib::Response& res) {
                                      [](size_t, httplib::DataSink&) { return false; });
 }
 
+/// A UDP socket that counts the datagrams it receives: a listed endpoint
+/// where nobody answers.
+class UdpSink {
+public:
+    UdpSink() : socket_(io_, asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0)) {
+        receive();
+        thread_ = std::thread([this] { io_.run(); });
+    }
+    ~UdpSink() {
+        asio::post(io_, [this] {
+            asio::error_code ec;
+            socket_.close(ec);
+        });
+        thread_.join();
+    }
+    std::string endpoint() const {
+        return "127.0.0.1:" + std::to_string(socket_.local_endpoint().port());
+    }
+    int received() const { return received_.load(); }
+
+private:
+    void receive() {
+        socket_.async_receive_from(asio::buffer(buf_), from_,
+                                   [this](const asio::error_code& ec, std::size_t) {
+                                       if (ec) return;
+                                       ++received_;
+                                       receive();
+                                   });
+    }
+    asio::io_context        io_;
+    asio::ip::udp::socket   socket_;
+    asio::ip::udp::endpoint from_;
+    std::array<uint8_t, 2048> buf_{};
+    std::atomic<int>        received_{0};
+    std::thread             thread_;
+};
+
 template <typename Pred>
 bool wait_for(Pred pred, std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -298,6 +338,33 @@ protected:
     std::string listed_peer_tunnel_ip() {
         std::lock_guard lock(listed_peer_mtx);
         return listed_peer_ip;
+    }
+
+    // The endpoint the peer list gives the other endpoint ("": the peer
+    // dataplane's own address).
+    std::string listed_endpoint_override;
+
+    void set_listed_peer_endpoint(std::string endpoint) {
+        std::lock_guard lock(listed_peer_mtx);
+        listed_endpoint_override = std::move(endpoint);
+    }
+    std::string listed_peer_endpoint() {
+        std::lock_guard lock(listed_peer_mtx);
+        return listed_endpoint_override.empty()
+                   ? "127.0.0.1:" + std::to_string(peer_mesh.bound_port())
+                   : listed_endpoint_override;
+    }
+
+    // The peers_revision of each heartbeat answer ("": the field is absent,
+    // as an older server sends it), and the relay ticket requests, which the
+    // stand-in server refuses.
+    std::mutex       revision_mtx;
+    std::string      heartbeat_revision;
+    std::atomic<int> relay_ticket_posts{0};
+
+    void set_heartbeat_revision(std::string revision) {
+        std::lock_guard lock(revision_mtx);
+        heartbeat_revision = std::move(revision);
     }
 
     // The stand-in server is the one reachable Tier 1 member of a five-member
@@ -480,7 +547,7 @@ protected:
                 {"node_id", kPeerId},
                 {"mesh_pubkey", peer_keys.second},
                 {"tunnel_ip", listed_peer_tunnel_ip()},
-                {"endpoint", "127.0.0.1:" + std::to_string(peer_mesh.bound_port())},
+                {"endpoint", listed_peer_endpoint()},
                 {"last_seen", 0},
                 {"mgmt_pubkey", "ed25519:cGVlci1tZ210LWtleQ=="},
                 // What the peer's key holds on this device: one malformed
@@ -537,7 +604,16 @@ protected:
             if (const auto next_epoch = departure_next_epoch.load(); next_epoch != 0) {
                 answer["tier1_departure"] = {{"next_epoch", next_epoch}};
             }
+            {
+                std::lock_guard lock(revision_mtx);
+                if (!heartbeat_revision.empty()) answer["peers_revision"] = heartbeat_revision;
+            }
             res.set_content(answer.dump(), "application/json");
+        });
+        srv.Post("/api/relay/ticket", [this](const httplib::Request&, httplib::Response& res) {
+            ++relay_ticket_posts;
+            res.status = 503;
+            res.set_content(R"({"error":"no relay tickets here"})", "application/json");
         });
     }
 
@@ -1285,6 +1361,123 @@ TEST_F(SdkMeshPrivateApiTest, RefreshNowFetchesPeersImmediately) {
     EXPECT_TRUE(wait_for([&] { return peer_list_gets.load() > before; }, std::chrono::seconds(3)))
         << "refresh_mesh_peers did not wake the orchestrator";
     client->disable_mesh();
+}
+
+// A refresh request punches in the same pass: a new burst toward a peer that
+// has no direct path yet, instead of the next pair slot.
+TEST_F(SdkMeshPrivateApiTest, ARefreshRequestPunchesAtOnce) {
+    LN_REQUIRE_TEST_TRUST();
+    UdpSink sink;
+    set_listed_peer_endpoint(sink.endpoint());
+    auto client = joined_client();
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 3600;
+    cfg.stun_refresh_interval_sec = 0;
+    client->enable_mesh(cfg);
+    // The first burst: five probes one second apart.
+    ASSERT_TRUE(wait_for([&] { return sink.received() >= 5; }, std::chrono::seconds(10)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    const int before = sink.received();
+    client->refresh_mesh_peers();
+    // A pair slot sends two probes; a new burst sends five, the first now.
+    EXPECT_TRUE(wait_for([&] { return sink.received() >= before + 3; },
+                         std::chrono::milliseconds(2600)))
+        << "the refresh request did not start a new punch burst";
+    client->disable_mesh();
+}
+
+// The heartbeat answer's peers_revision: an answer without it (an older
+// server) and an unchanged one leave the peer refresh on its interval. A
+// changed one fetches the peer list within one heartbeat, and a known peer
+// that now lists a new endpoint is probed at once and may get a relay
+// without the direct grace period.
+TEST_F(SdkMeshPrivateApiTest, AChangedPeersRevisionRefreshesWithinOneHeartbeat) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 1;
+    cfg.stun_refresh_interval_sec = 0;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return client->get_mesh_peers().size() == 1; },
+                         std::chrono::seconds(10)));
+    // The peer's dataplane answers: it has a direct path.
+    ASSERT_TRUE(wait_for([&] {
+        auto peers = client->get_mesh_peers();
+        return peers.size() == 1 && peers[0].last_handshake > 0;
+    }, std::chrono::seconds(10)));
+
+    const auto heartbeats_after = [&](std::size_t count) {
+        const auto start = heartbeats().size();
+        return wait_for([&] { return heartbeats().size() >= start + count; },
+                        std::chrono::seconds(10));
+    };
+    const int gets = peer_list_gets.load();
+    ASSERT_TRUE(heartbeats_after(3));
+    EXPECT_EQ(peer_list_gets.load(), gets) << "an answer without peers_revision refreshed";
+
+    set_heartbeat_revision("rev-1");  // the first value is the baseline
+    ASSERT_TRUE(heartbeats_after(3));
+    EXPECT_EQ(peer_list_gets.load(), gets) << "an unchanged peers_revision refreshed";
+
+    UdpSink sink;
+    set_listed_peer_endpoint(sink.endpoint());
+    const int tickets = relay_ticket_posts.load();
+    set_heartbeat_revision("rev-2");
+    const auto changed = std::chrono::steady_clock::now();
+    EXPECT_TRUE(wait_for([&] { return peer_list_gets.load() > gets; },
+                         std::chrono::milliseconds(2500)))
+        << "a changed peers_revision did not refresh the peer list";
+    EXPECT_TRUE(wait_for([&] { return sink.received() > 0; }, std::chrono::milliseconds(2500)))
+        << "the peer's new endpoint was not probed at once";
+    EXPECT_TRUE(wait_for([&] { return relay_ticket_posts.load() > tickets; },
+                         std::chrono::milliseconds(2500)))
+        << "the moved peer waited for the direct grace period before a relay";
+    EXPECT_LT(std::chrono::steady_clock::now() - changed,
+              std::chrono::milliseconds(1000) + lnsdk::kDirectAnswerWindow);
+    client->disable_mesh();
+}
+
+// A wall-clock gap between two loop passes (the process was suspended) runs
+// the resume path in the next pass: a peer refresh and a heartbeat at once,
+// although both intervals are an hour.
+TEST_F(SdkMeshPrivateApiTest, ASuspensionGapRunsTheResumePath) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::BoringtunMesh own;
+    const auto own_keys = lnsdk::BoringtunMesh::generate_keypair();
+    ASSERT_TRUE(own.start(mesh_config(own_keys, "10.64.0.9/32")));
+    std::atomic<int64_t> skew_ms{0};
+    {
+        lnsdk::MeshOrchestrator orchestrator(*client, own, kNodeId);
+        orchestrator.set_wall_clock([&skew_ms] {
+            return std::chrono::system_clock::now() + std::chrono::milliseconds(skew_ms.load());
+        });
+        lnsdk::MeshConfig cfg;
+        cfg.peer_refresh_interval_sec = 3600;
+        cfg.heartbeat_interval_sec    = 3600;
+        cfg.stun_refresh_interval_sec = 0;
+        orchestrator.start(cfg);
+        ASSERT_TRUE(wait_for([&] { return peer_list_gets.load() >= 1 && !heartbeats().empty(); },
+                             std::chrono::seconds(10)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const int gets = peer_list_gets.load();
+        const auto sent = heartbeats().size();
+
+        skew_ms = 60'000;  // a minute passed while the loop slept
+        EXPECT_TRUE(wait_for([&] {
+            return peer_list_gets.load() > gets && heartbeats().size() > sent;
+        }, std::chrono::milliseconds(7000))) << "the resume path did not run";
+
+        // One suspension, one resume pass: no further refresh follows.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        const int after = peer_list_gets.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(6000));
+        EXPECT_EQ(peer_list_gets.load(), after);
+        orchestrator.stop();
+    }
+    own.stop();
 }
 
 // The peer list carries each peer's management key and the permissions its

@@ -134,9 +134,19 @@ direct path to every peer before it uses a relay:
   could have observed it: a public address from any server, a private address
   only from a private or loopback server, and a loopback address only from a
   loopback server.
-- The heartbeat (`POST /api/mesh/heartbeat`) publishes the address. The
-  server stores it as the node's endpoint. A heartbeat with an empty endpoint
-  (no STUN answer yet) keeps the stored endpoint.
+- The heartbeat (`POST /api/mesh/heartbeat`, every 5 seconds) publishes the
+  address. The server stores it as the node's endpoint. A heartbeat with an
+  empty endpoint (no STUN answer yet) keeps the stored endpoint. A new
+  address goes out in a heartbeat at once, not at the next interval.
+- The heartbeat answer carries `peers_revision`, an opaque string that
+  changes when the device's peer list changes: a peer joins or leaves, or a
+  listed peer's mesh key, tunnel address, private subnet, endpoint,
+  hostname, or live session with the server changes. When the value differs
+  from the previous answer, the SDK fetches the peer list at once instead of
+  at the next `peer_refresh_interval_sec` (default 30). A peer that joined
+  or moved is therefore seen within one heartbeat. The value carries no peer
+  data; peers still come only from `GET /api/mesh/peers`. Servers without
+  the field leave the 30-second refresh as the only schedule.
 - Peers receive the endpoint in the verified Tier 1 server's peer list
   (`GET /api/mesh/peers`). The SDK ignores a listed endpoint that is not a
   dotted IPv4 unicast address. It accepts a loopback endpoint only when the
@@ -150,6 +160,18 @@ direct path to every peer before it uses a relay:
   probed address.
 - A peer with a fresh handshake on its direct path gets no probes. At most 16
   probes go out in one pass.
+- A known peer whose listed endpoint changed, or that this device reads
+  offline while the server saw it again, is *renewed*: it gets a new burst
+  at once, and a handshake from its old path no longer counts as a working
+  session. The relay fallback also skips the direct grace period for it.
+- `refresh_mesh_peers()` / `ln_mesh_refresh()` and a changed
+  `peers_revision` run the peer refresh, a STUN query, a new punch burst for
+  every peer still being probed, and the relay fallback in one pass.
+- When the SDK finds a wall-clock gap of more than 10 seconds between two
+  passes of its background loop beyond the planned sleep (the app was
+  suspended, or the computer slept), it resumes: it sends a fresh handshake
+  initiation to every peer and the server, sends a heartbeat, refreshes the
+  peer list, queries STUN, renews every peer, and runs the relay fallback.
 
 `ln_mesh_status` and `ln_mesh_peers` report a direct peer's address in
 `endpoint`.
@@ -159,7 +181,8 @@ direct path to every peer before it uses a relay:
 The SDK moves a peer onto a relay when the dataplane cannot reach it directly:
 
 - The peer has no direct endpoint in the server's peer list, or its direct
-  endpoint gave no handshake within 20 seconds.
+  endpoint gave no handshake within 3 seconds of the first probe
+  (`kDirectAnswerWindow`). The punch goes on in the background (see below).
 - Both peers choose the same relay on their own. The candidates are the
   verified Tier 1 servers (relay port `9103`) and the relays that
   `GET /api/relay/list` returns. A relay's id is its base64 node identity key.
@@ -175,9 +198,13 @@ five minutes, and the peer is retried with backoff. Set `prefer_direct` to
 `false` in the mesh config to relay every peer.
 
 With `prefer_direct` (the default), the SDK keeps probing a relayed peer's
-listed endpoint, two probes at each pair slot (every 60 seconds). When the
-peer answers there with a valid handshake, the peer moves to the direct path
-and the SDK closes the relay session. This does not count as a relay failure.
+listed endpoint: it finishes the first burst, then sends two probes at each
+pair slot (every 60 seconds). When the peer answers there with a valid
+handshake, the peer moves to the direct path and the SDK closes the relay
+session. This does not count as a relay failure. A relay request whose path
+is not in use yet closes the same way when the direct handshake arrives
+first. A relay that carries traffic stays open; it is abandoned only after
+180 seconds plus the grace period without an authenticated packet.
 
 `ln_mesh_status` and `ln_mesh_peers` report a relayed peer with an empty
 `endpoint` and its relay address (`ip:port`) in `relay_endpoint`.

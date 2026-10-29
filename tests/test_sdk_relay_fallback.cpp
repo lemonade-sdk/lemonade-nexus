@@ -214,8 +214,9 @@ TEST_F(SdkRelayFallbackTest, RelayIsNeededOnlyWithoutAWorkingDirectPath) {
     EXPECT_TRUE(F::relay_needed(false, 0, now, 0ms, true, t));
     // A fresh handshake is a working path.
     EXPECT_FALSE(F::relay_needed(false, now - 10, now, 0ms, true, t));
-    // A direct endpoint gets the grace period, then falls back.
-    EXPECT_FALSE(F::relay_needed(true, 0, now, 5s, true, t));
+    // A direct endpoint gets the short grace period, then falls back.
+    EXPECT_EQ(t.direct_grace, lnsdk::kDirectAnswerWindow);
+    EXPECT_FALSE(F::relay_needed(true, 0, now, 1s, true, t));
     EXPECT_TRUE(F::relay_needed(true, 0, now, t.direct_grace, true, t));
     EXPECT_TRUE(F::relay_needed(true, now - t.handshake_fresh_sec - 1, now, 60s, true, t));
     // Without prefer_direct, always relay.
@@ -350,6 +351,20 @@ TEST_F(SdkRelayFallbackTest, FallbackMovesUnreachablePeersOntoTheRelay) {
     EXPECT_TRUE(bob_fallback.relayed_peers().contains(alice_keys.second));
     EXPECT_EQ(r->session_count(), 1u);
 
+    // A renewal (the peer moved, or this device resumed) keeps a relay that
+    // carries traffic: only paired_action ends a paired channel.
+    bob_fallback.renew({alice_keys.second}, true);
+    alice_fallback.renew({bob_keys.second}, false);
+    for (int i = 0; i < 5; ++i) {
+        alice_fallback.maintain(alice_peers, true);
+        bob_fallback.maintain(bob_peers, true);
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_TRUE(bob_fallback.relayed_peers().contains(alice_keys.second));
+    EXPECT_TRUE(alice_fallback.relayed_peers().contains(bob_keys.second));
+    EXPECT_EQ(r->session_count(), 1u);
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong-through-relay");
+
     // A peer the server stops listing loses its relay path and session.
     bob_fallback.maintain({}, true);
     alice_fallback.maintain({}, true);
@@ -420,4 +435,75 @@ TEST_F(SdkRelayFallbackTest, NoTicketMeansNoChannelAndBackoff) {
     EXPECT_EQ(requests.load(), 1);  // retried only after the backoff
     EXPECT_TRUE(fallback.relayed_peers().empty());
     EXPECT_EQ(r->session_count(), 0u);
+}
+
+// A renewal with skip_grace lets a peer with a listed endpoint ask for a
+// relay at the next pass; without it the grace period starts again.
+TEST_F(SdkRelayFallbackTest, ARenewalCanSkipTheDirectGracePeriod) {
+    std::atomic<int> requests{0};
+    lnsdk::RelayFallback::Timing timing = fast_timing();
+    timing.direct_grace = 60s;  // nothing ends the grace period by itself here
+    timing.backoff_base = 60s;
+    lnsdk::RelayFallback fallback(
+        bob,
+        [&](const std::string&) {
+            ++requests;
+            return lnsdk::Result<lnsdk::RelayTicket>{false, {}, 503, "unavailable"};
+        },
+        [&] { return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}}; },
+        timing);
+    auto listed = peer(alice_keys.second, "10.64.0.2/32");
+    listed.endpoint = "127.0.0.1:9";
+    const std::vector<lnsdk::MeshPeer> peers = {listed};
+
+    for (int i = 0; i < 3; ++i) fallback.maintain(peers, true);
+    EXPECT_EQ(requests.load(), 0) << "a relay was requested within the grace period";
+
+    fallback.renew({alice_keys.second}, false);
+    fallback.maintain(peers, true);
+    EXPECT_EQ(requests.load(), 0);
+
+    fallback.renew({alice_keys.second}, true);
+    fallback.maintain(peers, true);
+    EXPECT_EQ(requests.load(), 1);
+
+    // The failed request set a 60 s retry delay. A renewal ends it: the
+    // peer's path changed since.
+    fallback.maintain(peers, true);
+    EXPECT_EQ(requests.load(), 1);
+    fallback.renew({alice_keys.second}, true);
+    fallback.maintain(peers, true);
+    EXPECT_EQ(requests.load(), 2);
+}
+
+// maintain() reports when it needs the next pass: at the end of a peer's
+// grace period, soon while a channel is being set up, and otherwise at the
+// latest kMaxPassGap ahead.
+TEST_F(SdkRelayFallbackTest, TheNextPassComesWhenTheGracePeriodEnds) {
+    using F = lnsdk::RelayFallback;
+    lnsdk::RelayFallback::Timing timing = fast_timing();
+    timing.direct_grace = 1500ms;
+    lnsdk::RelayFallback fallback(
+        bob, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("bob", relay_id), 200, ""};
+        },
+        [&] { return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}}; },
+        timing);
+    auto listed = peer(alice_keys.second, "10.64.0.2/32");
+    listed.endpoint = "127.0.0.1:9";
+
+    auto before = std::chrono::steady_clock::now();
+    auto next = fallback.maintain({listed}, true);
+    EXPECT_GE(next, before + timing.direct_grace - 100ms);
+    EXPECT_LE(next, before + timing.direct_grace + 100ms);
+
+    std::this_thread::sleep_until(next);
+    before = std::chrono::steady_clock::now();
+    next = fallback.maintain({listed}, true);  // opens a channel
+    EXPECT_LE(next, before + F::kPendingPassGap + 50ms);
+
+    before = std::chrono::steady_clock::now();
+    next = fallback.maintain({}, true);
+    EXPECT_GE(next, before + F::kMaxPassGap - 50ms);
+    EXPECT_LE(next, before + F::kMaxPassGap + 50ms);
 }

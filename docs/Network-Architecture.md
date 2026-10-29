@@ -244,7 +244,12 @@ which each side computes from the two public keys, so no signaling message is
 needed. A probe changes no state; only a valid handshake answer moves the peer
 to the probed address.
 
-When no direct handshake arrives within 20 seconds, the SDK relay fallback
+The heartbeat answer's `peers_revision` changes when a device's peer list
+changes, so the other side fetches a new or moved peer's endpoint within one
+heartbeat (5 seconds) and punches back at once, instead of at its next
+30-second peer refresh.
+
+When no direct handshake arrives within 3 seconds, the SDK relay fallback
 takes over (UDP `9103`): each peer requests its own relay ticket from its
 verified Tier 1 server, and the relay pairs the two peers' `Allocate`
 requests. A relayed peer keeps getting upgrade probes and moves back to the
