@@ -8,6 +8,7 @@
 
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
+#include <LemonadeNexusSDK/lemonade_nexus.h>
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
@@ -1162,6 +1163,57 @@ TEST_F(SdkMeshPrivateApiTest, PeerPermissionsAndManagementKeyComeFromThePeerList
     EXPECT_EQ(peers[0].mgmt_pubkey, "ed25519:cGVlci1tZ210LWtleQ==");
     EXPECT_EQ(peers[0].permissions, (std::vector<std::string>{"read", "svc:inference"}));
     client->disable_mesh();
+}
+
+// The C ABI peer list carries every field the header documents, through the
+// same serialization as the C++ types: lemond and the Flutter plugin read the
+// peer's permissions and management key from it.
+TEST_F(SdkMeshPrivateApiTest, CApiPeerListCarriesPermissionsKeyAndTimestamps) {
+    LN_REQUIRE_TEST_TRUST();
+    ln_client_t* c = ln_create_tls("localhost", static_cast<uint16_t>(pub_port));
+    ASSERT_NE(c, nullptr);
+    struct Destroy {
+        ln_client_t* c;
+        ~Destroy() { ln_destroy(c); }
+    } destroy{c};
+    ASSERT_EQ(ln_set_genesis_key(c, nexus::crypto::to_base64(chain.genesis.public_key).c_str(), 0),
+              LN_OK);
+    ASSERT_EQ(ln_set_session_token(c, "session-token"), LN_OK);
+    char* out = nullptr;
+    ASSERT_EQ(ln_join_network(c, "user", "password", &out), LN_OK) << (out ? out : "");
+    ln_free(out);
+    ASSERT_EQ(ln_mesh_enable_config(
+                  c, R"({"peer_refresh_interval_sec":3600,"heartbeat_interval_sec":3600})"),
+              LN_OK);
+
+    nlohmann::json peers;
+    ASSERT_TRUE(wait_for([&] {
+        char* listed = nullptr;
+        if (ln_mesh_peers(c, &listed) != LN_OK || !listed) return false;
+        peers = nlohmann::json::parse(listed, nullptr, false);
+        ln_free(listed);
+        return peers.is_array() && !peers.empty();
+    }, std::chrono::seconds(10)));
+    ASSERT_EQ(peers.size(), 1u) << peers.dump();
+    const auto& peer = peers[0];
+    EXPECT_EQ(peer["node_id"], kPeerId);
+    EXPECT_EQ(peer["mgmt_pubkey"], "ed25519:cGVlci1tZ210LWtleQ==");
+    EXPECT_EQ(peer["peer_permissions"], nlohmann::json::array({"read", "svc:inference"}));
+    for (const char* field : {"last_seen", "last_rx", "last_handshake", "is_online"}) {
+        EXPECT_TRUE(peer.contains(field)) << field << " missing: " << peer.dump();
+    }
+
+    char* status = nullptr;
+    ASSERT_EQ(ln_mesh_status(c, &status), LN_OK);
+    const auto st = nlohmann::json::parse(status ? status : "null", nullptr, false);
+    ln_free(status);
+    ASSERT_TRUE(st.is_object());
+    EXPECT_EQ(st.value("needs_rejoin", true), false);
+    ASSERT_TRUE(st.contains("peers") && st["peers"].is_array());
+    for (const auto& p : st["peers"]) {
+        EXPECT_TRUE(p.contains("peer_permissions") && p.contains("last_rx")) << p.dump();
+    }
+    ln_mesh_disable(c);
 }
 
 // A mesh state callback runs on the orchestrator thread and may call back into

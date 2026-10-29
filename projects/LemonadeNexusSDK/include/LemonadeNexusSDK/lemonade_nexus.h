@@ -425,7 +425,8 @@ ln_error_t ln_mesh_disable(ln_client_t* client);
 
 /** Get mesh tunnel status as JSON.
  *  Returns: {is_up, tunnel_ip, peer_count, online_count,
- *  total_rx_bytes, total_tx_bytes, peers: [...], needs_rejoin}.
+ *  total_rx_bytes, total_tx_bytes, peers: [...], needs_rejoin}. Each peer
+ *  has the fields ln_mesh_peers documents.
  *  needs_rejoin is true when the Tier 1 server that issued the session left
  *  the verified membership and the SDK could not move the session by itself
  *  (no identity set, or the silent join failed; see
@@ -464,8 +465,11 @@ ln_error_t ln_set_session_moved_callback(ln_client_t* client,
 
 /** Get current mesh peers as JSON array.
  *  Each peer: {node_id, hostname, mesh_pubkey, tunnel_ip, private_subnet,
- *  endpoint, relay_endpoint, is_online, last_handshake, rx_bytes, tx_bytes,
- *  latency_ms, keepalive, last_seen, mgmt_pubkey, peer_permissions}.
+ *  endpoint, relay_endpoint, is_online, last_handshake, last_rx, rx_bytes,
+ *  tx_bytes, latency_ms, keepalive, last_seen, mgmt_pubkey, peer_permissions}.
+ *  last_handshake, last_rx and last_seen are Unix seconds (0 = none):
+ *  last_rx is the last authenticated packet from the peer (keepalives
+ *  included), last_seen the server's last contact with it.
  *  peer_permissions lists what the peer's key holds on this device and its
  *  ancestor groups ("admin", "svc:<family>", ...), as the server reports it;
  *  the service ingress (ln_mesh_service_set_catalog) enforces them.
