@@ -85,6 +85,8 @@ constexpr int64_t kMeshBreakerCooldownMs  = 8000;
 // (TokenLinkAuthProvider): the same text for an unknown, expired, or spent
 // invite, so a join treats it as "unknown here" and asks another member.
 constexpr std::string_view kInviteUnknownError = "invalid or expired link token";
+// Tries of one join with an invite the first server does not hold.
+constexpr int kInviteJoinAttempts = 3;
 // Private requests that get no answer at the connect or handshake level for
 // this long, while the session server stays a verified member whose public
 // API answers, start a forced session move (see note_private_path_unanswered).
@@ -2607,6 +2609,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     // ask each other verified member once, challenge and join, before the
     // invite is reported invalid.
     std::set<std::string> refused_invite;
+    int invite_refusals = 0;
     std::string avoid_before;
     {
         std::lock_guard lock(impl_->transport_mtx);
@@ -2633,7 +2636,15 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         if (status == 403 && join_body.contains("link_token") && !target.empty() &&
             resp->value("error", std::string{}) == kInviteUnknownError) {
             refused_invite.insert(target);
-            if (refused_invite.size() < impl_->tier1.membership().servers.size()) {
+            // At most kInviteJoinAttempts tries in all: every refusal counts as
+            // a wrong invite code against this address on that server (5 per
+            // 10 minutes), and the next challenge may land on a server that
+            // refused already, so a count of distinct servers alone could
+            // repeat without end. The pause gives a fresh mint time to
+            // replicate.
+            if (++invite_refusals < kInviteJoinAttempts &&
+                refused_invite.size() < impl_->tier1.membership().servers.size()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1500 * invite_refusals));
                 spdlog::info("[LemonadeNexusClient] the invite is unknown to {}: asking "
                              "another verified Tier 1 server", target.substr(0, 12));
                 std::lock_guard lock(impl_->transport_mtx);
