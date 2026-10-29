@@ -910,6 +910,35 @@ TEST_F(SdkHolePunchTest, TheFirstBurstOutlivesTheRelayAndBurstNowStartsAnother) 
                            [] {}, 2s));
 }
 
+// After a suspension the dataplane sends every peer a fresh handshake
+// initiation at its current address, and the peer answers it.
+TEST_F(SdkHolePunchTest, RehandshakeAllRenewsTheSessions) {
+    const auto alice_reflexive = alice.query_reflexive(stun_endpoint(), 2000ms);
+    const auto bob_reflexive = bob.query_reflexive(stun_endpoint(), 2000ms);
+    ASSERT_TRUE(alice_reflexive && bob_reflexive);
+    ASSERT_TRUE(alice.sync_peers({peer(bob_keys.second, "10.64.0.3/32", *bob_reflexive)}).ok);
+    ASSERT_TRUE(bob.sync_peers({peer(alice_keys.second, "10.64.0.2/32", *alice_reflexive)}).ok);
+    ASSERT_TRUE(alice.probe_peer(bob_keys.second, *bob_reflexive));
+    ASSERT_TRUE(eventually(
+        [&] {
+            const auto b = status_of(bob.mesh_status(), alice_keys.second);
+            return b && b->last_handshake > 0;
+        },
+        [] {}, 5s));
+    const auto before = status_of(bob.mesh_status(), alice_keys.second)->last_handshake;
+
+    // Handshake times read in whole seconds, up to a second late.
+    std::this_thread::sleep_for(2100ms);
+    EXPECT_EQ(alice.rehandshake_all(), 1u);
+    EXPECT_TRUE(eventually(
+        [&] { return status_of(bob.mesh_status(), alice_keys.second)->last_handshake > before; },
+        [] {}, 5s));
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
+
+    lnsdk::BoringtunMesh stopped;
+    EXPECT_EQ(stopped.rehandshake_all(), 0u);
+}
+
 // Relay first, direct later: a listed endpoint that never answers gets a
 // relay once the short direct grace period ends, and when the peer's real
 // address is listed, the punch replaces the relay.
