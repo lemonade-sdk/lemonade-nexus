@@ -3011,6 +3011,41 @@ TEST_F(InviteHttpTest, TheOwnerRemovesAMemberAndAMemberLeaves) {
     EXPECT_FALSE(peers(bob).count(alice.node_id));
 }
 
+// A device that joined with an invite leaves the network: it deletes its own
+// node, though it holds no delete_node there. It deletes no sibling and not
+// the group, and the inviter still removes the devices it invited.
+TEST_F(InviteHttpTest, AnInvitedDeviceLeavesByDeletingOnlyItsOwnNode) {
+    const auto alice = join();
+    const auto device = join(invite_token(alice));
+    const auto sibling = join(invite_token(alice));
+    const auto other = join(invite_token(alice));
+    ASSERT_EQ(device.group, alice.group);
+    ASSERT_FALSE(tree->check_permission("ed25519:" + device.b64, device.node_id,
+                                        acl::Permission::DeleteNode));
+
+    EXPECT_EQ(post(device, "/api/tree/node/delete/" + sibling.node_id, json::object())->status,
+              403);
+    EXPECT_EQ(post(device, "/api/tree/node/delete/" + alice.group, json::object())->status, 403);
+    EXPECT_EQ(post(device, "/api/tree/node/delete/" + alice.node_id, json::object())->status,
+              403);
+    EXPECT_TRUE(tree->get_node(sibling.node_id).has_value());
+    EXPECT_TRUE(tree->get_node(alice.group).has_value());
+
+    auto left = post(device, "/api/tree/node/delete/" + device.node_id, json::object());
+    ASSERT_NE(left, nullptr);
+    ASSERT_EQ(left->status, 200) << left->body;
+    EXPECT_TRUE(json::parse(left->body).value("success", false));
+    EXPECT_FALSE(tree->get_node(device.node_id).has_value());
+    EXPECT_FALSE(peers(alice).count(device.node_id));
+    EXPECT_FALSE(peers(sibling).count(device.node_id));
+
+    auto removed = post(alice, "/api/tree/node/delete/" + other.node_id, json::object());
+    ASSERT_NE(removed, nullptr);
+    EXPECT_EQ(removed->status, 200) << removed->body;
+    EXPECT_FALSE(tree->get_node(other.node_id).has_value());
+    EXPECT_TRUE(tree->get_node(sibling.node_id).has_value());
+}
+
 TEST_F(InviteHttpTest, MembershipsListHomeAndMemberGroups) {
     const auto alice = join();
     const auto bob = join();

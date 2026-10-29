@@ -389,6 +389,67 @@ TEST_F(TreeOpsTest, GroupAdminRemovesDevicesThroughTheApiOnly) {
               TreeOpRefusal::Forbidden);
 }
 
+// A device that joined through an invite holds no delete_node on its own
+// node, yet it leaves the network by removing that node through the API. The
+// rule covers only the node its key joined as: never a sibling, the group, a
+// device with a node beneath it, or a signed delta.
+TEST_F(TreeOpsTest, AnInvitedDeviceRemovesOnlyItsOwnNode) {
+    auto owner = crypto_svc->ed25519_keygen();
+    const auto owner_pk = principal_of(owner);
+    ASSERT_TRUE(submit(seal(create_op(customer("acme", owner_pk), root_pk))).ok());
+    auto dev1 = crypto_svc->ed25519_keygen();
+    auto dev2 = crypto_svc->ed25519_keygen();
+    auto dev3 = crypto_svc->ed25519_keygen();
+    for (const auto* kp : {&dev1, &dev2, &dev3}) {
+        ASSERT_TRUE(submit(seal(join_op(*kp, "acme", owner_pk))).ok());
+    }
+    const auto dev1_pk = principal_of(dev1);
+    const auto id1 = tree::derive_join_node_id(*crypto_svc, dev1_pk);
+    const auto id2 = tree::derive_join_node_id(*crypto_svc, principal_of(dev2));
+    const auto id3 = tree::derive_join_node_id(*crypto_svc, principal_of(dev3));
+    ASSERT_FALSE(tree_svc->check_permission(dev1_pk, id1, acl::Permission::DeleteNode));
+
+    // Not a sibling, not the group.
+    EXPECT_EQ(submit(seal(delete_op(id2, dev1_pk))).refusal, TreeOpRefusal::Forbidden);
+    EXPECT_EQ(submit(seal(delete_op("acme", dev1_pk))).refusal, TreeOpRefusal::Forbidden);
+    EXPECT_FALSE(tree_svc->removes_own_device(dev1_pk, id2));
+    EXPECT_FALSE(tree_svc->removes_own_device(dev1_pk, "acme"));
+
+    // A signed delta keeps the delete_node rule.
+    auto d = signed_delta("delete_node", id1, tree::TreeNode{}, dev1, kBlock + 1);
+    EXPECT_EQ(submit(seal(delta_op(d), d.timestamp), kBlock + 1).refusal,
+              TreeOpRefusal::Forbidden);
+    EXPECT_TRUE(tree_svc->get_node(id1).has_value());
+
+    // A node beneath the device belongs to its creator: the device may not
+    // orphan it.
+    tree::TreeNode child;
+    child.id = "acme-dev3-child";
+    child.parent_id = id3;
+    child.type = tree::NodeType::Endpoint;
+    child.mgmt_pubkey = owner_pk;
+    child.assignments = {{owner_pk, {"read", "delete_node"}}};
+    ASSERT_TRUE(submit(seal(create_op(child, owner_pk)), kBlock + 2).ok());
+    EXPECT_FALSE(tree_svc->removes_own_device(principal_of(dev3), id3));
+    EXPECT_EQ(submit(seal(delete_op(id3, principal_of(dev3))), kBlock + 3).refusal,
+              TreeOpRefusal::Forbidden);
+
+    // Its own node, through the API: removed, and its link grants swept.
+    ASSERT_TRUE(tree_svc->check_permission(dev1_pk, id2, acl::Permission::Read));
+    EXPECT_TRUE(tree_svc->removes_own_device(dev1_pk, id1));
+    auto v = submit(seal(delete_op(id1, dev1_pk)), kBlock + 4);
+    ASSERT_TRUE(v.ok()) << v.reason;
+    EXPECT_FALSE(tree_svc->get_node(id1).has_value());
+    EXPECT_FALSE(tree_svc->check_permission(dev1_pk, id2, acl::Permission::Read));
+    EXPECT_TRUE(tree_svc->get_node(id2).has_value());
+    EXPECT_TRUE(tree_svc->get_node("acme").has_value());
+
+    // The inviter still removes the devices it placed.
+    v = submit(seal(delete_op(id2, owner_pk)), kBlock + 5);
+    ASSERT_TRUE(v.ok()) << v.reason;
+    EXPECT_FALSE(tree_svc->get_node(id2).has_value());
+}
+
 TEST_F(TreeOpsTest, JoinCreatesGroupAndEndpoint) {
     auto device = crypto_svc->ed25519_keygen();
     auto op = join_op(device);

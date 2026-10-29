@@ -122,6 +122,13 @@ bool PermissionTreeService::administers(std::string_view signer,
     return rules::admin_anchor(nodes_, node_id, signer).has_value();
 }
 
+bool PermissionTreeService::removes_own_device(std::string_view signer,
+                                               std::string_view node_id) const {
+    const auto joined_as = derive_join_node_id(crypto_, signer);
+    std::lock_guard lock(mutex_);
+    return rules::removes_own_device(nodes_, node_id, signer, joined_as);
+}
+
 bool PermissionTreeService::may_connect(std::string_view principal, std::string_view from_node_id,
                                         std::string_view to_node_id) const {
     std::lock_guard lock(mutex_);

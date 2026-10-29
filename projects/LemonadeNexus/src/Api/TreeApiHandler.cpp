@@ -1498,16 +1498,18 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                const SessionClaims& claims) {
         auto node_id = req.matches[1].str();
 
-        // DeleteNode on the node itself, or an admin of the node or an ancestor
-        // group (a group admin removes the group's devices). The root is never
-        // removed through the API.
+        // DeleteNode on the node itself, an admin of the node or an ancestor
+        // group (a group admin removes the group's devices), or the device
+        // that the caller's key joined as (a device leaves the network). The
+        // root is never removed through the API.
         const auto caller = normalize_pubkey(claims.pubkey);
         if (auto target = ctx_.tree.get_node(node_id); target && target->parent_id.empty()) {
             error_response(res, "the root node cannot be deleted", 403);
             return;
         }
         if (!ctx_.tree.check_permission(caller, node_id, acl::Permission::DeleteNode) &&
-            !ctx_.tree.administers(caller, node_id)) {
+            !ctx_.tree.administers(caller, node_id) &&
+            !ctx_.tree.removes_own_device(caller, node_id)) {
             error_response(res, "no delete_node permission", 403);
             return;
         }
@@ -1528,7 +1530,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         });
         if (answer_unfinished(res, s)) return;
         if (!s.verdict.ok()) {
-            error_response(res, "node not found or delete failed", 404);
+            error_response(res, s.verdict.reason, status_for_refusal(s.verdict.refusal));
             return;
         }
 

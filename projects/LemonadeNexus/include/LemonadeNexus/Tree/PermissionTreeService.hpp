@@ -59,6 +59,11 @@ public:
     /// not inherited.
     [[nodiscard]] bool administers(std::string_view signer, std::string_view node_id) const;
 
+    /// True when `signer` may remove `node_id` as its own device without
+    /// delete_node (rules::removes_own_device with the signer's join node
+    /// id). Thread-safe.
+    [[nodiscard]] bool removes_own_device(std::string_view signer, std::string_view node_id) const;
+
     /// The connect rule (rules::endpoint_may_connect) for endpoint
     /// `from_node_id`, acting as `principal`, to `to_node_id`. False when
     /// either node is missing. Thread-safe.
