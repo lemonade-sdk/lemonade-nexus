@@ -84,4 +84,10 @@ private:
                                        const std::filesystem::path& target,
                                        std::filesystem::perms mode, std::string& error);
 
+/// Write `content` to `target` the same way: a temporary file in the target
+/// directory, fsync, `mode`, and an atomic, durable rename.
+[[nodiscard]] bool write_file_atomic(std::string_view content,
+                                     const std::filesystem::path& target,
+                                     std::filesystem::perms mode, std::string& error);
+
 }  // namespace nexus::updater

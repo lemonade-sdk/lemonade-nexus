@@ -11,6 +11,24 @@ if(WIN32)
     return()
 endif()
 
+# The updater carries its own unit files: the fleet gets a release through
+# the binary swap, never through the package, so a cycle refreshes the
+# installed units from these built-in copies (SystemdUnits.hpp).
+# packaging/systemd stays the one source; a change there reconfigures.
+set(NEXUS_UPDATER_UNITS nexus-updater.service nexus-updater.timer nexus-updater.path)
+set(NEXUS_UPDATER_UNIT_FILES "")
+set(NEXUS_UPDATER_UNIT_ENTRIES "")
+foreach(unit IN LISTS NEXUS_UPDATER_UNITS)
+    set(unit_path "${CMAKE_SOURCE_DIR}/packaging/systemd/${unit}")
+    list(APPEND NEXUS_UPDATER_UNIT_FILES "${unit_path}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${unit_path}")
+    file(READ "${unit_path}" unit_text)
+    string(APPEND NEXUS_UPDATER_UNIT_ENTRIES
+           "    {\"${unit}\", R\"nexus-unit(${unit_text})nexus-unit\"},\n")
+endforeach()
+list(LENGTH NEXUS_UPDATER_UNITS NEXUS_UPDATER_UNIT_COUNT)
+configure_file(src/EmbeddedUnits.cpp.in "${CMAKE_CURRENT_BINARY_DIR}/EmbeddedUnits.cpp" @ONLY)
+
 # The logic lives in a library so the cycle is testable with fake GitHub
 # responses, a fake server socket, and a temporary root
 # (tests/test_nexus_updater.cpp).
@@ -22,8 +40,10 @@ add_library(LemonadeNexusUpdaterCore
         src/ReleaseTag.cpp
         src/ReleaseVerifier.cpp
         src/SigstoreVerifier.cpp
+        src/SystemdUnits.cpp
         src/Transport.cpp
-        src/Updater.cpp)
+        src/Updater.cpp
+        "${CMAKE_CURRENT_BINARY_DIR}/EmbeddedUnits.cpp")
 
 target_compile_features(LemonadeNexusUpdaterCore PUBLIC cxx_std_20)
 target_include_directories(LemonadeNexusUpdaterCore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -51,10 +71,7 @@ if(UNIX AND NOT APPLE)
     install(FILES "${CMAKE_SOURCE_DIR}/release/sigstore-trusted-root.json"
             DESTINATION lib/lemonade-nexus/updater
             COMPONENT Runtime)
-    install(FILES
-            "${CMAKE_SOURCE_DIR}/packaging/systemd/nexus-updater.service"
-            "${CMAKE_SOURCE_DIR}/packaging/systemd/nexus-updater.timer"
-            "${CMAKE_SOURCE_DIR}/packaging/systemd/nexus-updater.path"
+    install(FILES ${NEXUS_UPDATER_UNIT_FILES}
             DESTINATION lib/systemd/system
             COMPONENT Runtime)
 endif()

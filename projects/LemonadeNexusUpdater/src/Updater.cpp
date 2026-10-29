@@ -1,6 +1,7 @@
 #include <LemonadeNexusUpdater/Updater.hpp>
 
 #include <LemonadeNexusUpdater/FileSwap.hpp>
+#include <LemonadeNexusUpdater/SystemdUnits.hpp>
 
 #include <LemonadeNexus/Security/DurableWrite.hpp>
 #include <LemonadeNexus/Security/Sealing/SealedBlob.hpp>
@@ -320,7 +321,19 @@ CycleResult Updater::run_once() {
     }
 }
 
+void Updater::refresh_units() {
+    const auto result = refresh_systemd_units(config_.root, env_.run);
+    for (const auto& unit : result.refreshed) {
+        spdlog::info("[updater] refreshed systemd unit {}", unit);
+    }
+    if (!result.error.empty()) {
+        spdlog::warn("[updater] systemd unit refresh incomplete: {}; the cycle continues",
+                     result.error);
+    }
+}
+
 CycleResult Updater::cycle() {
+    refresh_units();
     auto state = load_state();
     if (!state) return {CycleOutcome::Refused, "the updater state file is unreadable"};
     if (state->phase != "idle") return resume(*state);

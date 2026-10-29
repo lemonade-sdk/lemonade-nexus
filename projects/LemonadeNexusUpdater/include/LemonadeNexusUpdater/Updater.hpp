@@ -3,6 +3,9 @@
 // nexus-updater: one update cycle (design Phase 4 and "OS updates and
 // reboot").
 //
+//   0. Refresh the updater's own systemd units from the built-in copies
+//      (SystemdUnits.hpp). A failure here is logged and changes nothing
+//      below.
 //   1. Resume an operation the state file shows as interrupted.
 //   2. Read the latest GitHub release. Stop when it is not newer than the
 //      installed release or when it is the release that halted.
@@ -142,6 +145,8 @@ private:
     struct Release;
 
     CycleResult cycle();
+    /// Step 0: refresh_systemd_units with the host root; logs the outcome.
+    void refresh_units();
     CycleResult resume(State& state);
     CycleResult start_update(State& state, const Release& release);
     CycleResult finish_without_reboot(State& state);

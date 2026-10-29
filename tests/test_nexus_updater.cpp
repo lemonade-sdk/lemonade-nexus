@@ -9,6 +9,7 @@
 #include <LemonadeNexusUpdater/ReleaseTag.hpp>
 #include <LemonadeNexusUpdater/ReleaseVerifier.hpp>
 #include <LemonadeNexusUpdater/SigstoreVerifier.hpp>
+#include <LemonadeNexusUpdater/SystemdUnits.hpp>
 #include <LemonadeNexusUpdater/Transport.hpp>
 #include <LemonadeNexusUpdater/Updater.hpp>
 
@@ -846,6 +847,8 @@ struct Host {
     int initrd_rebuilds = 0;
     /// Runs after each fake package install.
     std::function<void()> after_apt_install;
+    /// `systemctl daemon-reload` fails: the unit refresh cannot finish.
+    bool daemon_reload_fails = false;
 
     static constexpr std::string_view kInitrd = "/boot/initrd.img-6.8.0-45-generic";
     static constexpr std::string_view kMeasuredInitrd = "initrd measured at boot";
@@ -1007,6 +1010,9 @@ struct Host {
             }
             if (argv[0] == "systemctl" && argv[1] == "stop") running = false;
             if (argv[0] == "systemctl" && argv[1] == "start") running = true;
+            if (argv[0] == "systemctl" && argv[1] == "daemon-reload" && daemon_reload_fails) {
+                return {1, "Failed to reload daemon"};
+            }
             return {0, ""};
         };
         env.provenance = [](std::string_view bundle, std::string_view sha, std::string& why) {
@@ -1032,6 +1038,97 @@ struct Host {
         running = true;  // systemd starts the services at boot
     }
 };
+
+TEST(SystemdUnits, EmbeddedUnitsMatchThePackagingSources) {
+    const auto units = embedded_systemd_units();
+    ASSERT_EQ(units.size(), 3u);
+    std::set<std::string> names;
+    for (const auto& unit : units) {
+        names.insert(std::string(unit.name));
+        const auto source = fs::path(NEXUS_SOURCE_DIR) / "packaging" / "systemd" /
+                            std::string(unit.name);
+        ASSERT_TRUE(fs::exists(source)) << source;
+        EXPECT_EQ(read_text(source), unit.content) << unit.name;
+    }
+    EXPECT_EQ(names, (std::set<std::string>{"nexus-updater.service", "nexus-updater.timer",
+                                            "nexus-updater.path"}));
+}
+
+TEST(SystemdUnits, MissingAndStaleUnitsAreRewrittenAndIdenticalOnesLeftAlone) {
+    TempDir dir;
+    const fs::path installed = dir.path / "usr/lib/systemd/system";
+    std::vector<std::vector<std::string>> commands;
+    const CommandRunner run = [&](const std::vector<std::string>& argv) {
+        commands.push_back(argv);
+        return CommandResult{0, ""};
+    };
+    const auto units = embedded_systemd_units();
+    const auto unit = [&](std::string_view name) {
+        return *std::find_if(units.begin(), units.end(),
+                             [&](const SystemdUnit& u) { return u.name == name; });
+    };
+    write_text(installed / "nexus-updater.service", unit("nexus-updater.service").content);
+    write_text(installed / "nexus-updater.timer", "[Timer]\nOnUnitInactiveSec=15min\n");
+    const auto service_written = fs::last_write_time(installed / "nexus-updater.service");
+
+    auto result = refresh_systemd_units(dir.path, run);
+    EXPECT_TRUE(result.error.empty()) << result.error;
+    EXPECT_EQ(result.refreshed, (std::vector<std::string>{"nexus-updater.timer (changed)",
+                                                          "nexus-updater.path (missing)"}));
+    for (const auto& u : units) {
+        EXPECT_EQ(read_text(installed / std::string(u.name)), u.content) << u.name;
+        const auto mode = fs::status(installed / std::string(u.name)).permissions();
+        EXPECT_EQ(mode & fs::perms::others_read, fs::perms::others_read) << u.name;
+        EXPECT_EQ(mode & fs::perms::group_write, fs::perms::none) << u.name;
+    }
+    EXPECT_EQ(fs::last_write_time(installed / "nexus-updater.service"), service_written);
+    EXPECT_EQ(commands, (std::vector<std::vector<std::string>>{
+                            {"systemctl", "daemon-reload"},
+                            {"systemctl", "enable", "--now", "nexus-updater.path"}}));
+    // No temporary file is left behind.
+    for (const auto& entry : fs::directory_iterator(installed)) {
+        EXPECT_NE(entry.path().filename().string().front(), '.') << entry.path();
+    }
+
+    // Everything current: nothing is written and systemd is not touched.
+    commands.clear();
+    result = refresh_systemd_units(dir.path, run);
+    EXPECT_TRUE(result.error.empty()) << result.error;
+    EXPECT_TRUE(result.refreshed.empty());
+    EXPECT_TRUE(commands.empty());
+}
+
+TEST(SystemdUnits, ASystemctlFailureIsReportedAndTheWrittenUnitsStay) {
+    TempDir dir;
+    std::vector<std::vector<std::string>> commands;
+    const CommandRunner run = [&](const std::vector<std::string>& argv) {
+        commands.push_back(argv);
+        return CommandResult{argv[1] == "daemon-reload" ? 1 : 0, "no bus"};
+    };
+    const auto result = refresh_systemd_units(dir.path, run);
+    EXPECT_EQ(result.refreshed.size(), 3u);
+    EXPECT_NE(result.error.find("daemon-reload"), std::string::npos) << result.error;
+    EXPECT_EQ(commands.size(), 1u);
+    for (const auto& u : embedded_systemd_units()) {
+        EXPECT_EQ(read_text(dir.path / "usr/lib/systemd/system" / std::string(u.name)),
+                  u.content);
+    }
+}
+
+TEST(UpdaterCycle, ACycleRefreshesTheUnitsAndAFailureThereDoesNotBlockTheUpgrade) {
+    Host h;
+    h.daemon_reload_fails = true;
+    auto u = h.updater();
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_TRUE(h.ran({"systemctl", "daemon-reload"}));
+    EXPECT_FALSE(h.ran({"systemctl", "enable"}));
+    for (const auto& unit : embedded_systemd_units()) {
+        EXPECT_EQ(read_text(h.host("/usr/lib/systemd/system/" + std::string(unit.name))),
+                  unit.content);
+    }
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-new");
+}
 
 TEST(UpdaterCycle, StagesAndWaitsWhileTheTurnGateSaysWait) {
     Host h;

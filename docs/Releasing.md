@@ -435,6 +435,15 @@ servers takes about 15 to 20 minutes. The journal line `started by
 nexus-updater.path on /run/lemonade-nexus/updater-wake` or `started by
 nexus-updater.timer` says what started a cycle.
 
+The updater carries its three unit files, built in from
+`packaging/systemd`. At the start of every cycle it compares them with
+`/usr/lib/systemd/system/` and rewrites a unit that is missing or differs,
+then runs `systemctl daemon-reload` and `systemctl enable --now
+nexus-updater.path`. A release therefore updates the timer cadence and the
+path unit on a server that only ever received binaries. The journal reports
+`refreshed systemd unit <name> (missing|changed)`; a failure there is logged
+and the cycle continues.
+
 ```bash
 systemctl status nexus-updater.path nexus-updater.timer
 journalctl -u nexus-updater
