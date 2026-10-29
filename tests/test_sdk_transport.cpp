@@ -348,6 +348,10 @@ protected:
                 {"tunnel_ip", listed_peer_tunnel_ip()},
                 {"endpoint", "127.0.0.1:" + std::to_string(peer_mesh.bound_port())},
                 {"last_seen", 0},
+                {"mgmt_pubkey", "ed25519:cGVlci1tZ210LWtleQ=="},
+                // What the peer's key holds on this device: one malformed
+                // entry, which the client must drop.
+                {"peer_permissions", nlohmann::json::array({"read", "svc:inference", "bad perm", 7})},
             };
             nlohmann::json body;
             body["peers"] = nlohmann::json::array({peer});
@@ -885,6 +889,25 @@ TEST_F(SdkMeshPrivateApiTest, RefreshNowFetchesPeersImmediately) {
     client->refresh_mesh_peers();
     EXPECT_TRUE(wait_for([&] { return peer_list_gets.load() > before; }, std::chrono::seconds(3)))
         << "refresh_mesh_peers did not wake the orchestrator";
+    client->disable_mesh();
+}
+
+// The peer list carries each peer's management key and the permissions its
+// key holds on this device (peer_permissions). The client keeps the valid
+// tokens, which the service ingress enforces, and drops anything else.
+TEST_F(SdkMeshPrivateApiTest, PeerPermissionsAndManagementKeyComeFromThePeerList) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 3600;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return !client->get_mesh_peers().empty(); }, std::chrono::seconds(10)));
+    const auto peers = client->get_mesh_peers();
+    ASSERT_EQ(peers.size(), 1u);
+    EXPECT_EQ(peers[0].node_id, kPeerId);
+    EXPECT_EQ(peers[0].mgmt_pubkey, "ed25519:cGVlci1tZ210LWtleQ==");
+    EXPECT_EQ(peers[0].permissions, (std::vector<std::string>{"read", "svc:inference"}));
     client->disable_mesh();
 }
 
