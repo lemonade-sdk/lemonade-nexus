@@ -101,6 +101,10 @@ struct Updater::State {
     /// The initramfs kept before the package install (kInitrdPrefix + kernel
     /// release); empty when no package install or no image.
     std::string measured_initrd;
+    /// The release's updater asset (staged under staged/<tag>/) and its hash
+    /// from the signed manifest; empty when the release carries none.
+    std::string updater_asset;
+    std::string updater_sha256;
     std::string last_result;
 };
 
@@ -145,6 +149,8 @@ std::optional<Updater::State> Updater::load_state() {
         s.staged_seal_names = j.at("staged_seal_names").get<std::vector<std::string>>();
         // Absent in a state file written before this field existed.
         s.measured_initrd = j.value("measured_initrd", std::string());
+        s.updater_asset = j.value("updater_asset", std::string());
+        s.updater_sha256 = j.value("updater_sha256", std::string());
         s.last_result = j.at("last_result").get<std::string>();
         return s;
     } catch (const std::exception&) {
@@ -167,6 +173,8 @@ bool Updater::save_state(const State& s) {
         {"boot_id", s.boot_id},
         {"staged_seal_names", s.staged_seal_names},
         {"measured_initrd", s.measured_initrd},
+        {"updater_asset", s.updater_asset},
+        {"updater_sha256", s.updater_sha256},
         {"last_result", s.last_result},
     };
     std::error_code ec;
@@ -280,6 +288,12 @@ std::optional<Updater::Release> Updater::fetch_and_verify(const State& state,
                                                 {std::string(kApprovalAsset), *approval}};
     std::vector<std::string> names{verified->manifest.os_lock_asset};
     for (const auto& f : verified->manifest.server_files) names.push_back(f.asset);
+    if (verified->manifest.updater.asset.empty()) {
+        spdlog::info("[updater] {} carries no updater binary; the installed updater stays",
+                     gh->tag);
+    } else {
+        names.push_back(verified->manifest.updater.asset);
+    }
     for (const auto& name : names) {
         const auto bytes = fetch(name);
         if (!bytes) return std::nullopt;
@@ -487,6 +501,8 @@ CycleResult Updater::start_update(State& state, const Release& release) {
     next.staged_seal_names.clear();
     next.previous_grub_entry.clear();
     next.measured_initrd.clear();
+    next.updater_asset = v.manifest.updater.asset;
+    next.updater_sha256 = v.manifest.updater.sha256;
     if (!next.packages_install.empty() && !back_up_measured_initrd(next, error)) {
         return {CycleOutcome::Refused, error};
     }
@@ -552,7 +568,7 @@ CycleResult Updater::start_update(State& state, const Release& release) {
                          fs::perms::group_read | fs::perms::others_read;
     swap.files.push_back(approval_file);
 
-    FileSwapper swapper(state_dir() / "swap-journal.json");
+    FileSwapper swapper(swap_journal_path());
     if (!swapper.apply(swap, error)) return roll_back(state, error, true);
     state.phase = "swapped";
     (void)save_state(state);
@@ -561,7 +577,7 @@ CycleResult Updater::start_update(State& state, const Release& release) {
 
 CycleResult Updater::resume(State& state) {
     std::string error;
-    FileSwapper swapper(state_dir() / "swap-journal.json");
+    FileSwapper swapper(swap_journal_path());
     if (state.phase == "swapping") {
         spdlog::warn("[updater] resuming an interrupted swap of {}", state.tag);
         if (!swapper.resume(error)) return roll_back(state, error, true);
@@ -625,6 +641,7 @@ CycleResult Updater::resume(State& state) {
         state.phase = "idle";
         state.last_result = detail;
         swapper.clear();
+        FileSwapper(updater_journal_path()).clear();
         (void)save_state(state);
         return {CycleOutcome::Failed, detail};
     }
@@ -726,10 +743,11 @@ CycleResult Updater::run_health_gate(State& state) {
 
     // After a reboot: restore the files and boot the previous GRUB entry.
     std::string error;
-    FileSwapper swapper(state_dir() / "swap-journal.json");
+    FileSwapper swapper(swap_journal_path());
     std::string notes;
     (void)systemctl({"stop", std::string(kServerUnit), std::string(kAttestdUnit)}, error);
     if (!swapper.rollback(error)) notes += "; " + error;
+    roll_back_updater(notes);
     const auto set = env_.run({"grub-set-default", state.previous_grub_entry});
     if (set.exit_code != 0) notes += "; grub-set-default failed: " + trim(set.output);
     state.phase = "boot_rollback";
@@ -749,8 +767,9 @@ CycleResult Updater::roll_back(State& state, const std::string& reason, bool res
     std::string notes;
     std::string error;
     (void)systemctl({"stop", std::string(kServerUnit), std::string(kAttestdUnit)}, error);
-    FileSwapper swapper(state_dir() / "swap-journal.json");
+    FileSwapper swapper(swap_journal_path());
     if (swapper.load() && !swapper.rollback(error)) notes += "; " + error;
+    roll_back_updater(notes);
     // Packages change only after the swap completes ("swapped").
     if (!state.packages_install.empty() && state.phase != "swapping") {
         std::vector<OsPackage> restore;
@@ -778,12 +797,17 @@ CycleResult Updater::roll_back(State& state, const std::string& reason, bool res
 }
 
 CycleResult Updater::commit(State& state, const std::string& detail) {
+    // The server passed its health gate on the files this updater installed;
+    // only now does the updater replace itself. A crash before the state is
+    // recorded repeats the gate and this idempotent swap in the next cycle.
+    const std::string updater_note = install_updater(state);
     state.installed_release_number = state.number;
     state.phase = "idle";
-    state.last_result = state.tag + " upgraded: " + detail;
+    state.last_result = state.tag + " upgraded: " + detail + updater_note;
     if (!save_state(state)) return {CycleOutcome::Refused, "cannot record the installed release"};
-    report(state, true, detail);
-    FileSwapper(state_dir() / "swap-journal.json").clear();
+    report(state, true, detail + updater_note);
+    FileSwapper(swap_journal_path()).clear();
+    FileSwapper(updater_journal_path()).clear();
     // Keep only the files from before this release.
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(state_dir() / "previous", ec)) {
@@ -791,6 +815,43 @@ CycleResult Updater::commit(State& state, const std::string& detail) {
     }
     fs::remove_all(state_dir() / "staged", ec);
     return {CycleOutcome::Upgraded, state.last_result};
+}
+
+fs::path Updater::swap_journal_path() const { return state_dir() / "swap-journal.json"; }
+
+fs::path Updater::updater_journal_path() const {
+    return state_dir() / "updater-swap-journal.json";
+}
+
+std::string Updater::install_updater(const State& state) {
+    if (state.updater_asset.empty()) return {};
+    SwapPlan swap;
+    swap.release_tag = state.tag;
+    swap.backup_dir = state_dir() / "previous" / state.tag;
+    swap.files.push_back({host_path(kUpdaterPath),
+                          state_dir() / "staged" / state.tag / state.updater_asset,
+                          state.updater_sha256});
+    // No service stops: the running process keeps the old image until it
+    // exits, and the swap is a rename.
+    FileSwapper swapper(updater_journal_path());
+    std::string error;
+    if (swapper.apply(swap, error)) {
+        spdlog::info("[updater] installed the updater of {}; the next cycle runs it", state.tag);
+        return {};
+    }
+    spdlog::error("[updater] cannot install the updater of {}: {}; the installed updater stays",
+                  state.tag, error);
+    std::string notes;
+    roll_back_updater(notes);
+    return "; the updater binary was not replaced: " + error + notes;
+}
+
+void Updater::roll_back_updater(std::string& notes) {
+    FileSwapper swapper(updater_journal_path());
+    if (!swapper.load()) return;
+    std::string error;
+    if (!swapper.rollback(error)) notes += "; " + error;
+    swapper.clear();
 }
 
 }  // namespace nexus::updater

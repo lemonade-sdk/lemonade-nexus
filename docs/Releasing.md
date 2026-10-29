@@ -44,8 +44,8 @@ Do not push `v*` tags by hand. A tag push no longer starts a release.
 
 | Asset | Purpose |
 |---|---|
-| `lemonade-nexus-linux-x86_64`, `nexus-attestd-linux-x86_64` | Fleet server binaries, built in the pinned Ubuntu 24.04 / GCC 13.3 container. `nexus-updater` installs these. |
-| `nexus-updater-linux-x86_64` | The updater binary, for operators. The updater does not replace itself. |
+| `lemonade-nexus-linux-x86_64`, `nexus-attestd-linux-x86_64` | Fleet server binaries, built in the pinned Ubuntu 24.04 / GCC 13.3 container. `nexus-updater` installs these (`server_files` in the manifest). |
+| `nexus-updater-linux-x86_64` | The updater binary. `nexus-updater` installs it over itself after the server's health gate passes (`updater` in the manifest); operators also use it for a hand install. |
 | `release-approval.json` | The approval (format 3), signed by the release key. `release_number` is the tag's number. `approved_paths` lists this release's hashes; `previous_release_paths` lists the previous release's hashes, so servers on both releases attest each other. After a halted rollout it lists the hashes of the halted release and of the release before it ([Release guards](#release-guards)). The bootstrap release lists none. It also carries the boot line from `release/fleet-profile.json`. |
 | `manifest.json`, `manifest.json.sig` | Version, release number, file hashes, wire versions, and the OS package lock. The signature is Ed25519 by the release key over `lemonade-nexus/release-manifest/v1\n` followed by the file. |
 | `os-packages.lock` | The exact OS package versions of the release. |
@@ -435,6 +435,21 @@ servers takes about 15 to 20 minutes. The journal line `started by
 nexus-updater.path on /run/lemonade-nexus/updater-wake` or `started by
 nexus-updater.timer` says what started a cycle.
 
+The updater installs itself. A cycle that upgrades the server verifies the
+release's `nexus-updater-linux-x86_64` with the server binaries: its hash is
+in the signed manifest (`updater` entry, install path `/usr/bin/nexus-updater`)
+and its Sigstore provenance is checked like theirs. A hash or provenance
+failure refuses the whole release before any file changes. The swap of the
+updater comes last, after the server passed its health gate, with the previous
+copy kept in `previous/<tag>/nexus-updater`: a failed server upgrade is always
+rolled back by the updater that started it, and a crash before the commit is
+recorded rolls the updater back with the server files. The running process
+finishes its cycle on the old image; the next cycle runs the new binary and
+refreshes the units from it. No service restarts for the updater swap. A
+release whose manifest has no `updater` entry leaves the installed updater in
+place (`carries no updater binary` in the journal). The journal line
+`installed the updater of <tag>; the next cycle runs it` reports the swap.
+
 The updater carries its three unit files, built in from
 `packaging/systemd`. At the start of every cycle it compares them with
 `/usr/lib/systemd/system/` and rewrites a unit that is missing or differs,
@@ -454,7 +469,7 @@ cat /var/lib/nexus-updater/state.json
 |---|---|
 | `/var/lib/nexus-updater/state.json` | Installed and halted release numbers, the update phase, the last result |
 | `/var/lib/nexus-updater/staged/<tag>/` | Verified files waiting for the upgrade turn |
-| `/var/lib/nexus-updater/previous/<tag>/` | The files from before `<tag>` was installed. When `<tag>` installs OS packages, `boot/` holds the running kernel's measured initramfs |
+| `/var/lib/nexus-updater/previous/<tag>/` | The files from before `<tag>` was installed: the server binaries, the approval, and `nexus-updater` when the release carried one. When `<tag>` installs OS packages, `boot/` holds the running kernel's measured initramfs |
 | `/run/lemonade-nexus/upgrade.sock` | The server's upgrade control socket, root peers only ([Upgrade Control](Upgrade-Control)) |
 | `/run/lemonade-nexus/updater-wake` | The marker the server touches to start an updater cycle (`nexus-updater.path`) |
 
@@ -525,5 +540,7 @@ attestation at the next boot. Two rules keep the measured image:
   snapshot, GCC 13.3, the Rust toolchain, source paths, and
   `SOURCE_DATE_EPOCH`. A second run at the same commit is expected to give the
   same hashes; no run has confirmed this yet.
-- **The updater does not update itself.** Its hash is not in the approval.
-  Install a new updater with the package.
+- **The updater is not attested.** Its hash is not in the approval; the
+  signed manifest and the Sigstore provenance cover it. A server whose updater
+  predates the `updater` manifest entry never installs a newer updater on its
+  own: install that updater once by hand (the binary, or the package).

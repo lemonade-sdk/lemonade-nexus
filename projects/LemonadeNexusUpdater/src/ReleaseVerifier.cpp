@@ -152,6 +152,24 @@ std::optional<ReleaseManifest> parse_release_manifest(std::string_view text, std
         error = "the manifest must install every swappable path";
         return std::nullopt;
     }
+    if (const auto up = j.find("updater"); up != j.end()) {
+        if (!up->is_object() || !get_string(*up, "asset", m.updater.asset) ||
+            !get_string(*up, "path", m.updater.path) ||
+            !get_string(*up, "sha256", m.updater.sha256) || !valid_asset_name(m.updater.asset) ||
+            !is_hex(m.updater.sha256, 64)) {
+            error = "the manifest has an invalid updater entry";
+            return std::nullopt;
+        }
+        if (m.updater.path != kUpdaterPath) {
+            error = "the manifest installs the updater at a path the updater does not use: " +
+                    m.updater.path;
+            return std::nullopt;
+        }
+        if (!assets.insert(m.updater.asset).second) {
+            error = "the manifest names one path or asset twice";
+            return std::nullopt;
+        }
+    }
     if (const auto arts = j.find("artifacts"); arts != j.end()) {
         if (!arts->is_array() || arts->size() > 512) {
             error = "the manifest artifact list is invalid";
@@ -264,6 +282,8 @@ bool verify_asset_hash(const VerifiedRelease& release, std::string_view asset,
         expected = m.approval_sha256;
     } else if (asset == m.os_lock_asset) {
         expected = m.os_lock_sha256;
+    } else if (!m.updater.asset.empty() && asset == m.updater.asset) {
+        expected = m.updater.sha256;
     } else {
         for (const auto& f : m.server_files) {
             if (f.asset == asset) expected = f.sha256;

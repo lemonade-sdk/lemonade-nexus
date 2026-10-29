@@ -10,9 +10,10 @@
 //   2. Read the latest GitHub release. Stop when it is not newer than the
 //      installed release or when it is the release that halted.
 //   3. Fetch manifest.json, its signature, and release-approval.json; verify
-//      them (ReleaseVerifier). Fetch the server files and the OS package
-//      lock; check each hash against the signed manifest. Verify the Sigstore
-//      provenance of every consumed asset. Any failure stops the cycle.
+//      them (ReleaseVerifier). Fetch the server files, the updater binary
+//      when the manifest names one, and the OS package lock; check each hash
+//      against the signed manifest. Verify the Sigstore provenance of every
+//      consumed asset. Any failure stops the cycle.
 //   4. Stage the verified files under the state directory.
 //   5. Offer the approval to the server (its release chain must accept it),
 //      report the staged release, and ask for the upgrade turn. On
@@ -33,9 +34,14 @@
 //      install. A rollback puts it back in every case.
 //   8. Without a reboot: start the services and run the health gate. With a
 //      reboot: reboot; the next cycle after boot runs the health gate.
-//   9. Healthy: record the release as installed and report "upgraded".
-//      Otherwise restore the previous files (and packages, and GRUB entry),
-//      report "failed", and halt this release until a newer one appears.
+//   9. Healthy: install the release's updater binary over this one (the
+//      previous copy is kept; the running process finishes on the old image
+//      and the next cycle runs the new one), record the release as installed,
+//      and report "upgraded". Otherwise restore the previous files (and
+//      packages, and GRUB entry), report "failed", and halt this release
+//      until a newer one appears. The updater is swapped only after the gate,
+//      so a failed server upgrade is always rolled back by the updater that
+//      started it.
 //
 // The updater holds no server keys. It reads the Genesis public key from the
 // server's root-owned configuration and talks to the server only through the
@@ -153,6 +159,17 @@ private:
     CycleResult run_health_gate(State& state);
     CycleResult roll_back(State& state, const std::string& reason, bool restart_services);
     CycleResult commit(State& state, const std::string& detail);
+
+    /// Step 9: swap the staged updater binary into kUpdaterPath, with the
+    /// previous copy under previous/<tag>/ and its own journal. Nothing to do
+    /// when the release names no updater. Returns a note for the cycle
+    /// result when the swap failed; the server upgrade stands either way.
+    std::string install_updater(const State& state);
+    /// Restore the updater from its journal, when one exists, and drop the
+    /// journal. Appends a note on failure.
+    void roll_back_updater(std::string& notes);
+    [[nodiscard]] std::filesystem::path swap_journal_path() const;
+    [[nodiscard]] std::filesystem::path updater_journal_path() const;
 
     /// Copy the running kernel's initramfs to the backup of this release and
     /// record it in `state`. A host with no image at that path records none.

@@ -811,6 +811,7 @@ jobs:
             --lock dist/os-packages.lock --boot-chain-changed "$BOOT_CHAIN_CHANGED" \
             --server-file lemonade-nexus-linux-x86_64=/usr/bin/lemonade-nexus=dist/lemonade-nexus-linux-x86_64 \
             --server-file nexus-attestd-linux-x86_64=/usr/bin/nexus-attestd=dist/nexus-attestd-linux-x86_64 \
+            --updater-file nexus-updater-linux-x86_64=/usr/bin/nexus-updater=dist/nexus-updater-linux-x86_64 \
             --artifacts-dir dist --out manifest.json
           test "$(python3 -c 'import json; print(json.load(open("manifest.json"))["release_number"])')" = "$RELEASE_NUMBER"
 
