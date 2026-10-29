@@ -218,7 +218,10 @@ protected:
     std::unique_ptr<httplib::SSLServer> priv;
     std::thread pub_thread;
     std::thread priv_thread;
-    int pub_port = 0;
+    int pub_port  = 0;
+    int priv_port = 0;  // the private listener's port, kept across a restart
+    fs::path cert_file;
+    fs::path key_file;
 
     lnsdk::BoringtunMesh server_mesh;  // the server's dataplane
     lnsdk::BoringtunMesh peer_mesh;    // another endpoint in the client's peer list
@@ -257,6 +260,16 @@ protected:
     std::vector<std::string> join_bearers() {
         std::lock_guard lock(bearer_mtx);
         return join_bearers_seen;
+    }
+
+    // The mesh public key the last join registered: the client's peer as the
+    // server's dataplane knows it.
+    std::mutex  client_key_mtx;
+    std::string client_mesh_pubkey;
+
+    std::string joined_mesh_pubkey() {
+        std::lock_guard lock(client_key_mtx);
+        return client_mesh_pubkey;
     }
 
     // The tunnel address the peer list gives the other endpoint.
@@ -322,8 +335,10 @@ protected:
               ("nexus_sdk_mesh_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()) +
                "_" + std::to_string(reinterpret_cast<uintptr_t>(this)));
         fs::create_directories(dir);
-        const auto cert = dir / "cert.pem";
-        const auto key = dir / "key.pem";
+        cert_file = dir / "cert.pem";
+        key_file  = dir / "key.pem";
+        const auto& cert = cert_file;
+        const auto& key  = key_file;
         ASSERT_TRUE(make_localhost_cert(cert, key));
 #ifdef _WIN32
         (void)_putenv_s("SSL_CERT_FILE", cert.string().c_str());
@@ -336,10 +351,84 @@ protected:
         ASSERT_TRUE(server_mesh.start(mesh_config(server_keys, "10.64.0.1/32")));
         ASSERT_TRUE(peer_mesh.start(mesh_config(peer_keys, "10.64.0.4/32")));
 
-        priv = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
+        ASSERT_NO_FATAL_FAILURE(start_private_listener());
+        ASSERT_TRUE(server_mesh.tcp_ingress(kPrivPort,
+                                            "tcp:127.0.0.1:" + std::to_string(priv_port)));
+
+        server_identity = tier1_chain_test::new_identity();
+        next_identity   = tier1_chain_test::new_identity();
+        second_identity = tier1_chain_test::new_identity();
+        std::vector<nexus::crypto::Ed25519Keypair> epoch1 = {server_identity, second_identity};
+        std::vector<nexus::crypto::Ed25519Keypair> epoch2 = {next_identity, second_identity};
+        for (int i = 0; i < 3; ++i) {
+            const auto member = tier1_chain_test::new_identity();
+            epoch1.push_back(member);
+            epoch2.push_back(member);
+        }
+        chain = tier1_chain_test::Chain::make({epoch1, epoch2});
+
+        ASSERT_NO_FATAL_FAILURE(start_public_listener());
+
+        pub2 = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
+        ASSERT_TRUE(pub2->is_valid());
+        add_public_routes(*pub2, pub2_port, &second_identity, second_auth_posts,
+                          "session-token-3");
+        pub2_port = pub2->bind_to_any_port("127.0.0.1");
+        ASSERT_GT(pub2_port, 0);
+        pub2_thread = std::thread([this] { pub2->listen_after_bind(); });
+        pub2->wait_until_ready();
+    }
+
+    /// Serve the first server's public API on `pub_port` (any free port the
+    /// first time).
+    void start_public_listener() {
+        pub = std::make_unique<httplib::SSLServer>(cert_file.string().c_str(),
+                                                   key_file.string().c_str());
+        ASSERT_TRUE(pub->is_valid());
+        add_public_routes(*pub, pub_port, nullptr, auth_posts, "session-token");
+        if (pub_port == 0) {
+            pub_port = pub->bind_to_any_port("127.0.0.1");
+        } else {
+            ASSERT_TRUE(pub->bind_to_port("127.0.0.1", pub_port));
+        }
+        ASSERT_GT(pub_port, 0);
+        pub_thread = std::thread([this] { pub->listen_after_bind(); });
+        pub->wait_until_ready();
+    }
+
+    /// Take the first server's public API off the network.
+    void stop_public_listener() {
+        pub->stop();
+        if (pub_thread.joinable()) pub_thread.join();
+    }
+
+    /// Serve the private API on `priv_port` (any free port the first time)
+    /// behind the server's dataplane ingress.
+    void start_private_listener() {
+        priv = std::make_unique<httplib::SSLServer>(cert_file.string().c_str(),
+                                                    key_file.string().c_str());
         ASSERT_TRUE(priv->is_valid());
-        priv->Get(std::string("/api/mesh/peers/") + kNodeId,
-                  [this](const httplib::Request&, httplib::Response& res) {
+        add_private_routes(*priv);
+        if (priv_port == 0) {
+            priv_port = priv->bind_to_any_port("127.0.0.1");
+        } else {
+            ASSERT_TRUE(priv->bind_to_port("127.0.0.1", priv_port));
+        }
+        ASSERT_GT(priv_port, 0);
+        priv_thread = std::thread([this] { priv->listen_after_bind(); });
+        priv->wait_until_ready();
+    }
+
+    /// Take the private API down: the dataplane ingress still accepts the
+    /// client's connections, and closes each one before any TLS byte.
+    void stop_private_listener() {
+        priv->stop();
+        if (priv_thread.joinable()) priv_thread.join();
+    }
+
+    void add_private_routes(httplib::SSLServer& srv) {
+        srv.Get(std::string("/api/mesh/peers/") + kNodeId,
+                [this](const httplib::Request&, httplib::Response& res) {
             ++peer_list_gets;
             if (peer_list_reply.load() == Reply::CutAfterHeaders) return cut_after_headers(res);
             nlohmann::json peer = {
@@ -357,8 +446,8 @@ protected:
             body["peers"] = nlohmann::json::array({peer});
             res.set_content(body.dump(), "application/json");
         });
-        priv->Post(std::string("/api/tree/node/delete/") + kNodeId,
-                   [this](const httplib::Request&, httplib::Response& res) {
+        srv.Post(std::string("/api/tree/node/delete/") + kNodeId,
+                 [this](const httplib::Request&, httplib::Response& res) {
             ++delete_posts;
             switch (delete_reply.load()) {
             case Reply::Ok:
@@ -373,8 +462,8 @@ protected:
                 break;
             }
         });
-        priv->Post("/api/mesh/heartbeat", [this](const httplib::Request& req,
-                                                 httplib::Response& res) {
+        srv.Post("/api/mesh/heartbeat", [this](const httplib::Request& req,
+                                               httplib::Response& res) {
             if (server_left_tier1.load() &&
                 req.get_header_value("Authorization") == "Bearer session-token") {
                 res.status = 421;
@@ -394,41 +483,6 @@ protected:
             }
             res.set_content(answer.dump(), "application/json");
         });
-        const int priv_port = priv->bind_to_any_port("127.0.0.1");
-        ASSERT_GT(priv_port, 0);
-        priv_thread = std::thread([this] { priv->listen_after_bind(); });
-        priv->wait_until_ready();
-        ASSERT_TRUE(server_mesh.tcp_ingress(kPrivPort,
-                                            "tcp:127.0.0.1:" + std::to_string(priv_port)));
-
-        server_identity = tier1_chain_test::new_identity();
-        next_identity   = tier1_chain_test::new_identity();
-        second_identity = tier1_chain_test::new_identity();
-        std::vector<nexus::crypto::Ed25519Keypair> epoch1 = {server_identity, second_identity};
-        std::vector<nexus::crypto::Ed25519Keypair> epoch2 = {next_identity, second_identity};
-        for (int i = 0; i < 3; ++i) {
-            const auto member = tier1_chain_test::new_identity();
-            epoch1.push_back(member);
-            epoch2.push_back(member);
-        }
-        chain = tier1_chain_test::Chain::make({epoch1, epoch2});
-
-        pub = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
-        ASSERT_TRUE(pub->is_valid());
-        add_public_routes(*pub, pub_port, nullptr, auth_posts, "session-token");
-        pub_port = pub->bind_to_any_port("127.0.0.1");
-        ASSERT_GT(pub_port, 0);
-        pub_thread = std::thread([this] { pub->listen_after_bind(); });
-        pub->wait_until_ready();
-
-        pub2 = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
-        ASSERT_TRUE(pub2->is_valid());
-        add_public_routes(*pub2, pub2_port, &second_identity, second_auth_posts,
-                          "session-token-3");
-        pub2_port = pub2->bind_to_any_port("127.0.0.1");
-        ASSERT_GT(pub2_port, 0);
-        pub2_thread = std::thread([this] { pub2->listen_after_bind(); });
-        pub2->wait_until_ready();
     }
 
     /// The public routes of one stand-in Tier 1 server on `port`. It signs
@@ -520,6 +574,10 @@ protected:
             lnsdk::MeshPeer self;
             self.mesh_pubkey = body.is_object() ? body.value("mesh_pubkey", "") : "";
             self.tunnel_ip   = "10.64.0.3/32";
+            {
+                std::lock_guard lock(client_key_mtx);
+                client_mesh_pubkey = self.mesh_pubkey;
+            }
             (void)server_mesh.sync_peers({self});
             (void)peer_mesh.sync_peers({self});
             nlohmann::json j;
@@ -595,6 +653,30 @@ protected:
         auto refreshed = client.refresh_tier1();
         ASSERT_TRUE(refreshed.ok) << refreshed.error;
         ASSERT_EQ(refreshed.value.epoch, 2u);
+    }
+
+    /// The server restarted in place: its dataplane forgot the client's
+    /// peer, while its public API and its Tier 1 seat stay. The client's
+    /// handshakes go unanswered until a join adds the peer back.
+    void server_forgets_client() {
+        const auto key = joined_mesh_pubkey();
+        ASSERT_FALSE(key.empty());
+        ASSERT_TRUE(server_mesh.remove_peer(key).ok);
+    }
+
+    /// A client with the mesh orchestrator running at a one-second heartbeat
+    /// cadence and an identity to re-authenticate with.
+    std::unique_ptr<lnsdk::LemonadeNexusClient> heartbeating_client() {
+        auto client = joined_client();
+        lnsdk::Identity identity;
+        identity.generate();
+        client->set_identity(identity);
+        lnsdk::MeshConfig cfg;
+        cfg.peer_refresh_interval_sec = 3600;
+        cfg.heartbeat_interval_sec    = 1;
+        client->enable_mesh(cfg);
+        EXPECT_TRUE(wait_for([&] { return !heartbeats().empty(); }, std::chrono::seconds(10)));
+        return client;
     }
 };
 
@@ -809,6 +891,125 @@ TEST_F(SdkMeshPrivateApiTest, ADepartureNoticeTheClientCannotVerifyChangesNothin
     EXPECT_EQ(authority_gets.load(), walks_before);
     EXPECT_TRUE(moves().empty());
     EXPECT_EQ(client->session_token(), "session-token");
+}
+
+// A Tier 1 server that restarts in place keeps its seat and its public API
+// but forgets the client's dataplane peer: every private request fails before
+// the handshake completes, while the verified membership still lists the
+// server, so no departure notice, 421, or membership change starts a move.
+// Once private requests have gone unanswered for the window, the SDK verifies
+// the membership, finds the server a member whose public API answers, and
+// joins again anyway, through the same server: the fresh join adds the peer
+// back, the orchestrator comes back, and private requests answer again. One
+// lost handshake starts no move, and the one move is reported as silent.
+TEST_F(SdkMeshPrivateApiTest, ASessionServerThatStopsAnsweringOverTheMeshIsJoinedAgain) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = heartbeating_client();
+    const int walks_before = authority_gets.load();
+
+    ASSERT_NO_FATAL_FAILURE(server_forgets_client());
+    // The window starts at the first unanswered request, so nothing moves
+    // this early.
+    std::this_thread::sleep_for(std::chrono::seconds(20));
+    EXPECT_TRUE(moves().empty());
+    EXPECT_EQ(auth_posts.load(), 0);
+
+    ASSERT_TRUE(wait_for([&] { return moves().size() == 1; }, std::chrono::seconds(120)));
+    const auto move = moves().front();
+    EXPECT_TRUE(move.silent) << move.error;
+    EXPECT_EQ(move.from_node_id, node_b64(server_identity));
+    EXPECT_EQ(move.to_node_id, node_b64(server_identity));
+    EXPECT_EQ(move.from_host, "localhost");
+    EXPECT_EQ(move.to_host, "localhost");
+    EXPECT_EQ(move.epoch, 1u);
+    EXPECT_TRUE(move.error.empty());
+    EXPECT_GT(authority_gets.load(), walks_before) << "the move did not verify the membership";
+    EXPECT_EQ(auth_posts.load(), 1);
+    EXPECT_EQ(client->session_token(), "session-token");
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+    EXPECT_TRUE(client->is_mesh_active());
+
+    // The orchestrator came back and its heartbeats reach the server again.
+    const auto sent_after_move = heartbeats().size();
+    EXPECT_TRUE(wait_for([&] { return heartbeats().size() > sent_after_move; },
+                         std::chrono::seconds(30)));
+    EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    EXPECT_EQ(moves().size(), 1u);
+    client->disable_mesh();
+}
+
+// The same dead private path while the public API is out of reach too: this
+// device, not the server, lost the network. The window ends, but nothing
+// verifies, so nothing moves: the session, the token, and the dataplane stay.
+// Once the network returns, the still-dead private path moves the session in
+// a later window.
+TEST_F(SdkMeshPrivateApiTest, NoMoveWhileThePublicApiIsOutOfReachToo) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = heartbeating_client();
+
+    ASSERT_NO_FATAL_FAILURE(stop_public_listener());
+    ASSERT_NO_FATAL_FAILURE(server_forgets_client());
+    // Well past the first window's end: the first unanswered request is
+    // counted within about 35 s (one read timeout on the pooled connection,
+    // the breaker, one failed handshake), the window ends 30 s later, and
+    // the move thread then finds nothing to verify.
+    std::this_thread::sleep_for(std::chrono::seconds(100));
+    EXPECT_TRUE(moves().empty());
+    EXPECT_EQ(auth_posts.load(), 0);
+    EXPECT_EQ(client->session_token(), "session-token");
+    EXPECT_EQ(client->node_id(), kNodeId);
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+    EXPECT_TRUE(client->is_mesh_active());
+
+    ASSERT_NO_FATAL_FAILURE(start_public_listener());
+    ASSERT_TRUE(wait_for([&] { return moves().size() == 1; }, std::chrono::seconds(120)));
+    EXPECT_TRUE(moves().front().silent) << moves().front().error;
+    EXPECT_EQ(moves().front().to_node_id, node_b64(server_identity));
+    EXPECT_EQ(auth_posts.load(), 1);
+    EXPECT_TRUE(wait_for([&] { return client->mesh_heartbeat(kNodeId, "").ok; },
+                         std::chrono::seconds(30)));
+    client->disable_mesh();
+}
+
+// An answered private request ends the run of unanswered ones: the window
+// starts again at the next failure. Private requests fail for part of a
+// window, answer once, then fail again; a window counted from the first
+// failure would have moved the session, a window restarted by the answer has
+// not. The restarted window still ends in a move, and once the private API
+// answers again no further move follows.
+TEST_F(SdkMeshPrivateApiTest, AnAnsweredPrivateRequestRestartsTheUnansweredWindow) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = heartbeating_client();
+
+    // The private listener goes away: the dataplane ingress closes each
+    // connection before the TLS handshake, so every request fails fast.
+    ASSERT_NO_FATAL_FAILURE(stop_private_listener());
+    std::this_thread::sleep_for(std::chrono::seconds(15));
+    EXPECT_TRUE(moves().empty());
+
+    ASSERT_NO_FATAL_FAILURE(start_private_listener());
+    const auto sent_before_answer = heartbeats().size();
+    ASSERT_TRUE(wait_for([&] { return heartbeats().size() > sent_before_answer; },
+                         std::chrono::seconds(20)))
+        << "no heartbeat reached the restored private API";
+
+    ASSERT_NO_FATAL_FAILURE(stop_private_listener());
+    std::this_thread::sleep_for(std::chrono::seconds(24));
+    EXPECT_TRUE(moves().empty()) << "the answered request did not restart the window";
+    EXPECT_EQ(auth_posts.load(), 0);
+
+    ASSERT_TRUE(wait_for([&] { return moves().size() == 1; }, std::chrono::seconds(90)));
+    EXPECT_TRUE(moves().front().silent) << moves().front().error;
+    EXPECT_EQ(moves().front().to_node_id, node_b64(server_identity));
+    EXPECT_EQ(auth_posts.load(), 1);
+
+    ASSERT_NO_FATAL_FAILURE(start_private_listener());
+    const auto sent_after_move = heartbeats().size();
+    ASSERT_TRUE(wait_for([&] { return heartbeats().size() > sent_after_move; },
+                         std::chrono::seconds(30)));
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    EXPECT_EQ(moves().size(), 1u);
+    client->disable_mesh();
 }
 
 // check_health() names the reason once, when it finds the session's server
