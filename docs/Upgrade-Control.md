@@ -93,6 +93,11 @@ Tier 2 server is not held to a tree log, even when an older release ran one. A
 
 1. Every server polls the releases, verifies, and stages. Its updater sends
    `offer_approval` (a refusal stops the cycle), then `stage`, then `turn`.
+   On `not_started` or `wait` the cycle asks `turn` again every 10 seconds
+   for up to 20 minutes in all, so a server that staged before the Start is
+   waiting when it finalizes. When no cycle runs, the server's wake marker
+   (`/run/lemonade-nexus/updater-wake`, watched by `nexus-updater.path`)
+   starts one when a Start it takes part in finalizes.
 2. A Tier 1 leader proposes a Start record when every Tier 1 member reports a
    live status and some server runs an older release. The order is Tier 2
    servers first (those that report a configured attestation collector), then
@@ -101,12 +106,14 @@ Tier 2 server is not held to a tree log, even when an older release ran one. A
    record with its commit proof, judges the Start against that record: the
    records it lacks finalized before it, and the Start replaces them. It
    votes for no other record while it is behind.
-3. The first server in the order gets a Turn record; its gate says `go`.
+3. The first server in the order gets a Turn record; its gate says `go`. The
+   server touches its wake marker, so a cycle starts within seconds, and a
+   cycle already waiting reads `go` at its next poll.
 4. It restarts on the new release. When its signed status names the new
    release and the Healthy flag, Tier 1 witnesses challenge it with an
    UpgradeHealth attestation. A witness does not challenge earlier: each
-   chain position has a small attempt budget, and the updater installs on its
-   own timer. A Tier 2 server admits these challenges from the Tier 1 members
+   chain position has a small attempt budget, and the install takes a minute
+   or two. A Tier 2 server admits these challenges from the Tier 1 members
    of its verified epoch authority. When a witness quorum saw it attested,
    healthy, and measuring only the new release's hashes, an Upgraded record
    follows.

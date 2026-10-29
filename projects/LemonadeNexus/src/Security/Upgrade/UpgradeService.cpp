@@ -980,10 +980,12 @@ bool UpgradeService::accept_record(const UpgradeRecord& record, std::optional<Co
         case UpgradeEvent::Start:
             spdlog::info("[upgrade] release {} rollout started: {} participants",
                          record.release_number, record.order.size());
+            if (state_.participant(config_.self)) wake_updater("rollout started");
             break;
         case UpgradeEvent::Turn:
             spdlog::info("[upgrade] release {}: turn opened for {}", record.release_number,
                          short_id(record.subject));
+            if (record.subject == config_.self) wake_updater("turn opened");
             break;
         case UpgradeEvent::Upgraded:
             spdlog::info("[upgrade] release {}: {} upgraded ({} witnesses)",
@@ -997,6 +999,22 @@ bool UpgradeService::accept_record(const UpgradeRecord& record, std::optional<Co
     }
     drain_pending();
     return true;
+}
+
+void UpgradeService::wake_updater(std::string_view reason) const {
+    if (config_.updater_wake.empty()) return;
+    // nexus-updater.path watches the marker with PathChanged: a create or a
+    // close after a write is the event, the content is nothing. The service
+    // umask keeps the file owner-only; the path unit runs in the manager, as
+    // root. A failed touch costs timing only: the timer runs the next cycle.
+    std::ofstream marker(config_.updater_wake, std::ios::trunc);
+    if (!marker) {
+        spdlog::warn("[upgrade] cannot touch the updater wake marker {} ({}); the timer "
+                     "starts the next updater cycle",
+                     config_.updater_wake.string(), reason);
+        return;
+    }
+    spdlog::debug("[upgrade] woke the updater ({}): {}", reason, config_.updater_wake.string());
 }
 
 void UpgradeService::drain_pending() {

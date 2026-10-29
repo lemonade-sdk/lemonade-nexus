@@ -63,6 +63,12 @@ struct UpgradeServiceConfig {
     NetworkId network_id{};
     /// Durable records (data_root/security/upgrade).
     std::filesystem::path directory;
+    /// The nexus-updater wake marker (Core/UpgradeControl.hpp
+    /// kUpdaterWakePath in production). The service touches it when a
+    /// finalized Start names this server as a participant and when a
+    /// finalized Turn opens for this server; nexus-updater.path starts a
+    /// cycle on the change. Empty: no marker is written.
+    std::filesystem::path updater_wake;
     /// Unix time in milliseconds for status timestamps and freshness. Unset:
     /// this server sends no status and votes for no Turn or Halt.
     std::function<uint64_t()> wall_clock_ms;
@@ -270,6 +276,8 @@ private:
     /// does not extend the state.
     bool accept_record(const UpgradeRecord& record, std::optional<CommitProof> proof,
                        const UpgradeWitnessSet* witnesses, bool as_base);
+    /// Touches config_.updater_wake so that nexus-updater.path starts a cycle.
+    void wake_updater(std::string_view reason) const;
     void drain_pending();
     void broadcast_record(uint64_t sequence);
     void persist();

@@ -409,11 +409,43 @@ time limit, but plan the rollout and step 4 together.
 
 ## The updater on a server
 
-The package installs `nexus-updater.timer` (enabled, not started). It runs one
-cycle three minutes after boot and every 15 minutes after the last cycle.
+The package installs `nexus-updater.path` and `nexus-updater.timer` (enabled,
+not started). Two things start a cycle:
+
+- **The server wakes it.** The server touches
+  `/run/lemonade-nexus/updater-wake` when a finalized Start names it as a
+  participant and when its own Turn opens. The path unit starts a cycle
+  within seconds. The first Start a server sees usually arrives before its
+  timer would have found the release.
+- **The timer.** One cycle three minutes after boot and every 5 minutes (plus
+  up to one minute of jitter) after the last cycle. It is the fallback for a
+  missed path change and the way the first server discovers a release.
+
+A cycle that has staged a release and finds no turn yet (no rollout started,
+or another server in its turn) stays alive and asks the local turn gate again
+every 10 seconds, for up to 20 minutes in all, without GitHub traffic. A
+server that staged before the Start is already waiting when the Start lands
+and takes its turn in the same cycle. A cycle never installs on a wake alone:
+the same gate, witness attestation, health gate, and signed release checks
+apply.
+
+Expected timing: one server takes about the install and restart (one to two
+minutes) plus the witness attestation of its new release. A rollout over six
+servers takes about 15 to 20 minutes. The journal line `started by
+nexus-updater.path on /run/lemonade-nexus/updater-wake` or `started by
+nexus-updater.timer` says what started a cycle.
+
+The updater carries its three unit files, built in from
+`packaging/systemd`. At the start of every cycle it compares them with
+`/usr/lib/systemd/system/` and rewrites a unit that is missing or differs,
+then runs `systemctl daemon-reload` and `systemctl enable --now
+nexus-updater.path`. A release therefore updates the timer cadence and the
+path unit on a server that only ever received binaries. The journal reports
+`refreshed systemd unit <name> (missing|changed)`; a failure there is logged
+and the cycle continues.
 
 ```bash
-systemctl status nexus-updater.timer
+systemctl status nexus-updater.path nexus-updater.timer
 journalctl -u nexus-updater
 cat /var/lib/nexus-updater/state.json
 ```
@@ -424,6 +456,7 @@ cat /var/lib/nexus-updater/state.json
 | `/var/lib/nexus-updater/staged/<tag>/` | Verified files waiting for the upgrade turn |
 | `/var/lib/nexus-updater/previous/<tag>/` | The files from before `<tag>` was installed. When `<tag>` installs OS packages, `boot/` holds the running kernel's measured initramfs |
 | `/run/lemonade-nexus/upgrade.sock` | The server's upgrade control socket, root peers only ([Upgrade Control](Upgrade-Control)) |
+| `/run/lemonade-nexus/updater-wake` | The marker the server touches to start an updater cycle (`nexus-updater.path`) |
 
 A failed release halts on that server until a newer release appears. To retry
 the same release after a fix on the host, an operator sets

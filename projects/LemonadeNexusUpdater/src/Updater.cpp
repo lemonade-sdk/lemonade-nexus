@@ -1,6 +1,7 @@
 #include <LemonadeNexusUpdater/Updater.hpp>
 
 #include <LemonadeNexusUpdater/FileSwap.hpp>
+#include <LemonadeNexusUpdater/SystemdUnits.hpp>
 
 #include <LemonadeNexus/Security/DurableWrite.hpp>
 #include <LemonadeNexus/Security/Sealing/SealedBlob.hpp>
@@ -320,7 +321,19 @@ CycleResult Updater::run_once() {
     }
 }
 
+void Updater::refresh_units() {
+    const auto result = refresh_systemd_units(config_.root, env_.run);
+    for (const auto& unit : result.refreshed) {
+        spdlog::info("[updater] refreshed systemd unit {}", unit);
+    }
+    if (!result.error.empty()) {
+        spdlog::warn("[updater] systemd unit refresh incomplete: {}; the cycle continues",
+                     result.error);
+    }
+}
+
 CycleResult Updater::cycle() {
+    refresh_units();
     auto state = load_state();
     if (!state) return {CycleOutcome::Refused, "the updater state file is unreadable"};
     if (state->phase != "idle") return resume(*state);
@@ -350,6 +363,36 @@ CycleResult Updater::cycle() {
     return start_update(*state, *release);
 }
 
+std::optional<TurnGate> Updater::ask_turn(uint64_t release_number) {
+    const auto line = env_.control(encode_turn_request(release_number));
+    return line ? decode_turn_reply(*line) : std::nullopt;
+}
+
+bool Updater::turn_pending(TurnGate gate) {
+    return gate == TurnGate::Wait || gate == TurnGate::NotStarted;
+}
+
+TurnGate Updater::await_turn(uint64_t release_number, TurnGate last, const std::string& tag) {
+    spdlog::info("[updater] {}: upgrade turn: {}; asking the gate every {} s for up to {} s",
+                 tag, turn_gate_name(last), config_.turn_poll.count(),
+                 config_.turn_wait.count());
+    const auto deadline = env_.now() + config_.turn_wait;
+    while (env_.now() < deadline) {
+        env_.sleep(config_.turn_poll);
+        const auto gate = ask_turn(release_number);
+        if (!gate) continue;
+        if (!turn_pending(*gate)) {
+            spdlog::info("[updater] {}: upgrade turn: {}", tag, turn_gate_name(*gate));
+            return *gate;
+        }
+        if (*gate != last) {
+            spdlog::info("[updater] {}: upgrade turn: {}", tag, turn_gate_name(*gate));
+            last = *gate;
+        }
+    }
+    return last;
+}
+
 CycleResult Updater::start_update(State& state, const Release& release) {
     const auto& v = release.verified;
     const uint64_t number = v.tag.number;
@@ -371,19 +414,21 @@ CycleResult Updater::start_update(State& state, const Release& release) {
         return {CycleOutcome::Waiting,
                 "staged " + v.tag.tag + "; the server did not record the staged release"};
     }
-    const auto turn_line = env_.control(encode_turn_request(number));
-    const auto gate = turn_line ? decode_turn_reply(*turn_line) : std::nullopt;
+    auto gate = ask_turn(number);
     if (!gate) {
         return {CycleOutcome::Waiting,
                 "staged " + v.tag.tag + "; the turn gate did not answer"};
     }
+    if (turn_pending(*gate)) gate = await_turn(number, *gate, v.tag.tag);
     switch (*gate) {
         case TurnGate::Go:
             break;
         case TurnGate::Wait:
         case TurnGate::NotStarted:
-            return {CycleOutcome::Waiting, "staged " + v.tag.tag + "; upgrade turn: " +
-                                               std::string(turn_gate_name(*gate))};
+            return {CycleOutcome::Waiting,
+                    "staged " + v.tag.tag + "; upgrade turn: " +
+                        std::string(turn_gate_name(*gate)) + " (no turn within " +
+                        std::to_string(config_.turn_wait.count()) + " s)"};
         case TurnGate::Halted:
             state.halted_release_number = number;
             state.last_result = "the rollout of " + v.tag.tag + " halted";

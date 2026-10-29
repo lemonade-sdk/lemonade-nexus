@@ -45,6 +45,10 @@ namespace nexus::core {
 /// The production socket path. The directory is the service's runtime
 /// directory.
 inline constexpr std::string_view kUpgradeControlSocketPath = "/run/lemonade-nexus/upgrade.sock";
+/// The marker the server touches when a rollout it takes part in starts and
+/// when its upgrade turn opens (UpgradeService). nexus-updater.path watches
+/// it and starts an updater cycle; nexus-updater.timer is the fallback.
+inline constexpr std::string_view kUpdaterWakePath = "/run/lemonade-nexus/updater-wake";
 /// Largest request or reply line. The tree merge requests carry every
 /// server's tree export, so the limit is larger than an approval bundle
 /// needs. Only a root peer can send a line.

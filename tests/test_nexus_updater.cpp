@@ -9,6 +9,7 @@
 #include <LemonadeNexusUpdater/ReleaseTag.hpp>
 #include <LemonadeNexusUpdater/ReleaseVerifier.hpp>
 #include <LemonadeNexusUpdater/SigstoreVerifier.hpp>
+#include <LemonadeNexusUpdater/SystemdUnits.hpp>
 #include <LemonadeNexusUpdater/Transport.hpp>
 #include <LemonadeNexusUpdater/Updater.hpp>
 
@@ -825,6 +826,11 @@ struct Host {
     std::vector<std::vector<std::string>> commands;
     bool running = true;
     std::string turn_gate = "go";
+    /// Runs before each turn reply; a test changes turn_gate from it.
+    std::function<void()> on_turn;
+    /// The local turn wait, short under the fake clock.
+    std::chrono::seconds turn_poll{10};
+    std::chrono::seconds turn_wait{60};
     std::string offer_result = "adopted";
     std::string data_key = "unlocked";
     bool new_binary_is_broken = false;
@@ -841,6 +847,8 @@ struct Host {
     int initrd_rebuilds = 0;
     /// Runs after each fake package install.
     std::function<void()> after_apt_install;
+    /// `systemctl daemon-reload` fails: the unit refresh cannot finish.
+    bool daemon_reload_fails = false;
 
     static constexpr std::string_view kInitrd = "/boot/initrd.img-6.8.0-45-generic";
     static constexpr std::string_view kMeasuredInitrd = "initrd measured at boot";
@@ -922,7 +930,10 @@ struct Host {
                    "\n";
         }
         if (op == "stage") return json{{"ok", true}}.dump() + "\n";
-        if (op == "turn") return json{{"ok", true}, {"gate", turn_gate}}.dump() + "\n";
+        if (op == "turn") {
+            if (on_turn) on_turn();
+            return json{{"ok", true}, {"gate", turn_gate}}.dump() + "\n";
+        }
         if (op == "report") {
             reports.push_back(r.value("result", std::string()));
             return json{{"ok", true}}.dump() + "\n";
@@ -946,6 +957,8 @@ struct Host {
         cfg.trust = keys.trust();
         cfg.health_timeout = std::chrono::seconds(60);
         cfg.health_poll = std::chrono::seconds(5);
+        cfg.turn_poll = turn_poll;
+        cfg.turn_wait = turn_wait;
         UpdaterEnv env;
         env.http = [this](const std::string& url, std::size_t, std::string& error)
             -> std::optional<std::string> {
@@ -997,6 +1010,9 @@ struct Host {
             }
             if (argv[0] == "systemctl" && argv[1] == "stop") running = false;
             if (argv[0] == "systemctl" && argv[1] == "start") running = true;
+            if (argv[0] == "systemctl" && argv[1] == "daemon-reload" && daemon_reload_fails) {
+                return {1, "Failed to reload daemon"};
+            }
             return {0, ""};
         };
         env.provenance = [](std::string_view bundle, std::string_view sha, std::string& why) {
@@ -1023,17 +1039,192 @@ struct Host {
     }
 };
 
+TEST(SystemdUnits, EmbeddedUnitsMatchThePackagingSources) {
+    const auto units = embedded_systemd_units();
+    ASSERT_EQ(units.size(), 3u);
+    std::set<std::string> names;
+    for (const auto& unit : units) {
+        names.insert(std::string(unit.name));
+        const auto source = fs::path(NEXUS_SOURCE_DIR) / "packaging" / "systemd" /
+                            std::string(unit.name);
+        ASSERT_TRUE(fs::exists(source)) << source;
+        EXPECT_EQ(read_text(source), unit.content) << unit.name;
+    }
+    EXPECT_EQ(names, (std::set<std::string>{"nexus-updater.service", "nexus-updater.timer",
+                                            "nexus-updater.path"}));
+}
+
+TEST(SystemdUnits, MissingAndStaleUnitsAreRewrittenAndIdenticalOnesLeftAlone) {
+    TempDir dir;
+    const fs::path installed = dir.path / "usr/lib/systemd/system";
+    std::vector<std::vector<std::string>> commands;
+    const CommandRunner run = [&](const std::vector<std::string>& argv) {
+        commands.push_back(argv);
+        return CommandResult{0, ""};
+    };
+    const auto units = embedded_systemd_units();
+    const auto unit = [&](std::string_view name) {
+        return *std::find_if(units.begin(), units.end(),
+                             [&](const SystemdUnit& u) { return u.name == name; });
+    };
+    write_text(installed / "nexus-updater.service", unit("nexus-updater.service").content);
+    write_text(installed / "nexus-updater.timer", "[Timer]\nOnUnitInactiveSec=15min\n");
+    const auto service_written = fs::last_write_time(installed / "nexus-updater.service");
+
+    auto result = refresh_systemd_units(dir.path, run);
+    EXPECT_TRUE(result.error.empty()) << result.error;
+    EXPECT_EQ(result.refreshed, (std::vector<std::string>{"nexus-updater.timer (changed)",
+                                                          "nexus-updater.path (missing)"}));
+    for (const auto& u : units) {
+        EXPECT_EQ(read_text(installed / std::string(u.name)), u.content) << u.name;
+        const auto mode = fs::status(installed / std::string(u.name)).permissions();
+        EXPECT_EQ(mode & fs::perms::others_read, fs::perms::others_read) << u.name;
+        EXPECT_EQ(mode & fs::perms::group_write, fs::perms::none) << u.name;
+    }
+    EXPECT_EQ(fs::last_write_time(installed / "nexus-updater.service"), service_written);
+    EXPECT_EQ(commands, (std::vector<std::vector<std::string>>{
+                            {"systemctl", "daemon-reload"},
+                            {"systemctl", "enable", "--now", "nexus-updater.path"}}));
+    // No temporary file is left behind.
+    for (const auto& entry : fs::directory_iterator(installed)) {
+        EXPECT_NE(entry.path().filename().string().front(), '.') << entry.path();
+    }
+
+    // Everything current: nothing is written and systemd is not touched.
+    commands.clear();
+    result = refresh_systemd_units(dir.path, run);
+    EXPECT_TRUE(result.error.empty()) << result.error;
+    EXPECT_TRUE(result.refreshed.empty());
+    EXPECT_TRUE(commands.empty());
+}
+
+TEST(SystemdUnits, ASystemctlFailureIsReportedAndTheWrittenUnitsStay) {
+    TempDir dir;
+    std::vector<std::vector<std::string>> commands;
+    const CommandRunner run = [&](const std::vector<std::string>& argv) {
+        commands.push_back(argv);
+        return CommandResult{argv[1] == "daemon-reload" ? 1 : 0, "no bus"};
+    };
+    const auto result = refresh_systemd_units(dir.path, run);
+    EXPECT_EQ(result.refreshed.size(), 3u);
+    EXPECT_NE(result.error.find("daemon-reload"), std::string::npos) << result.error;
+    EXPECT_EQ(commands.size(), 1u);
+    for (const auto& u : embedded_systemd_units()) {
+        EXPECT_EQ(read_text(dir.path / "usr/lib/systemd/system" / std::string(u.name)),
+                  u.content);
+    }
+}
+
+TEST(UpdaterCycle, ACycleRefreshesTheUnitsAndAFailureThereDoesNotBlockTheUpgrade) {
+    Host h;
+    h.daemon_reload_fails = true;
+    auto u = h.updater();
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_TRUE(h.ran({"systemctl", "daemon-reload"}));
+    EXPECT_FALSE(h.ran({"systemctl", "enable"}));
+    for (const auto& unit : embedded_systemd_units()) {
+        EXPECT_EQ(read_text(h.host("/usr/lib/systemd/system/" + std::string(unit.name))),
+                  unit.content);
+    }
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-new");
+}
+
 TEST(UpdaterCycle, StagesAndWaitsWhileTheTurnGateSaysWait) {
     Host h;
     h.turn_gate = "wait";
     auto u = h.updater();
+    const auto started = h.clock;
     const auto r = u.run_once();
     EXPECT_EQ(r.outcome, CycleOutcome::Waiting) << r.detail;
     EXPECT_NE(r.detail.find("wait"), std::string::npos) << r.detail;
-    // The approval went to the server first, then the staged release, then the gate.
-    EXPECT_EQ(h.ops, (std::vector<std::string>{"offer_approval", "stage", "turn"}));
+    // The approval went to the server first, then the staged release, then
+    // the gate, which the cycle asked again every poll until the window
+    // closed. Nothing else: no second fetch, no report.
+    ASSERT_GE(h.ops.size(), 3u);
+    EXPECT_EQ((std::vector<std::string>(h.ops.begin(), h.ops.begin() + 3)),
+              (std::vector<std::string>{"offer_approval", "stage", "turn"}));
+    const auto polls = static_cast<std::size_t>(h.turn_wait / h.turn_poll);
+    EXPECT_EQ(h.ops.size(), 3 + polls);
+    EXPECT_TRUE(std::all_of(h.ops.begin() + 3, h.ops.end(),
+                            [](const std::string& op) { return op == "turn"; }));
+    EXPECT_EQ(h.clock - started, h.turn_wait);
     EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
     EXPECT_TRUE(fs::exists(u.state_dir() / "staged" / "v2026.10.24" / "lemonade-nexus-linux-x86_64"));
+    EXPECT_FALSE(h.ran({"systemctl", "stop"}));
+}
+
+TEST(UpdaterCycle, ATurnThatOpensDuringTheLocalWaitIsTaken) {
+    Host h;
+    h.turn_gate = "wait";
+    int asked = 0;
+    h.on_turn = [&] {
+        if (++asked == 4) h.turn_gate = "go";
+    };
+    auto u = h.updater();
+    const auto started = h.clock;
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_EQ(asked, 4);
+    // Three polls passed before the turn opened; the gate was asked once
+    // more at the start of the cycle.
+    EXPECT_EQ(std::count(h.ops.begin(), h.ops.end(), "turn"), 4);
+    EXPECT_GE(h.clock - started, 3 * h.turn_poll);
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-new");
+    EXPECT_EQ(h.reports, std::vector<std::string>{"upgraded"});
+}
+
+TEST(UpdaterCycle, AHaltDuringTheLocalWaitEndsTheCycleAtOnce) {
+    Host h;
+    h.turn_gate = "wait";
+    int asked = 0;
+    h.on_turn = [&] {
+        if (++asked == 3) h.turn_gate = "halted";
+    };
+    auto u = h.updater();
+    const auto started = h.clock;
+    EXPECT_EQ(u.run_once().outcome, CycleOutcome::Halted);
+    EXPECT_EQ(asked, 3);
+    EXPECT_EQ(h.clock - started, 2 * h.turn_poll);
+    EXPECT_FALSE(h.ran({"systemctl", "stop"}));
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
+}
+
+TEST(UpdaterCycle, AStartAndThenTheTurnDuringTheLocalWaitAreTakenInOneCycle) {
+    Host h;
+    h.turn_gate = "not_started";
+    int asked = 0;
+    h.on_turn = [&] {
+        ++asked;
+        if (asked == 3) h.turn_gate = "wait";
+        if (asked == 5) h.turn_gate = "go";
+    };
+    auto u = h.updater();
+    const auto started = h.clock;
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_EQ(asked, 5);
+    EXPECT_EQ(h.clock - started, 4 * h.turn_poll);
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-new");
+    EXPECT_EQ(h.reports, std::vector<std::string>{"upgraded"});
+}
+
+TEST(UpdaterCycle, TheLocalWaitWindowIsSharedAcrossNotStartedAndWait) {
+    Host h;
+    h.turn_gate = "not_started";
+    const auto polls = static_cast<int>(h.turn_wait / h.turn_poll);
+    int asked = 0;
+    h.on_turn = [&] {
+        // The rollout starts halfway through the window; the turn never opens.
+        if (++asked == polls / 2) h.turn_gate = "wait";
+    };
+    auto u = h.updater();
+    const auto started = h.clock;
+    const auto r = u.run_once();
+    EXPECT_EQ(r.outcome, CycleOutcome::Waiting) << r.detail;
+    EXPECT_NE(r.detail.find("wait"), std::string::npos) << r.detail;
+    EXPECT_EQ(asked, 1 + polls);
+    EXPECT_EQ(h.clock - started, h.turn_wait);
     EXPECT_FALSE(h.ran({"systemctl", "stop"}));
 }
 
@@ -1041,7 +1232,15 @@ TEST(UpdaterCycle, WaitsWhenNoRolloutStartedForTheRelease) {
     Host h;
     h.turn_gate = "not_started";
     auto u = h.updater();
-    EXPECT_EQ(u.run_once().outcome, CycleOutcome::Waiting);
+    const auto started = h.clock;
+    const auto r = u.run_once();
+    EXPECT_EQ(r.outcome, CycleOutcome::Waiting) << r.detail;
+    EXPECT_NE(r.detail.find("not_started"), std::string::npos) << r.detail;
+    // The cycle stays and asks the gate through the window, so a Start that
+    // lands meanwhile is seen without a new cycle.
+    const auto polls = static_cast<std::size_t>(h.turn_wait / h.turn_poll);
+    EXPECT_EQ(std::count(h.ops.begin(), h.ops.end(), "turn"), static_cast<long>(1 + polls));
+    EXPECT_EQ(h.clock - started, h.turn_wait);
     EXPECT_FALSE(h.ran({"systemctl", "stop"}));
 }
 

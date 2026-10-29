@@ -62,18 +62,15 @@ bool fsync_path(const fs::path& path) {
 #endif
 }
 
-}  // namespace
+fs::path temporary_for(const fs::path& target) {
+    return target.parent_path() / ("." + target.filename().string() + ".nexus-updater-new");
+}
 
-bool install_file_atomic(const fs::path& source, const fs::path& target, fs::perms mode,
-                         std::string& error) {
+/// Sets `mode` on the fully written `tmp`, syncs it, and renames it over
+/// `target`. Removes `tmp` on failure.
+bool commit_temporary(const fs::path& tmp, const fs::path& target, fs::perms mode,
+                      std::string& error) {
     std::error_code ec;
-    const fs::path tmp =
-        target.parent_path() / ("." + target.filename().string() + ".nexus-updater-new");
-    fs::remove(tmp, ec);
-    if (!fs::copy_file(source, tmp, fs::copy_options::overwrite_existing, ec)) {
-        error = "cannot copy " + source.string() + " to " + tmp.string() + ": " + ec.message();
-        return false;
-    }
     fs::permissions(tmp, mode, fs::perm_options::replace, ec);
     if (ec || !fsync_path(tmp)) {
         error = "cannot finish " + tmp.string();
@@ -86,6 +83,37 @@ bool install_file_atomic(const fs::path& source, const fs::path& target, fs::per
         return false;
     }
     return true;
+}
+
+}  // namespace
+
+bool install_file_atomic(const fs::path& source, const fs::path& target, fs::perms mode,
+                         std::string& error) {
+    std::error_code ec;
+    const fs::path tmp = temporary_for(target);
+    fs::remove(tmp, ec);
+    if (!fs::copy_file(source, tmp, fs::copy_options::overwrite_existing, ec)) {
+        error = "cannot copy " + source.string() + " to " + tmp.string() + ": " + ec.message();
+        return false;
+    }
+    return commit_temporary(tmp, target, mode, error);
+}
+
+bool write_file_atomic(std::string_view content, const fs::path& target, fs::perms mode,
+                       std::string& error) {
+    std::error_code ec;
+    const fs::path tmp = temporary_for(target);
+    fs::remove(tmp, ec);
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!out) {
+            error = "cannot write " + tmp.string();
+            fs::remove(tmp, ec);
+            return false;
+        }
+    }
+    return commit_temporary(tmp, target, mode, error);
 }
 
 FileSwapper::FileSwapper(fs::path journal_path) : journal_path_(std::move(journal_path)) {}

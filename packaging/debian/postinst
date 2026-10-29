@@ -213,10 +213,11 @@ APTEOF
     done
 fi
 
-# The updater timer is enabled, not started; it first runs after the next
-# boot or an explicit start. Until the server implements the consensus
-# upgrade turn, a cycle verifies and stages a release and installs nothing.
-systemctl enable nexus-updater.timer
+# The updater timer and path unit are enabled, not started; they first run
+# after the next boot or an explicit start. The path unit starts a cycle when
+# the server touches /run/lemonade-nexus/updater-wake (a rollout started, or
+# this server's turn opened); the timer is the fallback.
+systemctl enable nexus-updater.timer nexus-updater.path
 
 # The Nexus server wants the attestation daemon but does not require it. If the
 # unit shipped by the attestd package is present, enable it the same way: for

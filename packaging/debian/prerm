@@ -8,5 +8,5 @@ fi
 systemctl disable lemonade-nexus.service 2>/dev/null || true
 
 # The updater must not start a cycle against a package that is going away.
-systemctl stop nexus-updater.timer 2>/dev/null || true
-systemctl disable nexus-updater.timer 2>/dev/null || true
+systemctl stop nexus-updater.path nexus-updater.timer 2>/dev/null || true
+systemctl disable nexus-updater.path nexus-updater.timer 2>/dev/null || true

@@ -220,6 +220,7 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
             .identity = config.identity,
             .network_id = mesh_network_id(config),
             .directory = config.data_root / "security" / "upgrade",
+            .updater_wake = config.updater_wake,
             .wall_clock_ms =
                 [] {
                     return static_cast<uint64_t>(
