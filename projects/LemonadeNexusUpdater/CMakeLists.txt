@@ -54,6 +54,7 @@ if(UNIX AND NOT APPLE)
     install(FILES
             "${CMAKE_SOURCE_DIR}/packaging/systemd/nexus-updater.service"
             "${CMAKE_SOURCE_DIR}/packaging/systemd/nexus-updater.timer"
+            "${CMAKE_SOURCE_DIR}/packaging/systemd/nexus-updater.path"
             DESTINATION lib/systemd/system
             COMPONENT Runtime)
 endif()

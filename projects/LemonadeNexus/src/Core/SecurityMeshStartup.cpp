@@ -3,6 +3,7 @@
 #include <LemonadeNexus/Core/BootSet.hpp>
 #include <LemonadeNexus/Core/GenesisAnchor.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Core/UpgradeControl.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
@@ -30,6 +31,7 @@ std::optional<SecurityMeshStartup> start_security_mesh(
     }
     security::SecurityMeshConfig mesh_config;
     mesh_config.data_root = std::filesystem::path(config.data_root);
+    mesh_config.updater_wake = std::filesystem::path(std::string(kUpdaterWakePath));
     mesh_config.genesis_public_key = anchor->genesis_public_key;
     // Certificates bind to this network id; the gossip gate fails closed without it.
     gossip.set_network_id(crypto::to_hex(anchor->network_id));

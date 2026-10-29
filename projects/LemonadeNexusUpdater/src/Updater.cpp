@@ -350,6 +350,27 @@ CycleResult Updater::cycle() {
     return start_update(*state, *release);
 }
 
+std::optional<TurnGate> Updater::ask_turn(uint64_t release_number) {
+    const auto line = env_.control(encode_turn_request(release_number));
+    return line ? decode_turn_reply(*line) : std::nullopt;
+}
+
+TurnGate Updater::await_turn(uint64_t release_number, const std::string& tag) {
+    spdlog::info("[updater] {}: another server holds the upgrade turn; asking the gate every "
+                 "{} s for up to {} s",
+                 tag, config_.turn_poll.count(), config_.turn_wait.count());
+    const auto deadline = env_.now() + config_.turn_wait;
+    while (env_.now() < deadline) {
+        env_.sleep(config_.turn_poll);
+        const auto gate = ask_turn(release_number);
+        if (gate && *gate != TurnGate::Wait) {
+            spdlog::info("[updater] {}: upgrade turn: {}", tag, turn_gate_name(*gate));
+            return *gate;
+        }
+    }
+    return TurnGate::Wait;
+}
+
 CycleResult Updater::start_update(State& state, const Release& release) {
     const auto& v = release.verified;
     const uint64_t number = v.tag.number;
@@ -371,16 +392,19 @@ CycleResult Updater::start_update(State& state, const Release& release) {
         return {CycleOutcome::Waiting,
                 "staged " + v.tag.tag + "; the server did not record the staged release"};
     }
-    const auto turn_line = env_.control(encode_turn_request(number));
-    const auto gate = turn_line ? decode_turn_reply(*turn_line) : std::nullopt;
+    auto gate = ask_turn(number);
     if (!gate) {
         return {CycleOutcome::Waiting,
                 "staged " + v.tag.tag + "; the turn gate did not answer"};
     }
+    if (*gate == TurnGate::Wait) gate = await_turn(number, v.tag.tag);
     switch (*gate) {
         case TurnGate::Go:
             break;
         case TurnGate::Wait:
+            return {CycleOutcome::Waiting,
+                    "staged " + v.tag.tag + "; upgrade turn: wait (no turn within " +
+                        std::to_string(config_.turn_wait.count()) + " s)"};
         case TurnGate::NotStarted:
             return {CycleOutcome::Waiting, "staged " + v.tag.tag + "; upgrade turn: " +
                                                std::string(turn_gate_name(*gate))};

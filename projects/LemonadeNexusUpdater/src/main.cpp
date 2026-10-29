@@ -1,5 +1,7 @@
-// nexus-updater: one update cycle per run. nexus-updater.timer runs it every
-// 15 minutes and after boot; see Updater.hpp for the cycle.
+// nexus-updater: one update cycle per run. nexus-updater.path starts it when
+// the server touches the wake marker (a rollout started, or this server's
+// turn opened); nexus-updater.timer runs it after boot and every five minutes
+// after the last cycle. See Updater.hpp for the cycle.
 //
 //   nexus-updater [--config <server-config.json>] [--trusted-root <file>]
 //
@@ -16,6 +18,7 @@
 #include <sodium.h>
 #include <spdlog/spdlog.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -60,6 +63,13 @@ int main(int argc, char** argv) {
     if (sodium_init() < 0) {
         spdlog::error("[updater] libsodium did not initialize");
         return 1;
+    }
+    // systemd 252 and later name the activating unit: the path unit (with
+    // the changed path) or the timer.
+    if (const char* trigger = std::getenv("TRIGGER_UNIT")) {
+        const char* path = std::getenv("TRIGGER_PATH");
+        spdlog::info("[updater] started by {}{}{}", trigger, path != nullptr ? " on " : "",
+                     path != nullptr ? path : "");
     }
 
     // The Genesis anchor comes from the server's root-owned configuration.

@@ -156,11 +156,13 @@ Repository settings that this model depends on: branch protection on `main`
 
 ## Phase 4: Updater
 
-A separate small service, `nexus-updater` (systemd unit and timer, runs as
-root). The server keeps no write access to `/usr/bin`. The updater holds no
-server keys.
+A separate small service, `nexus-updater` (systemd unit, path unit, and
+timer, runs as root). The server keeps no write access to `/usr/bin`. The
+updater holds no server keys.
 
-1. Poll the GitHub releases API (default: every 15 minutes).
+1. Poll the GitHub releases API: every 5 minutes on the timer, and at once
+   when the server touches the wake marker (a rollout Start that names this
+   server, or its Turn).
 2. Download the manifest, the approval, and the artifacts for this host.
 3. Verify: the approval (Phase 2 rules), the artifact hashes against the
    approval, and the Sigstore provenance (repository, `release.yml`, `main`).

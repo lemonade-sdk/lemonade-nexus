@@ -61,6 +61,9 @@ struct SecurityMeshConfig {
     /// certificate is accepted when its founding approval carries the pinned
     /// release signer.
     std::optional<ReleaseApprovalBundleV1> installed_release;
+    /// The nexus-updater wake marker (UpgradeServiceConfig::updater_wake).
+    /// Empty: the updater runs on its timer only.
+    std::filesystem::path updater_wake;
     /// Where platform evidence comes from. Unset means this process collects
     /// it itself, which needs TPM and IMA access here; the assembled server
     /// sets it to the nexus-attestd socket so it needs neither. There is no

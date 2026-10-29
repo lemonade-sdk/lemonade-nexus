@@ -18,6 +18,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <filesystem>
 #include <fstream>
 
 namespace lifecycle_test {
@@ -100,6 +101,7 @@ protected:
         config.identity = node.identity;
         config.network_id = network;
         config.directory = node.dir / "upgrade";
+        config.updater_wake = wake_marker(node);
         config.wall_clock_ms = [this] { return kWallBase + mesh.now_ms; };
         config.running_release = stack.installed ? stack.installed->approval.release_number : 0;
         config.attestable = [] { return true; };
@@ -141,6 +143,19 @@ protected:
     }
 
     UpgradeService& upgrade(const Node* node) { return *stacks.at(node->id).service; }
+
+    /// Where the node's service touches the nexus-updater wake marker.
+    [[nodiscard]] static std::filesystem::path wake_marker(const Node& node) {
+        return node.dir / "updater-wake";
+    }
+    [[nodiscard]] static bool woken(const Node& node) {
+        std::error_code ec;
+        return std::filesystem::exists(wake_marker(node), ec);
+    }
+    static void clear_wake(const Node& node) {
+        std::error_code ec;
+        std::filesystem::remove(wake_marker(node), ec);
+    }
     ReleaseChain& chain(const Node* node) { return *stacks.at(node->id).chain; }
 
     /// The hashes the node's packaged release measures as.
@@ -481,6 +496,57 @@ TEST_F(UpgradePath, TurnsRunOneAtATimeTier2FirstAndOnlyAfterWitnesses) {
 // every Upgrade message of that epoch as EpochOutOfWindow, so the Start and
 // Turn records that opened its turn never reached it. Its gate stayed
 // NotStarted, and the rollout stood still on an open turn.
+TEST_F(UpgradePath, TheUpdaterIsWokenByAStartItTakesPartInAndByItsOwnTurn) {
+    bootstrap();
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(run_until([&] {
+        return std::all_of(reserves.begin(), reserves.end(),
+                           [](Node* r) { return r->driver->verified_authority() != nullptr; });
+    }));
+    for (Node* node : servers()) ASSERT_FALSE(woken(*node));
+
+    // A Tier 2 server that is down when the Start is composed is left out of
+    // the order. It learns the Start from its peers once it is back.
+    Node* absent = reserves.back();
+    mesh.offline.insert(absent->id);
+    mesh.now_ms += constants::kUpgradeLivenessWindowMs + 1000;
+    ASSERT_EQ(upgrade(founders.front()).offer_approval(
+                  release_approval_bundle_json(signer->approval(kN1, kN))),
+              ReleaseOfferResult::Adopted);
+    ASSERT_TRUE(run_until([&] { return finalized().release_number == kN1; }))
+        << "no rollout started";
+    ASSERT_FALSE(finalized().participant(absent->id));
+    mesh.offline.erase(absent->id);
+    ASSERT_TRUE(run_until([&] {
+        const auto all = servers();
+        return std::all_of(all.begin(), all.end(), [&](Node* node) {
+            return upgrade(node).state().release_number == kN1;
+        });
+    })) << "a server did not learn the Start";
+
+    // The Start woke every participant and nobody else.
+    for (Node* node : servers()) {
+        EXPECT_EQ(woken(*node), finalized().participant(node->id))
+            << (node == absent ? "the absent server" : "a participant");
+        clear_wake(*node);
+    }
+
+    // The first Turn wakes its subject only.
+    for (Node* node : servers()) upgrade(node).stage(kN1);
+    ASSERT_TRUE(run_until([&] {
+        const auto all = servers();
+        return finalized().in_turn.has_value() &&
+               std::all_of(all.begin(), all.end(), [&](Node* node) {
+                   return upgrade(node).state().sequence == finalized().sequence;
+               });
+    })) << "no turn opened";
+    const NodeId subject = *finalized().in_turn;
+    for (Node* node : servers()) {
+        EXPECT_EQ(woken(*node), node->id == subject)
+            << (node->id == subject ? "the subject" : "another server");
+    }
+}
+
 TEST_F(UpgradePath, ADemotedMemberTakesItsTier2TurnInALaterEpoch) {
     bootstrap();
     ASSERT_FALSE(HasFatalFailure());

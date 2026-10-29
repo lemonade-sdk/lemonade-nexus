@@ -1,0 +1,18 @@
+[Unit]
+Description=Start the Nexus release updater when the server wakes it
+Documentation=https://github.com/lemonade-sdk/lemonade-nexus/blob/main/docs/Releasing.md
+# lemonade-nexus touches the marker when a finalized rollout Start names this
+# server and when its upgrade turn opens (UpgradeService::wake_updater). The
+# runtime directory is owner-only (lemonade-nexus, mode 0700); the watch is
+# set by the manager as root, so that is no obstacle. A change that arrives
+# while a cycle runs starts nothing; the running cycle polls the turn gate,
+# and nexus-updater.timer runs the next cycle. The server's stop removes the
+# runtime directory with the marker, which also counts as a change: a cycle
+# after a server restart is harmless.
+
+[Path]
+PathChanged=/run/lemonade-nexus/updater-wake
+Unit=nexus-updater.service
+
+[Install]
+WantedBy=paths.target

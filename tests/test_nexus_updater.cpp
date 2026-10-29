@@ -825,6 +825,11 @@ struct Host {
     std::vector<std::vector<std::string>> commands;
     bool running = true;
     std::string turn_gate = "go";
+    /// Runs before each turn reply; a test changes turn_gate from it.
+    std::function<void()> on_turn;
+    /// The local turn wait, short under the fake clock.
+    std::chrono::seconds turn_poll{10};
+    std::chrono::seconds turn_wait{60};
     std::string offer_result = "adopted";
     std::string data_key = "unlocked";
     bool new_binary_is_broken = false;
@@ -922,7 +927,10 @@ struct Host {
                    "\n";
         }
         if (op == "stage") return json{{"ok", true}}.dump() + "\n";
-        if (op == "turn") return json{{"ok", true}, {"gate", turn_gate}}.dump() + "\n";
+        if (op == "turn") {
+            if (on_turn) on_turn();
+            return json{{"ok", true}, {"gate", turn_gate}}.dump() + "\n";
+        }
         if (op == "report") {
             reports.push_back(r.value("result", std::string()));
             return json{{"ok", true}}.dump() + "\n";
@@ -946,6 +954,8 @@ struct Host {
         cfg.trust = keys.trust();
         cfg.health_timeout = std::chrono::seconds(60);
         cfg.health_poll = std::chrono::seconds(5);
+        cfg.turn_poll = turn_poll;
+        cfg.turn_wait = turn_wait;
         UpdaterEnv env;
         env.http = [this](const std::string& url, std::size_t, std::string& error)
             -> std::optional<std::string> {
@@ -1027,14 +1037,72 @@ TEST(UpdaterCycle, StagesAndWaitsWhileTheTurnGateSaysWait) {
     Host h;
     h.turn_gate = "wait";
     auto u = h.updater();
+    const auto started = h.clock;
     const auto r = u.run_once();
     EXPECT_EQ(r.outcome, CycleOutcome::Waiting) << r.detail;
     EXPECT_NE(r.detail.find("wait"), std::string::npos) << r.detail;
-    // The approval went to the server first, then the staged release, then the gate.
-    EXPECT_EQ(h.ops, (std::vector<std::string>{"offer_approval", "stage", "turn"}));
+    // The approval went to the server first, then the staged release, then
+    // the gate, which the cycle asked again every poll until the window
+    // closed. Nothing else: no second fetch, no report.
+    ASSERT_GE(h.ops.size(), 3u);
+    EXPECT_EQ((std::vector<std::string>(h.ops.begin(), h.ops.begin() + 3)),
+              (std::vector<std::string>{"offer_approval", "stage", "turn"}));
+    const auto polls = static_cast<std::size_t>(h.turn_wait / h.turn_poll);
+    EXPECT_EQ(h.ops.size(), 3 + polls);
+    EXPECT_TRUE(std::all_of(h.ops.begin() + 3, h.ops.end(),
+                            [](const std::string& op) { return op == "turn"; }));
+    EXPECT_EQ(h.clock - started, h.turn_wait);
     EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
     EXPECT_TRUE(fs::exists(u.state_dir() / "staged" / "v2026.10.24" / "lemonade-nexus-linux-x86_64"));
     EXPECT_FALSE(h.ran({"systemctl", "stop"}));
+}
+
+TEST(UpdaterCycle, ATurnThatOpensDuringTheLocalWaitIsTaken) {
+    Host h;
+    h.turn_gate = "wait";
+    int asked = 0;
+    h.on_turn = [&] {
+        if (++asked == 4) h.turn_gate = "go";
+    };
+    auto u = h.updater();
+    const auto started = h.clock;
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_EQ(asked, 4);
+    // Three polls passed before the turn opened; the gate was asked once
+    // more at the start of the cycle.
+    EXPECT_EQ(std::count(h.ops.begin(), h.ops.end(), "turn"), 4);
+    EXPECT_GE(h.clock - started, 3 * h.turn_poll);
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-new");
+    EXPECT_EQ(h.reports, std::vector<std::string>{"upgraded"});
+}
+
+TEST(UpdaterCycle, AHaltDuringTheLocalWaitEndsTheCycleAtOnce) {
+    Host h;
+    h.turn_gate = "wait";
+    int asked = 0;
+    h.on_turn = [&] {
+        if (++asked == 3) h.turn_gate = "halted";
+    };
+    auto u = h.updater();
+    const auto started = h.clock;
+    EXPECT_EQ(u.run_once().outcome, CycleOutcome::Halted);
+    EXPECT_EQ(asked, 3);
+    EXPECT_EQ(h.clock - started, 2 * h.turn_poll);
+    EXPECT_FALSE(h.ran({"systemctl", "stop"}));
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
+}
+
+TEST(UpdaterCycle, NoLocalWaitBeforeARolloutStarts) {
+    Host h;
+    h.turn_gate = "not_started";
+    auto u = h.updater();
+    const auto started = h.clock;
+    EXPECT_EQ(u.run_once().outcome, CycleOutcome::Waiting);
+    // The wake marker restarts the cycle when the Start finalizes; the cycle
+    // does not hold the service open until then.
+    EXPECT_EQ(std::count(h.ops.begin(), h.ops.end(), "turn"), 1);
+    EXPECT_EQ(h.clock, started);
 }
 
 TEST(UpdaterCycle, WaitsWhenNoRolloutStartedForTheRelease) {

@@ -1,9 +1,11 @@
 [Unit]
 Description=Nexus release updater (one cycle)
 Documentation=https://github.com/lemonade-sdk/lemonade-nexus/blob/main/docs/Releasing.md
-# Started by nexus-updater.timer. One run is one cycle: verify the latest
-# release, stage it, and install it only when the server grants the upgrade
-# turn. See docs/Design-Auto-Update.md, Phase 4.
+# Started by nexus-updater.path (the server touched the wake marker) and by
+# nexus-updater.timer. One run is one cycle: verify the latest release, stage
+# it, and install it only when the server grants the upgrade turn. A cycle
+# that finds another server in its turn asks the local gate again for up to
+# 20 minutes before it ends. See docs/Design-Auto-Update.md, Phase 4.
 After=network-online.target lemonade-nexus.service
 Wants=network-online.target
 
@@ -22,6 +24,7 @@ ExecStart=/usr/bin/nexus-updater
 PrivateTmp=yes
 UMask=0022
 LimitCORE=0
-# A package install plus the health gate (15 minutes) fits in this bound.
-TimeoutStartSec=45min
+# The turn wait (20 minutes), a package install, and the health gate (15
+# minutes) fit in this bound.
+TimeoutStartSec=60min
 Nice=10
