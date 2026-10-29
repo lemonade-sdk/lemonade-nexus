@@ -238,18 +238,22 @@ TEST_F(AuthTest, LinkTokenMintAndConsume) {
     auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA",
                                         "customer-owner", std::chrono::seconds{600});
     ASSERT_TRUE(minted.has_value());
-    EXPECT_TRUE(minted->first.starts_with("lnk_"));
-    EXPECT_EQ(minted->second.group_node_id, "customer-owner");
-    EXPECT_GT(minted->second.expires_at, minted->second.created_at);
+    EXPECT_TRUE(minted->token.starts_with("lnk_"));
+    EXPECT_EQ(minted->token.size(), 4u + 64u);
+    EXPECT_TRUE(auth::is_link_code(minted->code));
+    EXPECT_EQ(minted->record.group_node_id, "customer-owner");
+    EXPECT_GT(minted->record.expires_at, minted->record.created_at);
+    ASSERT_TRUE(minted->record.grant.has_value());
+    EXPECT_EQ(minted->record.grant->code_hash, auth::link_code_hash_hex(minted->code));
 
-    auto consumed = auth->consume_link_token(minted->first);
+    auto consumed = auth->consume_link_token(minted->token);
     ASSERT_TRUE(consumed.has_value());
     EXPECT_EQ(consumed->owner_user_id, "owner-user");
     EXPECT_EQ(consumed->owner_pubkey, "ed25519:AAAA");
     EXPECT_EQ(consumed->group_node_id, "customer-owner");
 
     // Single use — a second consume fails
-    EXPECT_FALSE(auth->consume_link_token(minted->first).has_value());
+    EXPECT_FALSE(auth->consume_link_token(minted->token).has_value());
 }
 
 TEST_F(AuthTest, LinkTokenUnknownRejected) {
@@ -261,7 +265,7 @@ TEST_F(AuthTest, LinkTokenExpiredRejected) {
     auto minted = auth->mint_link_token("owner-user", "ed25519:BBBB",
                                         "customer-owner", std::chrono::seconds{60});
     ASSERT_TRUE(minted.has_value());
-    const auto& token = minted->first;
+    const auto& token = minted->token;
     const auto now = static_cast<uint64_t>(std::time(nullptr));
 
     auth->set_link_token_clock_for_testing([now] { return now + 61; });
@@ -272,16 +276,111 @@ TEST_F(AuthTest, LinkTokenExpiredRejected) {
     EXPECT_TRUE(auth->consume_link_token(token).has_value());
 }
 
-// The token itself is never stored: only its domain-separated hash.
+// Neither the token nor the code is ever stored: only their domain-separated
+// hashes.
 TEST_F(AuthTest, LinkTokenLedgerStoresOnlyTheHash) {
     auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA",
                                         "customer-owner", std::chrono::seconds{600});
     ASSERT_TRUE(minted.has_value());
     const auto env = storage->read_file("link_tokens", "ledger.json");
     ASSERT_TRUE(env.has_value());
-    EXPECT_EQ(env->data.find(minted->first.substr(4)), std::string::npos);
-    EXPECT_NE(env->data.find(auth::link_token_hash_hex(minted->first)), std::string::npos);
-    EXPECT_EQ(minted->second.token_hash, auth::link_token_hash_hex(minted->first));
+    EXPECT_EQ(env->data.find(minted->token.substr(4)), std::string::npos);
+    EXPECT_NE(env->data.find(auth::link_token_hash_hex(minted->token)), std::string::npos);
+    EXPECT_EQ(minted->record.token_hash, auth::link_token_hash_hex(minted->token));
+    EXPECT_EQ(env->data.find("\"" + minted->code + "\""), std::string::npos);
+    EXPECT_NE(env->data.find(auth::link_code_hash_hex(minted->code)), std::string::npos);
+}
+
+namespace {
+
+/// A different code of the same length: the last digit changed.
+std::string wrong_code(const std::string& code) {
+    auto other = code;
+    other.back() = other.back() == '9' ? '0' : static_cast<char>(other.back() + 1);
+    return other;
+}
+
+}  // namespace
+
+// The code and the token name one invite: whichever is used spends the
+// generation, and the other is refused until a refund opens the next one.
+TEST_F(AuthTest, AnInviteCodeSpendsTheSameGenerationAsTheToken) {
+    auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                        std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+    const auto& token = minted->token;
+    const auto& code = minted->code;
+
+    EXPECT_TRUE(auth->verify_link_token(code).has_value());
+    auto by_code = auth->consume_link_token(code);
+    ASSERT_TRUE(by_code.has_value());
+    EXPECT_EQ(by_code->generation, 0u);
+    EXPECT_EQ(by_code->token_hash, auth::link_token_hash_hex(token));
+    EXPECT_EQ(by_code->group_node_id, "customer-owner");
+    EXPECT_FALSE(auth->consume_link_token(code).has_value()) << "a code is single use";
+    EXPECT_FALSE(auth->consume_link_token(token).has_value()) << "the token shares the spend";
+    EXPECT_FALSE(auth->verify_link_token(token).has_value());
+
+    // A refund by code restores the invite for both forms.
+    EXPECT_FALSE(auth->refund_link_token(wrong_code(code), *by_code)) << "the record names the code";
+    EXPECT_TRUE(auth->refund_link_token(code, *by_code));
+    auto by_token = auth->consume_link_token(token);
+    ASSERT_TRUE(by_token.has_value());
+    EXPECT_EQ(by_token->generation, 1u);
+    EXPECT_FALSE(auth->consume_link_token(code).has_value());
+    EXPECT_TRUE(auth->refund_link_token(token, *by_token));
+    auto again = auth->consume_link_token(code);
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(again->generation, 2u);
+}
+
+// Every wrong code attempt counts against every code live on this server.
+// After kLinkCodeMaxFailures of them a live code is refused for good; its
+// token still works, and a code minted afterwards starts fresh.
+TEST_F(AuthTest, WrongCodeAttemptsLockTheLiveCodes) {
+    auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                        std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+    const auto bad = wrong_code(minted->code);
+    for (uint32_t i = 0; i + 1 < auth::kLinkCodeMaxFailures; ++i) {
+        EXPECT_FALSE(auth->consume_link_token(bad).has_value());
+    }
+    EXPECT_TRUE(auth->verify_link_token(minted->code).has_value()) << "one attempt left";
+    EXPECT_FALSE(auth->verify_link_token(bad).has_value()) << "a wrong verify counts too";
+    EXPECT_FALSE(auth->verify_link_token(minted->code).has_value()) << "locked";
+    EXPECT_FALSE(auth->consume_link_token(minted->code).has_value()) << "locked";
+    EXPECT_TRUE(auth->verify_link_token(minted->token).has_value()) << "the token is not locked";
+
+    auto later = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                       std::chrono::seconds{600});
+    ASSERT_TRUE(later.has_value());
+    EXPECT_TRUE(auth->consume_link_token(later->code).has_value())
+        << "earlier attempts do not count against a code minted later";
+    EXPECT_TRUE(auth->consume_link_token(minted->token).has_value());
+}
+
+// A code lives at most kLinkCodeMaxTtlSec; a longer token outlives it. A
+// shorter token takes its code with it.
+TEST_F(AuthTest, AnInviteCodeExpiresWithItsTokenAndAfterTenMinutesAtMost) {
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
+    auto hour = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                      std::chrono::seconds{3600});
+    auto minute = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
+                                        std::chrono::seconds{60});
+    ASSERT_TRUE(hour && minute);
+    ASSERT_TRUE(hour->record.grant.has_value());
+    EXPECT_EQ(auth::link_code_expires_at(*hour->record.grant),
+              hour->record.created_at + auth::kLinkCodeMaxTtlSec);
+    EXPECT_EQ(auth::link_code_expires_at(*minute->record.grant), minute->record.expires_at);
+
+    auth->set_link_token_clock_for_testing([now] { return now + auth::kLinkCodeMaxTtlSec + 1; });
+    EXPECT_FALSE(auth->verify_link_token(hour->code).has_value());
+    EXPECT_FALSE(auth->consume_link_token(hour->code).has_value());
+    EXPECT_TRUE(auth->verify_link_token(hour->token).has_value());
+    EXPECT_FALSE(auth->verify_link_token(minute->code).has_value());
+    EXPECT_FALSE(auth->verify_link_token(minute->token).has_value());
+    auth->set_link_token_clock_for_testing([now] { return now; });
+    EXPECT_TRUE(auth->consume_link_token(hour->code).has_value()) << "nothing was spent";
 }
 
 // A token an earlier release minted (one plaintext file named by plain
@@ -322,7 +421,7 @@ TEST_F(AuthTest, ARefundRestoresTheTokenOnce) {
     auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA",
                                         "customer-owner", std::chrono::seconds{600});
     ASSERT_TRUE(minted.has_value());
-    const auto& token = minted->first;
+    const auto& token = minted->token;
     auto first = auth->consume_link_token(token);
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(first->generation, 0u);
@@ -342,13 +441,13 @@ TEST_F(AuthTest, LinkTokensSurviveARestart) {
     auto spent = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
                                        std::chrono::seconds{600});
     ASSERT_TRUE(live && spent);
-    ASSERT_TRUE(auth->consume_link_token(spent->first).has_value());
+    ASSERT_TRUE(auth->consume_link_token(spent->token).has_value());
 
     auth->stop();
     auth = std::make_unique<auth::AuthService>(*storage, *crypto, rp_id, jwt_secret);
     auth->start();
-    EXPECT_FALSE(auth->consume_link_token(spent->first).has_value());
-    EXPECT_TRUE(auth->consume_link_token(live->first).has_value());
+    EXPECT_FALSE(auth->consume_link_token(spent->token).has_value());
+    EXPECT_TRUE(auth->consume_link_token(live->token).has_value());
 }
 
 TEST_F(AuthTest, AnOwnerHoldsABoundedNumberOfLiveTokens) {
@@ -383,11 +482,70 @@ struct TestSigner {
         const auto bytes = auth::link_token_event_signing_bytes(e);
         e.signature = crypto::to_base64(
             crypto.ed25519_sign(key.private_key, std::span<const uint8_t>(bytes)));
+        e.code_signature.clear();
+        if (!e.code_hash.empty()) {
+            const auto binding = auth::link_code_binding_bytes(e);
+            e.code_signature = crypto::to_base64(
+                crypto.ed25519_sign(key.private_key, std::span<const uint8_t>(binding)));
+        }
         return true;
+    }
+
+    /// A signed mint from another server, with `code_hash` when given.
+    auth::LinkTokenEvent mint(const std::string& token, uint64_t now,
+                              const std::string& code_hash = {}) {
+        auth::LinkTokenEvent e;
+        e.kind = auth::LinkTokenEventKind::Mint;
+        e.token_hash = auth::link_token_hash_hex(token);
+        e.expires_at = now + 600;
+        e.group_node_id = "customer-peer";
+        e.permissions = {"read"};
+        e.owner_user_id = "peer-owner";
+        e.owner_pubkey = "ed25519:PEER";
+        e.created_at = now;
+        e.timestamp = now;
+        e.code_hash = code_hash;
+        sign(e);
+        return e;
     }
 };
 
 }  // namespace
+
+// A mint from a server that issues no codes (an earlier release) redeems by
+// token only. Two mints that share a code (minted on two servers in the same
+// window) make the code unusable, and both tokens stay redeemable.
+TEST_F(AuthTest, MintsWithoutACodeAndMintsThatShareOneRedeemByTokenOnly) {
+    TestSigner self{*crypto, crypto->ed25519_keygen()};
+    TestSigner peer{*crypto, crypto->ed25519_keygen()};
+    auth->set_link_token_replication([&](auth::LinkTokenEvent& e) { return self.sign(e); },
+                                     [](const auth::LinkTokenEvent&) -> std::size_t { return 0; });
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
+
+    const auto plain = peer.mint("lnk_plain", now);
+    ASSERT_TRUE(plain.code_hash.empty());
+    ASSERT_TRUE(auth->apply_replicated_link_token(plain));
+    EXPECT_TRUE(auth->verify_link_token("lnk_plain").has_value());
+
+    const std::string code = "31415926";
+    const auto shared_a = peer.mint("lnk_shared_a", now, auth::link_code_hash_hex(code));
+    const auto shared_b = peer.mint("lnk_shared_b", now, auth::link_code_hash_hex(code));
+    ASSERT_TRUE(auth->apply_replicated_link_token(shared_a));
+    EXPECT_TRUE(auth->verify_link_token(code).has_value()) << "one mint: the code resolves";
+    ASSERT_TRUE(auth->apply_replicated_link_token(shared_b));
+    EXPECT_FALSE(auth->verify_link_token(code).has_value()) << "two mints: refused, not chosen";
+    EXPECT_FALSE(auth->consume_link_token(code).has_value());
+    EXPECT_TRUE(auth->consume_link_token("lnk_shared_a").has_value());
+    EXPECT_TRUE(auth->consume_link_token("lnk_shared_b").has_value());
+    EXPECT_TRUE(auth->consume_link_token("lnk_plain").has_value());
+
+    // A code binding changed after signing does not verify; the gossip
+    // receiver drops such a mint before it reaches the provider.
+    auto forged = peer.mint("lnk_forged", now, auth::link_code_hash_hex("27182818"));
+    EXPECT_TRUE(auth::link_token_event_signature_valid(*crypto, forged));
+    forged.code_hash = auth::link_code_hash_hex("16180339");
+    EXPECT_FALSE(auth::link_token_event_signature_valid(*crypto, forged));
+}
 
 // A refund by a server whose spend does not count never revives the token.
 TEST_F(AuthTest, ARefundByTheLosingServerDoesNotRestore) {
@@ -399,7 +557,7 @@ TEST_F(AuthTest, ARefundByTheLosingServerDoesNotRestore) {
     auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
                                         std::chrono::seconds{600});
     ASSERT_TRUE(minted.has_value());
-    auto consumed = auth->consume_link_token(minted->first);
+    auto consumed = auth->consume_link_token(minted->token);
     ASSERT_TRUE(consumed.has_value());
 
     auth::LinkTokenEvent competing;
@@ -411,8 +569,8 @@ TEST_F(AuthTest, ARefundByTheLosingServerDoesNotRestore) {
     ASSERT_TRUE(other.sign(competing));
     ASSERT_TRUE(auth->apply_replicated_link_token(competing));
 
-    EXPECT_FALSE(auth->refund_link_token(minted->first, *consumed));
-    EXPECT_FALSE(auth->consume_link_token(minted->first).has_value());
+    EXPECT_FALSE(auth->refund_link_token(minted->token, *consumed));
+    EXPECT_FALSE(auth->consume_link_token(minted->token).has_value());
 
     // An unsigned or malformed event is never taken from a peer.
     auto unsigned_event = competing;

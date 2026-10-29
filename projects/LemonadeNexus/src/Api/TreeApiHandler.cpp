@@ -320,10 +320,15 @@ bool link_owner_may_place(const tree::PermissionTreeService& tree,
 /// The signed grant a tree operation carries for `link`, so that every
 /// replica checks the invite and refuses a second redemption of it. nullopt
 /// for a token that has no signed grant (minted without replication, or by
-/// an earlier release); such an op keeps the earlier rules.
+/// an earlier release); such an op keeps the earlier rules. The op redeems
+/// the token, whether the holder presented it or its invite code, so the
+/// mint's code binding is left out: it is not part of the op encoding.
 std::optional<auth::LinkTokenEvent> signed_grant(const auth::LinkTokenRecord& link) {
     if (!link.grant || link.grant->signature.empty()) return std::nullopt;
-    return link.grant;
+    auto grant = *link.grant;
+    grant.code_hash.clear();
+    grant.code_signature.clear();
+    return grant;
 }
 
 /// HTTP status for a refused tree operation in the membership and move routes.

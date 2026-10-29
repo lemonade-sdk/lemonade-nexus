@@ -103,8 +103,46 @@ TEST(LinkTokenLedgerTest, SignaturesCoverEveryFieldAndTheWireFormRoundTrips) {
         EXPECT_FALSE(auth::link_token_event_signature_valid(crypto, t));
     }
 
-    // The wire parser refuses wrong types and oversized fields.
+    // Without a code the wire form is the one an earlier release writes.
     auto wire = auth::link_token_event_to_wire(e);
+    EXPECT_FALSE(wire.contains("code_hash"));
+    EXPECT_FALSE(wire.contains("code_signature"));
+
+    // With a code: the binding is signed on its own, the event signature is
+    // unchanged, and the wire form carries both fields.
+    auto coded = e;
+    coded.code_hash = auth::link_code_hash_hex("12345678");
+    const auto binding = auth::link_code_binding_bytes(coded);
+    coded.code_signature = crypto::to_base64(
+        crypto.ed25519_sign(kp.private_key, std::span<const uint8_t>(binding)));
+    EXPECT_EQ(auth::link_token_event_signing_bytes(coded), bytes);
+    EXPECT_TRUE(auth::link_token_event_signature_valid(crypto, coded));
+    EXPECT_FALSE(auth::link_token_event_shape_error(coded).has_value());
+    const auto coded_back = auth::link_token_event_from_wire(auth::link_token_event_to_wire(coded));
+    ASSERT_TRUE(coded_back.has_value());
+    EXPECT_EQ(*coded_back, coded);
+    for (auto tamper : std::vector<std::function<void(LinkTokenEvent&)>>{
+             [](LinkTokenEvent& x) { x.code_hash = auth::link_code_hash_hex("12345679"); },
+             [](LinkTokenEvent& x) { x.code_signature = x.signature; },
+             [](LinkTokenEvent& x) { x.code_signature.clear(); },
+             [](LinkTokenEvent& x) { x.origin_seq += 1; },
+             [&](LinkTokenEvent& x) { x.code_hash.clear(); },
+         }) {
+        auto t = coded;
+        tamper(t);
+        EXPECT_FALSE(auth::link_token_event_signature_valid(crypto, t));
+    }
+    // A release without codes drops the fields and keeps a valid event.
+    auto stripped = coded;
+    stripped.code_hash.clear();
+    stripped.code_signature.clear();
+    EXPECT_TRUE(auth::link_token_event_signature_valid(crypto, stripped));
+
+    // The wire parser refuses wrong types and oversized fields.
+    wire = auth::link_token_event_to_wire(coded);
+    wire["code_hash"] = 7;
+    EXPECT_FALSE(auth::link_token_event_from_wire(wire).has_value());
+    wire = auth::link_token_event_to_wire(e);
     wire["expires_at"] = "soon";
     EXPECT_FALSE(auth::link_token_event_from_wire(wire).has_value());
     wire = auth::link_token_event_to_wire(e);
@@ -114,6 +152,133 @@ TEST(LinkTokenLedgerTest, SignaturesCoverEveryFieldAndTheWireFormRoundTrips) {
     wire["permissions"] = nlohmann::json::array({"a", "b", "c", "d", "e", "f", "g", "h", "i"});
     EXPECT_FALSE(auth::link_token_event_from_wire(wire).has_value());
     crypto.stop();
+}
+
+TEST(LinkTokenLedgerTest, TheCodeHashIsDomainSeparatedAndTheCodeFormIsEightDigits) {
+    EXPECT_TRUE(auth::is_link_code("00000000"));
+    EXPECT_TRUE(auth::is_link_code("12345678"));
+    EXPECT_FALSE(auth::is_link_code("1234567"));
+    EXPECT_FALSE(auth::is_link_code("123456789"));
+    EXPECT_FALSE(auth::is_link_code("1234567a"));
+    EXPECT_FALSE(auth::is_link_code("1234 5678"));
+    EXPECT_FALSE(auth::is_link_code(""));
+    EXPECT_FALSE(auth::is_link_code("lnk_12345678"));
+    const auto code_hash = auth::link_code_hash_hex("12345678");
+    EXPECT_EQ(code_hash.size(), 64u);
+    EXPECT_NE(code_hash, auth::link_token_hash_hex("12345678"))
+        << "a code and a token with equal text hash differently";
+    EXPECT_NE(code_hash, auth::link_code_hash_hex("12345679"));
+}
+
+TEST(LinkTokenLedgerTest, ACodeBindingBelongsToASignedMintOnly) {
+    auto signed_mint = mint_event();
+    signed_mint.code_hash = auth::link_code_hash_hex("12345678");
+    EXPECT_TRUE(auth::link_token_event_shape_error(signed_mint).has_value())
+        << "a signed mint signs its code binding";
+    signed_mint.code_signature = "sig";
+    EXPECT_FALSE(auth::link_token_event_shape_error(signed_mint).has_value());
+    signed_mint.code_hash = "not-hex";
+    EXPECT_TRUE(auth::link_token_event_shape_error(signed_mint).has_value());
+
+    auto local_mint = mint_event();
+    local_mint.signature.clear();
+    local_mint.code_hash = auth::link_code_hash_hex("12345678");
+    EXPECT_FALSE(auth::link_token_event_shape_error(local_mint).has_value())
+        << "an unsigned local mint signs neither";
+    local_mint.code_signature = "sig";
+    EXPECT_TRUE(auth::link_token_event_shape_error(local_mint).has_value());
+
+    auto no_hash = mint_event();
+    no_hash.code_signature = "sig";
+    EXPECT_TRUE(auth::link_token_event_shape_error(no_hash).has_value());
+
+    auto spend = follow_up(mint_event(), LinkTokenEventKind::Spend, 0, "A");
+    spend.code_hash = auth::link_code_hash_hex("12345678");
+    spend.code_signature = "sig";
+    EXPECT_TRUE(auth::link_token_event_shape_error(spend).has_value());
+}
+
+// A code resolves to exactly one unexpired mint, or to nothing. A code lives
+// at most kLinkCodeMaxTtlSec, and prune forgets it with its token.
+TEST(LinkTokenLedgerTest, ACodeResolvesToOneUnexpiredMintOrFailsClosed) {
+    const auto code_hash = auth::link_code_hash_hex("12345678");
+    auto a = mint_event("lnk_a", kNow, 3600);
+    a.code_hash = code_hash;
+    a.code_signature = "sig";
+    auto b = mint_event("lnk_b", kNow + 300, 600);
+    b.code_hash = code_hash;
+    b.code_signature = "sig";
+    b.origin_pubkey = "N";
+
+    LinkTokenLedger ledger;
+    EXPECT_FALSE(ledger.code_in_use(code_hash, kNow));
+    ASSERT_EQ(ledger.add(a, kNow), LinkTokenLedger::AddResult::Added);
+    EXPECT_TRUE(ledger.code_in_use(code_hash, kNow));
+    EXPECT_TRUE(ledger.holds_code(code_hash));
+    auto live = ledger.live_by_code(code_hash, kNow);
+    ASSERT_TRUE(live.has_value());
+    EXPECT_EQ(live->mint.token_hash, a.token_hash);
+    EXPECT_EQ(auth::link_code_expires_at(a), kNow + auth::kLinkCodeMaxTtlSec);
+    EXPECT_FALSE(ledger.live_by_code(code_hash, kNow + auth::kLinkCodeMaxTtlSec).has_value())
+        << "the code ends after ten minutes";
+    EXPECT_TRUE(ledger.live(a.token_hash, kNow + auth::kLinkCodeMaxTtlSec).has_value())
+        << "the token goes on";
+    EXPECT_FALSE(ledger.code_in_use(code_hash, kNow + auth::kLinkCodeMaxTtlSec));
+
+    ASSERT_EQ(ledger.add(b, kNow + 300), LinkTokenLedger::AddResult::Added);
+    EXPECT_FALSE(ledger.live_by_code(code_hash, kNow + 300).has_value())
+        << "two unexpired mints share the code: refused";
+    EXPECT_TRUE(ledger.live(a.token_hash, kNow + 300).has_value());
+    EXPECT_TRUE(ledger.live(b.token_hash, kNow + 300).has_value());
+    live = ledger.live_by_code(code_hash, kNow + 650);
+    ASSERT_TRUE(live.has_value()) << "a's code expired; b's is the only one left";
+    EXPECT_EQ(live->mint.token_hash, b.token_hash);
+
+    // A spend by the token spends the code; a spent token's code resolves to
+    // nothing but still blocks the code for a new mint.
+    ASSERT_EQ(ledger.add(follow_up(b, LinkTokenEventKind::Spend, 0, "N"), kNow + 650),
+              LinkTokenLedger::AddResult::Added);
+    EXPECT_FALSE(ledger.live_by_code(code_hash, kNow + 650).has_value());
+    EXPECT_TRUE(ledger.code_in_use(code_hash, kNow + 650));
+
+    EXPECT_EQ(ledger.prune(kNow + 300 + 600 + auth::kLinkTokenRetentionSec), 1u);
+    EXPECT_TRUE(ledger.holds_code(code_hash)) << "a still carries it";
+    EXPECT_EQ(ledger.prune(kNow + 3600 + auth::kLinkTokenRetentionSec), 1u);
+    EXPECT_FALSE(ledger.holds_code(code_hash));
+}
+
+// A replica from a release before codes strips the binding and passes the
+// mint on. Whichever copy arrives first, the copy with the binding is kept.
+TEST(LinkTokenLedgerTest, TheCopyWithTheCodeBindingIsKeptInAnyArrivalOrder) {
+    auto full = mint_event();
+    full.code_hash = auth::link_code_hash_hex("12345678");
+    full.code_signature = "sig";
+    auto stripped = full;
+    stripped.code_hash.clear();
+    stripped.code_signature.clear();
+
+    LinkTokenLedger first_stripped;
+    EXPECT_EQ(first_stripped.add(stripped, kNow), LinkTokenLedger::AddResult::Added);
+    EXPECT_FALSE(first_stripped.live_by_code(full.code_hash, kNow).has_value());
+    EXPECT_EQ(first_stripped.add(full, kNow), LinkTokenLedger::AddResult::Added);
+    EXPECT_TRUE(first_stripped.live_by_code(full.code_hash, kNow).has_value());
+    EXPECT_EQ(first_stripped.add(stripped, kNow), LinkTokenLedger::AddResult::Duplicate);
+    EXPECT_EQ(first_stripped.mints().size(), 1u);
+    EXPECT_EQ(first_stripped.mints().front(), full);
+
+    LinkTokenLedger first_full;
+    EXPECT_EQ(first_full.add(full, kNow), LinkTokenLedger::AddResult::Added);
+    EXPECT_EQ(first_full.add(stripped, kNow), LinkTokenLedger::AddResult::Duplicate);
+    EXPECT_EQ(first_full.mints().front(), full);
+
+    // A mint that differs in anything else is still refused.
+    auto other_code = full;
+    other_code.code_hash = auth::link_code_hash_hex("87654321");
+    EXPECT_EQ(first_full.add(other_code, kNow), LinkTokenLedger::AddResult::Duplicate)
+        << "the held copy already carries a binding; a second one is not taken";
+    auto other_group = full;
+    other_group.group_node_id = "customer-b";
+    EXPECT_EQ(first_full.add(other_group, kNow), LinkTokenLedger::AddResult::Refused);
 }
 
 TEST(LinkTokenLedgerTest, TheStateDoesNotDependOnArrivalOrder) {

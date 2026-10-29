@@ -164,7 +164,9 @@ struct TreeOpBody {
     /// replica verifies it (origin is a trusted submitter, network, expiry
     /// against the block time, binding to the op) and refuses a second op
     /// that redeems the same token (redemption_id_hex), so an invite is
-    /// redeemed once across all Tier 1 servers.
+    /// redeemed once across all Tier 1 servers, by token or by invite code.
+    /// The encoding carries the mint without its code binding (code_hash,
+    /// code_signature); a submitter leaves those fields empty.
     std::optional<auth::LinkTokenEvent> invite_grant;
 };
 

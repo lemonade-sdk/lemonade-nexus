@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -47,6 +48,14 @@ struct LinkTokenRecord {
     std::optional<LinkTokenEvent> grant;
 };
 
+/// What mint() hands the inviter, once: the token, the invite code that
+/// names the same token, and the record. Neither secret is stored or logged.
+struct MintedLinkToken {
+    std::string     token;  ///< "lnk_" + 64 hex
+    std::string     code;   ///< kLinkCodeDigits decimal digits
+    LinkTokenRecord record;
+};
+
 /// Discord/WhatsApp-style link tokens (invites): an authenticated owner mints
 /// a one-time short-lived token out-of-band (link, QR code) for a target
 /// group. A new device presents it in POST /api/join (`link_token`) to be
@@ -57,6 +66,17 @@ struct LinkTokenRecord {
 /// kept in <data_root>/link_tokens/ledger.json (a storage-vault file) and,
 /// with replication wired, sent to every other Tier 1 server so that any of
 /// them can redeem it.
+///
+/// Every mint also issues an invite code: kLinkCodeDigits decimal digits
+/// that name the same token. The mint carries link_code_hash_hex(code), so
+/// every replica redeems the code as it redeems the token, against the same
+/// single-use generation. A string of exactly kLinkCodeDigits digits in a
+/// token position is a code (is_link_code). A code lives at most
+/// kLinkCodeMaxTtlSec, and each server refuses a code after
+/// kLinkCodeMaxFailures wrong code attempts made while it is live: a
+/// wrong attempt counts against every code live on that server, so an
+/// attacker gets at most that many guesses per code. The counter is per
+/// server and in memory. The token is never locked out.
 ///
 /// Thread safety: every member function is safe to call concurrently.
 class TokenLinkAuthProvider : public IAuthProvider<TokenLinkAuthProvider> {
@@ -69,23 +89,30 @@ public:
     [[nodiscard]] static constexpr std::string_view auth_provider_name() { return "token-link"; }
 
     /// Mint a single-use link token bound to `group_node_id` that carries
-    /// `permissions` for an accepting member. The caller checks that the owner
-    /// may invite into the group with those permissions. Returns the
-    /// plaintext token (only ever returned here) and its record.
-    [[nodiscard]] std::optional<std::pair<std::string, LinkTokenRecord>>
+    /// `permissions` for an accepting member, and the invite code that names
+    /// it. The caller checks that the owner may invite into the group with
+    /// those permissions. The code is unique among the unexpired codes this
+    /// server holds (it draws again on a collision, a bounded number of
+    /// times). Returns the plaintext token and code (only ever returned here)
+    /// and the record; nullopt when the owner is at its limit, no free code
+    /// was drawn, or the write failed.
+    [[nodiscard]] std::optional<MintedLinkToken>
     mint(const std::string& owner_user_id, const std::string& owner_pubkey,
          const std::string& group_node_id, std::chrono::seconds ttl,
          std::vector<std::string> permissions = {});
 
-    /// Look up a token without consuming it. nullopt when it is unknown,
-    /// expired, or spent.
-    [[nodiscard]] std::optional<LinkTokenRecord> verify(std::string_view token);
+    /// Look up a token, or the token an invite code names, without consuming
+    /// it. nullopt when it is unknown, expired, spent, or (a code) locked out
+    /// or shared by two unexpired mints. A code that resolves to nothing
+    /// counts as a wrong attempt.
+    [[nodiscard]] std::optional<LinkTokenRecord> verify(std::string_view token_or_code);
 
-    /// Verify and burn a token on this server. Records a Spend event and
-    /// publishes it. Single use across servers is enforced by the tree
+    /// Verify and burn a token on this server, presented as the token or as
+    /// its invite code; both spend the same generation. Records a Spend event
+    /// and publishes it. Single use across servers is enforced by the tree
     /// operation that redeems the token: it carries the signed grant, and
     /// consensus refuses a second redemption on every replica (TreeOps.hpp).
-    [[nodiscard]] std::optional<LinkTokenRecord> consume(std::string_view token);
+    [[nodiscard]] std::optional<LinkTokenRecord> consume(std::string_view token_or_code);
 
     /// Restore a token that consume() burned for a join that did not use it
     /// (the join was refused, failed, or did not place a new device). Records
@@ -94,11 +121,12 @@ public:
     /// nothing, when the token has expired, when this server's spend does not
     /// count, when the generation limit is reached, when it was already
     /// restored, or when the write fails. Call it at most once per consume(),
-    /// with the record consume() returned.
-    bool refund(std::string_view token, const LinkTokenRecord& record);
+    /// with the record consume() returned and the same token or code.
+    bool refund(std::string_view token_or_code, const LinkTokenRecord& record);
 
     /// Signs a locally made event: sets network_id, origin_pubkey,
-    /// origin_seq, and signature. Returns false when it cannot sign.
+    /// origin_seq, and signature, and code_signature when the event carries
+    /// a code_hash. Returns false when it cannot sign.
     using EventSigner = std::function<bool(LinkTokenEvent&)>;
     /// Sends a signed event to the other Tier 1 servers. Returns the number
     /// of servers it was sent to.
@@ -137,6 +165,16 @@ private:
     /// Set the event time, then sign `e` when `sign` is true and the signer
     /// succeeds; otherwise mark it local and unsigned. Caller holds mutex_.
     void author_locked(LinkTokenEvent& e, bool sign);
+    /// The live token `code` names here, or nullopt after counting a wrong
+    /// attempt. Caller holds mutex_.
+    [[nodiscard]] std::optional<LinkTokenLedger::Live> live_by_code_locked(std::string_view code,
+                                                                           uint64_t now);
+    /// Start the lockout count of the code a newly held mint carries. Caller
+    /// holds mutex_.
+    void track_code_locked(const LinkTokenEvent& e);
+    /// Prune the ledger and the lockout state of pruned codes. Caller holds
+    /// mutex_.
+    void prune_locked(uint64_t now);
     /// Persist the ledger. Caller holds mutex_.
     [[nodiscard]] bool save_locked();
     void load();
@@ -161,6 +199,12 @@ private:
     std::string                  self_origin_;   ///< origin of the last signed local event
     uint64_t                     local_seq_{0};
     std::function<uint64_t()>    clock_;
+
+    // Code lockout: every wrong code attempt counts against every code live
+    // here. A code is locked once code_failures_ has grown by
+    // kLinkCodeMaxFailures since this server first held its mint.
+    uint64_t                     code_failures_{0};
+    std::map<std::string, uint64_t> code_seen_;  ///< code_hash -> code_failures_ at first sight
 };
 
 } // namespace nexus::auth

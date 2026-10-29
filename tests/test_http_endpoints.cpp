@@ -2500,7 +2500,7 @@ TEST_F(HttpEndpointTest, ARepeatOfAPendingJoinWaitsForItsOpInsteadOfOrderingAnot
     ASSERT_TRUE(minted.has_value());
 
     auto kp = crypto->ed25519_keygen();
-    auto first = join_node(kp, minted->first);
+    auto first = join_node(kp, minted->token);
     ASSERT_NE(first, nullptr);
     ASSERT_EQ(first->status, 202) << first->body;
     const auto op_id = json::parse(first->body).value("op_id", std::string{});
@@ -2508,7 +2508,7 @@ TEST_F(HttpEndpointTest, ARepeatOfAPendingJoinWaitsForItsOpInsteadOfOrderingAnot
     ASSERT_EQ(op_id.size(), 64u);
     ASSERT_FALSE(node_id.empty());
     ASSERT_EQ(ordered_ops(), 1u);
-    EXPECT_FALSE(auth->consume_link_token(minted->first).has_value());
+    EXPECT_FALSE(auth->consume_link_token(minted->token).has_value());
 
     // The repeat while the op is pending: the same op, no second one.
     auto repeat = join_node(kp);
@@ -2545,7 +2545,7 @@ TEST_F(HttpEndpointTest, ARefusedJoinDoesNotSpendTheLinkToken) {
     const auto minted = auth->mint_link_token("owner", root_pubkey_str, "grp_later",
                                               std::chrono::seconds{600});
     ASSERT_TRUE(minted.has_value());
-    const auto& token = minted->first;
+    const auto& token = minted->token;
 
     // The token's group does not exist yet: the join is refused.
     auto first_kp = crypto->ed25519_keygen();
@@ -2812,6 +2812,78 @@ TEST_F(InviteHttpTest, AnInviteCarriesAServicePermissionToThePeerList) {
     res = post(carol, "/api/link/accept", {{"link_token", bob_token}});
     ASSERT_NE(res, nullptr);
     EXPECT_EQ(res->status, 200) << res->body;
+}
+
+// Every invite comes with an 8-digit code that works wherever the token
+// does: a new device's join, an existing identity's acceptance, and the
+// device-name check. Code and token spend one generation.
+TEST_F(InviteHttpTest, AnInviteCodeWorksWhereverTheTokenDoes) {
+    const auto alice = join();
+    const auto bob = join();
+    auto res = invite(alice);
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    auto minted = json::parse(res->body);
+    const auto token = minted.value("link_token", std::string{});
+    const auto code = minted.value("code", std::string{});
+    ASSERT_EQ(token.size(), 68u);
+    ASSERT_TRUE(auth::is_link_code(code)) << minted.dump();
+    EXPECT_LE(minted["code_expires_at"].get<uint64_t>(), minted["expires_at"].get<uint64_t>());
+
+    // The name check by code spends nothing; a wrong code is refused like a
+    // wrong token.
+    const std::string check = "/api/tree/device-name/check";
+    auto checked = post(bob, check, {{"name", "Work-PC"}, {"link_token", code}});
+    ASSERT_NE(checked, nullptr);
+    EXPECT_EQ(checked->status, 200) << checked->body;
+    auto wrong = code;
+    wrong.back() = wrong.back() == '9' ? '0' : static_cast<char>(wrong.back() + 1);
+    auto refused = post(bob, check, {{"name", "Work-PC"}, {"link_token", wrong}});
+    ASSERT_NE(refused, nullptr);
+    EXPECT_EQ(refused->status, 403) << refused->body;
+
+    // A new device joins with the code; the token is spent with it.
+    const auto device = join(code);
+    EXPECT_EQ(device.group, alice.group);
+    auto reuse_kp = crypto->ed25519_keygen();
+    auto reused = join_node(reuse_kp, token);
+    ASSERT_NE(reused, nullptr);
+    EXPECT_EQ(reused->status, 403) << reused->body;
+
+    // An existing identity accepts with the code; the token is spent with it.
+    res = invite(alice);
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    minted = json::parse(res->body);
+    auto accepted = post(bob, "/api/link/accept", {{"link_token", minted["code"]}});
+    ASSERT_NE(accepted, nullptr);
+    ASSERT_EQ(accepted->status, 200) << accepted->body;
+    EXPECT_EQ(json::parse(accepted->body)["status"], "member");
+    const auto carol = join();
+    auto spent = post(carol, "/api/link/accept", {{"link_token", minted["link_token"]}});
+    ASSERT_NE(spent, nullptr);
+    EXPECT_EQ(spent->status, 403) << spent->body;
+
+    // Five wrong code attempts lock the live codes on this server; the token
+    // still redeems.
+    res = invite(alice);
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    minted = json::parse(res->body);
+    const auto locked_code = minted["code"].get<std::string>();
+    wrong = locked_code;
+    wrong.back() = wrong.back() == '9' ? '0' : static_cast<char>(wrong.back() + 1);
+    for (uint32_t i = 0; i < auth::kLinkCodeMaxFailures; ++i) {
+        auto attempt = post(carol, "/api/link/accept", {{"link_token", wrong}});
+        ASSERT_NE(attempt, nullptr);
+        EXPECT_EQ(attempt->status, 403);
+    }
+    auto locked = post(carol, "/api/link/accept", {{"link_token", locked_code}});
+    ASSERT_NE(locked, nullptr);
+    EXPECT_EQ(locked->status, 403) << locked->body;
+    auto by_token = post(carol, "/api/link/accept", {{"link_token", minted["link_token"]}});
+    ASSERT_NE(by_token, nullptr);
+    EXPECT_EQ(by_token->status, 200) << by_token->body;
 }
 
 TEST_F(InviteHttpTest, AnExistingUserJoinsAnotherNetworkWithoutMoving) {
