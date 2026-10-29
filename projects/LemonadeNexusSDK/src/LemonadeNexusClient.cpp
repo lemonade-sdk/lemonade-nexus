@@ -1491,9 +1491,13 @@ Result<nlohmann::json> LemonadeNexusClient::delete_account() {
         // the session and the mesh session end here.
         disable_mesh();
         impl_->meshplane.stop();
-        std::lock_guard lock(impl_->mutex);
-        impl_->node_id.clear();
-        impl_->set_token({});
+        {
+            std::lock_guard lock(impl_->mutex);
+            impl_->node_id.clear();
+        }
+        // Drop the token with its server binding, so no session move joins
+        // the deleted account again.
+        set_session_token({});
         spdlog::info("[LemonadeNexusClient] deleted account {}",
                      result.value.value("account_id", std::string{}));
     }
