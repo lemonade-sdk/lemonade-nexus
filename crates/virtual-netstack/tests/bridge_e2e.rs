@@ -209,6 +209,118 @@ fn repeated_connections_and_larger_payload() {
 
 unsafe extern "C" fn discard_packets(_: *mut c_void, _: *const u8, _: usize) {}
 
+/// (vport, bridge port, source ip, source port, opened) as reported.
+type IngressEvents = Mutex<Vec<(u16, u16, u32, u16, i32)>>;
+
+unsafe extern "C" fn record_ingress(
+    ctx: *mut c_void,
+    vport: u16,
+    bridge_port: u16,
+    src_ip: u32,
+    src_port: u16,
+    opened: i32,
+) {
+    let events = &*(ctx as *const IngressEvents);
+    events.lock().unwrap().push((vport, bridge_port, src_ip, src_port, opened));
+}
+
+// An observed ingress forward reports each accepted connection's virtual
+// source, keyed by the loopback port the target sees, before the first byte
+// arrives at the target, and reports the connection closed afterwards.
+#[test]
+fn observed_forward_reports_the_virtual_source_of_each_connection() {
+    // The target records the remote port of each connection it accepts and
+    // echoes the data back.
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let accepted: &'static Mutex<Vec<u16>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+    std::thread::spawn(move || {
+        for stream in target.incoming() {
+            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            accepted.lock().unwrap().push(stream.peer_addr().unwrap().port());
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => { if stream.write_all(&buf[..n]).is_err() { break; } }
+                    }
+                }
+            });
+        }
+    });
+
+    let events = Box::into_raw(Box::new(IngressEvents::new(Vec::new())));
+    let wiring_a = Box::into_raw(Box::new(Wiring { peer: Mutex::new(None) }));
+    let wiring_b = Box::into_raw(Box::new(Wiring { peer: Mutex::new(None) }));
+    let stack_a = unsafe { ns_create(1420, forward_to_peer, wiring_a as *mut c_void) };
+    let stack_b = unsafe { ns_create(1420, forward_to_peer, wiring_b as *mut c_void) };
+    assert!(!stack_a.is_null() && !stack_b.is_null());
+    unsafe {
+        *(*wiring_a).peer.lock().unwrap() = Some(stack_b);
+        *(*wiring_b).peer.lock().unwrap() = Some(stack_a);
+        let a_ip = cs("10.0.0.1/8");
+        let b_ip = cs("10.0.0.2/8");
+        assert_eq!(ns_add_local_ip(stack_a, a_ip.as_ptr()), 0);
+        assert_eq!(ns_add_local_ip(stack_b, b_ip.as_ptr()), 0);
+        let spec = cs(&format!("tcp:{target_addr}"));
+        let b_vip = cs("10.0.0.2");
+        assert_eq!(
+            ns_add_tcp_forward_observed(stack_b, b_vip.as_ptr(), 80, spec.as_ptr(),
+                                        record_ingress, events as *mut c_void),
+            0
+        );
+        assert_eq!(
+            ns_add_tcp_forward_observed(std::ptr::null_mut(), b_vip.as_ptr(), 80, spec.as_ptr(),
+                                        record_ingress, events as *mut c_void),
+            -1
+        );
+    }
+    let dst_ip = cs("10.0.0.2");
+    let src_ip = cs("10.0.0.1");
+    let port = unsafe { ns_add_tcp_egress(stack_a, dst_ip.as_ptr(), 80, src_ip.as_ptr()) };
+    assert_ne!(port, 0);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    client.write_all(b"attributed").unwrap();
+    let mut got = [0u8; 10];
+    client.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"attributed");
+
+    let opened: Vec<_> = unsafe { (*events).lock().unwrap().clone() };
+    assert_eq!(opened.len(), 1, "one opened event before the first byte: {opened:?}");
+    let (vport, bridge_port, ip, src_port, flag) = opened[0];
+    assert_eq!(vport, 80);
+    assert_eq!(flag, 1);
+    assert_eq!(ip, 0x0A00_0001, "the virtual source is stack A's address");
+    assert_ne!(src_port, 0);
+    assert_ne!(bridge_port, 0);
+    assert_eq!(accepted.lock().unwrap().as_slice(), &[bridge_port],
+               "the target sees the reported bridge port as the remote port");
+
+    drop(client);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let events: Vec<_> = unsafe { (*events).lock().unwrap().clone() };
+        if events.len() == 2 {
+            assert_eq!(events[1], (80, bridge_port, 0x0A00_0001, src_port, 0));
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "no closed event: {events:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    unsafe {
+        ns_destroy(stack_a);
+        ns_destroy(stack_b);
+        drop(Box::from_raw(wiring_a));
+        drop(Box::from_raw(wiring_b));
+        drop(Box::from_raw(events));
+    }
+}
+
 // Removing one egress closes that loopback listener and leaves the others
 // serving: a removed or re-addressed peer must not stay reachable through a
 // stale port.
