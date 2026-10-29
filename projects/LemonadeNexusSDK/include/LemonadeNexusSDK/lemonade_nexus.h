@@ -1058,15 +1058,23 @@ ln_error_t ln_mesh_port_set_selection(ln_client_t* client, const char* target,
  *   tls: {state ("off" | "waiting" | "activating" | "active" |
  *   "unsupported_certificate" | "error"), domain, expires_at, error},
  *   urls: [{node_id, device_name, url, self}],
- *   devices: [{node_id, device_name, is_online}]}.
+ *   devices: [{node_id, device_name, is_online, app: {name, version},
+ *              families: [...], catalog_status}],
+ *   catalog: {...}}.
  *  "activating" means the first certificate is installed and the port switches
  *  to TLS as soon as the open plain HTTP requests finish; a running stream is
  *  never cut. `urls` lists this device and each online Tier 3 device that this
  *  device may connect to. Before TLS is active, only "http://127.0.0.1:<port>"
  *  is listed.
- *  `devices` lists the Tier 3 devices that can be selected. The peer key is
- *  never included. Caller must ln_free(*out_json). Returns LN_ERR_NULL_ARG for a
- *  NULL argument. Thread-safe. */
+ *  `devices` lists the Tier 3 devices that can be selected, each with what its
+ *  GET /.nexus/catalog last answered: the app name and version and the family
+ *  names of its service catalog, and catalog_status (the HTTP status of that
+ *  probe; 0 when the device has not answered yet, 404 when its SDK has no
+ *  catalog). A device that reports no catalog shows empty strings. `catalog`
+ *  is the catalog this client registered for mesh port 13305
+ *  (ln_mesh_service_set_catalog), or {}. The peer key is never included.
+ *  Caller must ln_free(*out_json). Returns LN_ERR_NULL_ARG for a NULL
+ *  argument. Thread-safe. */
 ln_error_t ln_mesh_port_status(ln_client_t* client, char** out_json);
 
 #if defined(__GNUC__) || defined(__clang__)

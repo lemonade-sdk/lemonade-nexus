@@ -1,6 +1,7 @@
 #include <LemonadeNexusSDK/MeshPort.hpp>
 #include <LemonadeNexusSDK/CertRenewal.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
+#include <LemonadeNexusSDK/ServiceIngress.hpp>
 #include "MeshProxy.hpp"
 
 #include <LemonadeNexus/Tree/DeviceLabel.hpp>
@@ -176,6 +177,75 @@ std::vector<std::string> model_ids(const json& listing) {
 
 int64_t epoch_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+/// One GET of a device's /.nexus/catalog. The probe needs no credentials: the
+/// device's SDK answers it for any attributed peer.
+MeshPortPeerCatalog fetch_catalog(httplib::Client& client) {
+    MeshPortPeerCatalog catalog;
+    const auto reply = get_json(client, std::string(service_ingress::kCatalogPath), "");
+    catalog.status = reply.status;
+    if (!reply.body || !reply.body->is_object()) return catalog;
+    const auto& body = *reply.body;
+    if (body.contains("version") && body["version"].is_number_integer() && body["version"].get<int64_t>() >= 0) {
+        catalog.version = body["version"].get<uint64_t>();
+    }
+    if (body.contains("app") && body["app"].is_object()) {
+        catalog.app_name = body["app"].value("name", "");
+        catalog.app_version = body["app"].value("version", "");
+    }
+    if (body.contains("families") && body["families"].is_array()) {
+        for (const auto& family : body["families"]) {
+            if (family.is_object() && family.contains("name") && family["name"].is_string()) {
+                catalog.families.push_back(family["name"].get<std::string>());
+            }
+        }
+    }
+    return catalog;
+}
+
+/// Runs `work(i)` for every i in [0, count) on at most eight threads at once and
+/// waits until all finish or `deadline` passes. Then `cancel(i)` runs for each i
+/// that has not finished, and every thread is joined: `work` must return soon
+/// after `cancel`, and must skip its request when cancelled before it started.
+void run_probes(size_t count, std::chrono::steady_clock::time_point deadline,
+                const std::function<void(size_t)>& work, const std::function<void(size_t)>& cancel) {
+    if (count == 0) return;
+    constexpr size_t kProbeThreads = 8;
+    std::mutex done_mutex;
+    std::condition_variable done;
+    std::vector<bool> finished(count, false);
+    size_t finished_count = 0;
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> workers;
+    for (size_t i = 0; i < std::min(kProbeThreads, count); ++i) {
+        workers.emplace_back([&] {
+            for (size_t index = next++; index < count; index = next++) {
+                work(index);
+                std::lock_guard lock(done_mutex);
+                finished[index] = true;
+                ++finished_count;
+                done.notify_all();
+            }
+        });
+    }
+    {
+        std::unique_lock lock(done_mutex);
+        done.wait_until(lock, deadline, [&] { return finished_count == count; });
+    }
+    std::vector<size_t> unfinished;
+    {
+        std::lock_guard lock(done_mutex);
+        for (size_t i = 0; i < count; ++i) {
+            if (!finished[i]) unfinished.push_back(i);
+        }
+    }
+    for (const auto index : unfinished) cancel(index);
+    for (auto& worker : workers) worker.join();
+}
+
+json catalog_json(const MeshPortPeerCatalog& catalog) {
+    return json{{"name", catalog.app_name}, {"version", catalog.app_version}};
 }
 
 }  // namespace
@@ -438,6 +508,7 @@ MeshPortBackend make_mesh_port_backend(LemonadeNexusClient& client) {
         }
         return members;
     };
+    backend.local_catalog = [&client] { return client.service_catalog(kMeshPortPeerServicePort); };
     backend.ensure_certificate = [&client](const std::string& cert_dir) -> std::optional<MeshPortCertificate> {
         const auto result = client.renew_certificate_if_needed(std::string(kGroupLoopbackCertTarget), cert_dir);
         if (result.status == CertRenewalStatus::Failed) {
@@ -738,6 +809,7 @@ void MeshPort::stop() {
     {
         std::lock_guard lock(cache_mutex_);
         peer_cache_.clear();
+        catalog_cache_.clear();
         local_models_.clear();
         local_models_authorization_.clear();
         local_models_fetched_ = {};
@@ -762,6 +834,7 @@ void MeshPort::refresh_now() {
     try {
         activate_pending_tls();
         refresh_members();
+        refresh_catalogs();
         check_certificate();
     } catch (const std::exception& e) {
         spdlog::warn("[MeshPort] refresh failed: {}", e.what());
@@ -972,13 +1045,22 @@ int MeshPort::set_selection(const std::string& target, const std::string& peer_k
 }
 
 nlohmann::json MeshPort::status() const {
-    std::lock_guard lock(state_mutex_);
     const auto self = backend_.self_node_id ? backend_.self_node_id() : std::string();
+    const auto local_catalog = backend_.local_catalog ? backend_.local_catalog() : json::object();
+    std::map<std::string, CachedCatalog> catalogs;
+    {
+        std::lock_guard lock(cache_mutex_);
+        catalogs = catalog_cache_;
+    }
+    std::lock_guard lock(state_mutex_);
     const bool tls = tls_state_ == "active";
     json devices = json::array();
     for (const auto& member : members_) {
         if (member.node_id == self || !member.is_inference || !member.can_connect) continue;
-        devices.push_back({{"node_id", member.node_id}, {"device_name", member.device_name}, {"is_online", member.is_online}});
+        MeshPortPeerCatalog catalog;
+        if (const auto cached = catalogs.find(member.node_id); cached != catalogs.end()) catalog = cached->second.catalog;
+        devices.push_back({{"node_id", member.node_id}, {"device_name", member.device_name}, {"is_online", member.is_online},
+            {"app", catalog_json(catalog)}, {"families", catalog.families}, {"catalog_status", catalog.status}});
     }
     return {
         {"running", running_},
@@ -995,6 +1077,7 @@ nlohmann::json MeshPort::status() const {
                                ? std::string("No certificate directory is set") : tls_error_}}},
         {"urls", running_ ? mesh_port::device_urls(members_, self, local_domain_, port_, tls) : json::array()},
         {"devices", devices},
+        {"catalog", local_catalog.is_object() ? local_catalog : json::object()},
     };
 }
 
@@ -1221,17 +1304,111 @@ std::vector<std::string> MeshPort::local_model_ids(const std::string& authorizat
     return ids;
 }
 
+std::optional<MeshPortPeerCatalog> MeshPort::cached_catalog(const std::string& node_id) {
+    std::lock_guard lock(cache_mutex_);
+    const auto cached = catalog_cache_.find(node_id);
+    if (cached == catalog_cache_.end() ||
+        std::chrono::steady_clock::now() - cached->second.fetched >= options_.catalog_ttl) {
+        return std::nullopt;
+    }
+    return cached->second.catalog;
+}
+
+void MeshPort::store_catalog(const std::string& node_id, const MeshPortPeerCatalog& catalog) {
+    std::lock_guard lock(cache_mutex_);
+    catalog_cache_[node_id] = {std::chrono::steady_clock::now(), catalog};
+}
+
+namespace {
+
+/// One peer probe: an egress and an HTTP client, cancelled by the coordinator
+/// at the deadline through `cancelled` and the client.
+struct MeshPortProbe {
+    const MeshPortMember* member{nullptr};
+    std::mutex mutex;
+    std::shared_ptr<httplib::Client> client;
+    bool cancelled{false};
+    bool done{false};
+
+    /// Opens the egress and the client; null when cancelled or unreachable.
+    std::shared_ptr<httplib::Client> open(const MeshPortBackend& backend, const MeshPort::Options& options,
+                                          std::mutex& state_mutex, std::map<std::string, std::string>& egress_ips) {
+        const auto address = strip_prefix_length(member->tunnel_ip);
+        const uint16_t egress = backend.open_egress && !address.empty()
+            ? backend.open_egress(address, kMeshPortPeerServicePort) : 0;
+        if (egress == 0) return nullptr;
+        {
+            std::lock_guard lock(state_mutex);
+            egress_ips[member->node_id] = address;
+        }
+        std::lock_guard lock(mutex);
+        if (cancelled) return nullptr;
+        client = std::make_shared<httplib::Client>("127.0.0.1", egress);
+        set_timeouts(*client, options.peer_probe_connect_timeout, options.peer_probe_deadline);
+        return client;
+    }
+    bool is_cancelled() {
+        std::lock_guard lock(mutex);
+        return cancelled;
+    }
+    void finish() {
+        std::lock_guard lock(mutex);
+        done = true;
+        client.reset();
+    }
+    /// Shuts the socket down under the probe thread, so its read fails now.
+    void cancel() {
+        std::shared_ptr<httplib::Client> open_client;
+        {
+            std::lock_guard lock(mutex);
+            if (done) return;
+            cancelled = true;
+            open_client = client;
+        }
+        if (open_client) open_client->stop();
+    }
+};
+
+}  // namespace
+
+// Runs on the refresh thread: reads the catalog of every reachable peer whose
+// cached answer is stale, so the status shows each device's app without a
+// request having probed it.
+void MeshPort::refresh_catalogs() {
+    std::vector<MeshPortMember> members;
+    {
+        std::lock_guard lock(state_mutex_);
+        if (!running_) return;
+        members = members_;
+    }
+    const auto self = backend_.self_node_id ? backend_.self_node_id() : std::string();
+    std::vector<std::unique_ptr<MeshPortProbe>> probes;
+    for (const auto& member : members) {
+        if (!reachable_peer(member, self) || cached_catalog(member.node_id)) continue;
+        auto probe = std::make_unique<MeshPortProbe>();
+        probe->member = &member;
+        probes.push_back(std::move(probe));
+    }
+    run_probes(probes.size(), std::chrono::steady_clock::now() + options_.peer_probe_deadline,
+        [&](size_t index) {
+            auto& probe = *probes[index];
+            MeshPortPeerCatalog catalog;
+            if (const auto client = probe.open(backend_, options_, state_mutex_, egress_ips_)) {
+                catalog = fetch_catalog(*client);
+            }
+            probe.finish();
+            // A peer that did not answer is cached as unknown until the next interval.
+            store_catalog(probe.member->node_id, catalog);
+        },
+        [&](size_t index) { probes[index]->cancel(); });
+}
+
 std::vector<MeshPortPeerModels> MeshPort::peer_models(const std::vector<MeshPortMember>& members,
                                                       const std::string& self,
                                                       const std::string& peer_authorization) {
-    // One peer's probe: egress, health and models, run on a probe thread. The
-    // coordinator cancels it at the deadline through `cancelled` and the client.
     struct Probe {
-        const MeshPortMember* member{nullptr};
+        MeshPortProbe probe;
         std::optional<MeshPortPeerModels> models;  // set for a cached or finished probe
-        std::mutex mutex;
-        std::shared_ptr<httplib::Client> client;
-        bool cancelled{false};
     };
     std::vector<std::unique_ptr<Probe>> probes;
     std::vector<Probe*> pending;
@@ -1251,99 +1428,55 @@ std::vector<MeshPortPeerModels> MeshPort::peer_models(const std::vector<MeshPort
         probes.push_back(std::move(probe));
     }
 
-    std::mutex done_mutex;
-    std::condition_variable done;
-    size_t finished = 0;
-    const auto run = [&](Probe& probe) {
-        const auto& member = *probe.member;
-        MeshPortPeerModels models;
-        models.node_id = member.node_id;
-        models.device_name = member.device_name;
-        models.latency_ms = member.latency_ms;
-        const auto address = strip_prefix_length(member.tunnel_ip);
-        const uint16_t port = backend_.open_egress && !address.empty()
-            ? backend_.open_egress(address, kMeshPortPeerServicePort) : 0;
-        if (port != 0) {
-            {
-                std::lock_guard lock(state_mutex_);
-                egress_ips_[member.node_id] = address;
-            }
-            std::shared_ptr<httplib::Client> client;
-            {
-                std::lock_guard lock(probe.mutex);
-                if (!probe.cancelled) {
-                    client = std::make_shared<httplib::Client>("127.0.0.1", port);
-                    set_timeouts(*client, options_.peer_probe_connect_timeout, options_.peer_probe_deadline);
-                    probe.client = client;
-                }
-            }
-            if (client) {
+    // A bounded set of threads probes the peers at the same time, so the listing
+    // waits for the slowest peer or the deadline, not for the sum.
+    run_probes(pending.size(), now + options_.peer_probe_deadline,
+        [&](size_t index) {
+            auto& entry = *pending[index];
+            const auto& member = *entry.probe.member;
+            MeshPortPeerModels models;
+            models.node_id = member.node_id;
+            models.device_name = member.device_name;
+            models.latency_ms = member.latency_ms;
+            if (const auto client = entry.probe.open(backend_, options_, state_mutex_, egress_ips_)) {
                 const auto health = get_json(*client, "/api/v1/health", peer_authorization);
                 if (health.body && health.body->is_object() && health.body->contains("all_models_loaded")) {
                     models.loaded = (*health.body)["all_models_loaded"];
                 }
-                bool cancelled = false;
-                {
-                    std::lock_guard lock(probe.mutex);
-                    cancelled = probe.cancelled;
-                }
-                if (!cancelled) {
+                if (!entry.probe.is_cancelled()) {
                     const auto listing = get_json(*client, "/api/v1/models", peer_authorization);
                     models.models_status = listing.status;
                     if (listing.body) models.available = model_ids(*listing.body);
                 }
+                if (const auto cached = cached_catalog(member.node_id)) {
+                    models.catalog = *cached;
+                } else if (!entry.probe.is_cancelled()) {
+                    models.catalog = fetch_catalog(*client);
+                    store_catalog(member.node_id, models.catalog);
+                }
             }
-        }
-        {
-            std::lock_guard lock(probe.mutex);
-            probe.models = std::move(models);
-            probe.client.reset();
-        }
-        std::lock_guard lock(done_mutex);
-        ++finished;
-        done.notify_all();
-    };
-
-    if (!pending.empty()) {
-        // A bounded set of threads probes the peers at the same time, so the listing
-        // waits for the slowest peer or the deadline, not for the sum.
-        constexpr size_t kProbeThreads = 8;
-        std::atomic<size_t> next{0};
-        std::vector<std::thread> workers;
-        for (size_t i = 0; i < std::min(kProbeThreads, pending.size()); ++i) {
-            workers.emplace_back([&] {
-                for (size_t index = next++; index < pending.size(); index = next++) run(*pending[index]);
-            });
-        }
-        {
-            std::unique_lock lock(done_mutex);
-            done.wait_until(lock, now + options_.peer_probe_deadline, [&] { return finished == pending.size(); });
-        }
-        for (auto* probe : pending) {
-            std::shared_ptr<httplib::Client> client;
-            {
-                std::lock_guard lock(probe->mutex);
-                if (probe->models) continue;
-                probe->cancelled = true;
-                client = probe->client;
-            }
-            // Shuts the socket down under the probe thread, so its read fails now.
-            if (client) client->stop();
-        }
-        for (auto& worker : workers) worker.join();
-    }
+            entry.probe.finish();
+            std::lock_guard lock(entry.probe.mutex);
+            entry.models = std::move(models);
+        },
+        [&](size_t index) { pending[index]->probe.cancel(); });
 
     std::vector<MeshPortPeerModels> result;
     const auto fetched = std::chrono::steady_clock::now();
     std::lock_guard lock(cache_mutex_);
     for (auto& probe : probes) {
-        if (!probe->models) continue;
+        std::optional<MeshPortPeerModels> models;
+        {
+            std::lock_guard probe_lock(probe->probe.mutex);
+            models = probe->models;
+        }
+        if (!models) continue;
         // A peer that did not answer by the deadline is cached as offering nothing,
         // so it is not probed again before the next interval.
         if (std::find(pending.begin(), pending.end(), probe.get()) != pending.end()) {
-            peer_cache_[std::make_pair(probe->member->node_id, peer_authorization)] = {fetched, *probe->models};
+            peer_cache_[std::make_pair(probe->probe.member->node_id, peer_authorization)] = {fetched, *models};
         }
-        result.push_back(std::move(*probe->models));
+        result.push_back(std::move(*models));
     }
     return result;
 }

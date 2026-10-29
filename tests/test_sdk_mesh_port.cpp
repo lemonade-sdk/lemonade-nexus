@@ -828,6 +828,61 @@ TEST_F(MeshPortTest, StopClearsTheSelectionAndAbortsStreams) {
     ASSERT_EQ(port->start(number, ""), MeshPortStartResult::Ok) << "the port can be bound again";
 }
 
+// The status shows what each device's SDK answers at /.nexus/catalog, read on
+// the refresh thread, so an app can show "lemonade 2026.46.0" or "unknown
+// app" without sending a request, and the catalog this device registered.
+TEST_F(MeshPortTest, StatusListsEachDevicesCatalogAndTheLocalOne) {
+    peer.server.Get("/.nexus/catalog", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(R"({"version":2,"app":{"name":"lemonade","version":"2026.46.0"},)"
+                        R"("families":[{"name":"inference","routes":[]},{"name":"management","routes":[]}]})",
+                        "application/json");
+    });
+    const json local_catalog = {{"version", 1}, {"app", {{"name", "local-app"}, {"version", "0.1"}}},
+                                {"families", json::array()}};
+    auto b = backend();
+    b.local_catalog = [local_catalog] { return local_catalog; };
+    port = std::make_unique<MeshPort>(std::move(b), options);
+    number = free_port();
+    ASSERT_EQ(port->start(number, ""), MeshPortStartResult::Ok);
+    port->refresh_now();
+
+    const auto status = port->status();
+    EXPECT_EQ(status["catalog"], local_catalog);
+    std::map<std::string, json> devices;
+    for (const auto& device : status["devices"]) devices[device["node_id"]] = device;
+    ASSERT_TRUE(devices.count("gpu"));
+    EXPECT_EQ(devices["gpu"]["app"]["name"], "lemonade");
+    EXPECT_EQ(devices["gpu"]["app"]["version"], "2026.46.0");
+    EXPECT_EQ(devices["gpu"]["families"], json::array({"inference", "management"}));
+    EXPECT_EQ(devices["gpu"]["catalog_status"], 200);
+    // The fast box has no mesh path in this fixture: an unknown app.
+    ASSERT_TRUE(devices.count("fast"));
+    EXPECT_EQ(devices["fast"]["app"]["name"], "");
+    EXPECT_EQ(devices["fast"]["families"], json::array());
+    EXPECT_EQ(devices["fast"]["catalog_status"], 0);
+
+    // The model probe carries the cached catalog too.
+    ASSERT_EQ(port->set_selection("auto", ""), 0);
+    httplib::Client client("127.0.0.1", number);
+    const auto listing = client.Get("/api/v1/models");
+    ASSERT_TRUE(listing);
+    EXPECT_EQ(listing->status, 200);
+}
+
+// A device whose service has no catalog answers 404 for /.nexus/catalog from
+// the service itself; the status reports that status and no app.
+TEST_F(MeshPortTest, ADeviceWithoutACatalogIsAnUnknownApp) {
+    start();
+    const auto status = port->status();
+    EXPECT_EQ(status["catalog"], json::object()) << "no local catalog without a backend function";
+    for (const auto& device : status["devices"]) {
+        if (device["node_id"] != "gpu") continue;
+        EXPECT_EQ(device["catalog_status"], 404);
+        EXPECT_EQ(device["app"]["name"], "");
+        EXPECT_EQ(device["app"]["version"], "");
+    }
+}
+
 TEST_F(MeshPortTest, RemovedPeerClosesItsEgress) {
     start();
     ASSERT_EQ(port->set_selection("gpu", ""), 0);

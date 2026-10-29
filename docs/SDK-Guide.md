@@ -380,6 +380,107 @@ C ABI equivalents: `ln_mesh_enable`, `ln_mesh_enable_config`,
 `ln_mesh_expose_service`, `ln_mesh_open_egress`, plus
 `ln_private_api_call` for generic authenticated private routes.
 
+### Service catalog and route policy
+
+A device that exposes its lemond (or another HTTP service) to mesh peers
+registers a catalog of the service's route families. From then on the SDK
+terminates HTTP at that port's mesh ingress and forwards a request to the
+service only when the calling peer may use the family of that route. Ports
+without a catalog keep the raw byte bridge.
+
+```c
+const char* catalog =
+    "{\"version\": 3,"
+    " \"app\": {\"name\": \"lemonade\", \"version\": \"2026.46.0\"},"
+    " \"families\": ["
+    "   {\"name\": \"inference\", \"routes\": ["
+    "      {\"methods\": [\"POST\"], \"path\": \"/api/v1/chat/completions\"},"
+    "      {\"methods\": [\"GET\"], \"prefix\": \"/api/v1/models\"}]},"
+    "   {\"name\": \"management\", \"routes\": ["
+    "      {\"methods\": [\"GET\"], \"path\": \"/api/v1/system-info\"}]}]}";
+ln_mesh_service_set_catalog(client, 13305, catalog);
+ln_mesh_expose_service(client, 13305, "tcp:127.0.0.1:13305");
+ln_set_ingress_denied_callback(client, on_refusal, NULL);
+```
+
+C++: `client.set_service_catalog(13305, json)`, `client.service_catalog(13305)`
+and `client.set_ingress_denied_callback(fn)`; the rules live in
+`lnsdk::service_ingress` (`LemonadeNexusSDK/ServiceIngress.hpp`).
+
+**Catalog format.** `version` is a required unsigned integer; `app` is
+optional. A family name matches `[a-z0-9][a-z0-9_.-]{0,62}` and appears once.
+A route lists at least one method and exactly one of `path` (an exact match)
+or `prefix` (the prefix itself and every path below it, by path segment);
+both are absolute. The same method with the same path or prefix appears only
+once in the catalog. At most 64 families, 1024 routes and 256 KiB of JSON. The
+order matters: the first route in catalog order that matches a request's
+method and path names the family. Registering a catalog again replaces the
+previous one; `ln_mesh_service_catalog` returns the registered one, or `{}`.
+
+**Attribution.** The dataplane accepts a packet only when its inner source
+address lies inside the sending peer's allowed IPs (its tunnel address on a
+direct path; on the hub path the server binds the address to the peer's key
+before it forwards). The ingress reads that source address and looks the
+peer up in the latest peer list (`ln_mesh_peers`): its node id, its key and
+its `peer_permissions`, the permissions the peer's key holds on this device
+and its ancestor groups. A connection that no listed peer accounts for is
+refused.
+
+**Decision.** `GET /.nexus/catalog` is answered by the SDK itself for any
+attributed peer with the registered catalog, so a client can learn the app
+name, version and families before it sends a request. Every other request is
+matched to a family and allowed when `peer_permissions` contains `admin` or
+`svc:<family>`. The local service then receives it with these headers, set by
+the SDK after any client-supplied `X-Nexus-*` header was removed:
+
+| Header | Value |
+|---|---|
+| `X-Nexus-Peer-Node` | the peer's node id |
+| `X-Nexus-Peer-Key` | the peer's management key when the peer list carries it, otherwise its mesh public key |
+| `X-Nexus-Peer-Permissions` | the peer's permissions, comma-separated |
+| `X-Nexus-Family` | the matched family |
+| `X-Nexus-Catalog-Version` | the catalog version |
+
+Status, `Content-Type` and streamed bodies (server-sent events, chunked
+responses) pass through unchanged, as they do through the mesh port.
+
+**Refusals.** Every refusal answers HTTP 403 with
+`Content-Type: application/json` and the body
+
+```json
+{"error": "<short reason>", "code": "nexus_permission_denied",
+ "family": "management", "required": "svc:management", "catalog_version": 3,
+ "app": {"name": "lemonade", "version": "2026.46.0"}}
+```
+
+where `code` is `nexus_permission_denied` (the peer lacks the family
+permission), `nexus_route_unregistered` (no route matches; `family` and
+`required` are empty) or `nexus_peer_unattributed` (no listed peer accounts
+for the connection). Each refusal is also reported to the callback of
+`ln_set_ingress_denied_callback` as
+
+```json
+{"kind": "denied", "vport": 13305, "peer_node_id": "...", "peer_key": "...",
+ "peer_tunnel_ip": "10.64.0.3", "method": "POST", "path": "/api/v1/...",
+ "family": "inference", "required": "svc:inference", "catalog_version": 3,
+ "time": 1790000000}
+```
+
+with `kind` one of `denied`, `unregistered` or `unattributed`. The host logs
+unregistered requests from this event; the event never carries a request
+body. The callback owns `event_json` and releases it with `ln_free()`. It runs
+on an SDK thread while the refused request waits, so it must return promptly;
+when the setter returns, the previous callback is not running and is not
+called again. Do not call the setter, or `ln_destroy`, from the callback.
+
+**What is not affected.** The mesh port's own `local` selection
+(`MeshPort::forward_local`) connects to the local service URL directly; it
+never enters the netstack, so this device's own traffic is not attributed or
+filtered. On the sending side, the mesh port reads each reachable device's
+`/.nexus/catalog` and reports the app name, version and families in
+`ln_mesh_port_status` under `devices`, and the catalog this device registered
+under `catalog`.
+
 ### Session moves
 
 The SDK moves a session whose Tier 1 server leaves the membership (see
