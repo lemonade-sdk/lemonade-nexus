@@ -390,6 +390,28 @@ TEST(SdkPeerLiveness, APeerSilentForOver180SecondsGoesOffline) {
     EXPECT_TRUE(*lnsdk::peer_signal_fresh(no_handshake_yet, start, 30));
 }
 
+// The run loop counts a wall-clock gap as a suspension only beyond its own
+// work and the sleep it asked for, plus kResumeGap.
+TEST(SdkMeshResume, OnlyAGapBeyondTheWorkAndTheSleepIsASuspension) {
+    using lnsdk::kResumeGap;
+    using lnsdk::loop_was_suspended;
+    // A normal pass: 40 ms of work, then the 5 s monitor sleep.
+    EXPECT_FALSE(loop_was_suspended(5040ms, 40ms, 5000ms));
+    // A slow pass (HTTP timeouts) is not a suspension.
+    EXPECT_FALSE(loop_was_suspended(45s, 40s, 5s));
+    // Woken early by a refresh request.
+    EXPECT_FALSE(loop_was_suspended(100ms, 10ms, 5000ms));
+    // A wall clock that stepped back.
+    EXPECT_FALSE(loop_was_suspended(-30s, 10ms, 5000ms));
+    // Exactly at the limit, and beyond it.
+    EXPECT_FALSE(loop_was_suspended(5s + kResumeGap, 0ms, 5s));
+    EXPECT_TRUE(loop_was_suspended(5s + kResumeGap + 1ms, 0ms, 5s));
+    // An app suspended for a minute while it slept.
+    EXPECT_TRUE(loop_was_suspended(65s, 20ms, 5s));
+    EXPECT_GE(kResumeGap, 2 * std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  lnsdk::kMonitorInterval));
+}
+
 TEST(HolePuncherSchedule, BothPeersPickTheSameSlot) {
     using P = lnsdk::HolePuncher;
     const int64_t interval = 60000;

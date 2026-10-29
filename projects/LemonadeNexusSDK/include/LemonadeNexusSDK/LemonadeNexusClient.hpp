@@ -415,7 +415,9 @@ public:
     /// Get the current list of known mesh peers.
     [[nodiscard]] std::vector<MeshPeer> get_mesh_peers() const;
 
-    /// Force an immediate peer refresh (fetch from server + sync tunnel).
+    /// Check the mesh paths now (see MeshOrchestrator::refresh_now): peer
+    /// refresh, STUN, a new punch burst, and relay fallback in one pass.
+    /// Returns at once. No effect while the mesh is disabled.
     void refresh_mesh_peers();
 
     /// Callback type for mesh state changes.
@@ -455,9 +457,14 @@ public:
     /// Used internally by MeshOrchestrator; also available for direct use.
     [[nodiscard]] Result<std::vector<MeshPeer>> fetch_mesh_peers(const std::string& node_id);
 
-    /// Send a heartbeat to the server reporting our current endpoint.
-    [[nodiscard]] StatusResult mesh_heartbeat(const std::string& node_id,
-                                               const std::string& endpoint);
+    /// Send a heartbeat to the server reporting our current endpoint (empty:
+    /// keep the stored one). On success, `value` is the server's
+    /// `peers_revision`: an opaque string that changes when this node's peer
+    /// list changes (see POST /api/mesh/heartbeat). It is empty when the
+    /// server sends none (older servers) or sends a malformed one. Compare
+    /// it only for equality; it carries no peer data.
+    [[nodiscard]] Result<std::string> mesh_heartbeat(const std::string& node_id,
+                                                     const std::string& endpoint);
 
     // -----------------------------------------------------------------
     // Session state

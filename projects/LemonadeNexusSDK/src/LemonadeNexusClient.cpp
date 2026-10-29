@@ -3383,8 +3383,8 @@ Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::s
     }
 }
 
-StatusResult LemonadeNexusClient::mesh_heartbeat(const std::string& nid,
-                                                   const std::string& endpoint) {
+Result<std::string> LemonadeNexusClient::mesh_heartbeat(const std::string& nid,
+                                                        const std::string& endpoint) {
     json body;
     body["node_id"]  = nid;
     body["endpoint"] = endpoint;
@@ -3403,7 +3403,16 @@ StatusResult LemonadeNexusClient::mesh_heartbeat(const std::string& nid,
         notice != resp->end() && notice->is_object()) {
         impl_->note_departure_notice(notice->value("next_epoch", uint64_t{0}));
     }
-    return {true, {}, status, ""};
+    // A change only makes the orchestrator fetch the peer list sooner, so a
+    // malformed value is ignored rather than refused.
+    constexpr std::size_t kMaxPeersRevision = 128;
+    std::string revision;
+    if (const auto found = resp->find("peers_revision");
+        found != resp->end() && found->is_string() &&
+        found->get_ref<const std::string&>().size() <= kMaxPeersRevision) {
+        revision = found->get<std::string>();
+    }
+    return {true, std::move(revision), status, ""};
 }
 
 // ---------------------------------------------------------------------------
