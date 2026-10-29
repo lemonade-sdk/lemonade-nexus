@@ -1,6 +1,7 @@
 #include <LemonadeNexusSDK/MeshPort.hpp>
 #include <LemonadeNexusSDK/CertRenewal.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
+#include "MeshProxy.hpp"
 
 #include <LemonadeNexus/Tree/DeviceLabel.hpp>
 
@@ -15,11 +16,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
-#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
-#include <random>
 
 #ifndef _WIN32
 #include <cerrno>
@@ -35,8 +34,6 @@ using json = nlohmann::json;
 /// The mesh port sends it to that device as Authorization and never forwards the
 /// caller's own Authorization to a peer.
 constexpr const char* kPeerAuthorizationHeader = "X-Lemonade-Peer-Authorization";
-constexpr size_t kPayloadLimit = 256u * 1024u * 1024u;
-constexpr size_t kPipeLimit = 1u * 1024u * 1024u;
 
 std::string lower(std::string_view text) {
     std::string result(text);
@@ -89,65 +86,8 @@ bool grants_connect(const std::vector<Assignment>& assignments, const std::strin
     return false;
 }
 
-void reply_error(httplib::Response& res, int status, const std::string& message) {
-    res.set_header("Cache-Control", "no-store");
-    res.status = status;
-    res.set_content(json{{"error", message}}.dump(), "application/json");
-}
-
 bool is_models_path(const std::string& path) {
     return path == "/api/v1/models" || path == "/api/v0/models" || path == "/v1/models" || path == "/v0/models";
-}
-
-struct FormPart {
-    std::string name;
-    std::string filename;
-    std::string content_type;
-    std::string content;
-};
-
-/// cpp-httplib 0.23 replaced Request::files with Request::form (fields and files);
-/// distributions ship both generations, so read whichever the header provides.
-template <typename Request>
-auto form_parts(const Request& req, int) -> decltype(req.form.files, std::vector<FormPart>()) {
-    std::vector<FormPart> parts;
-    for (const auto& [name, field] : req.form.fields) parts.push_back({field.name, "", "", field.content});
-    for (const auto& [name, file] : req.form.files) parts.push_back({file.name, file.filename, file.content_type, file.content});
-    return parts;
-}
-template <typename Request>
-std::vector<FormPart> form_parts(const Request& req, long) {
-    std::vector<FormPart> parts;
-    for (const auto& [name, part] : req.files) parts.push_back({part.name, part.filename, part.content_type, part.content});
-    return parts;
-}
-
-/// httplib parses a multipart body into its form parts and leaves req.body empty, so a
-/// forwarded multipart request is encoded again with a fresh boundary.
-std::pair<std::string, std::string> multipart_body(const httplib::Request& req) {
-    const auto parts = form_parts(req, 0);
-    std::random_device random;
-    std::string boundary;
-    std::string body;
-    for (int attempt = 0; attempt < 4; ++attempt) {
-        boundary = "lemonade-mesh-port-" + std::to_string(random()) + std::to_string(random()) + std::to_string(random());
-        body.clear();
-        for (const auto& part : parts) {
-            body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + part.name + "\"";
-            if (!part.filename.empty()) {
-                body += "; filename=\"" + part.filename + "\"\r\nContent-Type: " +
-                    (part.content_type.empty() ? std::string("application/octet-stream") : part.content_type);
-            }
-            body += "\r\n\r\n" + part.content + "\r\n";
-        }
-        body += "--" + boundary + "--\r\n";
-        bool collides = false;
-        for (const auto& part : parts) {
-            if (part.content.find(boundary) != std::string::npos) collides = true;
-        }
-        if (!collides) break;
-    }
-    return {"multipart/form-data; boundary=" + boundary, body};
 }
 
 /// Binds without SO_REUSEPORT, so a second process cannot share the port. Unix keeps
@@ -180,239 +120,6 @@ bool port_in_use(uint16_t port) {
 #endif
     httplib::detail::close_socket(sock);
     return in_use;
-}
-
-struct Pipe;
-
-}  // namespace
-
-/// The open requests of the listener: the handlers that are running and the pipes
-/// that still stream a response after their handler returned. stop() aborts the
-/// pipes; the switch from plain HTTP to TLS waits until nothing is open, because
-/// stopping an httplib server cuts every chunked response it is still writing.
-struct MeshPortProxies {
-    std::mutex mutex;
-    std::vector<std::weak_ptr<Pipe>> pipes;
-    size_t handlers{0};
-    bool switching{false};       // refuse new requests while the listener is replaced
-    bool wake_when_idle{false};  // a switch is waiting for the open requests to finish
-    std::function<void()> on_idle;
-
-    /// Registers a handler. False while the listener is being replaced.
-    bool enter() {
-        std::lock_guard lock(mutex);
-        if (switching) return false;
-        ++handlers;
-        return true;
-    }
-    void leave() {
-        std::function<void()> wake;
-        {
-            std::lock_guard lock(mutex);
-            --handlers;
-            wake = idle_wake_locked();
-        }
-        if (wake) wake();
-    }
-    void add(const std::shared_ptr<Pipe>& pipe) {
-        std::lock_guard lock(mutex);
-        prune_locked();
-        pipes.push_back(pipe);
-    }
-    /// Called by a pipe's destructor, once its response is written or aborted.
-    void released() {
-        std::function<void()> wake;
-        {
-            std::lock_guard lock(mutex);
-            wake = idle_wake_locked();
-        }
-        if (wake) wake();
-    }
-    /// Starts refusing new requests when nothing is open. Otherwise arranges for
-    /// on_idle to run when the last open request finishes and returns false.
-    bool begin_switch() {
-        std::lock_guard lock(mutex);
-        if (!idle_locked()) {
-            wake_when_idle = true;
-            return false;
-        }
-        wake_when_idle = false;
-        switching = true;
-        return true;
-    }
-    void end_switch() {
-        std::lock_guard lock(mutex);
-        switching = false;
-    }
-    void forget_switch() {
-        std::lock_guard lock(mutex);
-        switching = false;
-        wake_when_idle = false;
-    }
-    void cancel_all();
-
-private:
-    void prune_locked() {
-        pipes.erase(std::remove_if(pipes.begin(), pipes.end(), [](const auto& p) { return p.expired(); }), pipes.end());
-    }
-    bool idle_locked() {
-        prune_locked();
-        return handlers == 0 && pipes.empty();
-    }
-    std::function<void()> idle_wake_locked() {
-        if (!wake_when_idle || !idle_locked()) return {};
-        wake_when_idle = false;
-        return on_idle;
-    }
-};
-
-namespace {
-
-/// One forwarded request. A worker thread reads the upstream response into a bounded
-/// queue; the listener streams the queue to the caller with the upstream status and
-/// Content-Type.
-struct Pipe {
-    std::mutex mutex;
-    std::condition_variable changed;
-    bool headers{false};
-    bool finished{false};
-    bool cancelled{false};
-    int status{0};
-    std::string content_type;
-    std::deque<std::string> chunks;
-    size_t buffered{0};
-    std::unique_ptr<httplib::Client> client;
-    std::thread worker;
-    std::shared_ptr<MeshPortProxies> owner;
-
-    void cancel() {
-        {
-            std::lock_guard lock(mutex);
-            cancelled = true;
-        }
-        changed.notify_all();
-        if (client) client->stop();
-    }
-    void join() {
-        if (worker.joinable()) worker.join();
-    }
-    ~Pipe() {
-        if (worker.joinable()) {
-            cancel();
-            worker.join();
-        }
-        if (owner) owner->released();
-    }
-};
-
-}  // namespace
-
-void MeshPortProxies::cancel_all() {
-    std::vector<std::shared_ptr<Pipe>> open;
-    {
-        std::lock_guard lock(mutex);
-        for (const auto& weak : pipes) {
-            if (auto pipe = weak.lock()) open.push_back(std::move(pipe));
-        }
-        pipes.clear();
-    }
-    for (const auto& pipe : open) pipe->cancel();
-}
-
-namespace {
-
-void proxy(const std::shared_ptr<MeshPortProxies>& proxies, const std::string& host, uint16_t port,
-           const httplib::Request& req, const std::string& target, httplib::Headers headers,
-           const std::string& body, httplib::Response& res) {
-    auto pipe = std::make_shared<Pipe>();
-    pipe->owner = proxies;
-    pipe->client = std::make_unique<httplib::Client>(host, port);
-    pipe->client->set_connection_timeout(10, 0);
-    pipe->client->set_read_timeout(300, 0);
-    pipe->client->set_write_timeout(300, 0);
-    pipe->client->set_keep_alive(false);
-    proxies->add(pipe);
-
-    httplib::Request upstream;
-    upstream.method = req.method;
-    upstream.path = target;
-    upstream.headers = std::move(headers);
-    upstream.body = body;
-    Pipe* raw = pipe.get();
-    upstream.response_handler = [raw](const httplib::Response& reply) {
-        std::lock_guard lock(raw->mutex);
-        raw->status = reply.status;
-        raw->content_type = reply.get_header_value("Content-Type");
-        raw->headers = true;
-        raw->changed.notify_all();
-        return !raw->cancelled;
-    };
-    upstream.content_receiver = [raw](const char* data, size_t size, uint64_t, uint64_t) {
-        std::unique_lock lock(raw->mutex);
-        raw->changed.wait(lock, [raw] { return raw->cancelled || raw->buffered < kPipeLimit; });
-        if (raw->cancelled) return false;
-        raw->chunks.emplace_back(data, size);
-        raw->buffered += size;
-        raw->changed.notify_all();
-        return true;
-    };
-    // The worker holds a raw pointer: every path below joins it before the pipe is freed.
-    raw->worker = std::thread([raw, upstream = std::move(upstream)] {
-        auto result = raw->client->send(upstream);
-        (void)result;
-        std::lock_guard lock(raw->mutex);
-        raw->finished = true;
-        raw->changed.notify_all();
-    });
-
-    {
-        std::unique_lock lock(pipe->mutex);
-        pipe->changed.wait(lock, [&] { return pipe->headers || pipe->finished || pipe->cancelled; });
-    }
-    res.set_header("Cache-Control", "no-store");
-    bool ready = false;
-    int status = 0;
-    std::string type;
-    {
-        std::lock_guard lock(pipe->mutex);
-        ready = pipe->headers && !pipe->cancelled;
-        status = pipe->status;
-        type = pipe->content_type;
-    }
-    if (!ready) {
-        pipe->cancel();
-        pipe->join();
-        reply_error(res, 502, "Cannot reach that service");
-        return;
-    }
-    res.status = status;
-    if (status == 204 || status == 304) {
-        pipe->join();
-        return;
-    }
-    res.set_chunked_content_provider(
-        type.empty() ? "application/octet-stream" : type,
-        [pipe](size_t, httplib::DataSink& sink) {
-            std::string chunk;
-            {
-                std::unique_lock lock(pipe->mutex);
-                pipe->changed.wait(lock, [&] { return !pipe->chunks.empty() || pipe->finished || pipe->cancelled; });
-                if (pipe->chunks.empty()) {
-                    lock.unlock();
-                    sink.done();
-                    return true;
-                }
-                chunk = std::move(pipe->chunks.front());
-                pipe->chunks.pop_front();
-                pipe->buffered -= chunk.size();
-            }
-            pipe->changed.notify_all();
-            return sink.write(chunk.data(), chunk.size());
-        },
-        [pipe](bool) {
-            pipe->cancel();
-            pipe->join();
-        });
 }
 
 httplib::Headers forwarded_headers(const httplib::Request& req, const std::string& authorization,
@@ -919,7 +626,7 @@ MeshPortStartResult MeshPort::bind_listener(uint16_t port, bool tls) {
     server.set_read_timeout(30, 0);
     server.set_write_timeout(300, 0);
     server.set_keep_alive_timeout(2);
-    server.set_payload_max_length(kPayloadLimit);
+    server.set_payload_max_length(kProxyPayloadLimit);
     if (!server.bind_to_port("127.0.0.1", port)) {
         return port_in_use(port) ? MeshPortStartResult::PortInUse : MeshPortStartResult::BindFailed;
     }
@@ -1449,11 +1156,11 @@ void MeshPort::forward_to_node(const std::string& node_id, const std::string& pa
     }
     if (req.is_multipart_form_data()) {
         const auto [type, encoded] = multipart_body(req);
-        proxy(proxies_, "127.0.0.1", port, req, path, forwarded_headers(req, peer_authorization, type), encoded, res);
+        proxy_request(proxies_, "127.0.0.1", port, req, path, forwarded_headers(req, peer_authorization, type), encoded, res);
         return;
     }
     const auto type = req.has_header("Content-Type") ? req.get_header_value("Content-Type") : std::string();
-    proxy(proxies_, "127.0.0.1", port, req, path, forwarded_headers(req, peer_authorization, type), body, res);
+    proxy_request(proxies_, "127.0.0.1", port, req, path, forwarded_headers(req, peer_authorization, type), body, res);
 }
 
 void MeshPort::forward_local(const std::string& path, const httplib::Request& req, httplib::Response& res,
@@ -1473,11 +1180,11 @@ void MeshPort::forward_local(const std::string& path, const httplib::Request& re
     const auto authorization = req.get_header_value("Authorization");
     if (req.is_multipart_form_data()) {
         const auto [type, encoded] = multipart_body(req);
-        proxy(proxies_, host, port, req, path, forwarded_headers(req, authorization, type), encoded, res);
+        proxy_request(proxies_, host, port, req, path, forwarded_headers(req, authorization, type), encoded, res);
         return;
     }
     const auto type = req.has_header("Content-Type") ? req.get_header_value("Content-Type") : std::string();
-    proxy(proxies_, host, port, req, path, forwarded_headers(req, authorization, type), body, res);
+    proxy_request(proxies_, host, port, req, path, forwarded_headers(req, authorization, type), body, res);
 }
 
 nlohmann::json MeshPort::local_models(const std::string& authorization) {
@@ -1532,7 +1239,7 @@ std::vector<MeshPortPeerModels> MeshPort::peer_models(const std::vector<MeshPort
     for (const auto& member : members) {
         if (!reachable_peer(member, self)) continue;
         auto probe = std::make_unique<Probe>();
-        probe->member = &member;
+        probe->probe.member = &member;
         {
             std::lock_guard lock(cache_mutex_);
             const auto cached = peer_cache_.find(std::make_pair(member.node_id, peer_authorization));
