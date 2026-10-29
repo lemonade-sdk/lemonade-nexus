@@ -287,11 +287,12 @@ TEST(HolePuncherSchedule, PathSelection) {
     // Without prefer_direct a peer that has not fallen back still punches.
     EXPECT_EQ(P::punch_mode(true, false, 0, now, false, t), P::Mode::Direct);
 
-    // And the relay fallback keeps the direct grace period for a peer that
-    // has a listed endpoint, so the punch runs first.
+    // And the relay fallback keeps the short direct grace period for a peer
+    // that has a listed endpoint, so the first punch burst goes out first.
     using F = lnsdk::RelayFallback;
     const F::Timing ft;
-    EXPECT_FALSE(F::relay_needed(true, 0, now, 5s, true, ft));
+    EXPECT_FALSE(F::relay_needed(true, 0, now, 1s, true, ft));
+    EXPECT_TRUE(F::relay_needed(true, 0, now, lnsdk::kDirectAnswerWindow, true, ft));
     EXPECT_TRUE(F::relay_needed(false, 0, now, 0ms, true, ft));
 }
 
@@ -907,4 +908,136 @@ TEST_F(SdkHolePunchTest, TheFirstBurstOutlivesTheRelayAndBurstNowStartsAnother) 
     EXPECT_EQ(punch.probes_sent(), 2u * timing.burst_count);
     EXPECT_TRUE(eventually([&] { return sink.received() >= 2 * static_cast<int>(timing.burst_count); },
                            [] {}, 2s));
+}
+
+// Relay first, direct later: a listed endpoint that never answers gets a
+// relay once the short direct grace period ends, and when the peer's real
+// address is listed, the punch replaces the relay.
+TEST_F(SdkHolePunchTest, ASilentEndpointGetsARelayWithinTheWindowAndUpgradesLater) {
+    UdpSink alice_sink(io), bob_sink(io);
+    const auto candidates = [this] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}};
+    };
+    auto timing = fast_relay();  // the default direct grace period
+    lnsdk::RelayFallback alice_relay(
+        alice, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("alice", relay_id), 200, ""};
+        },
+        candidates, timing);
+    lnsdk::RelayFallback bob_relay(
+        bob, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("bob", relay_id), 200, ""};
+        },
+        candidates, timing);
+    lnsdk::HolePuncher alice_punch(alice, fast_punch());
+    lnsdk::HolePuncher bob_punch(bob, fast_punch());
+
+    std::vector<lnsdk::MeshPeer> alice_peers = {
+        peer(bob_keys.second, "10.64.0.3/32", bob_sink.endpoint())};
+    std::vector<lnsdk::MeshPeer> bob_peers = {
+        peer(alice_keys.second, "10.64.0.2/32", alice_sink.endpoint())};
+    const auto pass = [&] {
+        ASSERT_TRUE(alice.sync_peers(alice_peers).ok);
+        ASSERT_TRUE(bob.sync_peers(bob_peers).ok);
+        (void)alice_punch.maintain(alice_peers, alice_relay.relayed_peers(), true);
+        (void)bob_punch.maintain(bob_peers, bob_relay.relayed_peers(), true);
+        (void)alice_relay.maintain(alice_peers, true);
+        (void)bob_relay.maintain(bob_peers, true);
+    };
+
+    const auto start = std::chrono::steady_clock::now();
+    pass();
+    // Within the grace period the punch runs alone.
+    std::this_thread::sleep_for(lnsdk::kDirectAnswerWindow / 2);
+    pass();
+    EXPECT_TRUE(alice_relay.relayed_peers().empty());
+    EXPECT_GT(bob_sink.received(), 0) << "no probe went to the listed endpoint";
+
+    ASSERT_TRUE(eventually(
+        [&] {
+            return alice_relay.relayed_peers().contains(bob_keys.second) &&
+                   bob_relay.relayed_peers().contains(alice_keys.second);
+        },
+        pass, 10s));
+    const auto relayed_after = std::chrono::steady_clock::now() - start;
+    EXPECT_GE(relayed_after, lnsdk::kDirectAnswerWindow);
+    EXPECT_LT(relayed_after, lnsdk::kDirectAnswerWindow + 3s);
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
+
+    // The real addresses appear in the peer lists: the upgrade probes punch
+    // a direct path, and the relay closes.
+    const auto alice_reflexive = alice.query_reflexive(stun_endpoint(), 2000ms);
+    const auto bob_reflexive = bob.query_reflexive(stun_endpoint(), 2000ms);
+    ASSERT_TRUE(alice_reflexive && bob_reflexive);
+    alice_peers[0].endpoint = *bob_reflexive;
+    bob_peers[0].endpoint = *alice_reflexive;
+    ASSERT_TRUE(eventually(
+        [&] { return alice_relay.relayed_peers().empty() && bob_relay.relayed_peers().empty(); },
+        pass, 15s));
+    EXPECT_TRUE(eventually([&] { return r->session_count() == 0; }, [] {}, 3s));
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
+}
+
+// A relay request whose path is not in use yet closes when the peer answers
+// on a direct path first: the other side, which asks the same relay later,
+// is never paired, and neither side moves off the direct path.
+TEST_F(SdkHolePunchTest, ADirectAnswerClosesAnUnusedRelayRequest) {
+    const auto candidates = [this] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}};
+    };
+    auto timing = fast_relay();
+    timing.pending_limit = 30s;  // an unpaired request would outlive the test
+    lnsdk::RelayFallback alice_relay(
+        alice, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("alice", relay_id), 200, ""};
+        },
+        candidates, timing);
+    lnsdk::RelayFallback bob_relay(
+        bob, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("bob", relay_id), 200, ""};
+        },
+        candidates, timing);
+
+    const auto alice_reflexive = alice.query_reflexive(stun_endpoint(), 2000ms);
+    const auto bob_reflexive = bob.query_reflexive(stun_endpoint(), 2000ms);
+    ASSERT_TRUE(alice_reflexive && bob_reflexive);
+    // A long keepalive keeps the dataplanes from renewing a session on their
+    // own. A session that forms before the renewal does not count after it.
+    std::vector<lnsdk::MeshPeer> alice_peers = {
+        peer(bob_keys.second, "10.64.0.3/32", *bob_reflexive)};
+    std::vector<lnsdk::MeshPeer> bob_peers = {
+        peer(alice_keys.second, "10.64.0.2/32", *alice_reflexive)};
+    alice_peers[0].keepalive = bob_peers[0].keepalive = 25;
+    ASSERT_TRUE(alice.sync_peers(alice_peers).ok);
+    ASSERT_TRUE(bob.sync_peers(bob_peers).ok);
+    std::this_thread::sleep_for(1100ms);
+
+    // Alice renews Bob without a grace period: she asks the relay at once.
+    const auto renewed_at = static_cast<int64_t>(now_s());
+    alice_relay.renew({bob_keys.second}, true);
+    (void)alice_relay.maintain(alice_peers, true);
+    // Then the direct path answers. The dataplane reports handshake times in
+    // whole seconds, and a handshake counts only when it reads later than
+    // the renewal, so probe until one does, as the punch burst would.
+    ASSERT_TRUE(eventually(
+        [&] {
+            const auto a = status_of(alice.mesh_status(), bob_keys.second);
+            return a && a->last_handshake > renewed_at;
+        },
+        [&] { (void)alice.probe_peer(bob_keys.second, *bob_reflexive); }, 10s));
+    (void)alice_relay.maintain(alice_peers, true);
+
+    // Bob now asks the same relay. Alice's request is gone, so the relay
+    // never pairs them, and Alice stays on the direct path.
+    bob_relay.renew({alice_keys.second}, true);
+    for (int i = 0; i < 10; ++i) {
+        (void)alice_relay.maintain(alice_peers, true);
+        (void)bob_relay.maintain(bob_peers, true);
+        std::this_thread::sleep_for(100ms);
+    }
+    // Bob's request waits alone: a pairing would have moved him onto the
+    // relay within one pass.
+    EXPECT_TRUE(alice_relay.relayed_peers().empty());
+    EXPECT_TRUE(bob_relay.relayed_peers().empty());
+    EXPECT_EQ(status_of(alice.mesh_status(), bob_keys.second)->endpoint, *bob_reflexive);
 }
