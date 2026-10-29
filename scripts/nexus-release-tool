@@ -33,6 +33,7 @@ HEX96 = re.compile(r"^[0-9a-f]{96}$")
 KERNEL_HASHES = ("bzimage_sha256", "vmlinux_sha256", "module_tree_sha256",
                  "module_certificate_der_sha256")
 SWAPPABLE = ("/usr/bin/lemonade-nexus", "/usr/bin/nexus-attestd")
+UPDATER_PATH = "/usr/bin/nexus-updater"
 
 
 def fail(message):
@@ -292,6 +293,12 @@ def cmd_manifest(args):
     for f in files:
         if approved.get(f["path"], [None])[0] != f["sha256"]:
             fail(f"the approval does not list {f['path']} with the built hash first")
+    updater = None
+    if args.updater_file:
+        asset, path, file_path = args.updater_file.split("=", 2)
+        if path != UPDATER_PATH:
+            fail(f"{path} is not the path nexus-updater installs itself at")
+        updater = {"asset": asset, "path": path, "sha256": sha256_file(file_path)}
     artifacts = []
     for name in sorted(os.listdir(args.artifacts_dir)):
         full = os.path.join(args.artifacts_dir, name)
@@ -324,6 +331,8 @@ def cmd_manifest(args):
         },
         "artifacts": artifacts,
     }
+    if updater:
+        manifest["updater"] = updater
     if approval["release_id"] != args.tag:
         fail("the approval release_id is not the tag")
     write_json(args.out, manifest)
@@ -389,6 +398,9 @@ def main():
     p.add_argument("--boot-chain-changed", choices=("true", "false"), required=True)
     p.add_argument("--server-file", action="append", required=True,
                    help="asset=/install/path=local/file")
+    p.add_argument("--updater-file",
+                   help="asset=/usr/bin/nexus-updater=local/file; the updater installs it "
+                        "over itself after the health gate")
     p.add_argument("--artifacts-dir", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_manifest)

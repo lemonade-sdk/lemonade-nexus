@@ -150,6 +150,8 @@ struct ReleaseFiles {
     std::string tag;
     std::string nexus_bin;
     std::string attestd_bin;
+    /// Empty: the release carries no updater binary.
+    std::string updater_bin;
     std::string lock;
     std::string approval;
     std::string manifest;
@@ -182,6 +184,11 @@ std::string manifest_for(const ReleaseFiles& r, uint64_t number) {
           {"boot_chain_changed", r.boot_chain_changed}}},
         {"artifacts", json::array()},
     };
+    if (!r.updater_bin.empty()) {
+        m["updater"] = {{"asset", "nexus-updater-linux-x86_64"},
+                        {"path", "/usr/bin/nexus-updater"},
+                        {"sha256", sha256_hex(r.updater_bin)}};
+    }
     return m.dump(2);
 }
 
@@ -196,11 +203,12 @@ ReleaseFiles make_release(const Keys& k, const std::string& tag, const std::stri
                           const std::string& attestd_bin, const std::string& lock,
                           const std::vector<std::string>& previous_nexus = {},
                           const std::vector<std::string>& previous_attestd = {},
-                          char pcr = '8') {
+                          char pcr = '8', const std::string& updater_bin = {}) {
     ReleaseFiles r;
     r.tag = tag;
     r.nexus_bin = nexus_bin;
     r.attestd_bin = attestd_bin;
+    r.updater_bin = updater_bin;
     r.lock = lock;
     ApprovalSpec spec;
     spec.tag = tag;
@@ -385,6 +393,50 @@ TEST_F(VerifyFixture, RefusesAManifestForAnotherRepositoryOrPath) {
     release.manifest = m.dump(2);
     release.signature = sign_manifest(keys.release_sk, release.manifest);
     EXPECT_FALSE(verify());
+}
+
+TEST_F(VerifyFixture, ChecksTheUpdaterBinaryAgainstTheSignedManifest) {
+    release = make_release(keys, "v2026.10.24", "nexus-new", "attestd-new", kEmptyLock, {}, {},
+                           '8', "updater-new");
+    const auto v = verify();
+    ASSERT_TRUE(v) << error;
+    EXPECT_EQ(v->manifest.updater.asset, "nexus-updater-linux-x86_64");
+    EXPECT_EQ(v->manifest.updater.path, kUpdaterPath);
+    EXPECT_TRUE(verify_asset_hash(*v, "nexus-updater-linux-x86_64", sha256_hex("updater-new"), error));
+    EXPECT_FALSE(verify_asset_hash(*v, "nexus-updater-linux-x86_64", sha256_hex("updater-evil"), error));
+    EXPECT_NE(error.find("signed manifest lists"), std::string::npos) << error;
+
+    // A release without the entry verifies; the updater asset is then unlisted.
+    release = make_release(keys, "v2026.10.24", "nexus-new", "attestd-new", kEmptyLock);
+    const auto w = verify();
+    ASSERT_TRUE(w) << error;
+    EXPECT_TRUE(w->manifest.updater.asset.empty());
+    EXPECT_FALSE(verify_asset_hash(*w, "nexus-updater-linux-x86_64", sha256_hex("updater-new"), error));
+}
+
+TEST_F(VerifyFixture, RefusesAnUpdaterEntryForAnotherPathOrAReusedAsset) {
+    release = make_release(keys, "v2026.10.24", "nexus-new", "attestd-new", kEmptyLock, {}, {},
+                           '8', "updater-new");
+    auto m = json::parse(release.manifest);
+    m["updater"]["path"] = "/usr/bin/sudo";
+    release.manifest = m.dump(2);
+    release.signature = sign_manifest(keys.release_sk, release.manifest);
+    EXPECT_FALSE(verify());
+    EXPECT_NE(error.find("does not use"), std::string::npos) << error;
+
+    m["updater"]["path"] = std::string(kUpdaterPath);
+    m["updater"]["asset"] = "lemonade-nexus-linux-x86_64";
+    release.manifest = m.dump(2);
+    release.signature = sign_manifest(keys.release_sk, release.manifest);
+    EXPECT_FALSE(verify());
+    EXPECT_NE(error.find("twice"), std::string::npos) << error;
+
+    m["updater"]["asset"] = "nexus-updater-linux-x86_64";
+    m["updater"]["sha256"] = "not-a-hash";
+    release.manifest = m.dump(2);
+    release.signature = sign_manifest(keys.release_sk, release.manifest);
+    EXPECT_FALSE(verify());
+    EXPECT_NE(error.find("updater entry"), std::string::npos) << error;
 }
 
 // ---------------------------------------------------------------------------
@@ -849,9 +901,13 @@ struct Host {
     std::function<void()> after_apt_install;
     /// `systemctl daemon-reload` fails: the unit refresh cannot finish.
     bool daemon_reload_fails = false;
+    /// The updater binary on disk at each health request: shows whether the
+    /// updater replaced itself before or after the health gate.
+    std::set<std::string> updater_at_health;
 
     static constexpr std::string_view kInitrd = "/boot/initrd.img-6.8.0-45-generic";
     static constexpr std::string_view kMeasuredInitrd = "initrd measured at boot";
+    static constexpr std::string_view kUpdaterAsset = "nexus-updater-linux-x86_64";
 
     fs::path host(std::string_view p) const { return dir.path / fs::path(p).relative_path(); }
 
@@ -859,13 +915,15 @@ struct Host {
         installed = make_release(keys, "v2026.10.01", "nexus-old", "attestd-old", kEmptyLock);
         write_text(host("/usr/bin/lemonade-nexus"), installed.nexus_bin);
         write_text(host("/usr/bin/nexus-attestd"), installed.attestd_bin);
+        write_text(host(kUpdaterPath), "updater-old");
         write_text(host(security::kReleaseApprovalPath), installed.approval);
         write_text(host("/proc/sys/kernel/random/boot_id"), boot_id + "\n");
         write_text(host("/etc/default/grub"), "GRUB_DEFAULT=saved\n");
         write_text(host("/boot/grub/grub.cfg"), kGrubCfg);
         write_text(host(kInitrd), std::string(kMeasuredInitrd));
         set_next(make_release(keys, "v2026.10.24", "nexus-new", "attestd-new", kEmptyLock,
-                              {sha256_hex("nexus-old")}, {sha256_hex("attestd-old")}));
+                              {sha256_hex("nexus-old")}, {sha256_hex("attestd-old")}, '8',
+                              "updater-new"));
     }
 
     void set_next(ReleaseFiles r) {
@@ -876,8 +934,11 @@ struct Host {
                   {"os-packages.lock", next.lock},
                   {"lemonade-nexus-linux-x86_64", next.nexus_bin},
                   {"nexus-attestd-linux-x86_64", next.attestd_bin}};
+        if (!next.updater_bin.empty()) assets[std::string(kUpdaterAsset)] = next.updater_bin;
         for (const auto& name : {"manifest.json", "release-approval.json", "os-packages.lock",
-                                 "lemonade-nexus-linux-x86_64", "nexus-attestd-linux-x86_64"}) {
+                                 "lemonade-nexus-linux-x86_64", "nexus-attestd-linux-x86_64",
+                                 "nexus-updater-linux-x86_64"}) {
+            if (!assets.count(name)) continue;
             assets[std::string(name) + ".sigstore.json"] =
                 "provenance:" + sha256_hex(assets[name]);
         }
@@ -909,6 +970,7 @@ struct Host {
         const auto op = r.value("op", std::string());
         ops.push_back(op);
         if (op == "health") {
+            updater_at_health.insert(read_text(host(kUpdaterPath)));
             const auto h = *health();
             return json{{"ok", true},
                         {"running_release", h.running_release},
@@ -1317,6 +1379,178 @@ TEST(UpdaterCycle, RollsBackAndHaltsWhenTheHealthGateFails) {
     EXPECT_EQ(u.run_once().outcome, CycleOutcome::Upgraded);
 }
 
+TEST(UpdaterCycle, InstallsTheUpdaterAfterTheHealthGateAndKeepsThePreviousCopy) {
+    Host h;
+    auto u = h.updater();
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-new");
+    EXPECT_EQ(read_text(h.host("/usr/bin/nexus-attestd")), "attestd-new");
+    EXPECT_EQ(read_text(h.host(kUpdaterPath)), "updater-new");
+    EXPECT_NE(fs::status(h.host(kUpdaterPath)).permissions() & fs::perms::owner_exec,
+              fs::perms::none);
+    const auto previous = u.state_dir() / "previous" / h.next.tag;
+    EXPECT_EQ(read_text(previous / "lemonade-nexus"), "nexus-old");
+    EXPECT_EQ(read_text(previous / "nexus-attestd"), "attestd-old");
+    EXPECT_EQ(read_text(previous / "nexus-updater"), "updater-old");
+    // Every health request, the gate included, saw the old updater: the swap
+    // came after the gate passed.
+    EXPECT_EQ(h.updater_at_health, std::set<std::string>{"updater-old"});
+    // The updater swap touches no service: one stop and one start, around the
+    // server swap, and no restart.
+    int stops = 0, starts = 0, restarts = 0;
+    for (const auto& argv : h.commands) {
+        if (argv[0] != "systemctl") continue;
+        stops += argv[1] == "stop";
+        starts += argv[1] == "start";
+        restarts += argv[1] == "restart";
+    }
+    EXPECT_EQ(stops, 1);
+    EXPECT_EQ(starts, 1);
+    EXPECT_EQ(restarts, 0);
+    EXPECT_FALSE(fs::exists(u.state_dir() / "updater-swap-journal.json"));
+    EXPECT_FALSE(fs::exists(u.state_dir() / "staged"));
+    EXPECT_EQ(h.reports, std::vector<std::string>{"upgraded"});
+}
+
+TEST(UpdaterCycle, AReleaseWithoutAnUpdaterBinaryInstallsTheServerOnly) {
+    Host h;
+    h.set_next(make_release(h.keys, "v2026.10.24", "nexus-new", "attestd-new", kEmptyLock,
+                            {sha256_hex("nexus-old")}, {sha256_hex("attestd-old")}));
+    auto u = h.updater();
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-new");
+    EXPECT_EQ(read_text(h.host("/usr/bin/nexus-attestd")), "attestd-new");
+    EXPECT_EQ(read_text(h.host(kUpdaterPath)), "updater-old");
+    EXPECT_FALSE(fs::exists(u.state_dir() / "previous" / h.next.tag / "nexus-updater"));
+    EXPECT_EQ(h.reports, std::vector<std::string>{"upgraded"});
+}
+
+TEST(UpdaterCycle, AFailedHealthGateKeepsThePreviousServerAttestdAndUpdater) {
+    Host h;
+    h.new_binary_is_broken = true;
+    auto u = h.updater();
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Failed) << r.detail;
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
+    EXPECT_EQ(read_text(h.host("/usr/bin/nexus-attestd")), "attestd-old");
+    EXPECT_EQ(read_text(h.host(kUpdaterPath)), "updater-old");
+    EXPECT_EQ(h.updater_at_health, std::set<std::string>{"updater-old"});
+    EXPECT_FALSE(fs::exists(u.state_dir() / "updater-swap-journal.json"));
+    EXPECT_EQ(h.reports, std::vector<std::string>{"failed"});
+    // The fix release brings its own updater, installed once it is healthy.
+    h.new_binary_is_broken = false;
+    h.set_next(make_release(h.keys, "v2026.10.24.2", "nexus-new", "attestd-new", kEmptyLock,
+                            {sha256_hex("nexus-old")}, {sha256_hex("attestd-old")}, '8',
+                            "updater-fixed"));
+    ASSERT_EQ(u.run_once().outcome, CycleOutcome::Upgraded);
+    EXPECT_EQ(read_text(h.host(kUpdaterPath)), "updater-fixed");
+    EXPECT_EQ(read_text(u.state_dir() / "previous" / "v2026.10.24.2" / "nexus-updater"),
+              "updater-old");
+}
+
+TEST(UpdaterCycle, AnUpdaterSwapInterruptedBeforeTheCommitIsRolledBackWithTheServer) {
+    // The journal of the updater swap outlives a crash between the swap and
+    // the recorded commit; a rollback in the next cycle restores the updater.
+    Host h;
+    auto u = h.updater();
+    write_text(u.state_dir() / "staged" / h.next.tag / std::string(Host::kUpdaterAsset),
+               h.next.updater_bin);
+    SwapPlan plan;
+    plan.release_tag = h.next.tag;
+    plan.backup_dir = u.state_dir() / "previous" / h.next.tag;
+    plan.files = {{h.host(kUpdaterPath),
+                   u.state_dir() / "staged" / h.next.tag / std::string(Host::kUpdaterAsset),
+                   sha256_hex(h.next.updater_bin)}};
+    std::string error;
+    ASSERT_TRUE(FileSwapper(u.state_dir() / "updater-swap-journal.json").apply(plan, error))
+        << error;
+    ASSERT_EQ(read_text(h.host(kUpdaterPath)), "updater-new");
+    const auto baseline = h.serve(encode_health_request());
+    const json state = {
+        {"installed_release_number", 0},
+        {"halted_release_number", 0},
+        {"phase", "swapped"},
+        {"tag", h.next.tag},
+        {"number", 2026102401},
+        {"baseline", baseline},
+        {"packages_install", json::array()},
+        {"packages_previous", json::array()},
+        {"reboot", false},
+        {"previous_grub_entry", ""},
+        {"boot_id", ""},
+        {"staged_seal_names", json::array()},
+        {"updater_asset", std::string(Host::kUpdaterAsset)},
+        {"updater_sha256", sha256_hex(h.next.updater_bin)},
+        {"last_result", ""},
+    };
+    write_text(u.state_dir() / "state.json", state.dump());
+    // The server files were swapped and journaled before the crash too.
+    SwapPlan server;
+    server.release_tag = h.next.tag;
+    server.backup_dir = plan.backup_dir;
+    const auto staged = u.state_dir() / "staged" / h.next.tag;
+    write_text(staged / "lemonade-nexus-linux-x86_64", h.next.nexus_bin);
+    write_text(staged / "nexus-attestd-linux-x86_64", h.next.attestd_bin);
+    write_text(staged / "release-approval.json", h.next.approval);
+    server.files = {{h.host("/usr/bin/lemonade-nexus"), staged / "lemonade-nexus-linux-x86_64",
+                     sha256_hex(h.next.nexus_bin)},
+                    {h.host("/usr/bin/nexus-attestd"), staged / "nexus-attestd-linux-x86_64",
+                     sha256_hex(h.next.attestd_bin)},
+                    {h.host(security::kReleaseApprovalPath), staged / "release-approval.json",
+                     sha256_hex(h.next.approval)}};
+    ASSERT_TRUE(FileSwapper(u.state_dir() / "swap-journal.json").apply(server, error)) << error;
+    h.running = false;
+    h.new_binary_is_broken = true;
+
+    const auto r = u.run_once();
+    ASSERT_EQ(r.outcome, CycleOutcome::Failed) << r.detail;
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
+    EXPECT_EQ(read_text(h.host("/usr/bin/nexus-attestd")), "attestd-old");
+    EXPECT_EQ(read_text(h.host(kUpdaterPath)), "updater-old");
+    EXPECT_FALSE(fs::exists(u.state_dir() / "updater-swap-journal.json"));
+}
+
+TEST(UpdaterCycle, RefusesATamperedUpdaterAssetBeforeAnyFileChanges) {
+    Host h;
+    h.assets[std::string(Host::kUpdaterAsset)] = "updater-evil";
+    auto u = h.updater();
+    const auto r = u.run_once();
+    EXPECT_EQ(r.outcome, CycleOutcome::Refused);
+    EXPECT_NE(r.detail.find("signed manifest lists"), std::string::npos) << r.detail;
+    EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
+    EXPECT_EQ(read_text(h.host("/usr/bin/nexus-attestd")), "attestd-old");
+    EXPECT_EQ(read_text(h.host(kUpdaterPath)), "updater-old");
+    EXPECT_FALSE(h.ran({"systemctl", "stop"}));
+    EXPECT_FALSE(fs::exists(u.state_dir() / "staged" / h.next.tag));
+    EXPECT_FALSE(fs::exists(u.state_dir() / "previous"));
+}
+
+TEST(UpdaterCycle, RefusesAnUpdaterAssetThatIsMissingOrHasNoProvenance) {
+    {
+        Host h;
+        h.drop_assets.insert(std::string(Host::kUpdaterAsset) + ".sigstore.json");
+        auto u = h.updater();
+        const auto r = u.run_once();
+        EXPECT_EQ(r.outcome, CycleOutcome::Refused);
+        EXPECT_NE(r.detail.find("no provenance"), std::string::npos) << r.detail;
+        EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
+        EXPECT_EQ(read_text(h.host(kUpdaterPath)), "updater-old");
+    }
+    {
+        // The signed manifest names an updater the release does not carry.
+        Host h;
+        h.drop_assets.insert(std::string(Host::kUpdaterAsset));
+        auto u = h.updater();
+        const auto r = u.run_once();
+        EXPECT_EQ(r.outcome, CycleOutcome::Refused);
+        EXPECT_NE(r.detail.find("no asset"), std::string::npos) << r.detail;
+        EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
+        EXPECT_FALSE(h.ran({"systemctl", "stop"}));
+    }
+}
+
 TEST(UpdaterCycle, RollsBackWhenATier1ServerDoesNotRejoinBeforeTheDeadline) {
     Host h;
     h.tier1 = true;
@@ -1343,7 +1577,8 @@ TEST(UpdaterCycle, RebootsForABootChainChangeAfterStagingTheSealedBootSet) {
     Host h;
     h.set_next(make_release(h.keys, "v2026.10.24", "nexus-new", "attestd-new",
                             "format 1\npackage grub-efi-amd64-signed 1.202+2.12-1ubuntu8 boot\n",
-                            {sha256_hex("nexus-old")}, {sha256_hex("attestd-old")}, 'a'));
+                            {sha256_hex("nexus-old")}, {sha256_hex("attestd-old")}, 'a',
+                            "updater-new"));
     auto u = h.updater();
     auto r = u.run_once();
     ASSERT_EQ(r.outcome, CycleOutcome::Rebooting) << r.detail;
@@ -1351,11 +1586,16 @@ TEST(UpdaterCycle, RebootsForABootChainChangeAfterStagingTheSealedBootSet) {
     EXPECT_TRUE(h.ran({"systemctl", "reboot"}));
     EXPECT_TRUE(h.ran({"grub-editenv"}));
     EXPECT_EQ(h.packages["grub-efi-amd64-signed"], "1.202+2.12-1ubuntu8");
+    // The updater that started the update runs the health gate after boot.
+    EXPECT_EQ(read_text(h.host(kUpdaterPath)), "updater-old");
     // The next cycle after boot runs the health gate and commits.
     h.reboot();
     r = u.run_once();
     ASSERT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
     EXPECT_EQ(h.reports, std::vector<std::string>{"upgraded"});
+    EXPECT_EQ(read_text(h.host(kUpdaterPath)), "updater-new");
+    EXPECT_EQ(read_text(u.state_dir() / "previous" / "v2026.10.24" / "nexus-updater"),
+              "updater-old");
 }
 
 TEST(UpdaterCycle, BootsThePreviousGrubEntryWhenTheHealthGateFailsAfterReboot) {

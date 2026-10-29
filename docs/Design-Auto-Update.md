@@ -175,9 +175,10 @@ updater holds no server keys.
 7. **Health gate**, within a bounded time: the server reports the new version,
    passes attestation, resumes its epoch role, unlocks its data key, and
    catches up the tree log.
-8. On success, report "upgraded". On failure, restore the previous files,
-   restart, and report "failed". A failure halts the rollout for every server
-   until a newer release appears.
+8. On success, install the release's updater binary over the running one
+   (previous copy kept; the next cycle runs it) and report "upgraded". On
+   failure, restore the previous files, restart, and report "failed". A
+   failure halts the rollout for every server until a newer release appears.
 
 ## Phase 5: One at a time, through consensus
 

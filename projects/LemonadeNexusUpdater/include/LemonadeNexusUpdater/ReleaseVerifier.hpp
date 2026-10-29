@@ -35,13 +35,18 @@ inline constexpr std::string_view kManifestSignatureDomain =
 inline constexpr uint32_t kManifestFormatVersion = 1;
 inline constexpr std::size_t kMaxManifestBytes = 256 * 1024;
 
-/// The only files the updater replaces. Both are required approved paths;
-/// the approval itself installs at security::kReleaseApprovalPath. The
-/// updater does not replace itself: its hash is not in the approval.
+/// The server files the updater replaces in the swap. Both are required
+/// approved paths; the approval itself installs at
+/// security::kReleaseApprovalPath.
 inline constexpr std::string_view kSwappablePaths[] = {
     "/usr/bin/lemonade-nexus",
     "/usr/bin/nexus-attestd",
 };
+
+/// Where the updater installs its own binary. The updater is not attested, so
+/// its hash is not in the approval: the manifest signature and the Sigstore
+/// provenance cover it, and the swap happens only after the health gate.
+inline constexpr std::string_view kUpdaterPath = "/usr/bin/nexus-updater";
 
 struct ManifestFile {
     std::string asset;
@@ -69,6 +74,11 @@ struct ReleaseManifest {
     std::string approval_digest;
 
     std::vector<ManifestFile> server_files;
+
+    /// The release's updater binary, installed at kUpdaterPath after the
+    /// health gate. An empty asset: the release carries none and the
+    /// installed updater stays.
+    ManifestFile updater;
 
     std::string os_lock_asset;
     std::string os_lock_sha256;
