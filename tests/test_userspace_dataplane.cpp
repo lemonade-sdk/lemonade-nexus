@@ -167,6 +167,10 @@ TEST_F(UserspaceDataplaneTest, TwoNodesHandshakeAndExchangePackets) {
     EXPECT_GT(peers[0].last_handshake, 0u);
     EXPECT_GT(peers[0].rx_bytes, 0u);
     EXPECT_FALSE(peers[0].endpoint.empty());
+    // An authenticated packet from the client marks it alive (keepalives do
+    // too; the handshake time alone goes stale on an idle tunnel).
+    EXPECT_GT(peers[0].last_rx, 0u);
+    EXPECT_LE(peers[0].last_rx, static_cast<uint64_t>(std::time(nullptr)));
 
     client.dataplane.stop();
     server.dataplane.stop();
