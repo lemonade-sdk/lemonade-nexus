@@ -19,6 +19,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -427,6 +428,25 @@ TEST(MeshPortRules, AutoRouteOrder) {
     EXPECT_EQ(merged["data"][4]["id"], "Fast box/Big");
 }
 
+// Every model a device lists appears in the merged listing with a loaded flag
+// from its health all_models_loaded, so a client can badge loaded models.
+TEST(MeshPortRules, MergedModelsCarryALoadedFlag) {
+    lnsdk::MeshPortPeerModels gpu{"gpu", "GPU tower", 20,
+                                  json::array({{{"model_name", "Big"}, {"is_busy", true}}, "junk", {{"other", 1}}}),
+                                  {"Big", "Spare"}};
+    lnsdk::MeshPortPeerModels quiet{"fast", "Fast box", 2, json(), {"Idle"}};  // health gave no list
+    const auto merged = rules::merge_models({{"object", "list"}, {"data", json::array({{{"id", "Small"}}})}},
+                                            {gpu, quiet});
+    ASSERT_EQ(merged["data"].size(), 4u);
+    EXPECT_FALSE(merged["data"][0].contains("loaded")) << "local entries pass through unchanged";
+    EXPECT_EQ(merged["data"][1]["id"], "GPU tower/Big");
+    EXPECT_EQ(merged["data"][1]["loaded"], true);
+    EXPECT_EQ(merged["data"][2]["id"], "GPU tower/Spare");
+    EXPECT_EQ(merged["data"][2]["loaded"], false);
+    EXPECT_EQ(merged["data"][3]["loaded"], false);
+    EXPECT_EQ(rules::loaded_model_names(gpu), (std::set<std::string>{"Big"}));
+}
+
 TEST(MeshPortRules, UrlsDomainsAndLocalService) {
     const auto members = group_members();
     const auto urls = rules::device_urls(members, "self", kDomain, 13306, true);
@@ -548,6 +568,21 @@ TEST_F(MeshPortTest, AutoRouter) {
     ASSERT_EQ(ids.size(), 3u);
     EXPECT_EQ(ids[0]["id"], "LocalModel");
     EXPECT_EQ(ids[1]["id"], "GPU tower/PeerModel");
+    EXPECT_EQ(ids[1]["loaded"], true);
+    EXPECT_EQ(ids[2]["id"], "GPU tower/Shared");
+    EXPECT_EQ(ids[2]["loaded"], false);
+    // The status counts what that probe found; it sends no request itself.
+    const int listings = peer_model_listings.load();
+    bool found = false;
+    const auto status = port->status();
+    for (const auto& device : status["devices"]) {
+        if (device["node_id"] != "gpu") continue;
+        found = true;
+        EXPECT_EQ(device["models_count"], 2);
+        EXPECT_EQ(device["loaded_count"], 1);
+    }
+    EXPECT_TRUE(found);
+    EXPECT_EQ(peer_model_listings.load(), listings);
 }
 
 TEST_F(MeshPortTest, AutoRouterSkipsDevicesThatRefuseTheKey) {
@@ -893,6 +928,69 @@ TEST_F(MeshPortTest, RemovedPeerClosesItsEgress) {
         members.erase(members.begin() + 1);
     }
     port->refresh_now();
+    EXPECT_EQ(closed_egress.load(), 1);
+}
+
+// A bridge carries connections over the mesh path that was current when they
+// opened. A new relay allocation for the device closes it, so the next request
+// opens a fresh one; an unchanged path keeps it.
+TEST_F(MeshPortTest, ARelayChangeClosesTheEgress) {
+    start();
+    ASSERT_EQ(port->set_selection("gpu", ""), 0);
+    httplib::Client client("127.0.0.1", number);
+    const auto set_relay = [&](const std::string& relay) {
+        std::lock_guard lock(members_mutex);
+        members[1].relay_endpoint = relay;
+    };
+    ASSERT_TRUE(chat(client, "PeerModel"));
+    set_relay("198.51.100.7:9103");
+    port->refresh_now();
+    EXPECT_EQ(closed_egress.load(), 1) << "moving onto a relay closes the bridge";
+    ASSERT_TRUE(chat(client, "PeerModel"));
+    port->refresh_now();
+    EXPECT_EQ(closed_egress.load(), 1) << "the same relay keeps the bridge";
+    set_relay("203.0.113.9:9103");
+    port->refresh_now();
+    EXPECT_EQ(closed_egress.load(), 2) << "a new relay allocation closes the bridge";
+}
+
+// A request whose bridge answers nothing at once gets a new bridge and is sent
+// once more before it is answered.
+TEST_F(MeshPortTest, ADeadBridgeIsReplacedOnceBeforeTheAnswer) {
+    std::atomic<int> opened{0};
+    const auto dead = free_port();  // nothing listens there: the bridge is gone
+    auto b = backend();
+    const auto peer_port = static_cast<uint16_t>(peer.port);
+    b.open_egress = [&, dead, peer_port](const std::string& ip, uint16_t) -> uint16_t {
+        if (ip != "10.64.0.3") return 0;
+        return opened++ == 0 || closed_egress.load() == 0 ? dead : peer_port;
+    };
+    port = std::make_unique<MeshPort>(std::move(b), options);
+    number = free_port();
+    ASSERT_EQ(port->start(number, ""), MeshPortStartResult::Ok);
+    port->refresh_now();
+    closed_egress = 0;
+    opened = 0;
+    ASSERT_EQ(port->set_selection("gpu", ""), 0);
+    httplib::Client client("127.0.0.1", number);
+    auto served = chat(client, "PeerModel");
+    ASSERT_TRUE(served);
+    EXPECT_EQ(served->status, 200);
+    EXPECT_EQ(json::parse(served->body)["served_by"], "peer");
+    EXPECT_EQ(closed_egress.load(), 1);
+
+    // A bridge that stays dead is replaced only once, then answered with 502.
+    port->stop();
+    auto always_dead = backend();
+    always_dead.open_egress = [dead](const std::string&, uint16_t) -> uint16_t { return dead; };
+    port = std::make_unique<MeshPort>(std::move(always_dead), options);
+    ASSERT_EQ(port->start(number, ""), MeshPortStartResult::Ok);
+    port->refresh_now();
+    closed_egress = 0;
+    ASSERT_EQ(port->set_selection("gpu", ""), 0);
+    auto failed = chat(client, "PeerModel");
+    ASSERT_TRUE(failed);
+    EXPECT_EQ(failed->status, 502);
     EXPECT_EQ(closed_egress.load(), 1);
 }
 

@@ -38,6 +38,22 @@ TEST(SdkCapiMesh, InferenceRoleAndInactiveMeshCalls) {
     EXPECT_EQ(ln_mesh_open_egress(client.c, "10.64.0.2", 13305, &port), LN_ERR_CONNECT);
 }
 
+// The device name for the next join: argument checks and the names refused
+// before any request.
+TEST(SdkCapiMesh, DeviceNameIsCheckedBeforeTheJoin) {
+    EXPECT_EQ(ln_set_device_name(nullptr, "Work PC"), LN_ERR_NULL_ARG);
+    Client client;
+    ASSERT_NE(client.c, nullptr);
+    EXPECT_EQ(ln_set_device_name(client.c, "Work PC"), LN_OK);
+    EXPECT_EQ(ln_set_device_name(client.c, nullptr), LN_OK) << "NULL clears the name";
+    EXPECT_EQ(ln_set_device_name(client.c, ""), LN_OK);
+    for (const char* refused : {"---", "Geramy's PC", "a;b", "line\nbreak", "tab\there"}) {
+        EXPECT_EQ(ln_set_device_name(client.c, refused), LN_ERR_REJECTED) << refused;
+    }
+    EXPECT_EQ(ln_set_device_name(client.c, std::string(65, 'a').c_str()), LN_ERR_REJECTED);
+    EXPECT_EQ(ln_set_device_name(client.c, std::string(64, 'a').c_str()), LN_OK);
+}
+
 // Invite, membership, and move calls: argument checks, the caller-owned
 // out_json, and the inactive-mesh result (these are private-API calls).
 TEST(SdkCapiMesh, InviteMembershipAndMoveCallsCheckArguments) {

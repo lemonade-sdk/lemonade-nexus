@@ -353,6 +353,21 @@ Join is composite — one call does everything:
 After joining, private API calls (tree, IPAM, mesh, routing, certs) route
 over the mesh to the server's private API.
 
+**Device name.** Call `client.set_device_name("Work PC")` (C ABI:
+`ln_set_device_name`) before the join that creates the device's node; the
+join sends it as `hostname`. Without a name the server names the device
+`endpoint-<8 hex digits>`. The `username` argument of `join_network` is not a
+device name. A device that already has its node keeps its stored name; rename
+it with `update_node`. When the name folds to a mesh-port label that another
+device of the target group holds (see `ln_check_device_name`), the server
+refuses that name and the SDK joins again under the server's default name: the
+join succeeds and reports `device_name_refused` with `device_name_suggestion`,
+a free name taken from a device-name check of the invite. A name longer than
+64 bytes, with a control character or one of ``;|&$`(){}<>'"\``, or without a
+letter or digit is refused before any request (peers drop a listed device
+whose name carries those characters). When the join creates a new group (no
+invite), the server also gives the group that name.
+
 ## Invites and Other Networks
 
 An invite is single use and names one group. One call creates it: without a
@@ -504,6 +519,20 @@ C ABI equivalents: `ln_mesh_enable`, `ln_mesh_enable_config`,
 `ln_mesh_disable`, `ln_mesh_status`, `ln_mesh_peers`, `ln_mesh_refresh`,
 `ln_mesh_expose_service`, `ln_mesh_open_egress`, plus
 `ln_private_api_call` for generic authenticated private routes.
+`ln_mesh_peers` and the `peers` of `ln_mesh_status` carry every `MeshPeer`
+field, including `peer_permissions`, `mgmt_pubkey`, `last_seen` and
+`last_rx`.
+
+**Peer liveness.** A monitor pass every 5 s sets each peer's `is_online`
+(`lnsdk::peer_signal_fresh` and `lnsdk::next_peer_liveness` in
+`MeshOrchestrator.hpp`). An authenticated packet from the peer, keepalives
+included, within three keepalive intervals plus 5 s keeps it online. Before
+the first packet, a live WireGuard session (handshake under 200 s; BoringTun
+rejects a session after 180 s) or a recent server contact (`last_seen`
+within 15 s plus one peer refresh interval) counts. A relayed peer also
+stays online while the server's `last_seen` is that recent. An online peer
+reads offline only after two stale passes in a row, so one late keepalive
+or peer refresh does not flip it. The mesh port routes only to online peers.
 
 ### Service catalog and route policy
 
@@ -677,7 +706,11 @@ ln_mesh_port_stop(client);
 - With the `auto` selection, `/api/v1/models` merges the local models with
   `<device>/<model>` entries from each reachable Tier 3 device. The devices are
   probed concurrently with a 3 s deadline and the result is cached for a few
-  seconds. A model name that matches a local model ID exactly stays local, even
+  seconds. Each `<device>/<model>` entry carries `"loaded": true` or `false`
+  from that device's `/api/v1/health` `all_models_loaded`, and the status lists
+  `models_count` and `loaded_count` per device from the same probe, so an app
+  can show every model with a loaded badge without another request. A model
+  name that matches a local model ID exactly stays local, even
   when it contains `/`; otherwise `<device>/<model>` names that device. A
   device that answers 401 or 403 to the peer key is never chosen by `auto`.
 - The TLS server name and the `Host` header must name the same host, otherwise
@@ -686,6 +719,14 @@ ln_mesh_port_stop(client);
   be online and Tier 3 (409 otherwise), and this device must hold
   `connect_private`, `connect_shared` or `admin` on it (403 otherwise). An
   unknown name answers 404.
+- The port closes its loopback bridge to a device when the device's mesh
+  address or its relay path changes (it moves onto a relay, onto a new relay
+  allocation, or back to a direct path), so the next request opens a fresh
+  bridge. A forwarded request whose bridge answers nothing within 10 s gets a
+  new bridge and is sent once more; a request that reached the device and
+  failed before its first response byte can therefore run twice. An
+  application that holds a port from `ln_mesh_open_egress` should call it
+  again before each connection.
 - This device's own name and the loopback names serve the selection: `local`
   (the local service URL given to `ln_mesh_port_start`), `auto`, or one node ID.
   Without a selection, or when the selected device is offline, the answer is

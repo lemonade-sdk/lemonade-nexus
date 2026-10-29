@@ -8,6 +8,7 @@
 
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
+#include <LemonadeNexusSDK/lemonade_nexus.h>
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
@@ -242,6 +243,20 @@ protected:
     std::vector<bool> joins_with_link_token() {
         std::lock_guard lock(join_mtx);
         return join_had_link_token;
+    }
+    // The hostname of each join request ("<none>" without one), and whether
+    // a join that names its device is refused as a taken name.
+    std::vector<std::string> join_hostname_seen;
+    std::atomic<bool>        device_name_taken{false};
+    std::vector<nlohmann::json> name_checks_seen;  // device-name check bodies
+
+    std::vector<std::string> join_hostnames() {
+        std::lock_guard lock(join_mtx);
+        return join_hostname_seen;
+    }
+    std::vector<nlohmann::json> name_checks() {
+        std::lock_guard lock(join_mtx);
+        return name_checks_seen;
     }
     std::mutex               heartbeat_mtx;
     std::vector<std::string> heartbeat_endpoints;  // the "endpoint" of each heartbeat
@@ -583,6 +598,17 @@ protected:
                 nlohmann::json{{"challenge", nexus::crypto::to_base64(challenge)}}.dump(),
                 "application/json");
         });
+        srv.Post("/api/tree/device-name/check", [this](const httplib::Request& req,
+                                                       httplib::Response& res) {
+            {
+                std::lock_guard lock(join_mtx);
+                name_checks_seen.push_back(nlohmann::json::parse(req.body, nullptr, false));
+            }
+            res.set_content(R"({"label":"work-pc","available":false,)"
+                            R"("conflicts":[{"node_id":"dev-1","device_name":"work-pc"}],)"
+                            R"("suggestion":"work-pc-2"})",
+                            "application/json");
+        });
         srv.Post("/api/auth", [&auths](const httplib::Request&, httplib::Response& res) {
             ++auths;
             res.set_content(
@@ -595,6 +621,19 @@ protected:
             {
                 std::lock_guard lock(join_mtx);
                 join_had_link_token.push_back(body.is_object() && body.contains("link_token"));
+                join_hostname_seen.push_back(body.is_object() && body.contains("hostname")
+                                                 ? body.value("hostname", std::string{})
+                                                 : std::string{"<none>"});
+            }
+            if (device_name_taken.load() && body.is_object() && body.contains("hostname")) {
+                // The tree's refusal text (tree::rules::device_name_refusal).
+                res.status = 409;
+                res.set_content(nlohmann::json{{"error", "device name '" + body.value("hostname", std::string{}) +
+                                                             "' is the same as device 'work-pc' (dev-1) on "
+                                                             "the mesh port; pick another name"}}
+                                    .dump(),
+                                "application/json");
+                return;
             }
             {
                 std::lock_guard lock(bearer_mtx);
@@ -755,6 +794,51 @@ TEST_F(SdkMeshPrivateApiTest, APendingJoinIsRepeatedWithoutTheLinkTokenUntilItCo
     ASSERT_TRUE(client->is_mesh_active());
     EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, false}));
     EXPECT_EQ(pending_join_replies.load(), 0);
+}
+
+// A device name set before the join goes with the join, so the server names
+// the new node with it instead of "endpoint-<8>".
+TEST_F(SdkMeshPrivateApiTest, TheJoinCarriesTheDeviceName) {
+    LN_REQUIRE_TEST_TRUST();
+    lnsdk::ServerConfig cfg;
+    cfg.servers = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    client.set_session_token("session-token");
+    ASSERT_TRUE(client.set_device_name("Work PC"));
+    const auto joined = client.join_network("user", "password");
+    ASSERT_TRUE(joined.ok) << joined.error;
+    EXPECT_FALSE(joined.value.device_name_refused);
+    EXPECT_EQ(join_hostnames(), (std::vector<std::string>{"Work PC"}));
+    client.disable_mesh();
+}
+
+// A name that another device of the invite's group holds never fails the
+// join: the device joins again under the server's default name, keeps the
+// invite, and learns a free name for a rename.
+TEST_F(SdkMeshPrivateApiTest, ATakenDeviceNameFallsBackToTheServerDefault) {
+    LN_REQUIRE_TEST_TRUST();
+    device_name_taken = true;
+    lnsdk::ServerConfig cfg;
+    cfg.servers = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    client.set_session_token("session-token");
+    ASSERT_TRUE(client.set_link_token("12345678"));
+    ASSERT_TRUE(client.set_device_name("Work PC"));
+    const auto joined = client.join_network("user", "password");
+    ASSERT_TRUE(joined.ok) << joined.error;
+    EXPECT_TRUE(joined.value.device_name_refused);
+    EXPECT_EQ(joined.value.device_name_suggestion, "work-pc-2");
+    EXPECT_EQ(join_hostnames(), (std::vector<std::string>{"Work PC", "<none>"}));
+    EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, true})) << "the invite is kept";
+    const auto checks = name_checks();
+    ASSERT_EQ(checks.size(), 1u);
+    EXPECT_EQ(checks[0].value("name", ""), "Work PC");
+    EXPECT_EQ(checks[0].value("link_token", ""), "12345678");
+    client.disable_mesh();
 }
 
 // Tier 1 rotates a member out at an epoch boundary. A session bound to that
@@ -1162,6 +1246,57 @@ TEST_F(SdkMeshPrivateApiTest, PeerPermissionsAndManagementKeyComeFromThePeerList
     EXPECT_EQ(peers[0].mgmt_pubkey, "ed25519:cGVlci1tZ210LWtleQ==");
     EXPECT_EQ(peers[0].permissions, (std::vector<std::string>{"read", "svc:inference"}));
     client->disable_mesh();
+}
+
+// The C ABI peer list carries every field the header documents, through the
+// same serialization as the C++ types: lemond and the Flutter plugin read the
+// peer's permissions and management key from it.
+TEST_F(SdkMeshPrivateApiTest, CApiPeerListCarriesPermissionsKeyAndTimestamps) {
+    LN_REQUIRE_TEST_TRUST();
+    ln_client_t* c = ln_create_tls("localhost", static_cast<uint16_t>(pub_port));
+    ASSERT_NE(c, nullptr);
+    struct Destroy {
+        ln_client_t* c;
+        ~Destroy() { ln_destroy(c); }
+    } destroy{c};
+    ASSERT_EQ(ln_set_genesis_key(c, nexus::crypto::to_base64(chain.genesis.public_key).c_str(), 0),
+              LN_OK);
+    ASSERT_EQ(ln_set_session_token(c, "session-token"), LN_OK);
+    char* out = nullptr;
+    ASSERT_EQ(ln_join_network(c, "user", "password", &out), LN_OK) << (out ? out : "");
+    ln_free(out);
+    ASSERT_EQ(ln_mesh_enable_config(
+                  c, R"({"peer_refresh_interval_sec":3600,"heartbeat_interval_sec":3600})"),
+              LN_OK);
+
+    nlohmann::json peers;
+    ASSERT_TRUE(wait_for([&] {
+        char* listed = nullptr;
+        if (ln_mesh_peers(c, &listed) != LN_OK || !listed) return false;
+        peers = nlohmann::json::parse(listed, nullptr, false);
+        ln_free(listed);
+        return peers.is_array() && !peers.empty();
+    }, std::chrono::seconds(10)));
+    ASSERT_EQ(peers.size(), 1u) << peers.dump();
+    const auto& peer = peers[0];
+    EXPECT_EQ(peer["node_id"], kPeerId);
+    EXPECT_EQ(peer["mgmt_pubkey"], "ed25519:cGVlci1tZ210LWtleQ==");
+    EXPECT_EQ(peer["peer_permissions"], nlohmann::json::array({"read", "svc:inference"}));
+    for (const char* field : {"last_seen", "last_rx", "last_handshake", "is_online"}) {
+        EXPECT_TRUE(peer.contains(field)) << field << " missing: " << peer.dump();
+    }
+
+    char* status = nullptr;
+    ASSERT_EQ(ln_mesh_status(c, &status), LN_OK);
+    const auto st = nlohmann::json::parse(status ? status : "null", nullptr, false);
+    ln_free(status);
+    ASSERT_TRUE(st.is_object());
+    EXPECT_EQ(st.value("needs_rejoin", true), false);
+    ASSERT_TRUE(st.contains("peers") && st["peers"].is_array());
+    for (const auto& p : st["peers"]) {
+        EXPECT_TRUE(p.contains("peer_permissions") && p.contains("last_rx")) << p.dump();
+    }
+    ln_mesh_disable(c);
 }
 
 // A mesh state callback runs on the orchestrator thread and may call back into
