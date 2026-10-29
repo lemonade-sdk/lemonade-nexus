@@ -355,6 +355,7 @@ add_sdk_test(test_sdk_capi_mesh       test_sdk_capi_mesh.cpp)
 add_sdk_test(test_sdk_cert_renewal    test_sdk_cert_renewal.cpp)
 add_sdk_test(test_sdk_identity       test_sdk_identity.cpp)
 add_sdk_test(test_sdk_mesh_port      test_sdk_mesh_port.cpp)
+add_sdk_test(test_sdk_service_ingress test_sdk_service_ingress.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)
