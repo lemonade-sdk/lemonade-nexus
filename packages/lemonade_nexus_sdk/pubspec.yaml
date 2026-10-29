@@ -27,6 +27,9 @@ dev_dependencies:
 # android/src/main/jniLibs/<abi>/liblemonade_nexus_sdk.so, written by
 # scripts/build-sdk-mobile.sh or downloaded at build time (native/manifest.json).
 flutter:
+  # Root certificates for the SDK's TLS on iOS and Android (trust_store.dart).
+  assets:
+    - assets/cacert.pem
   plugin:
     platforms:
       android:

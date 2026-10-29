@@ -18,6 +18,7 @@ import 'dart:async';
 import 'dart:isolate';
 
 import 'lemonade_nexus_sdk.dart';
+import 'trust_store.dart';
 import 'models.dart' show SessionMoveEvent;
 
 class NexusWorker {
@@ -32,10 +33,13 @@ class NexusWorker {
   int _nextId = 0;
   bool _closed = false;
 
-  /// Starts the worker isolate and loads the native library there.
+  /// Starts the worker isolate and loads the native library there. On iOS
+  /// and Android it first installs the root certificates the SDK's TLS
+  /// needs ([ensureMobileTrustStore]), so call it on the root isolate.
   /// [libraryPath] is passed to [LemonadeNexusSdk]; null uses the platform
   /// default. A library that fails to load fails each [run] call.
   static Future<NexusWorker> spawn({String? libraryPath}) async {
+    await ensureMobileTrustStore();
     final responses = ReceivePort();
     final isolate = await Isolate.spawn(
       _workerMain,

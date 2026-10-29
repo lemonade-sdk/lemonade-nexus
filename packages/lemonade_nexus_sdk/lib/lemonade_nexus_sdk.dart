@@ -10,3 +10,4 @@ library;
 
 export 'src/sdk.dart';
 export 'src/nexus_worker.dart';
+export 'src/trust_store.dart' show ensureMobileTrustStore;
