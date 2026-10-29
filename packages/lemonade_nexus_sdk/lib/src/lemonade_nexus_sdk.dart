@@ -826,8 +826,11 @@ class LemonadeNexusSdk {
     return _parseJson(json, TreeNode.fromJson);
   }
 
-  /// Updates a node.
-  Future<TreeNode> updateNode({
+  /// Updates a node. Returns the server's answer, `{success, node_id,
+  /// delta_sequence}` (not the node: read it again with [getNode]). Throws
+  /// when the server refused the update, for example a device name another
+  /// device of the group holds (see [checkDeviceName]).
+  Future<Map<String, dynamic>> updateNode({
     required String nodeId,
     required Map<String, dynamic> updates,
   }) async {
@@ -838,7 +841,13 @@ class LemonadeNexusSdk {
     if (result == null) {
       throw SdkException(LnError.internal, message: 'Failed to update node');
     }
-    return _parseJson(result, TreeNode.fromJson);
+    final answer = _parseJson<Map<String, dynamic>>(result, (m) => m);
+    if (answer['success'] != true) {
+      throw SdkException(LnError.rejected,
+          message: answer['error']?.toString() ?? 'The update was refused',
+          rawJson: result);
+    }
+    return answer;
   }
 
   /// Deletes a node.
