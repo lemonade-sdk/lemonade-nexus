@@ -23,6 +23,13 @@ function count here.
 - **Identity:** `ln_identity_generate`, `ln_identity_load`,
   `ln_identity_save`, `ln_identity_pubkey`, `ln_identity_destroy`,
   `ln_set_identity`, `ln_identity_from_seed`, `ln_derive_seed`
+- **Per-user identity store:** `ln_identity_user_dir`,
+  `ln_identity_user_status`, `ln_identity_user_load`,
+  `ln_identity_user_create`, `ln_identity_user_import`,
+  `ln_identity_user_remove`, `ln_identity_from_json` (migration only). The
+  app keeps its device identity here (`loadUserIdentity`,
+  `createUserIdentity`, `identityStoreStatus`); see the client README,
+  "Device identity".
 - **Health/stats/discovery:** `ln_health`, `ln_stats`, `ln_servers`,
   `ln_server_latencies`
 - **Tier 1 servers:** `ln_set_genesis_key`, `ln_tier1_refresh`,

@@ -349,6 +349,120 @@ class LemonadeNexusSdk {
     return IdentityInfo(pubkey: pubkey ?? '');
   }
 
+  // =========================================================================
+  // Per-user identity store
+  // =========================================================================
+
+  /// The state of the per-user identity store. Computing `unlocked` reads the
+  /// wrapping key from the OS keystore, which may ask the OS for access.
+  Future<IdentityStoreStatus> identityStoreStatus() async {
+    _checkDisposed();
+    final (error, json) = _ffi.identityUserStatus();
+    if (error != LnError.success || json == null) {
+      throw SdkException(error, message: 'Failed to read the identity store');
+    }
+    return IdentityStoreStatus.fromJson(jsonDecode(json) as Map<String, dynamic>);
+  }
+
+  /// Loads the user's stored identity and makes it the current identity.
+  /// Throws [SdkException] with [LnError.notFound] when nothing is stored,
+  /// [LnError.auth] when the keystore is locked or refuses, [LnError.unsupported]
+  /// when no keystore is usable, [LnError.rejected] when the stored file fails
+  /// verification, or [LnError.internal].
+  Future<IdentityInfo> loadUserIdentity() async {
+    _checkDisposed();
+    return _adoptUserIdentity(_ffi.identityUserLoad, 'Failed to load the device identity');
+  }
+
+  /// Creates a new identity for the user, stores it, and makes it the current
+  /// identity. Throws [SdkException] with [LnError.rejected] when one is
+  /// stored already, or the codes listed for [loadUserIdentity].
+  Future<IdentityInfo> createUserIdentity() async {
+    _checkDisposed();
+    return _adoptUserIdentity(_ffi.identityUserCreate, 'Failed to create the device identity');
+  }
+
+  Future<IdentityInfo> _adoptUserIdentity(
+      (LnError, ffi.Pointer<ffi.Void>) Function() open, String message) async {
+    final (error, handle) = open();
+    if (error != LnError.success || handle == ffi.nullptr) {
+      if (handle != ffi.nullptr) _ffi.identityDestroy(handle);
+      throw SdkException(error, message: message);
+    }
+    _destroyIdentity();
+    _identity = handle;
+    return IdentityInfo(pubkey: _ffi.identityPubkey(handle) ?? '');
+  }
+
+  /// Removes the user's stored identity (keystore item first, then the file)
+  /// and drops the current identity when it is the stored one. Throws
+  /// [SdkException] with [LnError.notFound] when nothing is stored.
+  Future<void> removeUserIdentity() async {
+    _checkDisposed();
+    final error = _ffi.identityUserRemove();
+    if (error != LnError.success) {
+      throw SdkException(error, message: 'Failed to remove the device identity');
+    }
+    _destroyIdentity();
+  }
+
+  /// The public key (`ed25519:<base64>`) of a legacy 32-byte seed, without
+  /// storing or adopting it. Null when the seed is not valid.
+  String? publicKeyOfSeed(Uint8List seed) {
+    _checkDisposed();
+    return _withLegacyIdentity(() => _ffi.identityFromSeed(seed), _ffi.identityPubkey);
+  }
+
+  /// The public key of a legacy `identity.json` text held in memory, without
+  /// storing or adopting it. Null when the text is malformed.
+  String? publicKeyOfIdentityJson(String jsonText) {
+    _checkDisposed();
+    return _withLegacyIdentity(() => _ffi.identityFromJson(jsonText), _ffi.identityPubkey);
+  }
+
+  /// Stores a legacy seed as the user's identity (one-time migration) and
+  /// returns its public key. The current identity is unchanged. Throws
+  /// [SdkException] with [LnError.rejected] when the store already holds an
+  /// identity or the seed is not valid.
+  Future<String> importUserIdentityFromSeed(Uint8List seed) async {
+    _checkDisposed();
+    return _importLegacyIdentity(() => _ffi.identityFromSeed(seed));
+  }
+
+  /// Stores a legacy `identity.json` text as the user's identity (one-time
+  /// migration) and returns its public key. See [importUserIdentityFromSeed].
+  Future<String> importUserIdentityFromJson(String jsonText) async {
+    _checkDisposed();
+    return _importLegacyIdentity(() => _ffi.identityFromJson(jsonText));
+  }
+
+  Future<String> _importLegacyIdentity(ffi.Pointer<ffi.Void> Function() make) async {
+    final pubkey = _withLegacyIdentity(make, (handle) {
+      final error = _ffi.identityUserImport(handle);
+      if (error != LnError.success) {
+        throw SdkException(error, message: 'Failed to import the legacy identity');
+      }
+      return _ffi.identityPubkey(handle);
+    });
+    if (pubkey == null) {
+      throw SdkException(LnError.rejected, message: 'The legacy identity is not valid');
+    }
+    return pubkey;
+  }
+
+  /// Runs [body] on a temporary identity handle and destroys the handle
+  /// afterwards, so the legacy key never becomes the current identity.
+  T? _withLegacyIdentity<T>(
+      ffi.Pointer<ffi.Void> Function() make, T? Function(ffi.Pointer<ffi.Void>) body) {
+    final handle = make();
+    if (handle == ffi.nullptr) return null;
+    try {
+      return body(handle);
+    } finally {
+      _ffi.identityDestroy(handle);
+    }
+  }
+
   /// Derives a seed from username and password.
   Future<String> deriveSeed(String username, String password) async {
     _checkDisposed();

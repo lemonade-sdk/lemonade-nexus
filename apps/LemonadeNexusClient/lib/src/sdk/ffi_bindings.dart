@@ -127,6 +127,38 @@ typedef _LnDeriveSeedDart = ffi.Pointer<ffi.Char> Function(
   ffi.Pointer<ffi.Char> password,
 );
 
+// Per-user identity store (ln_identity_user_*). `ln_error_t` is a C enum,
+// so it crosses the boundary as a 32-bit int.
+typedef _LnIdentityUserDir = ffi.Pointer<ffi.Char> Function();
+typedef _LnIdentityUserDirDart = ffi.Pointer<ffi.Char> Function();
+
+typedef _LnIdentityUserStatus = ffi.Int32 Function(
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnIdentityUserStatusDart = int Function(
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+
+typedef _LnIdentityUserOpen = LnIdentityHandle Function(
+  ffi.Pointer<ffi.Int32> outErr,
+);
+typedef _LnIdentityUserOpenDart = LnIdentityHandle Function(
+  ffi.Pointer<ffi.Int32> outErr,
+);
+
+typedef _LnIdentityUserImport = ffi.Int32 Function(LnIdentityHandle identity);
+typedef _LnIdentityUserImportDart = int Function(LnIdentityHandle identity);
+
+typedef _LnIdentityUserRemove = ffi.Int32 Function();
+typedef _LnIdentityUserRemoveDart = int Function();
+
+typedef _LnIdentityFromJson = LnIdentityHandle Function(
+  ffi.Pointer<ffi.Char> jsonText,
+);
+typedef _LnIdentityFromJsonDart = LnIdentityHandle Function(
+  ffi.Pointer<ffi.Char> jsonText,
+);
+
 // Account group-key envelopes
 typedef _LnGroupKeyGenerate = ffi.Pointer<ffi.Char> Function();
 typedef _LnGroupKeyGenerateDart = ffi.Pointer<ffi.Char> Function();
@@ -850,6 +882,20 @@ class LemonadeNexusFfi {
           _LnIdentityFromSeedDart>('ln_identity_from_seed');
   late final _lnDeriveSeed =
       _lib.lookupFunction<_LnDeriveSeed, _LnDeriveSeedDart>('ln_derive_seed');
+  late final _lnIdentityUserDir = _lib.lookupFunction<_LnIdentityUserDir,
+      _LnIdentityUserDirDart>('ln_identity_user_dir');
+  late final _lnIdentityUserStatus = _lib.lookupFunction<_LnIdentityUserStatus,
+      _LnIdentityUserStatusDart>('ln_identity_user_status');
+  late final _lnIdentityUserLoad = _lib.lookupFunction<_LnIdentityUserOpen,
+      _LnIdentityUserOpenDart>('ln_identity_user_load');
+  late final _lnIdentityUserCreate = _lib.lookupFunction<_LnIdentityUserOpen,
+      _LnIdentityUserOpenDart>('ln_identity_user_create');
+  late final _lnIdentityUserImport = _lib.lookupFunction<_LnIdentityUserImport,
+      _LnIdentityUserImportDart>('ln_identity_user_import');
+  late final _lnIdentityUserRemove = _lib.lookupFunction<_LnIdentityUserRemove,
+      _LnIdentityUserRemoveDart>('ln_identity_user_remove');
+  late final _lnIdentityFromJson = _lib.lookupFunction<_LnIdentityFromJson,
+      _LnIdentityFromJsonDart>('ln_identity_from_json');
   late final _lnGroupKeyGenerate = _lib.lookupFunction<_LnGroupKeyGenerate,
       _LnGroupKeyGenerateDart>('ln_group_key_generate');
   late final _lnGroupKeyWrap =
@@ -1046,6 +1092,13 @@ class LemonadeNexusFfi {
     'ln_tier1_membership',
     'ln_discover_genesis_key',
     'ln_set_session_moved_callback',
+    'ln_identity_user_dir',
+    'ln_identity_user_status',
+    'ln_identity_user_load',
+    'ln_identity_user_create',
+    'ln_identity_user_import',
+    'ln_identity_user_remove',
+    'ln_identity_from_json',
   ];
 
   /// Required symbols absent from the loaded native library (empty when the
@@ -1173,8 +1226,61 @@ class LemonadeNexusFfi {
     final native = malloc<ffi.Uint8>(seed.length);
     native.asTypedList(seed.length).setAll(0, seed);
     final result = _lnIdentityFromSeed(native, seed.length);
+    native.asTypedList(seed.length).fillRange(0, seed.length, 0);
     malloc.free(native);
     return result;
+  }
+
+  /// Parses an identity from `identity.json` text held in memory (migration
+  /// only). The native copy of the text is wiped before it is released.
+  /// Returns null for malformed text.
+  LnIdentityHandle identityFromJson(String jsonText) {
+    final native = jsonText.toNativeUtf8();
+    final result = _lnIdentityFromJson(native.cast<ffi.Char>());
+    native.cast<ffi.Uint8>().asTypedList(native.length).fillRange(0, native.length, 0);
+    malloc.free(native);
+    return result;
+  }
+
+  // =========================================================================
+  // Per-user identity store (protected by the OS keystore)
+  // =========================================================================
+
+  /// The per-user identity directory, or null when it cannot be resolved.
+  String? identityUserDir() => toStringAndFree(_lnIdentityUserDir());
+
+  /// The store state as JSON {present, backend, unlocked, public_key?, dir}.
+  /// It never carries secret material.
+  (LnError, String?) identityUserStatus() => _jsonOut(_lnIdentityUserStatus);
+
+  /// Loads the user's stored identity. The handle is null unless the code is
+  /// [LnError.success]; see `ln_identity_user_load` for the codes.
+  (LnError, LnIdentityHandle) identityUserLoad() => _identityOut(_lnIdentityUserLoad);
+
+  /// Creates and stores a new identity for the user. The handle is null
+  /// unless the code is [LnError.success]; [LnError.rejected] means one is
+  /// stored already.
+  (LnError, LnIdentityHandle) identityUserCreate() => _identityOut(_lnIdentityUserCreate);
+
+  /// Stores an existing identity for the user (one-time migration). The
+  /// handle stays owned by the caller. [LnError.rejected] when one is
+  /// stored already.
+  LnError identityUserImport(LnIdentityHandle identity) =>
+      LnError.fromCode(_lnIdentityUserImport(identity));
+
+  /// Removes the stored identity: keystore item first, then the file.
+  LnError identityUserRemove() => LnError.fromCode(_lnIdentityUserRemove());
+
+  /// Runs a C call that returns an identity handle and writes its error code
+  /// to the out-parameter.
+  (LnError, LnIdentityHandle) _identityOut(_LnIdentityUserOpenDart call) {
+    final outErr = calloc<ffi.Int32>();
+    try {
+      final handle = call(outErr);
+      return (LnError.fromCode(outErr.value), handle);
+    } finally {
+      calloc.free(outErr);
+    }
   }
 
   String? deriveSeed(String username, String password) {

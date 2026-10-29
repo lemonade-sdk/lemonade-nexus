@@ -782,3 +782,58 @@ class IdentityInfo {
 
   Map<String, dynamic> toJson() => _$IdentityInfoToJson(this);
 }
+
+/// The per-user identity store as `ln_identity_user_status` reports it. The
+/// store keeps one device identity for the signed-in OS user, wrapped under a
+/// key that lives in the OS keystore. Nothing here is secret.
+class IdentityStoreStatus {
+  /// True when an identity file exists in [dir].
+  final bool present;
+
+  /// The keystore that protects the identity: "keychain" (macOS login
+  /// keychain), "dpapi" (Windows, user scope), "libsecret" (Secret Service),
+  /// or "none" when no keystore is usable in this process.
+  final String backend;
+
+  /// True when the stored identity loads right now (the keystore gave up the
+  /// wrapping key). False when nothing is stored or the keystore is locked.
+  final bool unlocked;
+
+  /// The stored identity's public key (`ed25519:<base64>`); null when none
+  /// is stored.
+  final String? publicKey;
+
+  /// The per-user directory that holds the identity file.
+  final String dir;
+
+  const IdentityStoreStatus({
+    required this.present,
+    required this.backend,
+    required this.unlocked,
+    required this.dir,
+    this.publicKey,
+  });
+
+  /// True when a keystore can protect an identity in this process.
+  bool get keystoreAvailable => backend != 'none';
+
+  /// Missing fields fail closed: no keystore, nothing stored, locked.
+  factory IdentityStoreStatus.fromJson(Map<String, dynamic> json) {
+    final backend = json['backend'];
+    return IdentityStoreStatus(
+      present: json['present'] == true,
+      backend: backend is String && backend.isNotEmpty ? backend : 'none',
+      unlocked: json['unlocked'] == true,
+      publicKey: json['public_key'] as String?,
+      dir: (json['dir'] as String?) ?? '',
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'present': present,
+        'backend': backend,
+        'unlocked': unlocked,
+        if (publicKey != null) 'public_key': publicKey,
+        'dir': dir,
+      };
+}
