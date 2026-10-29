@@ -26,6 +26,24 @@ acl::Permission permission_from_string(std::string_view perm_str) {
     return acl::Permission::None;
 }
 
+bool is_service_permission(std::string_view name) {
+    if (!name.starts_with(kServicePermissionPrefix)) return false;
+    const auto family = name.substr(kServicePermissionPrefix.size());
+    if (family.empty() || family.size() > kServicePermissionFamilyMax) return false;
+    // Byte checks, not <cctype>: the result must not depend on the locale.
+    const auto lower_alnum = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    };
+    if (!lower_alnum(family.front())) return false;
+    return std::all_of(family.begin(), family.end(), [&](char c) {
+        return lower_alnum(c) || c == '_' || c == '.' || c == '-';
+    });
+}
+
+bool permission_name_known(std::string_view name) {
+    return permission_from_string(name) != acl::Permission::None || is_service_permission(name);
+}
+
 acl::Permission required_permission_for(std::string_view op) {
     if (op == "create_node") return acl::Permission::AddChild;
     if (op == "update_node" || op == "allocate_ip" || op == "register_relay" ||
@@ -267,7 +285,7 @@ std::optional<AssignmentRuling> assignment_change_refusal(
         return AssignmentRuling{AssignmentRefusal::Invalid, "invalid principal"};
     }
     for (const auto& p : permissions) {
-        if (permission_from_string(p) == acl::Permission::None) {
+        if (!permission_name_known(p)) {
             return AssignmentRuling{AssignmentRefusal::Invalid, "unknown permission '" + p + "'"};
         }
     }
@@ -361,22 +379,30 @@ bool at_or_under(const NodeMap& nodes, std::string_view node_id, std::string_vie
 }
 
 bool invite_permission_allowed(std::string_view perm) {
-    return std::find(kInvitePermissions.begin(), kInvitePermissions.end(), perm) !=
-           kInvitePermissions.end();
+    return is_service_permission(perm) ||
+           std::find(kInvitePermissions.begin(), kInvitePermissions.end(), perm) !=
+               kInvitePermissions.end();
 }
 
-/// True when `principal`'s entry on `node` names a connect permission
-/// literally. `admin` implies every bit but is not a membership grant.
-bool holds_literal_connect(const TreeNode& node, std::string_view principal) {
+/// True when `principal`'s entry on `node` names `name` literally. An `admin`
+/// entry implies every bit but names only "admin".
+bool holds_literal_name(const TreeNode& node, std::string_view principal, std::string_view name) {
     const auto canon = canonical_principal(principal);
     if (canon.empty()) return false;
     for (const auto& a : node.assignments) {
         if (canonical_principal(a.management_pubkey) != canon) continue;
-        for (const auto& p : a.permissions) {
-            if (p == "connect_private" || p == "connect_shared") return true;
+        if (std::find(a.permissions.begin(), a.permissions.end(), name) != a.permissions.end()) {
+            return true;
         }
     }
     return false;
+}
+
+/// True when `principal`'s entry on `node` names a connect permission
+/// literally. `admin` is not a membership grant.
+bool holds_literal_connect(const TreeNode& node, std::string_view principal) {
+    return holds_literal_name(node, principal, "connect_private") ||
+           holds_literal_name(node, principal, "connect_shared");
 }
 
 }  // namespace
@@ -405,7 +431,14 @@ std::optional<AssignmentRuling> invite_refusal(const NodeMap& nodes, std::string
                                 "the inviter needs add_child on the invite target"};
     }
     for (const auto& p : permissions) {
-        if (!holds_or_administers(nodes, target_id, inviter, permission_from_string(p))) {
+        // A service permission maps to no flag (every key "holds" None), so
+        // it passes on only through a literal entry or administration.
+        const bool held =
+            is_service_permission(p)
+                ? holds_literal_name(it->second, inviter, p) ||
+                      admin_anchor(nodes, target_id, inviter).has_value()
+                : holds_or_administers(nodes, target_id, inviter, permission_from_string(p));
+        if (!held) {
             return AssignmentRuling{AssignmentRefusal::Forbidden,
                                     "the inviter does not hold '" + p + "' on the invite target"};
         }
@@ -460,6 +493,34 @@ bool endpoint_may_connect(const NodeMap& nodes, std::string_view principal, cons
     }
     return membership_reaches(nodes, principal, to) ||
            (!to.mgmt_pubkey.empty() && membership_reaches(nodes, to.mgmt_pubkey, from));
+}
+
+PeerPermissions peer_permissions(const NodeMap& nodes, std::string_view principal,
+                                 const TreeNode& device) {
+    PeerPermissions out;
+    const auto canon = canonical_principal(principal);
+    if (canon.empty()) return out;
+    const auto collect = [&](const TreeNode& node) {
+        for (const auto& a : node.assignments) {
+            if (canonical_principal(a.management_pubkey) != canon) continue;
+            out.names.insert(out.names.end(), a.permissions.begin(), a.permissions.end());
+        }
+    };
+    collect(device);
+    std::unordered_set<std::string> visited{device.id};
+    std::string current = device.parent_id;
+    while (!current.empty() && visited.insert(current).second) {
+        auto it = nodes.find(current);
+        if (it == nodes.end()) break;
+        if (it->second.type == NodeType::Customer) collect(it->second);
+        current = it->second.parent_id;
+    }
+    out.admin = signer_has_permission(device, principal, acl::Permission::Admin) ||
+                (!device.parent_id.empty() && admin_anchor(nodes, device.parent_id, principal));
+    if (out.admin) out.names.emplace_back("admin");
+    std::sort(out.names.begin(), out.names.end());
+    out.names.erase(std::unique(out.names.begin(), out.names.end()), out.names.end());
+    return out;
 }
 
 std::optional<AssignmentRuling> move_refusal(const NodeMap& nodes, std::string_view node_id,

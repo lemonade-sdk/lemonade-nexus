@@ -1299,6 +1299,196 @@ TEST_F(TreeMembershipTest, NewOpKindsRoundTripAndApplyIdentically) {
     storage_b->stop();
 }
 
+// --- Service permissions (svc:<family>) -------------------------------------
+
+using Names = std::vector<std::string>;
+
+TEST_F(TreeMembershipTest, ServicePermissionNamesAreCheckedLikeOtherNames) {
+    using tree::rules::is_service_permission;
+    using tree::rules::permission_name_known;
+    EXPECT_TRUE(is_service_permission("svc:inference"));
+    EXPECT_TRUE(is_service_permission("svc:a"));
+    EXPECT_TRUE(is_service_permission("svc:files.read_v2-x"));
+    EXPECT_TRUE(is_service_permission("svc:" + std::string(63, 'a')));
+    EXPECT_FALSE(is_service_permission("svc:" + std::string(64, 'a')));
+    EXPECT_FALSE(is_service_permission("svc:"));
+    EXPECT_FALSE(is_service_permission("svc:Inference"));
+    EXPECT_FALSE(is_service_permission("svc:in ference"));
+    EXPECT_FALSE(is_service_permission("svc:-x"));
+    EXPECT_FALSE(is_service_permission("svc:.x"));
+    EXPECT_FALSE(is_service_permission("svc:x/y"));
+    EXPECT_FALSE(is_service_permission("svc:x\xc3\xa4"));
+    EXPECT_FALSE(is_service_permission("svc"));
+    EXPECT_FALSE(is_service_permission("SVC:x"));
+    EXPECT_FALSE(is_service_permission("inference"));
+    EXPECT_TRUE(permission_name_known("read"));
+    EXPECT_TRUE(permission_name_known("svc:inference"));
+    EXPECT_FALSE(permission_name_known("made_up"));
+
+    // An assignment and an invite refuse each malformed name and keep
+    // refusing a made-up plain name; nothing is stored.
+    const auto alpha_before = version_of("alpha");
+    const Names bad_names = {"svc:",   "svc:Inference", "svc:in ference", "svc:-x",
+                             "svc:" + std::string(64, 'a'), "made_up"};
+    for (const auto& bad : bad_names) {
+        auto v = run(next(assign_op("alpha", pa, pa2, {"read", bad})));
+        EXPECT_EQ(v.refusal, TreeOpRefusal::Invalid) << bad;
+        EXPECT_EQ(v.reason, "unknown permission '" + bad + "'");
+        auto i = run(next(accept_op("alpha", pb, pa, {"read", bad})));
+        EXPECT_EQ(i.refusal, TreeOpRefusal::Invalid) << bad;
+        EXPECT_EQ(i.reason, "an invite cannot grant '" + bad + "'");
+    }
+    EXPECT_EQ(version_of("alpha"), alpha_before);
+}
+
+TEST_F(TreeMembershipTest, ServicePermissionsAreStoredAndGrantNothing) {
+    // The group admin assigns one to a joined key, and an invite carries one.
+    auto v = run(next(assign_op("alpha", pa, pa2, {"svc:inference", "read", "svc:inference"})));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    v = run(next(accept_op("alpha", pb, pa, {"read", "svc:inference"})));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    auto entry = [&](const std::string& node_id, const std::string& who) -> Names {
+        const auto n = *tree_svc->get_node(node_id);
+        for (const auto& a : n.assignments) {
+            if (tree::canonical_principal(a.management_pubkey) == tree::canonical_principal(who)) {
+                return a.permissions;
+            }
+        }
+        return {};
+    };
+    EXPECT_EQ(entry("alpha", pa2), (Names{"read", "svc:inference"}));
+    EXPECT_EQ(entry("alpha", pb), (Names{"read", "svc:inference"}));
+
+    // The name is no authority: the holder cannot write, administer, grant,
+    // or invite with it.
+    EXPECT_FALSE(tree_svc->check_permission(pb, "alpha", acl::Permission::Write));
+    EXPECT_FALSE(tree_svc->check_permission(pb, "alpha", acl::Permission::EditNode));
+    EXPECT_FALSE(tree_svc->administers(pb, "alpha-dev"));
+    EXPECT_FALSE(connects(pb, "beta-dev", "alpha-dev")) << "a service permission is not a membership";
+    EXPECT_EQ(run(next(assign_op("alpha", pa2, pb2, {"read"}))).refusal, TreeOpRefusal::Forbidden);
+    EXPECT_EQ(run(next(accept_op("alpha", pb2, pa2, {"read"}))).refusal, TreeOpRefusal::Forbidden);
+
+    // A key whose entry holds only a service permission reads, edits, and
+    // connects nothing on that node.
+    v = run(next(assign_op("alpha-dev2", pa, pa, {"svc:inference"})));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    EXPECT_EQ(entry("alpha-dev2", pa), (Names{"svc:inference"}));
+    EXPECT_FALSE(tree_svc->check_permission(pa, "alpha-dev2", acl::Permission::Read));
+    EXPECT_FALSE(tree_svc->check_permission(pa, "alpha-dev2", acl::Permission::EditNode));
+    EXPECT_FALSE(tree_svc->check_permission(pa, "alpha-dev2", acl::Permission::ConnectPrivate));
+    EXPECT_FALSE(tree_svc->check_permission(pa, "alpha-dev2", acl::Permission::ConnectShared));
+    EXPECT_FALSE(connects(pa, "alpha-dev", "alpha-dev2"));
+}
+
+TEST_F(TreeMembershipTest, AnInvitePassesOnOnlyTheServicePermissionsTheInviterHolds) {
+    const auto nodes = [&] { return tree_svc->nodes_snapshot(); };
+    using tree::rules::AssignmentRefusal;
+    using tree::rules::invite_refusal;
+    // The group admin grants any service permission; a member with
+    // add_child and svc:x grants svc:x and nothing else.
+    EXPECT_FALSE(invite_refusal(nodes(), "alpha", pa, {"read", "svc:y"}).has_value());
+    auto v = run(next(accept_op("alpha", pb, pa, {"add_child", "read", "svc:x"})));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    EXPECT_FALSE(invite_refusal(nodes(), "alpha", pb, {"read", "svc:x"}).has_value());
+    const auto denied = invite_refusal(nodes(), "alpha", pb, {"read", "svc:y"});
+    ASSERT_TRUE(denied.has_value());
+    EXPECT_EQ(denied->refusal, AssignmentRefusal::Forbidden);
+    EXPECT_EQ(denied->reason, "the inviter does not hold 'svc:y' on the invite target");
+    EXPECT_EQ(run(next(accept_op("alpha", pb2, pb, {"read", "svc:y"}))).refusal,
+              TreeOpRefusal::Forbidden);
+    v = run(next(accept_op("alpha", pb2, pb, {"read", "svc:x"})));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    v = run(next(accept_op("alpha", principal_of(stranger_kp), pa, {"read", "svc:y"})));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    // Administration above the target counts; a member's entry on the parent
+    // group gives it nothing on a subgroup.
+    EXPECT_FALSE(invite_refusal(nodes(), "alpha-sub1", pa, {"read", "svc:z"}).has_value());
+    EXPECT_TRUE(invite_refusal(nodes(), "alpha-sub1", pb, {"read", "svc:x"}).has_value());
+}
+
+TEST_F(TreeMembershipTest, ServicePermissionsSurviveCanonicalAndBinaryEncoding) {
+    const Names names{"read", "svc:files.read-v2_x", "svc:inference"};
+    const auto dev = node("svc-dev", "alpha", tree::NodeType::Endpoint, pa2, {{pa2, names}});
+    const auto canonical = tree::canonical_node_json(dev);
+    EXPECT_NE(canonical.find("\"svc:inference\""), std::string::npos);
+    EXPECT_NE(canonical.find("\"svc:files.read-v2_x\""), std::string::npos);
+    const auto decoded = tree::decode_tree_node(tree::encode_tree_node(dev));
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->assignments.size(), 1u);
+    EXPECT_EQ(decoded->assignments[0].permissions, names);
+    EXPECT_EQ(tree::canonical_node_json(*decoded), canonical);
+    const auto from_json = nlohmann::json(dev).get<tree::TreeNode>();
+    EXPECT_EQ(from_json.assignments[0].permissions, names);
+
+    // The ops that carry the names apply identically on a second replica
+    // through the binary op encoding.
+    auto storage_b = make_storage("b3");
+    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
+    tree_b.start();
+    build(tree_b);
+    auto both = [&](const TreeOp& op) {
+        const auto sig = tree::tree_op_signature_bytes(op);
+        ASSERT_TRUE(sig.has_value());
+        const auto decoded_op = tree::decode_tree_op(tree::encode_tree_op(op), *sig);
+        ASSERT_TRUE(decoded_op.has_value());
+        EXPECT_EQ(tree::op_id_hex(*decoded_op), tree::op_id_hex(op));
+        auto va = run(op);
+        auto vb = run(*decoded_op, &tree_b);
+        ASSERT_EQ(va.refusal, vb.refusal) << va.reason << " / " << vb.reason;
+        ASSERT_TRUE(va.ok()) << va.reason;
+    };
+    both(next(create_op(dev, pa)));
+    both(next(assign_op("alpha", pa, pa2, {"read", "svc:inference"})));
+    both(next(accept_op("alpha", pb, pa, {"read", "svc:inference"})));
+    EXPECT_EQ(tree_svc->tree_digest(), tree_b.tree_digest());
+    EXPECT_EQ(tree_b.get_node("svc-dev")->assignments[0].permissions, names);
+    tree_b.stop();
+    storage_b->stop();
+}
+
+TEST_F(TreeMembershipTest, PeerPermissionsCollectDeviceGroupAndAdminNames) {
+    using tree::rules::peer_permissions;
+    auto v = run(next(accept_op("alpha", pb, pa, {"connect_private", "read", "svc:inference"})));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    const auto sub_dev =
+        node("sub1-dev", "alpha-sub1", tree::NodeType::Endpoint, pa2, {{pa2, {"read"}}});
+    ASSERT_TRUE(run(next(create_op(sub_dev, pa))).ok());
+    v = run(next(accept_op("alpha-sub1", pb2, pa, {"read", "svc:sub"})));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    const auto nodes = tree_svc->nodes_snapshot();
+
+    // A membership: the group entry reaches every device beneath the group.
+    auto member = peer_permissions(nodes, pb, nodes.at("alpha-dev"));
+    EXPECT_EQ(member.names, (Names{"connect_private", "read", "svc:inference"}));
+    EXPECT_FALSE(member.admin);
+    EXPECT_EQ(peer_permissions(nodes, pb, nodes.at("sub1-dev")).names,
+              (Names{"connect_private", "read", "svc:inference"}));
+    // A subgroup entry reaches only that subgroup.
+    EXPECT_EQ(peer_permissions(nodes, pb2, nodes.at("sub1-dev")).names, (Names{"read", "svc:sub"}));
+    EXPECT_TRUE(peer_permissions(nodes, pb2, nodes.at("alpha-dev")).names.empty());
+    // The group admin: "admin" plus its literal entry on the device.
+    auto admin = peer_permissions(nodes, pa, nodes.at("alpha-dev2"));
+    EXPECT_TRUE(admin.admin);
+    EXPECT_EQ(admin.names, (Names{"admin", "connect_private", "read"}));
+    // The root admin reaches every device through its anchor alone.
+    auto root = peer_permissions(nodes, root_pk, nodes.at("beta-dev"));
+    EXPECT_TRUE(root.admin);
+    EXPECT_EQ(root.names, Names{"admin"});
+    // A per-device entry only, a key with no entry, and no principal.
+    EXPECT_EQ(peer_permissions(nodes, pa2, nodes.at("alpha-dev")).names,
+              (Names{"connect_private", "read"}));
+    EXPECT_TRUE(
+        peer_permissions(nodes, principal_of(stranger_kp), nodes.at("alpha-dev")).names.empty());
+    EXPECT_TRUE(peer_permissions(nodes, "", nodes.at("alpha-dev")).names.empty());
+    // Both base64 spellings of one key are one principal.
+    std::string alt = "ed25519:";
+    for (char ch : pb.substr(8)) {
+        if (ch == '=') continue;
+        alt.push_back(ch == '+' ? '-' : ch == '/' ? '_' : ch);
+    }
+    EXPECT_EQ(peer_permissions(nodes, alt, nodes.at("alpha-dev")).names, member.names);
+}
+
 // --- Account deletion (DeleteAccount) ---------------------------------------
 
 class TreeAccountDeletionTest : public TreeMembershipTest {

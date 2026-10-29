@@ -60,15 +60,14 @@ bool mesh_peer_listed(const tree::PermissionTreeService& tree,
 
 namespace {
 
-/// The endpoints that `from`, acting as `caller_pubkey`, may connect to
-/// (tree::rules::endpoint_may_connect): first those in `home_scope` (the
-/// parent-group subtree, in its order), then those outside it that an invite
-/// membership covers, sorted by node id.
-std::vector<tree::TreeNode> connectable_endpoints(const tree::PermissionTreeService& tree,
+/// The endpoints in `nodes` that `from`, acting as `caller_pubkey`, may
+/// connect to (tree::rules::endpoint_may_connect): first those in
+/// `home_scope` (the parent-group subtree, in its order), then those outside
+/// it that an invite membership covers, sorted by node id.
+std::vector<tree::TreeNode> connectable_endpoints(const tree::rules::NodeMap& nodes,
                                                   std::string_view caller_pubkey,
                                                   const tree::TreeNode& from,
                                                   const std::vector<tree::TreeNode>& home_scope) {
-    const auto nodes = tree.nodes_snapshot();
     std::vector<tree::TreeNode> out;
     std::unordered_set<std::string> seen;
     for (const auto& n : home_scope) {
@@ -150,6 +149,15 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // to (tree::rules::endpoint_may_connect: a connect grant in the parent-group
     // subtree, or an invite membership), and the relays in that subtree that
     // mesh_peer_listed admits. Read on the requesting node lets the caller ask.
+    //
+    // Each peer entry carries `mgmt_pubkey`, the peer node's management
+    // public key as the tree stores it, and `peer_permissions`: the sorted,
+    // de-duplicated permission names (tree names and `svc:` service
+    // permissions) that this key holds on the requesting node and on its
+    // ancestor groups, plus "admin" when the peer administers the requesting
+    // node (tree::rules::peer_permissions). Together they let the requesting
+    // device attribute a connecting peer and decide what it may do; they
+    // change nothing about who is listed.
     // ========================================================================
     priv.Get(R"(/api/mesh/peers/([a-zA-Z0-9_-]+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
@@ -193,11 +201,18 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         // Descendants of the caller's parent group (relays below), and the
         // endpoints the connect rule admits, including invite memberships.
         auto reachable = ctx_.tree.collect_subtree(node.parent_id);
-        const auto endpoints = connectable_endpoints(ctx_.tree, caller_pubkey, node, reachable);
+        const auto nodes = ctx_.tree.nodes_snapshot();
+        const auto endpoints = connectable_endpoints(nodes, caller_pubkey, node, reachable);
 
         // Use Noise handshake activity to determine peer liveness.
         auto mesh_handshakes = build_mesh_handshake_map(ctx_.boringtun);
         auto now = epoch_seconds();
+
+        // What the peer's key holds toward the requesting node; the peer is
+        // already listed, so this adds information and no reach.
+        const auto names_toward_caller = [&](const tree::TreeNode& peer) {
+            return tree::rules::peer_permissions(nodes, peer.mgmt_pubkey, node).names;
+        };
 
         // Build peer list: every endpoint the caller's node may connect to
         nlohmann::json peers = nlohmann::json::array();
@@ -214,15 +229,17 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             }
 
             nlohmann::json peer;
-            peer["node_id"]        = sibling.id;
-            peer["hostname"]       = sibling.hostname;
-            peer["mesh_pubkey"]    = sibling.mesh_pubkey;
-            peer["tunnel_ip"]      = sibling.tunnel_ip;
-            peer["private_subnet"] = sibling.private_subnet;
-            peer["endpoint"]       = sibling.listen_endpoint;
-            peer["relay_endpoint"] = "";  // filled by relay discovery
-            peer["is_online"]      = online;
-            peer["last_seen"]      = last_seen;
+            peer["node_id"]          = sibling.id;
+            peer["hostname"]         = sibling.hostname;
+            peer["mesh_pubkey"]      = sibling.mesh_pubkey;
+            peer["tunnel_ip"]        = sibling.tunnel_ip;
+            peer["private_subnet"]   = sibling.private_subnet;
+            peer["endpoint"]         = sibling.listen_endpoint;
+            peer["relay_endpoint"]   = "";  // filled by relay discovery
+            peer["is_online"]        = online;
+            peer["last_seen"]        = last_seen;
+            peer["mgmt_pubkey"]      = sibling.mgmt_pubkey;
+            peer["peer_permissions"] = names_toward_caller(sibling);
             peers.push_back(std::move(peer));
         }
 
@@ -232,17 +249,19 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             if (!mesh_peer_listed(ctx_.tree, caller_pubkey, sibling)) continue;
 
             nlohmann::json peer;
-            peer["node_id"]        = sibling.id;
-            peer["hostname"]       = sibling.hostname;
-            peer["mesh_pubkey"]    = sibling.mesh_pubkey;
-            peer["tunnel_ip"]      = sibling.tunnel_ip;
-            peer["private_subnet"] = sibling.private_subnet;
-            peer["endpoint"]       = sibling.listen_endpoint;
-            peer["relay_endpoint"] = sibling.listen_endpoint;
-            peer["is_online"]      = true;  // relays are always considered online
-            peer["is_relay"]       = true;
-            peer["region"]         = sibling.region;
-            peer["capacity_mbps"]  = sibling.capacity_mbps;
+            peer["node_id"]          = sibling.id;
+            peer["hostname"]         = sibling.hostname;
+            peer["mesh_pubkey"]      = sibling.mesh_pubkey;
+            peer["tunnel_ip"]        = sibling.tunnel_ip;
+            peer["private_subnet"]   = sibling.private_subnet;
+            peer["endpoint"]         = sibling.listen_endpoint;
+            peer["relay_endpoint"]   = sibling.listen_endpoint;
+            peer["is_online"]        = true;  // relays are always considered online
+            peer["is_relay"]         = true;
+            peer["region"]           = sibling.region;
+            peer["capacity_mbps"]    = sibling.capacity_mbps;
+            peer["mgmt_pubkey"]      = sibling.mgmt_pubkey;
+            peer["peer_permissions"] = names_toward_caller(sibling);
             peers.push_back(std::move(peer));
         }
 
@@ -414,7 +433,8 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             auto reachable = ctx_.tree.collect_subtree(node.parent_id);
             auto mesh_handshakes = build_mesh_handshake_map(ctx_.boringtun);
             auto now = epoch_seconds();
-            for (const auto& s : connectable_endpoints(ctx_.tree, caller_pubkey, node, reachable)) {
+            for (const auto& s : connectable_endpoints(ctx_.tree.nodes_snapshot(), caller_pubkey,
+                                                       node, reachable)) {
                 ++peer_count;
                 auto sip = strip_cidr(s.tunnel_ip);
                 auto it = mesh_handshakes.find(sip);

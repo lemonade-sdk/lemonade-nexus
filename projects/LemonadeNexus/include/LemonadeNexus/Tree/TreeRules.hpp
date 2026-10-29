@@ -12,6 +12,7 @@
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 
 #include <array>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -24,8 +25,31 @@ namespace nexus::tree::rules {
 using NodeMap = std::unordered_map<std::string, TreeNode>;
 
 /// Map an assignment permission name ("read", "admin", ...) to its flag.
-/// Unknown names map to acl::Permission::None.
+/// Unknown names, including service permissions, map to acl::Permission::None.
 [[nodiscard]] acl::Permission permission_from_string(std::string_view perm_str);
+
+// --- Service permissions -----------------------------------------------------
+//
+// A service permission is a name of the form "svc:<family>". The tree stores
+// and replicates it like any other assignment name and attaches no permission
+// bit to it, so it grants no tree or connect right on the server. The device
+// that a peer connects to reads it from the peer list (peer_permissions,
+// below) and enforces it.
+
+/// The prefix of a service permission name.
+inline constexpr std::string_view kServicePermissionPrefix = "svc:";
+
+/// The longest family a service permission name may carry, in bytes.
+inline constexpr std::size_t kServicePermissionFamilyMax = 63;
+
+/// True when `name` is a well-formed service permission: the prefix and a
+/// family of 1 to kServicePermissionFamilyMax bytes, the first in [a-z0-9]
+/// and the rest in [a-z0-9_.-].
+[[nodiscard]] bool is_service_permission(std::string_view name);
+
+/// True when an assignment may hold `name`: a name permission_from_string
+/// knows, or a well-formed service permission. Every other name is refused.
+[[nodiscard]] bool permission_name_known(std::string_view name);
 
 /// The permission a delta operation requires. None for unknown operations.
 [[nodiscard]] acl::Permission required_permission_for(std::string_view operation);
@@ -117,11 +141,11 @@ struct AssignmentRuling {
 
 /// The rules for setting exactly the permissions `principal` holds on
 /// `node_id`: the node exists; the principal and every permission name are
-/// valid; `signer` holds `admin` on the node or an ancestor; a signer cannot
-/// change its own entry on the node that grants its admin; and a principal
-/// given any permission has joined inside that admin's subtree. nullopt when
-/// the change is allowed. The checks run in this order, so the first failing
-/// rule decides the reason.
+/// valid (permission_name_known); `signer` holds `admin` on the node or an
+/// ancestor; a signer cannot change its own entry on the node that grants its
+/// admin; and a principal given any permission has joined inside that admin's
+/// subtree. nullopt when the change is allowed. The checks run in this order,
+/// so the first failing rule decides the reason.
 ///
 /// One change needs no admin: a principal removes its own entry (empty
 /// `permissions`, `signer` equals `principal`) from a group (Customer node)
@@ -170,11 +194,13 @@ inline constexpr std::array<std::string_view, 2> kDefaultInvitePermissions = {
 /// The rules for an invite into `target_id` minted by `inviter` with
 /// `permissions`: the target exists and is a group (Customer node); the
 /// inviter holds add_child on it or administers it (holds_or_administers);
-/// every permission name is in kInvitePermissions; and the inviter holds
-/// each permission on the target or administers it, so an invite never grants
-/// more than the inviter holds. An empty list is allowed: such an invite can
-/// place a new device but cannot make a member. nullopt when the invite is
-/// allowed.
+/// every permission name is in kInvitePermissions or is a service permission
+/// (is_service_permission); and the inviter holds each permission on the
+/// target or administers it, so an invite never grants more than the inviter
+/// holds. A service permission has no flag, so the inviter passes it on only
+/// when its own entry on the target names it, or when it administers the
+/// target. An empty list is allowed: such an invite can place a new device
+/// but cannot make a member. nullopt when the invite is allowed.
 [[nodiscard]] std::optional<AssignmentRuling> invite_refusal(
         const NodeMap& nodes, std::string_view target_id, std::string_view inviter,
         const std::vector<std::string>& permissions);
@@ -211,6 +237,34 @@ inline constexpr std::array<std::string_view, 2> kDefaultInvitePermissions = {
 /// Never true for a node to itself or for a `from` without a parent.
 [[nodiscard]] bool endpoint_may_connect(const NodeMap& nodes, std::string_view principal,
                                         const TreeNode& from, const TreeNode& to);
+
+// --- Peer permissions --------------------------------------------------------
+
+/// What one key holds toward one device (peer_permissions).
+struct PeerPermissions {
+    /// Every name in the key's entries on the device and on each strict
+    /// ancestor group (Customer node), plus "admin" when `admin` is true.
+    /// Sorted, de-duplicated.
+    std::vector<std::string> names;
+    /// True when the key holds `admin` on the device or on an ancestor
+    /// (admin_anchor).
+    bool admin = false;
+};
+
+/// The permission names `principal` holds toward `device`. This is the one
+/// definition of service permission reach: a `svc:` name on a group applies
+/// to every device beneath it (the shape of membership_reaches), and `admin`
+/// on the device or above it implies every service permission. The mesh peer
+/// list reports this set to the device as `peer_permissions`, so the device
+/// can enforce service permissions without reading the group's entries.
+///
+/// The set reports; it grants nothing on the server. A plain name on an
+/// ancestor group appears as it is held and gives `principal` no right on the
+/// device beyond what the other rules give it. An empty or invalid principal
+/// holds nothing. `device` need not be in `nodes`. Deterministic; a parent
+/// loop or a missing ancestor ends the walk.
+[[nodiscard]] PeerPermissions peer_permissions(const NodeMap& nodes, std::string_view principal,
+                                               const TreeNode& device);
 
 // --- Moves -------------------------------------------------------------------
 
