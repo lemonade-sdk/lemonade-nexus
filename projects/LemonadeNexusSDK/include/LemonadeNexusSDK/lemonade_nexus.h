@@ -366,7 +366,15 @@ ln_error_t ln_join_network(ln_client_t* client,
                             const char* password,
                             char** out_json);
 
-/** Submit delete_node delta for current node. */
+/** Leave the network: delete this device's own node on the server (see
+ *  LemonadeNexusClient::leave_network). Requires an established mesh
+ *  session. On success the mesh stops and the node id and session token are
+ *  cleared; the server may revoke the key of a device that owns no other
+ *  node, so a later join may need a new identity. On failure the mesh stays
+ *  up. *out_json is {success, error?}; error names the node, the HTTP status
+ *  or that the server was not reached, and the server's reason. The caller
+ *  owns *out_json and must release it with ln_free(). Returns LN_OK,
+ *  LN_ERR_NULL_ARG, or LN_ERR_REJECTED for any failure. */
 ln_error_t ln_leave_network(ln_client_t* client, char** out_json);
 
 /* ------------------------------------------------------------------ */

@@ -258,7 +258,17 @@ public:
     [[nodiscard]] Result<JoinResult> join_network(const std::string& username,
                                                     const std::string& password);
 
-    /// Submit delete_node delta for the current node.
+    /// Leave the network: delete this device's own node through the private
+    /// API (POST /api/tree/node/delete/{node_id}), which is reachable only
+    /// over the mesh. The server lets a device delete the node its key joined
+    /// as, including a device that joined through an invite and holds no
+    /// delete_node there. On success the mesh stops and the node id and the
+    /// session token are cleared; a server can also revoke the key of a
+    /// device that owns no other node, so a later join may need a new
+    /// identity. On failure nothing changes and the mesh stays up for a
+    /// retry; the error names the node, the HTTP status (or that the server
+    /// was not reached), and the server's reason. Fails without a node id.
+    /// Blocks on network I/O. Do not call it from a mesh state callback.
     [[nodiscard]] StatusResult leave_network();
 
     // -----------------------------------------------------------------
