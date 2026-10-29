@@ -263,9 +263,9 @@ public:
     /// over the mesh. The server lets a device delete the node its key joined
     /// as, including a device that joined through an invite and holds no
     /// delete_node there. On success the mesh stops and the node id and the
-    /// session token are cleared; a server can also revoke the key of a
-    /// device that owns no other node, so a later join may need a new
-    /// identity. On failure nothing changes and the mesh stays up for a
+    /// session token (with its server binding) are cleared. The device key
+    /// stays valid, so the device can join again later, for example with a
+    /// new invite. On failure nothing changes and the mesh stays up for a
     /// retry; the error names the node, the HTTP status (or that the server
     /// was not reached), and the server's reason. Fails without a node id.
     /// Blocks on network I/O. Do not call it from a mesh state callback.

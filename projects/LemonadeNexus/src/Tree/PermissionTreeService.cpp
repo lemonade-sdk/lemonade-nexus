@@ -414,7 +414,7 @@ TreeOpVerdict PermissionTreeService::validate_local_op(const TreeOp& op,
 TreeOpVerdict PermissionTreeService::submit_local_op(const TreeOp& op,
                                                      const TreeOpPolicy& policy,
                                                      uint64_t block_time_sec) {
-    std::vector<TreeNode> removed;
+    std::vector<RemovedNode> removed;
     std::vector<AccountDeletion> accounts;
     TreeOpVerdict verdict;
     {
@@ -438,7 +438,7 @@ TreeOpVerdict PermissionTreeService::submit_local_op(const TreeOp& op,
 }
 
 TreeOpVerdict PermissionTreeService::apply_op(const TreeOp& op) {
-    std::vector<TreeNode> removed;
+    std::vector<RemovedNode> removed;
     std::vector<AccountDeletion> accounts;
     TreeOpVerdict verdict;
     {
@@ -453,7 +453,7 @@ TreeOpVerdict PermissionTreeService::apply_op(const TreeOp& op) {
 
 TreeOpVerdict PermissionTreeService::apply_committed_ops(const std::vector<TreeOp>& ops,
                                                          uint64_t block_time_sec) {
-    std::vector<TreeNode> removed;
+    std::vector<RemovedNode> removed;
     std::vector<AccountDeletion> accounts;
     TreeOpVerdict verdict;
     {
@@ -471,7 +471,7 @@ TreeOpVerdict PermissionTreeService::apply_committed_ops(const std::vector<TreeO
 }
 
 void PermissionTreeService::set_removed_nodes_hook(
-        std::function<void(const std::vector<TreeNode>&)> hook) {
+        std::function<void(const std::vector<RemovedNode>&)> hook) {
     std::lock_guard lock(removed_hook_mtx_);
     removed_hook_ = std::move(hook);
 }
@@ -493,9 +493,9 @@ void PermissionTreeService::notify_accounts(const std::vector<AccountDeletion>& 
     for (const auto& account : accounts) hook(account);
 }
 
-void PermissionTreeService::notify_removed(const std::vector<TreeNode>& removed) const {
+void PermissionTreeService::notify_removed(const std::vector<RemovedNode>& removed) const {
     if (removed.empty()) return;
-    std::function<void(const std::vector<TreeNode>&)> hook;
+    std::function<void(const std::vector<RemovedNode>&)> hook;
     {
         std::lock_guard lock(removed_hook_mtx_);
         hook = removed_hook_;
@@ -513,7 +513,7 @@ void PermissionTreeService::persist_committed_ops_after(const TreeOpVerdict& ver
 }
 
 bool PermissionTreeService::write_effect_locked(const TreeOpEffect& effect,
-                                                std::vector<TreeNode>& removed) {
+                                                std::vector<RemovedNode>& removed) {
     // Persist writes before removals, so a failed write never leaves a node
     // deleted for an op that did not complete.
     for (const auto& node : effect.writes) {
@@ -537,7 +537,7 @@ bool PermissionTreeService::write_effect_locked(const TreeOpEffect& effect,
         if (!it->second.endpoint_identifier.empty()) {
             identifier_index_.erase(it->second.endpoint_identifier);
         }
-        removed.push_back(std::move(it->second));
+        removed.push_back(RemovedNode{std::move(it->second)});
         nodes_.erase(it);
         if (!remove_node(id)) {
             spdlog::warn("[{}] storage delete failed for '{}'", name(), id);
@@ -547,7 +547,7 @@ bool PermissionTreeService::write_effect_locked(const TreeOpEffect& effect,
 }
 
 TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op,
-                                                     std::vector<TreeNode>& removed,
+                                                     std::vector<RemovedNode>& removed,
                                                      std::vector<AccountDeletion>& accounts) {
     TreeOpEffect effect;
     if (auto verdict = plan_op(op, nodes_, effect); !verdict.ok()) {
@@ -565,12 +565,23 @@ TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op,
         spdlog::error("[{}] tree op on '{}' did not complete", name(), op.target);
         return TreeOpVerdict{TreeOpRefusal::StorageError, "failed to persist node"};
     }
+    // A device's own leave keeps its key valid. Only the node whose key
+    // signed the op is marked, so the mark never protects another key.
+    if (is_own_device_removal(crypto_, op)) {
+        for (auto i = removed_before; i < removed.size(); ++i) {
+            auto& r = removed[i];
+            r.own_device_left = r.node.id == op.target &&
+                                canonical_principal(r.node.mgmt_pubkey) ==
+                                    canonical_principal(op.principal);
+        }
+    }
     if (op.kind == TreeOpKind::DeleteAccount) {
-        accounts.push_back(AccountDeletion{
-            op.principal, op.target,
-            std::vector<TreeNode>(removed.begin() + static_cast<std::ptrdiff_t>(removed_before),
-                                  removed.end()),
-            std::move(swept_keys)});
+        std::vector<TreeNode> account_nodes;
+        for (auto i = removed_before; i < removed.size(); ++i) {
+            account_nodes.push_back(removed[i].node);
+        }
+        accounts.push_back(AccountDeletion{op.principal, op.target, std::move(account_nodes),
+                                           std::move(swept_keys)});
     }
 
     record_committed(committed_ops_, op);

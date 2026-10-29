@@ -450,6 +450,43 @@ TEST_F(TreeOpsTest, AnInvitedDeviceRemovesOnlyItsOwnNode) {
     EXPECT_FALSE(tree_svc->get_node(id2).has_value());
 }
 
+// The removed-nodes hook marks a device's own leave, decided from the
+// committed op alone, so every replica keeps the device key valid for it. An
+// inviter's removal of the same kind of node is not marked.
+TEST_F(TreeOpsTest, TheRemovalHookMarksOnlyADevicesOwnLeave) {
+    auto owner = crypto_svc->ed25519_keygen();
+    const auto owner_pk = principal_of(owner);
+    ASSERT_TRUE(submit(seal(create_op(customer("acme", owner_pk), root_pk))).ok());
+    auto dev1 = crypto_svc->ed25519_keygen();
+    auto dev2 = crypto_svc->ed25519_keygen();
+    ASSERT_TRUE(submit(seal(join_op(dev1, "acme", owner_pk))).ok());
+    ASSERT_TRUE(submit(seal(join_op(dev2, "acme", owner_pk))).ok());
+    const auto id1 = tree::derive_join_node_id(*crypto_svc, principal_of(dev1));
+    const auto id2 = tree::derive_join_node_id(*crypto_svc, principal_of(dev2));
+
+    std::vector<tree::RemovedNode> reported;
+    tree_svc->set_removed_nodes_hook([&](const std::vector<tree::RemovedNode>& removed) {
+        reported.insert(reported.end(), removed.begin(), removed.end());
+    });
+    const auto leave = seal(delete_op(id1, principal_of(dev1)), kBlock + 1);
+    EXPECT_TRUE(tree::is_own_device_removal(*crypto_svc, leave));
+    ASSERT_TRUE(tree_svc->apply_committed_ops({leave}, kBlock + 1).ok());
+    const auto removal = seal(delete_op(id2, owner_pk), kBlock + 2);
+    EXPECT_FALSE(tree::is_own_device_removal(*crypto_svc, removal));
+    ASSERT_TRUE(tree_svc->apply_committed_ops({removal}, kBlock + 2).ok());
+    tree_svc->set_removed_nodes_hook({});
+
+    ASSERT_EQ(reported.size(), 2u);
+    EXPECT_EQ(reported[0].node.id, id1);
+    EXPECT_TRUE(reported[0].own_device_left);
+    EXPECT_EQ(reported[1].node.id, id2);
+    EXPECT_FALSE(reported[1].own_device_left);
+
+    // A signed delta is never an own leave, even from the device's key.
+    auto d = signed_delta("delete_node", id2, tree::TreeNode{}, dev2, kBlock + 3);
+    EXPECT_FALSE(tree::is_own_device_removal(*crypto_svc, delta_op(d)));
+}
+
 TEST_F(TreeOpsTest, JoinCreatesGroupAndEndpoint) {
     auto device = crypto_svc->ed25519_keygen();
     auto op = join_op(device);
@@ -1027,10 +1064,13 @@ TEST_F(TreeOpsTest, ApplyingACommittedDeleteReportsTheRemovedNode) {
     ASSERT_TRUE(submit(seal(create_op(customer("acme", root_pk), root_pk))).ok());
     const auto before = *tree_svc->get_node("acme");
     std::vector<tree::TreeNode> reported;
-    tree_svc->set_removed_nodes_hook([&](const std::vector<tree::TreeNode>& removed) {
+    tree_svc->set_removed_nodes_hook([&](const std::vector<tree::RemovedNode>& removed) {
         // The hook runs without the tree lock held, so it may read the tree.
         EXPECT_FALSE(tree_svc->get_node("acme").has_value());
-        reported.insert(reported.end(), removed.begin(), removed.end());
+        for (const auto& r : removed) {
+            EXPECT_FALSE(r.own_device_left);
+            reported.push_back(r.node);
+        }
     });
 
     ASSERT_TRUE(tree_svc->apply_committed_ops({seal(delete_op("acme", root_pk))}, kBlock).ok());

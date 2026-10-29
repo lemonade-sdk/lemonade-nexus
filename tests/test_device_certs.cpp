@@ -503,7 +503,7 @@ TEST_F(DeviceCertTest, DeleteCleanupRemovesTheStoredCertificates) {
     auto bob_node = tree->get_node(bob_id);
     ASSERT_TRUE(bob_node);
     ASSERT_TRUE(test_support::remove_node(*tree, bob_id));
-    tree_handler->cleanup_removed_nodes({*bob_node});
+    tree_handler->cleanup_removed_nodes({{*bob_node}});
     EXPECT_FALSE(fs::exists(cert_dir(desk)));
     EXPECT_TRUE(fs::exists(cert_dir(group_a) / "privkey.pem"));
 
@@ -513,7 +513,7 @@ TEST_F(DeviceCertTest, DeleteCleanupRemovesTheStoredCertificates) {
     ASSERT_TRUE(alice_node && group_node);
     ASSERT_TRUE(test_support::remove_node(*tree, alice_id));
     ASSERT_TRUE(test_support::remove_node(*tree, "customer-" + alice_id));
-    tree_handler->cleanup_removed_nodes({*alice_node, *group_node});
+    tree_handler->cleanup_removed_nodes({{*alice_node}, {*group_node}});
     EXPECT_FALSE(fs::exists(cert_dir(laptop)));
     EXPECT_FALSE(fs::exists(cert_dir(group_a)));
 }

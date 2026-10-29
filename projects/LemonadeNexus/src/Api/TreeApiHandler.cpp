@@ -554,21 +554,22 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
 TreeApiHandler::TreeApiHandler(ApiContext& ctx)
     : ctx_(ctx), pending_joins_(std::make_shared<PendingJoins>()) {
     ctx_.tree.set_removed_nodes_hook(
-        [this](const std::vector<tree::TreeNode>& removed) { cleanup_removed_nodes(removed); });
+        [this](const std::vector<tree::RemovedNode>& removed) { cleanup_removed_nodes(removed); });
 }
 
 TreeApiHandler::~TreeApiHandler() {
     ctx_.tree.set_removed_nodes_hook({});
 }
 
-void TreeApiHandler::cleanup_removed_nodes(const std::vector<tree::TreeNode>& removed) {
-    for (const auto& node : removed) cascade_node_cleanup(node.id, node);
+void TreeApiHandler::cleanup_removed_nodes(const std::vector<tree::RemovedNode>& removed) {
+    for (const auto& r : removed) cascade_node_cleanup(r.node.id, r.node, !r.own_device_left);
 }
 
 // Post-delete cascade, run by the committed-removal hook. IPAM release results
 // are ignored, and peer/DNS removal is logged on success only.
 void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
-                                          const std::optional<tree::TreeNode>& doomed) {
+                                          const std::optional<tree::TreeNode>& doomed,
+                                          bool revoke_key) {
     if (!doomed) return;
     // 1. Revoke the device's Ed25519 credential so a deleted device
     //    cannot silently auto-re-register (node_id is key-deterministic).
@@ -576,8 +577,11 @@ void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
     //    customer group AND every sibling endpoint, so deleting ONE of
     //    their own devices must NOT blocklist that shared key. Only revoke
     //    a key that no surviving node still owns — i.e. a linked-device
-    //    key, which owns only the endpoint just deleted.
-    if (!doomed->mgmt_pubkey.empty() &&
+    //    key, which owns only the endpoint just deleted. A device that left
+    //    on its own keeps its key (revoke_key is false), so it can join
+    //    again with a new invite; the committed op decides that, not this
+    //    server's state.
+    if (revoke_key && !doomed->mgmt_pubkey.empty() &&
         !ctx_.tree.is_mgmt_pubkey_in_use(doomed->mgmt_pubkey)) {
         ctx_.auth.revoke_ed25519(
             std::string(strip_ed25519_prefix(doomed->mgmt_pubkey)));

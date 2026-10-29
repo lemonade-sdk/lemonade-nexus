@@ -9,6 +9,7 @@
 
 namespace nexus::tree {
 struct TreeNode;
+struct RemovedNode;
 } // namespace nexus::tree
 
 namespace nexus::api {
@@ -34,21 +35,24 @@ public:
     TreeApiHandler& operator=(const TreeApiHandler&) = delete;
 
     /// Run the post-delete cleanup for nodes an applied tree operation
-    /// removed. `removed` holds each node as it was before the delete.
+    /// removed. `removed` holds each node as it was before the delete. A node
+    /// its own device removed (own_device_left) keeps its key valid; every
+    /// other removal revokes a key that no surviving node owns.
     /// Thread-safe to the same degree as the delete routes.
-    void cleanup_removed_nodes(const std::vector<tree::TreeNode>& removed);
+    void cleanup_removed_nodes(const std::vector<tree::RemovedNode>& removed);
 
 private:
     void do_register_routes(httplib::Server& pub, httplib::Server& priv);
 
     // Post-delete cleanup that cleanup_removed_nodes runs for every node a
-    // committed op removed: (1) credential revocation (owner-protected), (2) IPAM releases,
+    // committed op removed: (1) credential revocation (owner-protected, and
+    // skipped when `revoke_key` is false), (2) IPAM releases,
     // (3) mesh peer removal, (4) private EP DNS record removal, (5) removal of
     // the stored device or group loopback certificate. All steps are
     // best-effort; a failure never aborts the cascade. `doomed` is the
     // pre-delete snapshot of the node.
     void cascade_node_cleanup(const std::string& node_id,
-                              const std::optional<tree::TreeNode>& doomed);
+                              const std::optional<tree::TreeNode>& doomed, bool revoke_key);
 
     // The dataplane and DNS steps of a join that wrote the node: drop the
     // stale peer named by `rekey`, add the client peer for `tunnel_cidr`, and

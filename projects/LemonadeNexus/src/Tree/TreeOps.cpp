@@ -828,6 +828,11 @@ std::string derive_join_node_id(crypto::SodiumCryptoService& crypto,
     return crypto::to_hex(std::span<const uint8_t>(hash.data(), hash.size())).substr(0, 32);
 }
 
+bool is_own_device_removal(crypto::SodiumCryptoService& crypto, const TreeOp& op) {
+    return op.kind == TreeOpKind::DeleteNode && op.body.source != TreeOpSource::Delta &&
+           !op.target.empty() && op.target == derive_join_node_id(crypto, op.principal);
+}
+
 // --- Validation -------------------------------------------------------------
 
 namespace {
