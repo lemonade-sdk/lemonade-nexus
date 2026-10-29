@@ -2364,6 +2364,71 @@ TEST_F(MeshPeersConnectTest, PeerPermissionsNameWhatThePeerHoldsTowardTheCaller)
     EXPECT_EQ(status_peer_count(), 5u);
 }
 
+// The heartbeat answer carries peers_revision. It stays the same while the
+// caller's peer list stays the same, and it changes when a listed peer
+// moves, changes its mesh key or tunnel address, or a peer joins the list.
+// A node the caller may not connect to changes nothing, and a caller without
+// Read on its node gets no revision.
+TEST_F(MeshPeersConnectTest, HeartbeatPeersRevisionFollowsThePeerList) {
+    const auto revision = [this](const std::string& node, const std::string& pubkey) {
+        const auto now = std::chrono::system_clock::now();
+        const auto token = jwt::create()
+                               .set_issuer("lemonade-nexus")
+                               .set_subject(node)
+                               .set_issued_at(now)
+                               .set_expires_at(now + std::chrono::hours{1})
+                               .set_payload_claim("pubkey", jwt::claim(pubkey))
+                               .sign(jwt::algorithm::hs256{jwt_secret});
+        httplib::Client cli("127.0.0.1", mesh_port);
+        const json body = {{"node_id", node}, {"endpoint", ""}};
+        auto res = cli.Post("/api/mesh/heartbeat", {{"Authorization", "Bearer " + token}},
+                            body.dump(), "application/json");
+        EXPECT_NE(res, nullptr);
+        if (!res) return std::string{"<no answer>"};
+        EXPECT_EQ(res->status, 200) << res->body;
+        const auto answer = json::parse(res->body);
+        if (!answer.contains("peers_revision")) return std::string{};
+        EXPECT_TRUE(answer["peers_revision"].is_string()) << res->body;
+        return answer["peers_revision"].get<std::string>();
+    };
+    const auto mine = [&] { return revision("mc_self", caller); };
+    const auto update = [this](const std::string& id, const auto& change) {
+        auto n = tree->get_node(id);
+        ASSERT_TRUE(n.has_value());
+        change(*n);
+        ASSERT_TRUE(test_support::put_node(*tree, *n));
+    };
+
+    add("mc_peer", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    const auto first = mine();
+    ASSERT_FALSE(first.empty());
+    EXPECT_EQ(mine(), first);
+
+    add("mc_unlisted", "mc_group", tree::NodeType::Endpoint,
+        {{principal(), {"connect_private"}}});
+    EXPECT_EQ(mine(), first) << "a peer outside the caller's list changed the revision";
+
+    update("mc_peer", [](tree::TreeNode& n) { n.listen_endpoint = "203.0.113.20:51940"; });
+    const auto moved = mine();
+    EXPECT_NE(moved, first);
+    EXPECT_EQ(mine(), moved);
+
+    update("mc_peer", [](tree::TreeNode& n) { n.mesh_pubkey = "mesh-rotated"; });
+    const auto rekeyed = mine();
+    EXPECT_NE(rekeyed, moved);
+
+    update("mc_peer", [](tree::TreeNode& n) { n.tunnel_ip = "10.64.9.200/32"; });
+    const auto readdressed = mine();
+    EXPECT_NE(readdressed, rekeyed);
+
+    add("mc_second", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_shared"}}});
+    EXPECT_NE(mine(), readdressed);
+
+    const auto stranger = principal();
+    add("mc_no_read", "mc_group", tree::NodeType::Endpoint, {{stranger, {"connect_private"}}});
+    EXPECT_EQ(revision("mc_no_read", stranger), "");
+}
+
 // --- Review fixes: server-assigned fields, delete cleanup, link tokens, IPAM ---
 
 // A joined device holds add_child and edit_node on its endpoint and owns its
