@@ -504,6 +504,20 @@ C ABI equivalents: `ln_mesh_enable`, `ln_mesh_enable_config`,
 `ln_mesh_disable`, `ln_mesh_status`, `ln_mesh_peers`, `ln_mesh_refresh`,
 `ln_mesh_expose_service`, `ln_mesh_open_egress`, plus
 `ln_private_api_call` for generic authenticated private routes.
+`ln_mesh_peers` and the `peers` of `ln_mesh_status` carry every `MeshPeer`
+field, including `peer_permissions`, `mgmt_pubkey`, `last_seen` and
+`last_rx`.
+
+**Peer liveness.** A monitor pass every 5 s sets each peer's `is_online`
+(`lnsdk::peer_signal_fresh` and `lnsdk::next_peer_liveness` in
+`MeshOrchestrator.hpp`). An authenticated packet from the peer, keepalives
+included, within three keepalive intervals plus 5 s keeps it online. Before
+the first packet, a live WireGuard session (handshake under 200 s; BoringTun
+rejects a session after 180 s) or a recent server contact (`last_seen`
+within 15 s plus one peer refresh interval) counts. A relayed peer also
+stays online while the server's `last_seen` is that recent. An online peer
+reads offline only after two stale passes in a row, so one late keepalive
+or peer refresh does not flip it. The mesh port routes only to online peers.
 
 ### Service catalog and route policy
 

@@ -10,6 +10,7 @@
 
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
 #include <LemonadeNexusSDK/HolePunch.hpp>
+#include <LemonadeNexusSDK/MeshOrchestrator.hpp>
 #include <LemonadeNexusSDK/RelayFallback.hpp>
 
 #include <asio.hpp>
@@ -290,6 +291,100 @@ TEST(HolePuncherSchedule, PathSelection) {
     const F::Timing ft;
     EXPECT_FALSE(F::relay_needed(true, 0, now, 5s, true, ft));
     EXPECT_TRUE(F::relay_needed(false, 0, now, 0ms, true, ft));
+}
+
+// ---------------------------------------------------------------------------
+// Peer liveness (MeshOrchestrator monitor pass)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Runs monitor passes every 5 s from `from` to `to` and reports whether the
+/// peer read online on every pass. `update` sets the peer's signals for the
+/// pass time.
+template <typename Update>
+bool online_throughout(lnsdk::MeshPeer& peer, int64_t from, int64_t to, Update update) {
+    lnsdk::PeerLiveness state{true, 0};
+    for (int64_t now = from; now <= to; now += 5) {
+        update(peer, now);
+        const auto fresh = lnsdk::peer_signal_fresh(peer, now, 30);
+        if (fresh) state = lnsdk::next_peer_liveness(state, *fresh);
+        if (!state.online) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+// A relayed peer renews its WireGuard handshake only every 60-120 s while its
+// keepalives arrive every 5 s through the relay: it stays online.
+TEST(SdkPeerLiveness, ARelayedPeerBetweenHandshakesStaysOnline) {
+    const int64_t start = 1'000'000;
+    lnsdk::MeshPeer peer;
+    peer.keepalive = 5;
+    peer.relay_endpoint = "198.51.100.7:9103";
+    EXPECT_TRUE(online_throughout(peer, start, start + 600, [&](lnsdk::MeshPeer& p, int64_t now) {
+        p.last_rx = now - 3;
+        // Handshakes at start, +60, +180, +300, ...: 60 then 120 s apart.
+        if (now - start == 60 || (now - start >= 180 && (now - start - 180) % 120 == 0)) {
+            p.last_handshake = now;
+        }
+        if (p.last_handshake == 0) p.last_handshake = start;
+    }));
+
+    // Before its first packet arrives, a live session keeps it online too.
+    lnsdk::MeshPeer quiet;
+    quiet.relay_endpoint = "198.51.100.7:9103";
+    EXPECT_TRUE(online_throughout(quiet, start, start + 600, [&](lnsdk::MeshPeer& p, int64_t now) {
+        if (p.last_handshake == 0 || now - p.last_handshake >= 120) p.last_handshake = now - 2;
+    }));
+}
+
+// One late keepalive (a single stale pass) does not flip an online peer; a
+// second stale pass in a row does.
+TEST(SdkPeerLiveness, OneStalePassDoesNotFlipAPeer) {
+    using lnsdk::next_peer_liveness;
+    auto state = next_peer_liveness({false, 0}, true);
+    EXPECT_TRUE(state.online);
+    state = next_peer_liveness(state, false);
+    EXPECT_TRUE(state.online) << "one stale pass flipped the peer offline";
+    state = next_peer_liveness(state, true);
+    EXPECT_TRUE(state.online);
+    EXPECT_EQ(state.stale_passes, 0u);
+    state = next_peer_liveness(state, false);
+    state = next_peer_liveness(state, false);
+    EXPECT_FALSE(state.online);
+    // An offline peer comes back on its first fresh signal.
+    EXPECT_TRUE(next_peer_liveness(state, true).online);
+    EXPECT_FALSE(next_peer_liveness(state, false).online);
+}
+
+// A peer silent for more than 180 s (no packet, no handshake, no server
+// contact) reads offline; a peer with no signal at all is left as it was.
+TEST(SdkPeerLiveness, APeerSilentForOver180SecondsGoesOffline) {
+    const int64_t start = 1'000'000;
+    lnsdk::MeshPeer peer;
+    peer.keepalive = 5;
+    peer.relay_endpoint = "198.51.100.7:9103";
+    peer.last_rx = start;
+    peer.last_handshake = start;
+    peer.last_seen = static_cast<uint64_t>(start);
+    lnsdk::PeerLiveness state{true, 0};
+    for (int64_t now = start + 5; now <= start + 185; now += 5) {
+        state = lnsdk::next_peer_liveness(state, *lnsdk::peer_signal_fresh(peer, now, 30));
+    }
+    EXPECT_FALSE(state.online);
+    for (const int64_t age : {181, 200, 600}) {
+        EXPECT_FALSE(*lnsdk::peer_signal_fresh(peer, start + age, 30)) << age;
+    }
+
+    lnsdk::MeshPeer no_handshake_yet;
+    EXPECT_FALSE(lnsdk::peer_signal_fresh(no_handshake_yet, start, 30).has_value());
+    // Before any packet, a handshake older than the session lifetime is stale.
+    no_handshake_yet.last_handshake = start - 201;
+    EXPECT_FALSE(*lnsdk::peer_signal_fresh(no_handshake_yet, start, 30));
+    no_handshake_yet.last_handshake = start - 150;
+    EXPECT_TRUE(*lnsdk::peer_signal_fresh(no_handshake_yet, start, 30));
 }
 
 TEST(HolePuncherSchedule, BothPeersPickTheSameSlot) {
