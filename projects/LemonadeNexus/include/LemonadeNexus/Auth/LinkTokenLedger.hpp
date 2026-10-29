@@ -8,7 +8,8 @@
 // signed by one Tier 1 server:
 //
 //   Mint    the minting server's grant: target group, permissions, inviter,
-//           network, issue and expiry times (generation 0).
+//           network, issue and expiry times (generation 0), and, when the
+//           server issued an invite code too, the code's hash.
 //   Spend   a server consumed generation g of the token.
 //   Refund  the server whose spend of generation g counts restored the token
 //           as generation g + 1 (the join that consumed it did not use it).
@@ -26,6 +27,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -38,9 +40,30 @@ namespace nexus::auth {
 inline constexpr std::string_view kLinkTokenHashDomain = "lemonade-nexus/link-token-hash:v1";
 /// Domain of the bytes an origin signs (link_token_event_signing_bytes).
 inline constexpr std::string_view kLinkTokenEventDomain = "lemonade-nexus/link-token-event:v1";
+/// Domain of the invite code hash (link_code_hash_hex).
+inline constexpr std::string_view kLinkCodeHashDomain = "lemonade-nexus/link-code-hash:v1";
+/// Domain of the code binding an origin signs (link_code_binding_bytes).
+inline constexpr std::string_view kLinkCodeBindingDomain = "lemonade-nexus/link-code-binding:v1";
 
 /// Longest token lifetime, from issue to expiry (TokenLinkAuthProvider::kMaxTtl).
 inline constexpr uint64_t kLinkTokenMaxTtlSec = 3600;
+/// Length of an invite code: decimal digits.
+inline constexpr std::size_t kLinkCodeDigits = 8;
+/// Longest life of an invite code, from the mint's created_at. A code whose
+/// token lives longer stops working at this bound; the token goes on.
+inline constexpr uint64_t kLinkCodeMaxTtlSec = 600;
+/// Window of the wrong-code limits, and the lockout a source address gets.
+inline constexpr uint64_t kLinkCodeFailureWindowSec = 600;
+/// Wrong code attempts one source address may make within the window; from
+/// the next one on, that address's code attempts are refused for the window.
+inline constexpr uint32_t kLinkCodeMaxFailuresPerSource = 5;
+/// Wrong code attempts a server accepts from all addresses within the
+/// window; from the next one on, codes are refused on that server until the
+/// window passes.
+inline constexpr uint32_t kLinkCodeMaxFailuresPerServer = 100;
+/// Source addresses a server tracks at once; beyond it, a new address's code
+/// attempts are refused until an entry expires.
+inline constexpr std::size_t kLinkCodeMaxSources = 4096;
 /// Records stay this long after expiry, so a late copy of a mint cannot
 /// outlive the spend that consumed it on a server with a slower clock.
 inline constexpr uint64_t kLinkTokenRetentionSec = 600;
@@ -79,6 +102,15 @@ struct LinkTokenEvent {
     std::string              owner_pubkey;   ///< inviter's key ("ed25519:<base64>")
     uint64_t                 created_at{0};  ///< Unix seconds
 
+    // Invite code binding (Mint only, optional). A short decimal code names
+    // the same token: the mint carries link_code_hash_hex(code), and the
+    // origin signs the binding separately (link_code_binding_bytes), so the
+    // event signature and every encoding a release before the code existed
+    // computes stay as they are. A replica from such a release drops both
+    // fields and redeems the token only.
+    std::string              code_hash;      ///< 64 lowercase hex, or empty (no code)
+    std::string              code_signature; ///< base64 Ed25519 by origin_pubkey; empty when local
+
     // Authorship.
     uint64_t                 timestamp{0};   ///< Unix seconds when the origin made the event
     std::string              origin_pubkey;  ///< base64 Ed25519 gossip key of the origin server
@@ -96,19 +128,40 @@ inline constexpr std::string_view kLinkTokenLocalOrigin = "local";
 /// kLinkTokenHashDomain.
 [[nodiscard]] std::string link_token_hash_hex(std::string_view token);
 
-/// The bytes an origin signs: every field except `signature`, canonically
-/// encoded under kLinkTokenEventDomain.
+/// True when `secret` has the form of an invite code: exactly kLinkCodeDigits
+/// ASCII digits. Anything else presented in a token position is a token.
+[[nodiscard]] bool is_link_code(std::string_view secret);
+
+/// Lowercase hex of SHA-256 over the canonical encoding of `code` under
+/// kLinkCodeHashDomain. Distinct from link_token_hash_hex even for equal input.
+[[nodiscard]] std::string link_code_hash_hex(std::string_view code);
+
+/// The bytes an origin signs for a mint's code binding: token_hash,
+/// code_hash, network_id, expires_at, origin_pubkey, and origin_seq under
+/// kLinkCodeBindingDomain. The origin and sequence tie the binding to one
+/// signed mint.
+[[nodiscard]] std::vector<uint8_t> link_code_binding_bytes(const LinkTokenEvent& e);
+
+/// Unix second from which the code of `mint` is refused:
+/// min(expires_at, created_at + kLinkCodeMaxTtlSec).
+[[nodiscard]] uint64_t link_code_expires_at(const LinkTokenEvent& mint);
+
+/// The bytes an origin signs: every field except `signature` and the code
+/// binding, canonically encoded under kLinkTokenEventDomain.
 [[nodiscard]] std::vector<uint8_t> link_token_event_signing_bytes(const LinkTokenEvent& e);
 
 /// True when `e.signature` is origin_pubkey's Ed25519 signature over
-/// link_token_event_signing_bytes(e). Says nothing about whether the origin
-/// is a certified or Tier 1 server; callers check that.
+/// link_token_event_signing_bytes(e) and, when the event carries a code
+/// binding, `e.code_signature` is the same key's signature over
+/// link_code_binding_bytes(e). Says nothing about whether the origin is a
+/// certified or Tier 1 server; callers check that.
 [[nodiscard]] bool link_token_event_signature_valid(crypto::SodiumCryptoService& crypto,
                                                     const LinkTokenEvent& e);
 
 /// Structural check: field formats and bounds, kind and generation, grant
 /// fields present on a Mint and absent otherwise, lifetime at most
-/// kLinkTokenMaxTtlSec. nullopt when well formed.
+/// kLinkTokenMaxTtlSec, a code binding only on a signed Mint. nullopt when
+/// well formed.
 [[nodiscard]] std::optional<std::string> link_token_event_shape_error(const LinkTokenEvent& e);
 
 /// Time check against the receiver's clock: the event is still retained
@@ -122,12 +175,14 @@ inline constexpr std::string_view kLinkTokenLocalOrigin = "local";
 /// replaces another.
 [[nodiscard]] std::string link_token_event_key(const LinkTokenEvent& e);
 
-/// Wire and storage form (a JSON object; msgpack on the backbone).
+/// Wire and storage form (a JSON object; msgpack on the backbone). The code
+/// binding fields are present only when set, so an event without a code has
+/// the form an earlier release writes.
 [[nodiscard]] nlohmann::json link_token_event_to_wire(const LinkTokenEvent& e);
 
 /// Parse the wire form. nullopt when a field is missing, of the wrong type,
-/// or beyond its bound. Unknown fields are ignored. Does not run the shape,
-/// time, or signature checks.
+/// or beyond its bound. The code binding fields are optional. Unknown fields
+/// are ignored. Does not run the shape, time, or signature checks.
 [[nodiscard]] std::optional<LinkTokenEvent> link_token_event_from_wire(const nlohmann::json& j);
 
 /// The events of every token one server holds, and the state they imply.
@@ -149,13 +204,34 @@ public:
     };
 
     /// Add `e` after the shape and time checks. An event whose network or
-    /// expiry differs from the token's earlier events is refused.
+    /// expiry differs from the token's earlier events is refused. A Mint
+    /// equal to the held one except that it carries the code binding the
+    /// held copy lacks (the held copy came through a replica that drops the
+    /// binding) replaces it and counts as Added.
     AddResult add(const LinkTokenEvent& e, uint64_t now_sec);
 
     /// The token's current state when it can be consumed: a mint is held,
     /// no revoke is held, now < expires_at, and the current generation has no
     /// counting spend.
     [[nodiscard]] std::optional<Live> live(std::string_view token_hash, uint64_t now_sec) const;
+
+    /// The token an invite code names, when it can be consumed now. Fails
+    /// closed: nullopt unless exactly one held mint carries `code_hash` with
+    /// now < link_code_expires_at(mint), and that token is live. Two mints
+    /// with one code (minted on different servers at the same time) make the
+    /// code unusable; both tokens stay redeemable.
+    [[nodiscard]] std::optional<Live> live_by_code(std::string_view code_hash,
+                                                   uint64_t now_sec) const;
+
+    /// True when a held mint carries `code_hash` and its code has not
+    /// expired (now < link_code_expires_at). The minting server draws another
+    /// code while this holds.
+    [[nodiscard]] bool code_in_use(std::string_view code_hash, uint64_t now_sec) const;
+
+    /// True when any held mint carries `code_hash`.
+    [[nodiscard]] bool holds_code(std::string_view code_hash) const {
+        return codes_.find(code_hash) != codes_.end();
+    }
 
     /// Origin of the spend that counts for `generation`: the smallest origin
     /// among the spends of that generation. nullopt when none is held.
@@ -186,7 +262,10 @@ public:
 
     [[nodiscard]] std::size_t token_count() const { return tokens_.size(); }
 
-    void clear() { tokens_.clear(); }
+    void clear() {
+        tokens_.clear();
+        codes_.clear();
+    }
 
 private:
     struct Token {
@@ -197,6 +276,8 @@ private:
     };
 
     std::map<std::string, Token, std::less<>> tokens_;
+    /// code_hash -> token hashes of the held mints that carry it.
+    std::map<std::string, std::set<std::string>, std::less<>> codes_;
 };
 
 }  // namespace nexus::auth

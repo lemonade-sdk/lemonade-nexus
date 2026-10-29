@@ -42,11 +42,13 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <set>
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -3271,8 +3273,35 @@ TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
         auto minted = s.mint_link_token("owner", "ed25519:OWNER", "customer-g",
                                         std::chrono::seconds{ttl});
         EXPECT_TRUE(minted.has_value());
-        return minted ? minted->first : std::string{};
+        return minted ? minted->token : std::string{};
     };
+
+    // Minted on A with its invite code, redeemed on B by the code; the spend
+    // reaches A, where neither the code nor the token redeems again.
+    {
+        const auto minted = A.mint_link_token("owner", "ed25519:OWNER", "customer-g",
+                                              std::chrono::seconds{600});
+        ASSERT_TRUE(minted.has_value());
+        ASSERT_TRUE(auth::is_link_code(minted->code));
+        ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token(minted->token).has_value(); }));
+        auto by_code = auth_b().consume_link_token(minted->code);
+        ASSERT_TRUE(by_code.has_value());
+        EXPECT_EQ(by_code->token_hash, auth::link_token_hash_hex(minted->token));
+        EXPECT_EQ(by_code->spent_by, b_b64);
+        ASSERT_TRUE(pump_until([&] { return !A.verify_link_token(minted->token).has_value(); }));
+        EXPECT_FALSE(A.consume_link_token(minted->code).has_value());
+        EXPECT_FALSE(auth_b().consume_link_token(minted->token).has_value());
+        // The code and the token travel nowhere in clear.
+        for (const auto* file : {"link_tokens/ledger.json", "link_replica/replica.json"}) {
+            for (Node* n : {&a, &b}) {
+                std::ifstream in(n->dir / file, std::ios::binary);
+                std::stringstream ss;
+                ss << in.rdbuf();
+                EXPECT_EQ(ss.str().find(minted->code), std::string::npos) << file;
+                EXPECT_EQ(ss.str().find(minted->token.substr(4)), std::string::npos) << file;
+            }
+        }
+    }
 
     // Minted on A, redeemed on B; the spend reaches A.
     const auto t1 = mint(A);
@@ -3332,7 +3361,8 @@ TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
     const auto c_port = gossip::GossipBallotTestAccess::port(*c.gossip);
     uint64_t seq = 1'000'000;
     const auto event_for = [&](const std::string& token, const crypto::Ed25519Keypair& author,
-                               const std::string& network = kTestNetworkHex) {
+                               const std::string& network = kTestNetworkHex,
+                               const std::string& code = {}) {
         auth::LinkTokenEvent e;
         e.kind = auth::LinkTokenEventKind::Mint;
         e.token_hash = auth::link_token_hash_hex(token);
@@ -3349,6 +3379,12 @@ TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
         const auto bytes = auth::link_token_event_signing_bytes(e);
         e.signature = crypto::to_base64(kc->ed25519_sign(author.private_key,
                                                          std::span<const uint8_t>(bytes)));
+        if (!code.empty()) {
+            e.code_hash = auth::link_code_hash_hex(code);
+            const auto binding = auth::link_code_binding_bytes(e);
+            e.code_signature = crypto::to_base64(
+                kc->ed25519_sign(author.private_key, std::span<const uint8_t>(binding)));
+        }
         return auth::link_token_event_to_wire(e);
     };
     const auto over_backbone = [&](network::VirtualNetService& from_stack, const char* from_ip,
@@ -3362,6 +3398,19 @@ TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
     // Positive control.
     over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port, event_for("lnk_ok", a_kp));
     ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token("lnk_ok").has_value(); }));
+    // Positive control with a code binding: B redeems the code.
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  event_for("lnk_coded", a_kp, kTestNetworkHex, "24681357"));
+    ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token("lnk_coded").has_value(); }));
+    EXPECT_TRUE(auth_b().verify_link_token("24681357").has_value());
+    // Refused: the code hash changed after A signed the binding.
+    auto recoded = event_for("lnk_recoded", a_kp, kTestNetworkHex, "13572468");
+    recoded["code_hash"] = auth::link_code_hash_hex("31415926");
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port, recoded);
+    // Refused: a code hash without its binding signature.
+    auto unbound = event_for("lnk_unbound", a_kp, kTestNetworkHex, "11223344");
+    unbound.erase("code_signature");
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port, unbound);
 
     // Refused: a field changed after A signed it.
     auto tampered = event_for("lnk_tampered", a_kp);
@@ -3385,9 +3434,11 @@ TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
     over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
                   nlohmann::json{{"kind", 1}, {"token_hash", "x"}});
     pump_for(std::chrono::milliseconds(400));
-    for (const auto* t : {"lnk_tampered", "lnk_network", "lnk_stranger", "lnk_public"}) {
+    for (const auto* t : {"lnk_tampered", "lnk_network", "lnk_stranger", "lnk_public",
+                          "lnk_recoded", "lnk_unbound"}) {
         EXPECT_FALSE(auth_b().verify_link_token(t).has_value()) << t;
     }
+    EXPECT_FALSE(auth_b().verify_link_token("31415926").has_value());
     EXPECT_FALSE(A.verify_link_token("lnk_via_c").has_value());
 
     // An account deletion on A revokes the account's tokens; the revocation
@@ -3395,13 +3446,13 @@ TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
     const auto t5 = A.mint_link_token("doomed", "ed25519:DOOMED", "customer-doomed",
                                       std::chrono::seconds{600});
     ASSERT_TRUE(t5.has_value());
-    ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token(t5->first).has_value(); }));
+    ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token(t5->token).has_value(); }));
     EXPECT_EQ(A.revoke_link_tokens(
                   [](const auth::LinkTokenRecord& r) { return r.owner_user_id == "doomed"; }),
               1u);
-    EXPECT_FALSE(A.verify_link_token(t5->first).has_value());
-    ASSERT_TRUE(pump_until([&] { return !auth_b().verify_link_token(t5->first).has_value(); }));
-    EXPECT_FALSE(auth_b().consume_link_token(t5->first).has_value());
+    EXPECT_FALSE(A.verify_link_token(t5->token).has_value());
+    ASSERT_TRUE(pump_until([&] { return !auth_b().verify_link_token(t5->token).has_value(); }));
+    EXPECT_FALSE(auth_b().consume_link_token(t5->token).has_value());
     EXPECT_TRUE(auth_b().verify_link_token(t2).has_value());
 
     // B misses a live event (its store refuses it), then catches up from A's
@@ -3430,7 +3481,7 @@ TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
         EXPECT_TRUE(auth_b().verify_link_token(t4).has_value()) << missing;
         EXPECT_TRUE(auth_b().verify_link_token("lnk_ok").has_value()) << missing;
         EXPECT_FALSE(auth_b().verify_link_token(t1).has_value()) << "spent stays spent";
-        EXPECT_FALSE(auth_b().verify_link_token(t5->first).has_value()) << "revoked stays revoked";
+        EXPECT_FALSE(auth_b().verify_link_token(t5->token).has_value()) << "revoked stays revoked";
     }
 }
 

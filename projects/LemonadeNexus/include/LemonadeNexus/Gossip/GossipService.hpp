@@ -951,9 +951,10 @@ public:
     void set_link_token_sink(std::function<bool(const auth::LinkTokenEvent&)> sink);
 
     /// Sign a link token event this server made: sets network_id (this
-    /// network), origin_pubkey (this gossip identity), origin_seq, and the
-    /// signature over link_token_event_signing_bytes. False before start()
-    /// or while no network id is set. Thread-safe.
+    /// network), origin_pubkey (this gossip identity), origin_seq, the
+    /// signature over link_token_event_signing_bytes, and, when the event
+    /// carries a code_hash, the code_signature over link_code_binding_bytes.
+    /// False before start() or while no network id is set. Thread-safe.
     [[nodiscard]] bool sign_link_token_event(auth::LinkTokenEvent& event);
 
     /// Replicate a signed link token event this server made to every Tier 1

@@ -526,9 +526,10 @@ administers the target.
 ### Invites and group membership
 
 An invite is a single-use link token for a target group
-(`POST /api/link/token`, optional `target_node_id` and `permissions`). Without
-a target, the target is the caller's own group. The rules
-(`tree::rules::invite_refusal`) are:
+(`POST /api/link/token`, optional `target_node_id` and `permissions`), issued
+together with an 8-digit invite code that names the same token (see "Invite
+codes" below). Without a target, the target is the caller's own group. The
+rules (`tree::rules::invite_refusal`) are:
 
 - **The target is a group.** An invite never targets a device or the root.
 - **The inviter has authority on the target.** The inviter holds `add_child`
@@ -551,8 +552,9 @@ again against the current tree (`tree::rules::invite_acceptance_refusal`):
 an inviter that lost its authority voids the invite, and an identity that
 already joined inside the target, or administers it, is refused. A refused
 acceptance does not spend the token. Tokens stay single use and expire after
-at most one hour. Any Tier 1 server redeems a token, whichever Tier 1 server
-minted it (see "Invite replication" below).
+at most one hour; the code of a token stops working after at most ten
+minutes. Any Tier 1 server redeems a token or its code, whichever Tier 1
+server minted it (see "Invite replication" below).
 
 **Linked devices see each other.** When a new device joins with a token, each
 device already in the target group (same parent group, Endpoint nodes only)
@@ -695,6 +697,62 @@ The replicated `Spend` and `Refund` events keep every server's ledger in
 step; they decide no redemption. A redemption fails while the token's `Mint`
 has not reached the redeeming server yet (normally under a second after
 minting).
+
+### Invite codes
+
+Every mint also issues an invite code: 8 decimal digits (about 26.6 bits),
+returned once to the inviter as `code` next to `link_token`. A string of
+exactly 8 digits in a token position (`link_token` in `POST /api/join`,
+`POST /api/link/accept`, and `POST /api/tree/device-name/check`) is a code;
+anything else is a token. The code is an alias of the token, not a second
+invite:
+
+- **Hash only.** The `Mint` carries `code_hash`, SHA-256 of the code under
+  the domain `lemonade-nexus/link-code-hash:v1`; the code itself is never
+  stored or logged. The origin signs the binding (`token_hash`, `code_hash`,
+  network id, expiry, origin, sequence) on its own under
+  `lemonade-nexus/link-code-binding:v1` as `code_signature`, so the event
+  signature, the ledger file, and the tree-op encoding a release without
+  codes computes stay as they are. A receiver verifies both signatures and
+  refuses a mint whose binding does not verify.
+- **One generation.** A redemption by code resolves the code to its token
+  and spends that token's current generation; the token is refused until a
+  refund opens the next one, and the other way round. The tree operation
+  carries the signed `Mint` without its code binding, so every replica
+  checks and records the redemption of the token, whichever form the holder
+  presented.
+- **Lifetime.** A code works until `min(expires_at, created_at + 600 s)`
+  (`code_expires_at` in the mint response); the token works until
+  `expires_at`.
+- **Attempt limits.** Each Tier 1 server counts wrong code attempts: a code
+  that resolves to no live token on that server (unknown, expired, spent,
+  or shared). Two limits apply, both over a 10-minute window:
+  - *Per source address:* after 5 wrong attempts from one address within
+    the window, that address's code attempts are refused for 10 minutes.
+  - *Per server:* after 100 wrong attempts from any addresses within the
+    window, the server refuses codes until the window passes.
+
+  A refused attempt counts toward neither limit, so an address that is
+  locked out cannot close codes for everyone, and tokens are never
+  refused by either limit. An attacker with N addresses gets at most
+  min(5N, 100) guesses per 10 minutes per server against a space of 10^8
+  codes that each live at most 10 minutes. The hash and the lookup run
+  before the limits are consulted, so a refused or wrong code costs the
+  same work as a wrong token (neither reveals how close the guess was).
+  The counters are per server and in memory: a restart or another server
+  starts them again. A server tracks at most 4096 addresses; beyond that a
+  new address's code attempts are refused until an entry expires.
+- **Uniqueness and collisions.** The minting server draws a code that no
+  unexpired code in its own ledger uses (a bounded number of draws; a mint
+  fails when none is free). Two servers can still mint the same code in the
+  same window, before either sees the other's mint. A receiver that holds
+  two unexpired mints with one `code_hash` refuses that code (it never picks
+  one); both tokens stay redeemable. With at most 16384 tokens per server
+  and 10^8 codes, the chance of a collision per mint is below 2 x 10^-4.
+- **Older replicas.** A server from a release without codes ignores the two
+  fields, redeems the token only, and passes the mint on without them. A
+  server with codes keeps the copy that carries the binding, whichever copy
+  arrives first.
 
 ### Account deletion
 

@@ -67,23 +67,28 @@ public:
     bool unrevoke_ed25519(const std::string& pubkey_b64);
 
     /// Mint a single-use link token (invite) bound to `group_node_id` that
-    /// carries `permissions` for an accepting member (see
-    /// TokenLinkAuthProvider::mint). The caller authorizes the invite.
-    [[nodiscard]] std::optional<std::pair<std::string, LinkTokenRecord>>
+    /// carries `permissions` for an accepting member, and its invite code
+    /// (see TokenLinkAuthProvider::mint). The caller authorizes the invite.
+    [[nodiscard]] std::optional<MintedLinkToken>
     mint_link_token(const std::string& owner_user_id, const std::string& owner_pubkey,
                     const std::string& group_node_id, std::chrono::seconds ttl,
                     std::vector<std::string> permissions = {});
 
-    /// Look up a link token without consuming it. nullopt when it is unknown,
-    /// expired, or spent.
-    [[nodiscard]] std::optional<LinkTokenRecord> verify_link_token(std::string_view token);
+    /// Look up a link token, or the token an invite code names, without
+    /// consuming it. nullopt when it is unknown, expired, spent, or refused
+    /// (see TokenLinkAuthProvider::verify). `source` is the requester's
+    /// address for the wrong-code limits; empty when unknown.
+    [[nodiscard]] std::optional<LinkTokenRecord> verify_link_token(std::string_view token_or_code,
+                                                                   std::string_view source = {});
 
-    /// Verify and burn a device-link token (single use).
-    [[nodiscard]] std::optional<LinkTokenRecord> consume_link_token(std::string_view token);
+    /// Verify and burn a device-link token (single use), presented as the
+    /// token or as its invite code. `source` as in verify_link_token.
+    [[nodiscard]] std::optional<LinkTokenRecord> consume_link_token(std::string_view token_or_code,
+                                                                    std::string_view source = {});
 
     /// Restore a link token that a join consumed but did not use (see
     /// TokenLinkAuthProvider::refund). False when nothing was restored.
-    bool refund_link_token(std::string_view token, const LinkTokenRecord& record);
+    bool refund_link_token(std::string_view token_or_code, const LinkTokenRecord& record);
 
     /// Wire link token replication between Tier 1 servers (see
     /// TokenLinkAuthProvider::set_replication). Call before serving requests.

@@ -4044,6 +4044,14 @@ bool GossipService::sign_link_token_event(auth::LinkTokenEvent& event) {
         keypair_.private_key,
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical.data()),
                                  canonical.size())));
+    event.code_signature.clear();
+    if (!event.code_hash.empty()) {
+        // The code binding is signed on its own, so the event signature and
+        // the encodings an earlier release computes stay unchanged.
+        const auto binding = auth::link_code_binding_bytes(event);
+        event.code_signature = crypto::to_base64(crypto_.ed25519_sign(
+            keypair_.private_key, std::span<const uint8_t>(binding)));
+    }
     return true;
 }
 
@@ -4128,6 +4136,15 @@ std::optional<std::string> GossipService::link_token_origin_error(
                   author_signature_valid(canonical, event.origin_pubkey, event.signature)
             : delta_origin_verified(canonical, event.origin_pubkey, event.signature);
     if (!verified) return "origin signature invalid or origin not a certified server";
+    if (!event.code_hash.empty()) {
+        // The same origin signs the code binding; the enrollment check above
+        // already covers the key.
+        const auto binding = auth::link_code_binding_bytes(event);
+        if (!author_signature_valid(std::string(binding.begin(), binding.end()),
+                                    event.origin_pubkey, event.code_signature)) {
+            return "code binding signature invalid";
+        }
+    }
     return std::nullopt;
 }
 

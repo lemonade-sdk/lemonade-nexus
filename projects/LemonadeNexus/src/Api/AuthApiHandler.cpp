@@ -208,12 +208,16 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
             return;
         }
 
+        // The token and the code are handed out here, once; neither is
+        // stored or logged in clear.
         nlohmann::json j = {
-            {"link_token",     minted->first},
-            {"group_node_id",  minted->second.group_node_id},
-            {"target_node_id", minted->second.group_node_id},
-            {"permissions",    minted->second.permissions},
-            {"expires_at",     minted->second.expires_at},
+            {"link_token",     minted->token},
+            {"code",           minted->code},
+            {"group_node_id",  minted->record.group_node_id},
+            {"target_node_id", minted->record.group_node_id},
+            {"permissions",    minted->record.permissions},
+            {"expires_at",     minted->record.expires_at},
+            {"code_expires_at", auth::link_code_expires_at(*minted->record.grant)},
         };
         json_response(res, j);
     }));

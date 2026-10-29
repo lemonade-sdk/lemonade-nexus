@@ -47,7 +47,7 @@ std::optional<nlohmann::json> AuthService::issue_passkey_challenge(const std::st
     return passkey_provider_.issue_challenge(user_id);
 }
 
-std::optional<std::pair<std::string, LinkTokenRecord>>
+std::optional<MintedLinkToken>
 AuthService::mint_link_token(const std::string& owner_user_id,
                              const std::string& owner_pubkey,
                              const std::string& group_node_id,
@@ -57,16 +57,19 @@ AuthService::mint_link_token(const std::string& owner_user_id,
                                      std::move(permissions));
 }
 
-std::optional<LinkTokenRecord> AuthService::verify_link_token(std::string_view token) {
-    return token_link_provider_.verify(token);
+std::optional<LinkTokenRecord> AuthService::verify_link_token(std::string_view token_or_code,
+                                                              std::string_view source) {
+    return token_link_provider_.verify(token_or_code, source);
 }
 
-std::optional<LinkTokenRecord> AuthService::consume_link_token(std::string_view token) {
-    return token_link_provider_.consume(token);
+std::optional<LinkTokenRecord> AuthService::consume_link_token(std::string_view token_or_code,
+                                                               std::string_view source) {
+    return token_link_provider_.consume(token_or_code, source);
 }
 
-bool AuthService::refund_link_token(std::string_view token, const LinkTokenRecord& record) {
-    return token_link_provider_.refund(token, record);
+bool AuthService::refund_link_token(std::string_view token_or_code,
+                                    const LinkTokenRecord& record) {
+    return token_link_provider_.refund(token_or_code, record);
 }
 
 void AuthService::set_link_token_replication(TokenLinkAuthProvider::EventSigner signer,

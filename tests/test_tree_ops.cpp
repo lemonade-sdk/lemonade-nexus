@@ -1870,6 +1870,33 @@ TEST_F(TreeInviteRedemptionTest, TheLinkExtensionRoundTripsAndOldOpsKeepTheirEnc
     EXPECT_FALSE(tree::decode_tree_op(bytes, *tree::tree_op_signature_bytes(move)).has_value());
 }
 
+// The mint's invite code binding is not part of the op: an op built from a
+// grant that carries it encodes, signs, and decodes as the op built from the
+// grant without it, so a redemption by code is the redemption of the token.
+TEST_F(TreeInviteRedemptionTest, TheInviteCodeBindingIsNotPartOfTheOp) {
+    const auto device = crypto_svc->ed25519_keygen();
+    const auto g = grant(server_kp, "alpha", pa, {"read", "connect_private"});
+    auto with_code = g;
+    with_code.code_hash = auth::link_code_hash_hex("12345678");
+    const auto binding = auth::link_code_binding_bytes(with_code);
+    with_code.code_signature = crypto::to_base64(
+        crypto_svc->ed25519_sign(server_kp.private_key, std::span<const uint8_t>(binding)));
+    ASSERT_TRUE(auth::link_token_event_signature_valid(*crypto_svc, with_code));
+    const auto plain = seal_by(linked_join(device, g), server_kp);
+    auto coded = plain;
+    coded.body.invite_grant = with_code;
+    EXPECT_EQ(tree::encode_tree_op(coded), tree::encode_tree_op(plain));
+    EXPECT_EQ(tree::op_id_hex(coded), tree::op_id_hex(plain));
+    const auto decoded =
+        tree::decode_tree_op(tree::encode_tree_op(coded), *tree::tree_op_signature_bytes(coded));
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_TRUE(decoded->body.invite_grant.has_value());
+    EXPECT_EQ(*decoded->body.invite_grant, g);
+    EXPECT_TRUE(decoded->body.invite_grant->code_hash.empty());
+    auto v = run(coded);
+    ASSERT_TRUE(v.ok()) << v.reason;
+}
+
 // The group owner's key already holds an entry on a linked device. With the
 // extension, the join completes that entry, so the owner's first device and
 // the new device reach each other. An op from an earlier release (no

@@ -17,3 +17,4 @@ export 'ffi_bindings.dart' show LnError, LemonadeNexusFfi;
 
 // Models
 export 'models.dart';
+export 'invite.dart';

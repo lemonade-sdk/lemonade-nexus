@@ -222,12 +222,13 @@ TEST_F(SdkDeviceNameMockTest, TheAnswerKeepsTheServersShapeAndRefusalsMapToError
     EXPECT_EQ(sent[0]["group_node_id"], "grp-1");
     EXPECT_FALSE(sent[0].contains("link_token"));
 
-    // The invite form sends the token and no group; a free name round-trips.
+    // The invite form sends the invite (here an 8-digit code) as link_token
+    // and no group; a free name round-trips.
     answer(200, {{"label", "printer"},
                  {"available", true},
                  {"conflicts", json::array()},
                  {"suggestion", "printer"}});
-    ASSERT_EQ(ln_check_device_name(c, "Printer", "", "invite-code", &out), LN_OK);
+    ASSERT_EQ(ln_check_device_name(c, "Printer", "", "12345678", &out), LN_OK);
     j = take_json(out);
     EXPECT_EQ(j["label"], "printer");
     EXPECT_EQ(j["available"], true);
@@ -236,8 +237,15 @@ TEST_F(SdkDeviceNameMockTest, TheAnswerKeepsTheServersShapeAndRefusalsMapToError
     sent = requests();
     ASSERT_EQ(sent.size(), 2u);
     EXPECT_EQ(sent[1]["name"], "Printer");
-    EXPECT_EQ(sent[1]["link_token"], "invite-code");
+    EXPECT_EQ(sent[1]["link_token"], "12345678");
     EXPECT_FALSE(sent[1].contains("group_node_id"));
+
+    // An invite that is neither a code nor a token is refused without a
+    // request.
+    EXPECT_EQ(ln_check_device_name(c, "Printer", "", "invite-code", &out), LN_ERR_REJECTED);
+    j = take_json(out);
+    EXPECT_FALSE(j.value("error", std::string{}).empty());
+    EXPECT_EQ(requests().size(), 2u);
 
     // Refusals keep the server's reason and map to the error class.
     answer(403, {{"error", "no read permission"}});

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <span>
 #include <sstream>
 #include <system_error>
@@ -37,6 +38,33 @@ uint64_t system_now_ms() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+/// Draws the minting server makes before it gives up on a free invite code.
+constexpr int kCodeDraws = 8;
+
+/// A uniformly random invite code of kLinkCodeDigits decimal digits.
+std::string draw_code(crypto::SodiumCryptoService& crypto) {
+    constexpr uint32_t kSpace = [] {
+        uint32_t n = 1;
+        for (std::size_t i = 0; i < auth::kLinkCodeDigits; ++i) n *= 10;
+        return n;
+    }();
+    constexpr uint32_t kLimit = (std::numeric_limits<uint32_t>::max() / kSpace) * kSpace;
+    for (;;) {
+        std::array<uint8_t, 4> raw{};
+        crypto.random_bytes(std::span<uint8_t>(raw));
+        uint32_t v = (uint32_t{raw[0]} << 24) | (uint32_t{raw[1]} << 16) |
+                     (uint32_t{raw[2]} << 8) | uint32_t{raw[3]};
+        if (v >= kLimit) continue;  // rejection keeps every code equally likely
+        v %= kSpace;
+        std::string code(auth::kLinkCodeDigits, '0');
+        for (std::size_t i = auth::kLinkCodeDigits; i-- > 0;) {
+            code[i] = static_cast<char>('0' + v % 10);
+            v /= 10;
+        }
+        return code;
+    }
 }
 
 enum class LegacyFileState { Absent, Unreadable, Present };
@@ -169,6 +197,59 @@ void TokenLinkAuthProvider::author_locked(LinkTokenEvent& e, bool sign) {
     local_seq_ = std::max(local_seq_ + 1, system_now_ms());
     e.origin_seq = local_seq_;
     e.signature.clear();
+    e.code_signature.clear();
+}
+
+std::optional<LinkTokenLedger::Live> TokenLinkAuthProvider::live_by_code_locked(
+        std::string_view code, std::string_view source, uint64_t now) {
+    // The hash and the lookup run before any limit is consulted, so a refused
+    // attempt costs what a wrong code costs.
+    const auto code_hash = link_code_hash_hex(code);
+    auto live = ledger_.live_by_code(code_hash, now);
+
+    const auto window_open = [now](const CodeFailures& f) {
+        return f.count > 0 && now < f.window_start + kLinkCodeFailureWindowSec;
+    };
+    const auto note_failure = [now, &window_open](CodeFailures& f) {
+        if (!window_open(f)) {
+            f.window_start = now;
+            f.count = 0;
+        }
+        ++f.count;
+    };
+
+    // Entries whose window and lockout both passed carry nothing.
+    std::erase_if(code_failures_by_source_, [&](const auto& kv) {
+        return !window_open(kv.second) && now >= kv.second.locked_until;
+    });
+    auto by_source = code_failures_by_source_.find(source);
+    if (by_source == code_failures_by_source_.end()) {
+        if (code_failures_by_source_.size() >= kLinkCodeMaxSources) {
+            spdlog::debug("[token-link] invite code refused: source table full");
+            return std::nullopt;
+        }
+        by_source = code_failures_by_source_.emplace(std::string(source), CodeFailures{}).first;
+    }
+    const bool source_locked = now < by_source->second.locked_until;
+    const bool server_locked = window_open(code_failures_all_) &&
+                               code_failures_all_.count >= kLinkCodeMaxFailuresPerServer;
+    if (source_locked || server_locked) {
+        // Refused outright, right or wrong; a refused attempt counts toward
+        // neither limit, so a locked address cannot close codes for everyone.
+        spdlog::debug("[token-link] invite code refused: {} limit", source_locked ? "source" : "server");
+        return std::nullopt;
+    }
+    if (!live) {
+        // Unknown, expired, spent, or shared: one wrong attempt for this
+        // address and for the server. The code is not logged.
+        note_failure(by_source->second);
+        if (by_source->second.count >= kLinkCodeMaxFailuresPerSource) {
+            by_source->second.locked_until = now + kLinkCodeFailureWindowSec;
+        }
+        note_failure(code_failures_all_);
+        spdlog::debug("[token-link] invite code refused");
+    }
+    return live;
 }
 
 bool TokenLinkAuthProvider::save_locked() {
@@ -221,7 +302,7 @@ LinkTokenRecord TokenLinkAuthProvider::record_from_grant(const LinkTokenEvent& m
     return record;
 }
 
-std::optional<std::pair<std::string, LinkTokenRecord>>
+std::optional<MintedLinkToken>
 TokenLinkAuthProvider::mint(const std::string& owner_user_id,
                             const std::string& owner_pubkey,
                             const std::string& group_node_id,
@@ -234,6 +315,7 @@ TokenLinkAuthProvider::mint(const std::string& owner_user_id,
     crypto_.random_bytes(std::span<uint8_t>(raw));
     auto token = "lnk_" + crypto::to_hex(std::span<const uint8_t>(raw));
 
+    std::string code;
     LinkTokenEvent mint;
     EventPublisher publisher;
     {
@@ -245,6 +327,19 @@ TokenLinkAuthProvider::mint(const std::string& owner_user_id,
                          owner_user_id, kLinkTokenMaxPerOwner);
             return std::nullopt;
         }
+        // The code is unique among the unexpired codes this server holds.
+        // Another server can still mint the same code in the same window;
+        // then neither code redeems (LinkTokenLedger::live_by_code) and both
+        // tokens do.
+        for (int draw = 0; draw < kCodeDraws && code.empty(); ++draw) {
+            auto candidate = draw_code(crypto_);
+            if (!ledger_.code_in_use(link_code_hash_hex(candidate), now)) code = std::move(candidate);
+        }
+        if (code.empty()) {
+            spdlog::error("[token-link] no free invite code in {} draws; refusing to mint",
+                          kCodeDraws);
+            return std::nullopt;
+        }
         mint.kind          = LinkTokenEventKind::Mint;
         mint.token_hash    = link_token_hash_hex(token);
         mint.generation    = 0;
@@ -254,6 +349,7 @@ TokenLinkAuthProvider::mint(const std::string& owner_user_id,
         mint.owner_user_id = owner_user_id;
         mint.owner_pubkey  = owner_pubkey;
         mint.created_at    = now;
+        mint.code_hash     = link_code_hash_hex(code);
         author_locked(mint, true);
         if (ledger_.add(mint, now) != LinkTokenLedger::AddResult::Added || !save_locked()) {
             spdlog::error("[token-link] could not record a new link token");
@@ -265,25 +361,34 @@ TokenLinkAuthProvider::mint(const std::string& owner_user_id,
 
     spdlog::info("[token-link] Minted link token for group {} (owner {}, ttl {}s)",
                  group_node_id, owner_user_id, ttl.count());
-    return std::make_pair(std::move(token), record_from_grant(mint));
+    return MintedLinkToken{std::move(token), std::move(code), record_from_grant(mint)};
 }
 
-std::optional<LinkTokenRecord> TokenLinkAuthProvider::verify(std::string_view token) {
-    if (token.empty()) return std::nullopt;
+std::optional<LinkTokenRecord> TokenLinkAuthProvider::verify(std::string_view token_or_code,
+                                                             std::string_view source) {
+    if (token_or_code.empty()) return std::nullopt;
     {
         std::lock_guard lock(mutex_);
-        if (const auto live = ledger_.live(link_token_hash_hex(token), now_sec())) {
+        const auto now = now_sec();
+        const auto live = is_link_code(token_or_code)
+                              ? live_by_code_locked(token_or_code, source, now)
+                              : ledger_.live(link_token_hash_hex(token_or_code), now);
+        if (live) {
             auto record = record_from_grant(live->mint);
             record.generation = live->generation;
             return record;
         }
+        // A code never names a token from an earlier release.
+        if (is_link_code(token_or_code)) return std::nullopt;
     }
-    return legacy_verify(token);
+    return legacy_verify(token_or_code);
 }
 
-std::optional<LinkTokenRecord> TokenLinkAuthProvider::consume(std::string_view token) {
-    if (token.empty()) return std::nullopt;
-    const auto hash = link_token_hash_hex(token);
+std::optional<LinkTokenRecord> TokenLinkAuthProvider::consume(std::string_view token_or_code,
+                                                              std::string_view source) {
+    if (token_or_code.empty()) return std::nullopt;
+    const bool by_code = is_link_code(token_or_code);
+    std::string hash = by_code ? std::string{} : link_token_hash_hex(token_or_code);
 
     LinkTokenEvent spend;
     LinkTokenRecord record;
@@ -291,15 +396,22 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::consume(std::string_view t
     {
         std::lock_guard lock(mutex_);
         const auto now = now_sec();
-        const auto live = ledger_.live(hash, now);
-        if (!live) {
-            if (ledger_.holds(hash)) {
-                spdlog::warn("[token-link] Link token spent or expired");
-                return std::nullopt;
+        std::optional<LinkTokenLedger::Live> live;
+        if (by_code) {
+            live = live_by_code_locked(token_or_code, source, now);
+            if (!live) return std::nullopt;
+            hash = live->mint.token_hash;
+        } else {
+            live = ledger_.live(hash, now);
+            if (!live) {
+                if (ledger_.holds(hash)) {
+                    spdlog::warn("[token-link] Link token spent or expired");
+                    return std::nullopt;
+                }
+                // Not a replicated token: it may be one an earlier release
+                // minted on this server.
+                return legacy_consume(token_or_code);
             }
-            // Not a replicated token: it may be one an earlier release
-            // minted on this server.
-            return legacy_consume(token);
         }
         spend.kind       = LinkTokenEventKind::Spend;
         spend.token_hash = hash;
@@ -329,12 +441,21 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::consume(std::string_view t
     return record;
 }
 
-bool TokenLinkAuthProvider::refund(std::string_view token, const LinkTokenRecord& record) {
-    if (token.empty() || record.owner_user_id.empty() || record.group_node_id.empty()) {
+bool TokenLinkAuthProvider::refund(std::string_view token_or_code,
+                                   const LinkTokenRecord& record) {
+    if (token_or_code.empty() || record.owner_user_id.empty() || record.group_node_id.empty()) {
         return false;
     }
-    if (record.token_hash.empty()) return legacy_refund(token, record);
-    if (link_token_hash_hex(token) != record.token_hash || !record.grant) return false;
+    const bool by_code = is_link_code(token_or_code);
+    if (record.token_hash.empty()) return !by_code && legacy_refund(token_or_code, record);
+    if (!record.grant) return false;
+    // The secret presented must name the record's token, as the token or as
+    // the code its mint binds.
+    const bool names_token =
+        by_code ? !record.grant->code_hash.empty() &&
+                      link_code_hash_hex(token_or_code) == record.grant->code_hash
+                : link_token_hash_hex(token_or_code) == record.token_hash;
+    if (!names_token) return false;
 
     LinkTokenEvent refund;
     EventPublisher publisher;
