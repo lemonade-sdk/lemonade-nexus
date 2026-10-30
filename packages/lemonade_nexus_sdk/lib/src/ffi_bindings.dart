@@ -560,6 +560,25 @@ typedef _LnRemoveGroupMemberDart = int Function(
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 
+typedef _LnGetGroupDevices = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> groupId,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnGetGroupDevicesDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> groupId,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnListNetworkDevices = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnListNetworkDevicesDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+
 typedef _LnGetGroupMembers = ffi.Int32 Function(
   LnClientHandle client,
   ffi.Pointer<ffi.Char> nodeId,
@@ -1013,6 +1032,12 @@ class LemonadeNexusFfi {
           _LnAddGroupMemberDart>('ln_add_group_member');
   late final _lnRemoveGroupMember = _lib.lookupFunction<_LnRemoveGroupMember,
           _LnRemoveGroupMemberDart>('ln_remove_group_member');
+  // Looked up on first use: a native build without these symbols still
+  // loads, and only the call fails.
+  late final _lnGetGroupDevices = _lib.lookupFunction<_LnGetGroupDevices,
+      _LnGetGroupDevicesDart>('ln_get_group_devices');
+  late final _lnListNetworkDevices = _lib.lookupFunction<_LnListNetworkDevices,
+      _LnListNetworkDevicesDart>('ln_list_network_devices');
   late final _lnGetGroupMembers = _lib.lookupFunction<_LnGetGroupMembers,
           _LnGetGroupMembersDart>('ln_get_group_members');
   late final _lnJoinGroup =
@@ -2000,6 +2025,31 @@ class LemonadeNexusFfi {
       }
       freeString(outJson.value);
       return null;
+    } finally {
+      calloc.free(outJson);
+    }
+  }
+
+  /// ln_get_group_devices: the error code and the out JSON (the device
+  /// array, or {"error": ...} on failure).
+  (LnError, String?) getGroupDevices(LnClientHandle client, String groupId) {
+    final groupIdPtr = groupId.toNativeUtf8().cast<ffi.Char>();
+    final outJson = calloc<ffi.Pointer<ffi.Char>>();
+    try {
+      final result = _lnGetGroupDevices(client, groupIdPtr, outJson);
+      return (LnError.fromCode(result), toStringAndFree(outJson.value));
+    } finally {
+      malloc.free(groupIdPtr);
+      calloc.free(outJson);
+    }
+  }
+
+  /// ln_list_network_devices: the error code and the out JSON.
+  (LnError, String?) listNetworkDevices(LnClientHandle client) {
+    final outJson = calloc<ffi.Pointer<ffi.Char>>();
+    try {
+      final result = _lnListNetworkDevices(client, outJson);
+      return (LnError.fromCode(result), toStringAndFree(outJson.value));
     } finally {
       calloc.free(outJson);
     }

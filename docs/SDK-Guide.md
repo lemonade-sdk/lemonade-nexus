@@ -398,6 +398,8 @@ within 10 minutes; the token still works then.
 | `create_link_token(ttl, target, perms)` | `ln_invite_create(client, target_or_NULL, perms_json_or_NULL, ttl, &json)` | Create an invite |
 | `accept_invite(code)` | `ln_invite_accept(client, code, &json)` | Join another network with an existing account |
 | `list_memberships()` | `ln_memberships_list(client, &json)` | Groups this identity belongs to |
+| `get_group_devices(group)` | `ln_get_group_devices(client, group, &json)` | Devices of one group, members included |
+| `list_network_devices()` | `ln_list_network_devices(client, &json)` | Devices of every network of this identity |
 | `leave_membership(group)` | `ln_membership_leave(client, group, &json)` | Leave a group joined by invite |
 | `move_node(node, parent)` | `ln_move_node(client, node, parent, &json)` | Move a device or subgroup |
 | `check_device_name(name, group, code)` | `ln_check_device_name(client, name, group_or_NULL, code_or_NULL, &json)` | Check a device name before a join or rename |
@@ -414,6 +416,23 @@ within 10 minutes; the token still works then.
   and becomes a member of the invite's group. Its device can then reach that
   group's devices, and they can reach it, as the invite's permissions allow.
   The inviter never sees the member's other devices.
+- A device that **already has a node** and joins with `set_link_token(code)`
+  gets the same result: it stays in its own network and becomes a member. The
+  join still succeeds; `JoinResult::membership` (C: the `membership` object of
+  `ln_join_network`) reports `member`, `pending`, or `refused` with the
+  server's reason. A client must show this result: the device is not placed in
+  the invite's group.
+- **Device lists.** `get_group_devices(group)` (`GET /api/tree/devices/<group>`)
+  walks the group and every subgroup this identity may read, and lists the
+  devices placed there and the devices of members that joined from their own
+  networks (`member`). A member's device is listed to the group's
+  administrators and editors, to devices that may connect to it, and to the
+  member itself. `can_connect` applies the mesh peer-list rule from this
+  device. `list_network_devices()` lists every group of `list_memberships()`,
+  home groups first, each device once. Read online state from the mesh peer
+  list. The mesh port uses `list_network_devices()`, so a member's inference
+  server can serve this device. Build device lists from these calls, not from
+  `get_children`: children leave out members.
 - An invite never grants `admin`, `edit_node`, or `delete_node`, and never
   grants more than the inviter holds. The server checks the inviter's
   authority again when the code is used.

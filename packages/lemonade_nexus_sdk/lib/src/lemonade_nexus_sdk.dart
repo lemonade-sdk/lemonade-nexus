@@ -1069,6 +1069,43 @@ class LemonadeNexusSdk {
     return _parseJsonList(json, GroupMember.fromJson);
   }
 
+  /// The devices of group [groupId] this identity may see: the devices
+  /// placed in it and in the subgroups it may read, and the devices of
+  /// identities that joined it from their own networks
+  /// ([NetworkDevice.member]). Online state is not part of it; see
+  /// [getMeshPeers]. Throws [SdkException] with the server's reason.
+  Future<List<NetworkDevice>> getGroupDevices(String groupId) async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread((f, c) => f.getGroupDevices(c, groupId));
+    return _deviceList(error, json);
+  }
+
+  /// Every device of this identity's networks: its own groups first, then
+  /// the groups it joined with an invite, each device once
+  /// ([NetworkDevice.groupRole]). Throws [SdkException] with the server's
+  /// reason.
+  Future<List<NetworkDevice>> listNetworkDevices() async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread((f, c) => f.listNetworkDevices(c));
+    return _deviceList(error, json);
+  }
+
+  List<NetworkDevice> _deviceList(LnError error, String? json) {
+    if (error != LnError.success || json == null) {
+      String? reason;
+      if (json != null) {
+        try {
+          reason = (jsonDecode(json) as Map<String, dynamic>)['error']?.toString();
+        } catch (_) {}
+      }
+      throw SdkException(error == LnError.success ? LnError.internal : error,
+          message: reason ?? 'The device list is not available', rawJson: json);
+    }
+    return _parseJsonList(json, NetworkDevice.fromJson);
+  }
+
   /// Joins a group by creating an endpoint and allocating an IP.
   Future<GroupJoinResponse> joinGroup(String parentNodeId) async {
     _checkDisposed();
