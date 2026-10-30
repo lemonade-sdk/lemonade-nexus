@@ -187,7 +187,7 @@ section 2.
 - **`cross-server-join` is a manual check.** `nexus-e2e cross-server-join` drives two devices that
   attach to two different Tier 1 servers, then reopen and authenticate again
   (`Live-E2E.md`, "Two servers, one group"). No job runs it: it creates devices and a group on the
-  fleet, and its last check fails once the group already exists (see section 7).
+  fleet.
 
 ## 5. Housekeeping
 
@@ -239,14 +239,13 @@ The rollout steps are in `Releasing.md` ("The tree operations release"). What re
   `apply_delta` cases of `test_permission_tree.cpp`, in a follow-up change.
 - **Not tested on the fleet.** The migration ran in unit and multi-server tests only. Nobody has run
   it against the encrypted production trees.
-- **Ops that only some servers apply.** `TreeConsensus::submit` queues the op in memory and calls
+- **A forwarded op is sent once.** `TreeConsensus::submit` queues the op in memory and calls
   `broadcast_` once (`projects/LemonadeNexus/src/Tree/TreeConsensus.cpp:228`).
   `TreeConsensus::receive_forwarded` drops the op when the receiving server is unhealthy or awaiting
   a merge, when `validate_local_op` refuses it, or when it already has that op id, and nothing
   re-sends it (`projects/LemonadeNexus/src/Tree/TreeConsensus.cpp:233`). `TreeOpPool` keeps pending
   ops in memory only (`projects/LemonadeNexus/include/LemonadeNexus/Tree/TreeOpPool.hpp:94`), so a
-  restart loses whatever a server held. Consequence: an op submitted to one Tier 1 server — the join
-  of a device that attached there — can stay unknown to the others, and two replicas keep different
-  state roots. `nexus-e2e cross-server-join` shows the difference against the live fleet
-  (`Live-E2E.md`). A fix needs a durable pending pool or a re-publish path, with expiry and retry;
-  nothing in the current tree does that, and `gpatch` does not address it.
+  restart loses whatever a server held. This affects liveness, not agreement: every replica applies
+  only committed blocks that chain on the previous state root (`TreeConsensus::on_committed`), so an
+  op that a leader never receives is never committed and its submitter times out. A fix needs a
+  durable pending pool or a re-publish path, with expiry and retry.

@@ -268,9 +268,11 @@ and in the same group. Each cycle checks that:
 
 - both devices report the same group (`both devices are in the same group`),
 - each server's group lists both devices, and each peer list contains the other,
-- the two servers report the same tree height, the same applied height, and the
-  same state root, and neither is unhealthy, behind, halted, or still awaiting
-  the tree merge.
+- within 120 seconds, the two servers report the same tree height, the same
+  applied height, and the same state root, and neither is unhealthy, behind,
+  halted, or still awaiting the tree merge. The log keeps committing while the
+  check reads it, so one read of each server can catch one of them a block or
+  two behind; the check reads again until replication catches up.
 
 Key files are created when missing, so a run uses two new devices instead of the
 persistent CI accounts. **The run changes the fleet:** it places two devices and
@@ -279,9 +281,8 @@ files to reuse them.
 
 **What a run shows today.** On 2026-10-30 two runs against the `us-west` fleet
 reached epoch 72 and passed every check in cycle 1, including both devices on
-each side. The first run also passed cycle 2. On the second run, made with the
-same two keys after the group already existed, every check passed except
-`cycle 2: both servers hold the same tree`: the creator's server had applied
-height 627 and the joiner's 629, with different state roots, so one replica had
-not caught up. See `Outstanding-Work.md` section 7 for why that can happen and
-what a fix needs.
+each side. The first run also passed cycle 2. In the second run, an earlier
+version of the check read each server once: the creator's server reported
+applied height 627 and the joiner's 629. Different heights give different
+state roots, so that read shows one replica two blocks behind, not two
+replicas that disagree. The check now waits for replication before it compares.

@@ -2069,9 +2069,20 @@ bool run_cross_server_cycle(int cycle, const Options& o, Report& report, DeviceS
     ok = peers && ok;
 
     // 4. The two servers must hold the same tree: the same state root, the
-    //    same height, and neither behind, halted, or awaiting the merge.
-    const auto a_sync = read_tree_sync(a, creator);
-    const auto b_sync = read_tree_sync(b, joiner);
+    //    same height, and neither behind, halted, or awaiting the merge. Each
+    //    read is a moment of a log that keeps committing, so one server can
+    //    be a block or two behind the other; only a difference that outlasts
+    //    replication is a divergence.
+    TreeSync a_sync;
+    TreeSync b_sync;
+    (void)wait_until(120s, 3s, [&] {
+        a_sync = read_tree_sync(a, creator);
+        b_sync = read_tree_sync(b, joiner);
+        return a_sync.ok() && b_sync.ok() && !a_sync.awaiting_merge && !b_sync.awaiting_merge &&
+               a_sync.healthy && b_sync.healthy && !a_sync.behind && !b_sync.behind &&
+               a_sync.state_root == b_sync.state_root && a_sync.height == b_sync.height &&
+               a_sync.applied_height == b_sync.applied_height;
+    });
     if (!a_sync.ok() || !b_sync.ok()) {
         report.add(stage + ": both servers hold the same tree", Outcome::Fail,
                    a_sync.describe() + " | " + b_sync.describe());
@@ -2085,7 +2096,8 @@ bool run_cross_server_cycle(int cycle, const Options& o, Report& report, DeviceS
                a_sync.state_root != b_sync.state_root || a_sync.height != b_sync.height ||
                a_sync.applied_height != b_sync.applied_height) {
         report.add(stage + ": both servers hold the same tree", Outcome::Fail,
-                   "the two trees diverged: " + a_sync.describe() + " | " + b_sync.describe());
+                   "after 120 s the two trees still differ: " + a_sync.describe() + " | " +
+                       b_sync.describe());
         ok = false;
     } else {
         report.add(stage + ": both servers hold the same tree", Outcome::Pass,
