@@ -59,7 +59,7 @@ void Tier1ApiHandler::do_register_routes(httplib::Server& pub,
             // The chain a client verifies against is served from the local
             // store: a 404 is how an empty or stale replica announces
             // itself, so the requested epoch goes to the log.
-            spdlog::info("[Tier1Api] authority: no chain after have_epoch={}", have_epoch);
+            spdlog::debug("[Tier1Api] authority: no chain after have_epoch={}", have_epoch);
             error_response(res, "no authority chain after this epoch", 404);
             return;
         }
@@ -69,7 +69,9 @@ void Tier1ApiHandler::do_register_routes(httplib::Server& pub,
             if (decoded->has_base && decoded->links.empty()) top = 1;
             if (!decoded->links.empty()) top = decoded->links.back().handoff.to_epoch.underlying();
         }
-        spdlog::info("[Tier1Api] authority: have_epoch={} served to epoch {} ({} links{})",
+        // Debug: the route is public and unauthenticated, so an info line per
+        // request would let any caller fill the log.
+        spdlog::debug("[Tier1Api] authority: have_epoch={} served to epoch {} ({} links{})",
                      have_epoch, top, decoded ? decoded->links.size() : 0u,
                      decoded && decoded->has_base ? ", with base" : "");
         json_response(res, nlohmann::json{{"have_epoch", have_epoch},
