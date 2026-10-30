@@ -245,15 +245,46 @@ cryptography is involved, and a punch grants no authority:
   the endpoint only for the caller's own node, as a `SetEndpoint` tree
   operation when tree operations are on. It refuses IPv4 addresses that are
   not unicast. An empty endpoint keeps the stored one.
+- **LAN endpoints go only to authorized peers.** The heartbeat may carry
+  `local_endpoints`: up to four of the device's private IPv4 addresses
+  (10/8, 172.16/12, 192.168/16, and 100.64/10 only when STUN saw that very
+  address) with its dataplane port. The server accepts them only from the
+  node's own management key on the private API, refuses public, loopback
+  (unless the server itself is on loopback), link-local, and malformed
+  entries, and keeps them in memory for 120 seconds, not in the tree. It
+  returns them only in the `GET /api/mesh/peers` entries of callers that
+  already list the node, that is, peers that may connect to it. The public
+  API never returns them, and an unauthenticated caller never sees them.
+  What this discloses: the private addresses of a device's LAN interfaces to
+  the peers that may already open a BoringTun session with it and that
+  already see its public endpoint. A private address is not routable from
+  the internet, and it reveals little more than the public endpoint does.
+  The SDK skips VPN, tunnel, container, and cellular interfaces, so their
+  addresses are not disclosed.
+- **A LAN endpoint only changes where packets go.** The SDK probes a peer's
+  LAN endpoints only when they are private addresses and the peer is on its
+  own network (the same public address, or a LAN endpoint inside one of its
+  subnets; `lan_probe_targets`). A probe is the same BoringTun handshake
+  initiation, sent to the LAN endpoints and the listed endpoint at once
+  (`UserspaceDataplane::probe_endpoints`). The peer moves to a LAN address
+  only when an authenticated handshake answers from it, so a device that
+  claims a LAN address cannot impersonate the peer: it does not hold the
+  peer's static key. Handshakes from addresses that are not listed are
+  handled as before (authenticated roaming). A false LAN endpoint can at
+  worst aim a few handshake initiations at a private address on the
+  victim's network, at the rate limits below, and delay the relay by the
+  1.5-second LAN window.
 - **A change notice adds no peer.** The heartbeat answer's `peers_revision`
   is an opaque hash, present only when the caller holds Read on its node. A
   changed value only makes the SDK fetch the verified peer list sooner; it
   names no peer and no address.
-- **Probes are rate limited.** At most 16 probes go out per pass and passes
-  are at least 250 ms apart. A peer gets a burst of five probes, then two
+- **Probes are rate limited.** At most 16 peers are probed per pass, each
+  probe goes to at most five addresses (four LAN endpoints and the listed
+  endpoint), and passes are at least 250 ms apart. A peer gets a burst of five probes, then two
   probes per 15-second slot, or per 60-second slot while it is relayed. A peer
   with a fresh direct handshake gets none. A new burst starts only when the
-  peer's listed endpoint changes, the peer comes back online at the server,
+  peer's listed endpoint or LAN endpoints change, its LAN path goes silent,
+  the peer comes back online at the server,
   the application requests a refresh, the peer list changes at the server,
   or the device resumes from a suspension.
 
@@ -906,10 +937,14 @@ These are implementation limits, not settings an operator can disable:
    learning, and hole punching have unit tests and loopback end-to-end tests
    (`test_relay_service`, `test_sdk_relay_fallback`, `test_sdk_hole_punch`).
    They are not tested across real NAT devices or under load. Each device
-   publishes one reflexive endpoint from one STUN server: there are no LAN
-   candidates, and the SDK does not detect endpoint-dependent (symmetric) NAT
-   mappings. Two peers behind the same NAT connect directly only when the NAT
-   supports hairpinning. Pair slots assume that the two device clocks agree to
+   publishes one reflexive endpoint from one STUN server, and the SDK does not
+   detect endpoint-dependent (symmetric) NAT mappings. LAN endpoints are
+   tested on loopback only (`test_sdk_lan_paths`, `test_sdk_hole_punch`,
+   `test_sdk_transport`). A Tier 1 server keeps the LAN endpoints of the
+   devices whose heartbeats reach it, in memory: they are not replicated, so
+   two devices whose sessions are on different Tier 1 servers do not learn
+   each other's LAN endpoints, and two such devices behind one NAT connect
+   directly only when the NAT supports hairpinning. Pair slots assume that the two device clocks agree to
    within the NAT mapping lifetime. A peer without a listed direct endpoint
    always uses a relay. Both peers pick the relay from their own
    candidate lists; when the lists differ, the peers can pick different relays

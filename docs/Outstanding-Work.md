@@ -28,8 +28,10 @@ Check this list before the next release. Nothing below is a blocker unless marke
 - **Mesh hole punching** (owner approval, 2026-10-25). The SDK learns its reflexive address with a
   STUN query from the dataplane socket, publishes it with the heartbeat, and punches direct paths
   to peers at their listed endpoints; a relayed peer moves back to a direct path when a punch
-  succeeds. Follow-ups: relay fallback and hole punching are not tested across real NAT devices
-  or under load; there are no LAN candidates and no symmetric-NAT detection; and tree-derived DNS
+  succeeds. Follow-ups: relay fallback, hole punching, and LAN-direct paths are not tested across
+  real NAT devices or under load; LAN endpoints are kept per Tier 1 server and not replicated, so
+  devices with sessions on different Tier 1 servers do not see each other's; there is no
+  symmetric-NAT detection; and tree-derived DNS
   names are answered by Tier 1 nameservers only. See `Security.md`, current limitations 6 to 8.
 
 ## 1. Remove the two storage flags

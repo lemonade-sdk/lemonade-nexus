@@ -249,7 +249,16 @@ changes, so the other side fetches a new or moved peer's endpoint within one
 heartbeat (5 seconds) and punches back at once, instead of at its next
 30-second peer refresh.
 
-When no direct handshake arrives within 3 seconds, the SDK relay fallback
+The heartbeat also carries the device's private LAN addresses with its
+dataplane port (`local_endpoints`). The server keeps them in memory and
+lists them only to the peers that already list the device. A device probes
+the LAN endpoints of a peer on its own network (the same public address, or
+a shared subnet) together with the peer's public endpoint, so two devices
+behind a router that does not hairpin UDP still connect directly over the
+LAN.
+
+When no direct handshake arrives within 3 seconds (1.5 seconds for a peer
+reachable only on the LAN), the SDK relay fallback
 takes over (UDP `9103`): each peer requests its own relay ticket from its
 verified Tier 1 server, and the relay pairs the two peers' `Allocate`
 requests. A relayed peer keeps getting upgrade probes and moves back to the

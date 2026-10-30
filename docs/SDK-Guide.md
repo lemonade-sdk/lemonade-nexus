@@ -526,8 +526,8 @@ C ABI equivalents: `ln_mesh_enable`, `ln_mesh_enable_config`,
 `ln_mesh_expose_service`, `ln_mesh_open_egress`, plus
 `ln_private_api_call` for generic authenticated private routes.
 `ln_mesh_peers` and the `peers` of `ln_mesh_status` carry every `MeshPeer`
-field, including `peer_permissions`, `mgmt_pubkey`, `last_seen` and
-`last_rx`.
+field, including `peer_permissions`, `mgmt_pubkey`, `last_seen`, `last_rx`,
+`local_endpoints` and `path`.
 
 **Peer liveness.** A monitor pass every 5 s sets each peer's `is_online`
 (`lnsdk::peer_signal_fresh` and `lnsdk::next_peer_liveness` in
@@ -539,6 +539,35 @@ within 15 s plus one peer refresh interval) counts. A relayed peer also
 stays online while the server's `last_seen` is that recent. An online peer
 reads offline only after two stale passes in a row, so one late keepalive
 or peer refresh does not flip it. The mesh port routes only to online peers.
+
+**LAN-direct paths.** The SDK reports the device's private LAN addresses
+with the dataplane port in each heartbeat (`local_endpoints`), and probes
+the LAN endpoints of a peer on the same network before its public endpoint
+and before a relay. Two devices behind a router that does not hairpin UDP
+then connect over the LAN instead of a relay. Each `MeshPeer` reports:
+
+- `local_endpoints`: the peer's LAN endpoints that the SDK probes. They are
+  empty when the peer is on another network (another public address and no
+  shared subnet).
+- `path`: `"lan"` (the session runs over a LAN endpoint), `"direct"` (over
+  another direct address, normally the punched public endpoint), `"relay"`,
+  or `""` (no working path yet, or the path went silent).
+
+The mesh port device status carries the same `path`. Call
+`ln_mesh_refresh` / `refresh_mesh_peers()` after a network change: the SDK
+reads the interface addresses again and reports a new list at once. See
+[Client SDK](Client-SDK#lan-direct-paths) for the rules and
+[Security](Security#direct-paths) for what is disclosed.
+
+**Mobile apps.** On iOS 14 and later, the first datagram an app sends to a
+LAN address shows the system's Local Network permission prompt. An app that
+embeds the SDK must declare `NSLocalNetworkUsageDescription` in its
+`Info.plist`, with a sentence that says why (for example, "Connects directly
+to your other devices on this network."). The SDK sends only unicast UDP, so
+no Bonjour service entry (`NSBonjourServices`) is needed. If the user denies
+the permission, the LAN probes fail without an error and the device uses the
+public path or a relay, as before. Android needs no permission beyond
+`INTERNET` for unicast UDP to LAN addresses.
 
 ### Service catalog and route policy
 
