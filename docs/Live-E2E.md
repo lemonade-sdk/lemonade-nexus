@@ -268,8 +268,9 @@ and in the same group. Each cycle checks that:
 
 - both devices report the same group (`both devices are in the same group`),
 - each server's group lists both devices, and each peer list contains the other,
-- the two servers report the same tree mode, height, applied height, and state
-  root (`both servers hold the same tree`).
+- the two servers report the same tree height, the same applied height, and the
+  same state root, and neither is unhealthy, behind, halted, or still awaiting
+  the tree merge.
 
 Key files are created when missing, so a run uses two new devices instead of the
 persistent CI accounts. **The run changes the fleet:** it places two devices and
