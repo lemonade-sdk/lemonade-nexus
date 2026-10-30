@@ -159,7 +159,7 @@ direct path to every peer before it uses a relay:
   probe changes no state. Only a valid handshake answer moves the peer to the
   probed address.
 - A peer with a fresh handshake on its direct path gets no probes. At most 16
-  probes go out in one pass.
+  peers are probed in one pass.
 - A known peer whose listed endpoint changed, or that this device reads
   offline while the server saw it again, is *renewed*: it gets a new burst
   at once, and a handshake from its old path no longer counts as a working
@@ -176,13 +176,58 @@ direct path to every peer before it uses a relay:
 `ln_mesh_status` and `ln_mesh_peers` report a direct peer's address in
 `endpoint`.
 
+### LAN-Direct Paths
+
+Two devices behind one router that does not hairpin UDP never meet at their
+public endpoints. They connect over the LAN instead:
+
+- At join and `enable_mesh`, on every refresh request and resume, and every
+  60 seconds, the SDK lists the host's IPv4 interface addresses
+  (`list_interface_addresses`: `getifaddrs` on Linux, macOS, iOS, and Android;
+  `GetAdaptersAddresses` on Windows). It keeps up to four private addresses
+  (10/8, 172.16/12, 192.168/16) of interfaces that are up, and pairs them
+  with the dataplane's UDP port (`select_local_endpoints`). It skips
+  loopback, link-local, public, and mesh-plane addresses, and VPN, tunnel,
+  container, and cellular interfaces (`utun`, `tun`, `wg`, `ppp`, `docker`,
+  `rmnet`, `pdp_ip`, and others; on Windows, adapters that are not Ethernet or
+  Wi-Fi, or that name themselves virtual or VPN). A carrier NAT address
+  (100.64/10) counts only when STUN saw that very address.
+- The heartbeat carries them as `local_endpoints`. A changed list goes out at
+  once. The server lists them only to the peers that already list the
+  device (see [Security](Security#direct-paths)), and `peers_revision`
+  changes with them.
+- A peer is on this device's network when its public endpoint has the same
+  IP address as this device's reflexive address (one NAT), or when one of
+  its LAN endpoints is inside one of this device's subnets. Only then does
+  `ln_mesh_peers` list its `local_endpoints`, and only then are they probed.
+- Each probe of such a peer is one handshake initiation, sent to its LAN
+  endpoints first and to its public endpoint in the same moment. The
+  BoringTun session runs over the address that answers. The relay fallback
+  waits 1.5 seconds (`kLanAnswerWindow`) for a LAN answer before it pairs a
+  relay, also after a renewal. A peer on another network does not wait.
+- `MeshPeer::path` (`path` in `ln_mesh_peers` and `ln_mesh_status`, and in
+  the mesh port device status) says where the traffic goes: `"lan"`,
+  `"direct"`, `"relay"`, or `""` (no working path yet).
+- A LAN path that gets no authenticated packet for the liveness window
+  (three keepalive intervals plus 5 seconds) ends at the next monitor pass:
+  the peer is probed again at every address and falls back to the public
+  path or a relay. A relayed peer keeps getting upgrade probes at its LAN
+  endpoints, and a refresh request probes them at once, so the LAN path
+  returns when it answers.
+- Servers without the field ignore `local_endpoints`, and clients without it
+  change nothing. A server keeps the LAN endpoints of the devices whose
+  heartbeats reach it; two devices with sessions on different Tier 1 servers
+  do not see each other's LAN endpoints.
+
 ## Relay Fallback
 
 The SDK moves a peer onto a relay when the dataplane cannot reach it directly:
 
 - The peer has no direct endpoint in the server's peer list, or its direct
   endpoint gave no handshake within 3 seconds of the first probe
-  (`kDirectAnswerWindow`). The punch goes on in the background (see below).
+  (`kDirectAnswerWindow`). A peer on this device's network also gets
+  1.5 seconds for its LAN endpoints (`kLanAnswerWindow`). The punch goes on
+  in the background (see below).
 - Both peers choose the same relay on their own. The candidates are the
   verified Tier 1 servers (relay port `9103`) and the relays that
   `GET /api/relay/list` returns. A relay's id is its base64 node identity key.
@@ -206,7 +251,7 @@ five minutes, and the peer is retried with backoff. Set `prefer_direct` to
 `false` in the mesh config to relay every peer.
 
 With `prefer_direct` (the default), the SDK keeps probing a relayed peer's
-listed endpoint: it finishes the first burst, then sends two probes at each
+listed endpoint and LAN endpoints: it finishes the first burst, then sends two probes at each
 pair slot (every 60 seconds). When the peer answers there with a valid
 handshake, the peer moves to the direct path and the SDK closes the relay
 session. This does not count as a relay failure. A relay request whose path
