@@ -117,6 +117,12 @@ public:
     /// Thread-safe.
     bool probe_peer(const std::string& pubkey, const std::string& endpoint);
 
+    /// probe_peer toward several endpoints with one handshake initiation,
+    /// sent to each in order (UserspaceDataplane::probe_endpoints). Returns
+    /// the number of endpoints it went to; 0 when inactive, the peer is
+    /// unknown or is the server, or no endpoint parses. Thread-safe.
+    std::size_t probe_peer(const std::string& pubkey, const std::vector<std::string>& endpoints);
+
     /// Send a fresh handshake initiation to every peer, the server peer
     /// included, at the address the dataplane sends to now (a relayed peer:
     /// its relay channel). Use it after the process resumed from a

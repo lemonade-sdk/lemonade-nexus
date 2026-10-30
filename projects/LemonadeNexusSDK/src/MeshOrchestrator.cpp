@@ -64,6 +64,20 @@ std::optional<bool> peer_signal_fresh(const MeshPeer& peer, int64_t now_unix,
     return std::nullopt;
 }
 
+std::string peer_path(const MeshPeer& peer, const std::string& dataplane_endpoint,
+                      const std::string& relay_endpoint, bool fresh) {
+    if (!relay_endpoint.empty()) return "relay";
+    if (!fresh || (peer.last_handshake == 0 && peer.last_rx == 0)) return "";
+    if (dataplane_endpoint.empty()) return "";
+    const auto& lan = peer.local_endpoints;
+    if (std::find(lan.begin(), lan.end(), dataplane_endpoint) != lan.end()) return "lan";
+    return "direct";
+}
+
+bool lan_path_lost(const std::string& previous_path, const std::string& path) {
+    return previous_path == "lan" && path.empty();
+}
+
 bool loop_was_suspended(std::chrono::milliseconds wall_elapsed, std::chrono::milliseconds busy,
                         std::chrono::milliseconds planned_wait) {
     return wall_elapsed - busy - std::max(planned_wait, std::chrono::milliseconds{0}) > kResumeGap;
@@ -356,6 +370,13 @@ std::vector<std::string> MeshOrchestrator::do_peer_refresh() {
     // A listed endpoint is only a send target: drop one that is not a usable
     // unicast address before the dataplane or the hole puncher sees it.
     const auto server_scope = endpoint_scope(mesh_.server_endpoint());
+    std::string own_reflexive;
+    std::vector<InterfaceAddress> own_lan;
+    {
+        std::lock_guard lock(mutex_);
+        own_reflexive = our_endpoint_;
+        own_lan = own_lan_;
+    }
     for (auto& peer : server_peers) {
         for (auto* endpoint : {&peer.endpoint, &peer.relay_endpoint}) {
             if (!endpoint->empty() && !peer_endpoint_usable(*endpoint, server_scope)) {
@@ -364,6 +385,18 @@ std::vector<std::string> MeshOrchestrator::do_peer_refresh() {
                 endpoint->clear();
             }
         }
+        // LAN endpoints must be private addresses, and are probed only for
+        // a peer on this device's network.
+        std::erase_if(peer.local_endpoints, [&](const std::string& endpoint) {
+            if (lan_endpoint_usable(endpoint, server_scope == AddressScope::Loopback)) return false;
+            spdlog::warn("[MeshOrchestrator] peer {} lists unusable LAN endpoint '{}'; ignored",
+                         peer.node_id, endpoint);
+            return true;
+        });
+        if (peer.local_endpoints.size() > kMaxLocalEndpoints) {
+            peer.local_endpoints.resize(kMaxLocalEndpoints);
+        }
+        peer.local_endpoints = lan_probe_targets(peer, own_reflexive, own_lan);
     }
 
     // Sync to the boringtun mesh dataplane
@@ -387,15 +420,20 @@ std::vector<std::string> MeshOrchestrator::do_peer_refresh() {
                 // again: the old path may be gone, and the peer's side is
                 // probing toward this device now.
                 const bool moved = !peer.endpoint.empty() && peer.endpoint != old.endpoint;
+                const bool lan_moved = !peer.local_endpoints.empty() &&
+                                       peer.local_endpoints != old.local_endpoints;
                 const bool back = !old.is_online && peer.last_seen > old.last_seen;
-                if (moved || back) {
+                if (moved || lan_moved || back) {
                     renewed.push_back(peer.mesh_pubkey);
                     spdlog::info("[MeshOrchestrator] peer {} {}; probing it now", peer.node_id,
-                                 moved ? "lists a new endpoint" : "is back online at the server");
+                                 moved       ? "lists a new endpoint"
+                                 : lan_moved ? "lists new LAN endpoints"
+                                             : "is back online at the server");
                 }
                 peer.last_handshake = std::max(peer.last_handshake, old.last_handshake);
                 peer.last_rx        = std::max(peer.last_rx, old.last_rx);
                 peer.is_online      = old.is_online;
+                peer.path           = old.path;
                 // The server does not know the relay path; the next monitor
                 // pass corrects it. Without this the path read "" between a
                 // refresh and that pass, and the mesh port saw a path change.
@@ -559,6 +597,7 @@ void MeshOrchestrator::do_monitor(bool count_stale) {
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
 
+    std::vector<std::string> lan_lost;
     {
         std::lock_guard lock(mutex_);
         std::map<std::string, uint32_t> stale_passes;
@@ -566,8 +605,12 @@ void MeshOrchestrator::do_monitor(bool count_stale) {
             // Merge handshake timestamps from the dataplane status. The
             // dataplane knows a peer only by its mesh public key: its
             // tunnel_ip has no prefix and its node_id is empty.
+            std::string dataplane_endpoint;
+            std::string dataplane_relay;
             for (const auto& tp : ms.peers) {
                 if (!peer.mesh_pubkey.empty() && tp.mesh_pubkey == peer.mesh_pubkey) {
+                    dataplane_endpoint = tp.endpoint;
+                    dataplane_relay = tp.relay_endpoint;
                     if (tp.last_handshake > peer.last_handshake) {
                         peer.last_handshake = tp.last_handshake;
                     }
@@ -586,6 +629,17 @@ void MeshOrchestrator::do_monitor(bool count_stale) {
 
             const auto fresh =
                 peer_signal_fresh(peer, now_epoch, config_.peer_refresh_interval_sec);
+            // A pass between monitor intervals reports a path that came up
+            // but never takes one away, so a lost LAN path is seen once, at
+            // a monitor interval.
+            const auto path =
+                peer_path(peer, dataplane_endpoint, dataplane_relay, fresh.value_or(false));
+            if (count_stale || !path.empty()) {
+                if (count_stale && lan_path_lost(peer.path, path)) {
+                    lan_lost.push_back(peer.mesh_pubkey);
+                }
+                peer.path = path;
+            }
             if (!fresh) continue;
             const auto found = stale_passes_.find(peer.mesh_pubkey);
             if (!count_stale && !*fresh) {
@@ -607,6 +661,8 @@ void MeshOrchestrator::do_monitor(bool count_stale) {
                 tp.node_id   = peer.node_id;
                 tp.hostname  = peer.hostname;
                 tp.is_online = peer.is_online;
+                tp.path      = peer.path;
+                tp.local_endpoints = peer.local_endpoints;
                 break;
             }
         }
@@ -617,6 +673,15 @@ void MeshOrchestrator::do_monitor(bool count_stale) {
             if (p.is_online) ++ms.online_count;
         }
         ms.peer_count = static_cast<uint32_t>(known_peers_.size());
+    }
+
+    // The LAN path went silent: the peer is probed again at once, at every
+    // target, and gets a relay when nothing answers within the LAN window.
+    if (!lan_lost.empty()) {
+        hole_puncher_->renew(lan_lost);
+        relay_fallback_->renew(lan_lost, true);
+        spdlog::info("[MeshOrchestrator] {} peer(s) lost their LAN path; probing them again",
+                     lan_lost.size());
     }
 
     StateCallback cb;

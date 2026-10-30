@@ -379,6 +379,11 @@ struct MeshPeer {
     /// device's network (lan_probe_targets). Empty otherwise.
     std::vector<std::string> local_endpoints;
     std::string relay_endpoint;         ///< Relay fallback "ip:port" (empty if not needed)
+    /// The path the peer's traffic takes now, as the mesh orchestrator's
+    /// last monitor pass found it: "lan" (one of local_endpoints), "direct"
+    /// (another address, normally the punched public endpoint), "relay", or
+    /// "" (no working path yet, or the path went silent).
+    std::string path;
     bool        is_online{false};
     int64_t     last_handshake{0};      ///< Unix timestamp
     /// Unix timestamp of the last authenticated packet from the peer,

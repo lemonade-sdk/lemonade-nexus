@@ -1154,3 +1154,251 @@ TEST_F(SdkHolePunchTest, TwoPeersBehindOneNatKeepTheirRelayThroughRenewals) {
     EXPECT_TRUE(online()) << "the relay did not survive the renewals";
     EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
 }
+
+// ---------------------------------------------------------------------------
+// LAN-direct paths
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A LAN between two dataplanes that can go silent. Each side has an
+/// address the other side probes (its advertised LAN endpoint): a datagram
+/// to alice_side() reaches Alice's dataplane from bob_side(), and one to
+/// bob_side() reaches Bob's dataplane from alice_side(), so each dataplane
+/// sees the other at the other's LAN endpoint. cut() drops every datagram.
+class LanLink {
+public:
+    LanLink(asio::io_context& io, uint16_t alice_port, uint16_t bob_port)
+        : to_alice_(io, asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0)),
+          to_bob_(io, asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0)),
+          alice_(asio::ip::address_v4::loopback(), alice_port),
+          bob_(asio::ip::address_v4::loopback(), bob_port) {
+        forward(to_alice_, to_bob_, alice_, alice_buf_, alice_from_);
+        forward(to_bob_, to_alice_, bob_, bob_buf_, bob_from_);
+    }
+    ~LanLink() {
+        asio::error_code ec;
+        to_alice_.close(ec);
+        to_bob_.close(ec);
+    }
+    /// Alice's LAN endpoint, as Bob's peer list names it.
+    std::string alice_side() const { return endpoint_of(to_alice_); }
+    /// Bob's LAN endpoint, as Alice's peer list names it.
+    std::string bob_side() const { return endpoint_of(to_bob_); }
+    std::atomic<bool> cut{false};
+
+private:
+    static std::string endpoint_of(const asio::ip::udp::socket& s) {
+        return "127.0.0.1:" + std::to_string(s.local_endpoint().port());
+    }
+    /// Datagrams arriving at `in` leave from `out` toward `to`.
+    void forward(asio::ip::udp::socket& in, asio::ip::udp::socket& out,
+                 asio::ip::udp::endpoint to, std::array<uint8_t, 2048>& buf,
+                 asio::ip::udp::endpoint& from) {
+        in.async_receive_from(asio::buffer(buf), from,
+                              [this, &in, &out, to, &buf, &from](const asio::error_code& ec,
+                                                                 std::size_t n) {
+                                  if (ec) return;
+                                  if (!cut.load()) {
+                                      asio::error_code send_ec;
+                                      out.send_to(asio::buffer(buf.data(), n), to, 0, send_ec);
+                                  }
+                                  forward(in, out, to, buf, from);
+                              });
+    }
+    asio::ip::udp::socket     to_alice_;
+    asio::ip::udp::socket     to_bob_;
+    asio::ip::udp::endpoint   alice_;
+    asio::ip::udp::endpoint   bob_;
+    std::array<uint8_t, 2048> alice_buf_{};
+    std::array<uint8_t, 2048> bob_buf_{};
+    asio::ip::udp::endpoint   alice_from_;
+    asio::ip::udp::endpoint   bob_from_;
+};
+
+/// What the mesh orchestrator's monitor pass does for one peer: merge the
+/// dataplane's view, work out the path (peer_path), and report whether the
+/// LAN path was lost since the previous pass (lan_path_lost).
+bool monitor_pass(lnsdk::BoringtunMesh& mesh, lnsdk::MeshPeer& peer) {
+    for (const auto& tp : mesh.mesh_status().peers) {
+        if (tp.mesh_pubkey != peer.mesh_pubkey) continue;
+        peer.last_handshake = std::max(peer.last_handshake, tp.last_handshake);
+        peer.last_rx = std::max(peer.last_rx, tp.last_rx);
+        const auto fresh =
+            lnsdk::peer_signal_fresh(peer, static_cast<int64_t>(now_s()), 30).value_or(false);
+        const auto path = lnsdk::peer_path(peer, tp.endpoint, tp.relay_endpoint, fresh);
+        const bool lost = lnsdk::lan_path_lost(peer.path, path);
+        peer.path = path;
+        return lost;
+    }
+    return false;
+}
+
+}  // namespace
+
+// Two devices behind one router that does not hairpin UDP: their public
+// endpoints never answer and no relay has been needed. They meet at their
+// advertised LAN endpoints, the dataplane sends to the LAN address, and the
+// path reads "lan". When the LAN goes silent, the monitor pass sees the lost
+// LAN path, renews the peer, and the relay takes over. When the LAN answers
+// again, an upgrade probe moves the peer back to it and the relay closes.
+TEST_F(SdkHolePunchTest, PeersBehindOneNatMeetOnTheLanAndFallBackToARelay) {
+    UdpSink alice_public(io), bob_public(io);
+    LanLink lan(io, alice.bound_port(), bob.bound_port());
+    std::atomic<int> tickets{0};
+    const auto candidates = [this] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}};
+    };
+    lnsdk::RelayFallback alice_relay(
+        alice, [&](const std::string& relay_id) {
+            ++tickets;
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("alice", relay_id), 200, ""};
+        },
+        candidates, fast_relay());
+    lnsdk::RelayFallback bob_relay(
+        bob, [&](const std::string& relay_id) {
+            ++tickets;
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("bob", relay_id), 200, ""};
+        },
+        candidates, fast_relay());
+    lnsdk::HolePuncher alice_punch(alice, fast_punch());
+    lnsdk::HolePuncher bob_punch(bob, fast_punch());
+
+    std::vector<lnsdk::MeshPeer> alice_peers = {
+        peer(bob_keys.second, "10.64.0.3/32", bob_public.endpoint())};
+    std::vector<lnsdk::MeshPeer> bob_peers = {
+        peer(alice_keys.second, "10.64.0.2/32", alice_public.endpoint())};
+    alice_peers[0].local_endpoints = {lan.bob_side()};
+    bob_peers[0].local_endpoints = {lan.alice_side()};
+    const auto pass = [&] {
+        ASSERT_TRUE(alice.sync_peers(alice_peers).ok);
+        ASSERT_TRUE(bob.sync_peers(bob_peers).ok);
+        (void)alice_punch.maintain(alice_peers, alice_relay.relayed_peers(), true);
+        (void)bob_punch.maintain(bob_peers, bob_relay.relayed_peers(), true);
+        (void)alice_relay.maintain(alice_peers, true);
+        (void)bob_relay.maintain(bob_peers, true);
+        if (monitor_pass(alice, alice_peers[0])) {
+            alice_punch.renew({bob_keys.second});
+            alice_relay.renew({bob_keys.second}, true);
+        }
+        if (monitor_pass(bob, bob_peers[0])) {
+            bob_punch.renew({alice_keys.second});
+            bob_relay.renew({alice_keys.second}, true);
+        }
+    };
+
+    // On the LAN within the LAN window, without a relay request.
+    const auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(eventually(
+        [&] { return alice_peers[0].path == "lan" && bob_peers[0].path == "lan"; }, pass, 10s));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, lnsdk::kLanAnswerWindow);
+    EXPECT_EQ(status_of(alice.mesh_status(), bob_keys.second)->endpoint, lan.bob_side());
+    EXPECT_EQ(status_of(bob.mesh_status(), alice_keys.second)->endpoint, lan.alice_side());
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
+    for (int i = 0; i < 10; ++i) {
+        pass();
+        std::this_thread::sleep_for(200ms);
+    }
+    EXPECT_EQ(tickets.load(), 0) << "a peer on the LAN asked for a relay";
+    EXPECT_TRUE(alice_relay.relayed_peers().empty());
+    EXPECT_GT(alice_public.received() + bob_public.received(), 0)
+        << "the public endpoints were not probed alongside the LAN";
+
+    // The LAN goes silent: after the liveness window both sides move to the
+    // relay.
+    lan.cut = true;
+    ASSERT_TRUE(eventually(
+        [&] {
+            return alice_relay.relayed_peers().contains(bob_keys.second) &&
+                   bob_relay.relayed_peers().contains(alice_keys.second);
+        },
+        pass, 30s));
+    EXPECT_GT(tickets.load(), 0);
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
+    ASSERT_TRUE(eventually([&] { return alice_peers[0].path == "relay"; }, pass, 5s));
+
+    // The LAN answers again: the upgrade probes reach it, the relay closes,
+    // and the path reads "lan" again.
+    lan.cut = false;
+    ASSERT_TRUE(eventually(
+        [&] {
+            return alice_relay.relayed_peers().empty() && bob_relay.relayed_peers().empty() &&
+                   alice_peers[0].path == "lan";
+        },
+        pass, 20s));
+    EXPECT_EQ(status_of(alice.mesh_status(), bob_keys.second)->endpoint, lan.bob_side());
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
+}
+
+// A peer whose LAN endpoints are on another network is not a LAN candidate:
+// it has no LAN endpoints to probe, so a peer without a direct endpoint asks
+// for a relay in its first pass. A peer on this device's network whose LAN
+// endpoint does not answer gets its relay only after the LAN window.
+TEST_F(SdkHolePunchTest, APeerOnAnotherNetworkDoesNotWaitForTheLanWindow) {
+    UdpSink silent_lan(io);
+    std::atomic<int> tickets{0};
+    const auto candidates = [this] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}};
+    };
+    auto timing = fast_relay();
+    timing.pending_limit = 30s;
+    lnsdk::RelayFallback relay(
+        alice, [&](const std::string& relay_id) {
+            ++tickets;
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("alice", relay_id), 200, ""};
+        },
+        candidates, timing);
+
+    // Another network: another public address and no shared subnet.
+    auto listed = peer(bob_keys.second, "10.64.0.3/32");
+    listed.local_endpoints = {"192.168.77.5:41000"};
+    const std::vector<lnsdk::InterfaceAddress> own = {{"en0", "10.20.0.2", 24}};
+    listed.local_endpoints = lnsdk::lan_probe_targets(listed, "203.0.113.9:5000", own);
+    ASSERT_TRUE(listed.local_endpoints.empty());
+    ASSERT_TRUE(alice.sync_peers({listed}).ok);
+    (void)relay.maintain({listed}, true);
+    EXPECT_EQ(tickets.load(), 1) << "a peer on another network waited for the LAN window";
+    relay.stop();
+
+    // This device's network: the LAN endpoint is probed first.
+    lnsdk::RelayFallback lan_relay(
+        alice, [&](const std::string& relay_id) {
+            ++tickets;
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("alice", relay_id), 200, ""};
+        },
+        candidates, timing);
+    lnsdk::HolePuncher punch(alice, fast_punch());
+    auto local = peer(bob_keys.second, "10.64.0.3/32");
+    local.local_endpoints = {silent_lan.endpoint()};
+    const std::vector<lnsdk::MeshPeer> peers = {local};
+    const auto start = std::chrono::steady_clock::now();
+    const int before = tickets.load();
+    ASSERT_TRUE(eventually(
+        [&] { return tickets.load() > before; },
+        [&] {
+            (void)punch.maintain(peers, lan_relay.relayed_peers(), true);
+            (void)lan_relay.maintain(peers, true);
+        },
+        10s));
+    EXPECT_GE(std::chrono::steady_clock::now() - start, lnsdk::kLanAnswerWindow);
+    EXPECT_GT(silent_lan.received(), 0) << "the LAN endpoint was not probed";
+    lan_relay.stop();
+}
+
+// One initiation goes to every probe target, LAN endpoints first: separate
+// initiations would leave all but the newest two unanswerable.
+TEST_F(SdkHolePunchTest, OneProbeReachesEveryTarget) {
+    UdpSink first(io), second(io), public_sink(io);
+    ASSERT_TRUE(alice.sync_peers({peer(bob_keys.second, "10.64.0.3/32")}).ok);
+    EXPECT_EQ(alice.probe_peer(bob_keys.second,
+                               std::vector<std::string>{first.endpoint(), "bogus",
+                                                        second.endpoint(), public_sink.endpoint()}),
+              3u);
+    EXPECT_TRUE(eventually(
+        [&] {
+            return first.received() == 1 && second.received() == 1 && public_sink.received() == 1;
+        },
+        [] {}, 3s));
+    EXPECT_EQ(alice.probe_peer(bob_keys.second, std::vector<std::string>{"bogus"}), 0u);
+    EXPECT_EQ(alice.probe_peer("not-a-key", std::vector<std::string>{first.endpoint()}), 0u);
+}

@@ -384,6 +384,12 @@ bool BoringtunMesh::probe_peer(const std::string& pubkey, const std::string& end
     return impl_->dp.probe_endpoint(pubkey, endpoint);
 }
 
+std::size_t BoringtunMesh::probe_peer(const std::string& pubkey,
+                                      const std::vector<std::string>& endpoints) {
+    if (!impl_->active.load() || pubkey.empty() || pubkey == impl_->server_pubkey) return 0;
+    return impl_->dp.probe_endpoints(pubkey, endpoints);
+}
+
 std::size_t BoringtunMesh::rehandshake_all() {
     if (!impl_->active.load()) return 0;
     std::size_t sent = 0;

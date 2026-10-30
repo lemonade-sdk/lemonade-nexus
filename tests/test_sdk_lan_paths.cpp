@@ -1,12 +1,18 @@
 // LAN-direct paths: which local addresses a device advertises, and which LAN
 // endpoints of a peer it probes.
 
+#include <LemonadeNexusSDK/HolePunch.hpp>
 #include <LemonadeNexusSDK/LanPaths.hpp>
+#include <LemonadeNexusSDK/MeshOrchestrator.hpp>
+#include <LemonadeNexusSDK/RelayFallback.hpp>
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
 #include <vector>
+
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -159,4 +165,64 @@ TEST(SdkLanPaths, HostInterfacesAreListed) {
     rules.allow_loopback = true;
     const auto with_loopback = lnsdk::select_local_endpoints(host, 9, rules);
     EXPECT_LE(with_loopback.size(), lnsdk::kMaxLocalEndpoints);
+}
+
+// A peer with LAN endpoints gets no relay before the LAN window, also when
+// it has no direct endpoint or a renewal skipped the direct grace period. A
+// peer without LAN endpoints does not wait for the window.
+TEST(SdkLanPaths, TheRelayWaitsForTheLanWindowOnlyForLanPeers) {
+    using F = lnsdk::RelayFallback;
+    const F::Timing t;
+    const int64_t now = 1'000'000;
+    const auto lan = t.lan_grace;
+    EXPECT_EQ(lan, lnsdk::kLanAnswerWindow);
+    // LAN only: wait for the window, then relay.
+    EXPECT_FALSE(F::relay_needed(false, 0, now, 0ms, true, t, true, 0ms));
+    EXPECT_FALSE(F::relay_needed(false, 0, now, t.direct_grace, true, t, true, lan - 1ms));
+    EXPECT_TRUE(F::relay_needed(false, 0, now, t.direct_grace, true, t, true, lan));
+    // LAN and a listed endpoint: the longer of the two waits.
+    EXPECT_FALSE(F::relay_needed(true, 0, now, 1s, true, t, true, lan));
+    EXPECT_TRUE(F::relay_needed(true, 0, now, t.direct_grace, true, t, true, lan));
+    EXPECT_FALSE(F::relay_needed(true, 0, now, t.direct_grace, true, t, true, 0ms));
+    // Another network: no LAN endpoints, no wait.
+    EXPECT_TRUE(F::relay_needed(false, 0, now, 0ms, true, t, false, 0ms));
+    // A fresh handshake or no prefer_direct decides as before.
+    EXPECT_FALSE(F::relay_needed(false, now - 5, now, 0ms, true, t, true, lan));
+    EXPECT_TRUE(F::relay_needed(false, 0, now, 0ms, false, t, true, 0ms));
+}
+
+// The probe targets: LAN endpoints first, then the listed endpoint, each once.
+TEST(SdkLanPaths, ProbeTargetsPutTheLanFirst) {
+    lnsdk::MeshPeer peer;
+    EXPECT_TRUE(lnsdk::HolePuncher::probe_targets(peer).empty());
+    peer.endpoint = "203.0.113.7:5000";
+    EXPECT_EQ(lnsdk::HolePuncher::probe_targets(peer),
+              std::vector<std::string>{"203.0.113.7:5000"});
+    peer.local_endpoints = {"192.168.1.30:5000", "10.0.0.4:5000", "192.168.1.30:5000"};
+    EXPECT_EQ(lnsdk::HolePuncher::probe_targets(peer),
+              (std::vector<std::string>{"192.168.1.30:5000", "10.0.0.4:5000",
+                                        "203.0.113.7:5000"}));
+    peer.endpoint.clear();
+    EXPECT_EQ(lnsdk::HolePuncher::probe_targets(peer),
+              (std::vector<std::string>{"192.168.1.30:5000", "10.0.0.4:5000"}));
+}
+
+TEST(SdkLanPaths, PeerPathNamesTheRoute) {
+    lnsdk::MeshPeer peer;
+    peer.local_endpoints = {"192.168.1.30:5000"};
+    // No session yet.
+    EXPECT_EQ(lnsdk::peer_path(peer, "192.168.1.30:5000", "", true), "");
+    peer.last_handshake = 100;
+    EXPECT_EQ(lnsdk::peer_path(peer, "192.168.1.30:5000", "", true), "lan");
+    EXPECT_EQ(lnsdk::peer_path(peer, "203.0.113.7:5000", "", true), "direct");
+    EXPECT_EQ(lnsdk::peer_path(peer, "", "", true), "");
+    // A silent path is no path; a relay is a relay.
+    EXPECT_EQ(lnsdk::peer_path(peer, "192.168.1.30:5000", "", false), "");
+    EXPECT_EQ(lnsdk::peer_path(peer, "", "198.51.100.2:9103", false), "relay");
+
+    EXPECT_TRUE(lnsdk::lan_path_lost("lan", ""));
+    EXPECT_FALSE(lnsdk::lan_path_lost("lan", "lan"));
+    EXPECT_FALSE(lnsdk::lan_path_lost("lan", "direct"));
+    EXPECT_FALSE(lnsdk::lan_path_lost("direct", ""));
+    EXPECT_FALSE(lnsdk::lan_path_lost("", ""));
 }
