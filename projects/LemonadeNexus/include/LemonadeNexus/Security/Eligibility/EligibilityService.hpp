@@ -24,6 +24,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 namespace nexus::security {
@@ -86,6 +87,9 @@ public:
     /// Records the platform half of a verdict this node verified. Two passing
     /// verdicts in one epoch that disagree about the incarnation are objective
     /// evidence of a duplicate incarnation, and record it as a fault.
+    ///
+    /// A fault is a permanent fact about a node, so it is written at once and
+    /// never held in a write window.
     void record_verdict(const AttestationVerdict& verdict);
 
     /// Signs this node's statement about the attestation it verified for
@@ -114,8 +118,11 @@ public:
         Height height, const Digest& state_reference);
 
     /// Records an observation from any observer, including this node's own.
+    /// An accepted observation marks the store dirty; flush() writes it.
     [[nodiscard]] ObservationOutcome accept(const EligibilityObservation& observation);
 
+    /// Records proved misbehavior and writes the fault set at once, so a fault
+    /// never sits in a delay window.
     void record_fault(const NodeId& subject, ObjectiveFault fault);
 
     /// The state this node would finalize for the given boundary.
@@ -139,9 +146,23 @@ public:
     /// this boundary AND this node's recomputation still matches it.
     [[nodiscard]] std::optional<Tier1Set> frozen_pool(EpochId next_epoch) const;
 
-    /// Writes observations and faults. Called after every accepted change, so a
-    /// restart resumes from what the mesh actually said.
-    [[nodiscard]] bool persist();
+    /// Writes what changed since the last write: the observations of the
+    /// current epoch when an accepted observation made them dirty, and the
+    /// fault set when it differs from the last written one. Returns false when
+    /// a needed write failed; the dirty state then stays set, so the next call
+    /// tries again.
+    ///
+    /// accept() only marks the observations dirty. The caller decides when to
+    /// write (SecurityDriver writes at most once per
+    /// kEligibilityFlushIntervalMs and on shutdown). A crash in between loses
+    /// at most the observations accepted since the last write. That is a
+    /// same-epoch rollback, which costs availability and never creates
+    /// authority (see the file comment). Faults are not delayed: record_fault()
+    /// writes them at once.
+    [[nodiscard]] bool flush();
+
+    /// True when accepted observations wait for flush().
+    [[nodiscard]] bool dirty() const { return observations_dirty_; }
 
     [[nodiscard]] Height max_observed_height() const {
         return ledger_.max_height(context_.epoch);
@@ -178,6 +199,14 @@ private:
 
     std::function<bool(const NodeId&)> certificate_source_;
     std::optional<FinalizedEligibility> finalized_;
+
+    /// True when accepted observations wait for flush(). Only flush() clears
+    /// it, so a failed write stays pending for the next attempt.
+    bool observations_dirty_ = false;
+
+    /// The fault set as last written successfully. Empty optional means nothing
+    /// is known to be on disk, so the next write writes the file once.
+    std::optional<std::map<NodeId, std::set<ObjectiveFault>>> faults_written_;
 };
 
 }  // namespace nexus::security

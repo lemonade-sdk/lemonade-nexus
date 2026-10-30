@@ -435,8 +435,29 @@ void SecurityDriver::issue_genesis_challenge(const NodeId& peer) {
                        router_.compose(SecurityMessageKind::AttestationChallenge, *challenge, 1));
 }
 
+void SecurityDriver::maybe_flush_eligibility(uint64_t now_ms) {
+    if (!eligibility_.dirty() ||
+        now_ms - last_eligibility_flush_ms_ < kEligibilityFlushIntervalMs) {
+        return;
+    }
+    last_eligibility_flush_ms_ = now_ms;
+    if (!eligibility_.flush()) {
+        spdlog::warn("[security] eligibility state not written; retrying in {} ms",
+                     kEligibilityFlushIntervalMs);
+    }
+}
+
+void SecurityDriver::flush_durable_state() {
+    if (!eligibility_.flush()) {
+        spdlog::warn("[security] eligibility state not written at shutdown");
+    }
+}
+
 void SecurityDriver::tick(uint64_t now_ms) {
     now_ms_ = now_ms;
+    // Checked before anything below can return early: the wait is what keeps
+    // an accepted observation off the disk, so every tick has to look at it.
+    maybe_flush_eligibility(now_ms);
     if (phase_ == DriverPhase::Failed) {
         return;
     }

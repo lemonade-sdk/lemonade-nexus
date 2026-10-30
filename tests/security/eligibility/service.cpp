@@ -16,6 +16,8 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -159,6 +161,17 @@ struct ServiceMesh : ::testing::Test {
         std::vector<std::size_t> all(kMembers);
         for (std::size_t i = 0; i < kMembers; ++i) all[i] = i;
         return all;
+    }
+
+    /// The inode of `path`, or nullopt when it cannot be read. Comparing
+    /// inodes is how these tests tell "written again" from "left alone":
+    /// a durable write renames a new file into place.
+    [[nodiscard]] std::optional<ino_t> inode_of(const fs::path& path) const {
+        struct stat status{};
+        if (::stat(path.c_str(), &status) != 0) {
+            return std::nullopt;
+        }
+        return status.st_ino;
     }
 
     /// Drives the full mesh to the point where every member holds both facts.
@@ -577,10 +590,112 @@ TEST_F(ServiceMesh, AFaultDeniesEligibilityAndOutlivesARestart) {
     EXPECT_TRUE(faults.at(ids[3]).contains(ObjectiveFault::Equivocation));
 }
 
+// A proved fault is written the moment it is recorded, and a fault set that
+// has not changed is written once. Before this change every accepted
+// observation rewrote faults.json, which on these nodes held nothing at all.
+TEST_F(ServiceMesh, UnchangedFaultsAreNotRewritten) {
+    const fs::path faults_file = directory_of(0) / "faults.json";
+    services[0]->record_fault(ids[3], ObjectiveFault::Equivocation);
+    ASSERT_TRUE(fs::exists(faults_file));
+    const auto written = inode_of(faults_file);
+    ASSERT_TRUE(written.has_value());
+
+    // An accepted observation is a different file. The fault set has not
+    // changed, so nothing writes faults.json again.
+    services[0]->record_verdict(verdict_for(ids[1], 1));
+    const auto observation = services[0]->observe_attestation(ids[1], 1, reference(1));
+    ASSERT_TRUE(observation.has_value());
+    ASSERT_TRUE(services[0]->flush());
+    EXPECT_EQ(inode_of(faults_file), written)
+        << "an unchanged fault set must not be written again";
+
+    // A newly proved fault is a change, so it reaches the disk at once in a
+    // replacement file rather than staying in the one already written.
+    services[0]->record_fault(ids[3], ObjectiveFault::DuplicateIncarnation);
+    const auto rewritten = inode_of(faults_file);
+    ASSERT_TRUE(rewritten.has_value());
+    EXPECT_NE(*rewritten, *written) << "a new fault must reach the disk";
+}
+
+// Accepting an observation no longer writes it. The store waits dirty for the
+// caller, which is what takes the eligibility write off the path a consensus
+// view runs on.
+TEST_F(ServiceMesh, AcceptMarksDirtyAndFlushWritesOnce) {
+    const fs::path observations = directory_of(0) / "observations-1.json";
+
+    services[0]->record_verdict(verdict_for(ids[1], 1));
+    const auto observation = services[0]->observe_attestation(ids[1], 1, reference(1));
+    ASSERT_TRUE(observation.has_value());
+    EXPECT_TRUE(services[0]->dirty()) << "an accepted observation must wait for flush";
+    EXPECT_FALSE(fs::exists(observations)) << "nothing is written before flush";
+
+    ASSERT_TRUE(services[0]->flush());
+    ASSERT_TRUE(fs::exists(observations));
+    EXPECT_FALSE(services[0]->dirty());
+    const auto written = inode_of(observations);
+    ASSERT_TRUE(written.has_value());
+
+    // Nothing new was accepted, so the second flush writes nothing at all.
+    ASSERT_TRUE(services[0]->flush());
+    EXPECT_EQ(inode_of(observations), written)
+        << "a clean store must not be written again";
+}
+
+// An epoch change must not drop what was accepted but not yet written: the
+// observations belong to the outgoing epoch's file, so install() writes them
+// before it resets the ledger.
+TEST_F(ServiceMesh, EnteringTheNextEpochWritesTheOutgoingObservations) {
+    const auto directory = directory_of(0);
+    services[0]->record_verdict(verdict_for(ids[1], 1));
+    const auto observation = services[0]->observe_attestation(ids[1], 1, reference(1));
+    ASSERT_TRUE(observation.has_value());
+    ASSERT_TRUE(services[0]->dirty());
+    const std::size_t held = services[0]->ledger().size();
+    ASSERT_FALSE(fs::exists(directory / "observations-1.json"));
+
+    ASSERT_NE(services[0]->enter_epoch(kNext, ids), EligibilityRestore::Corrupt);
+    EXPECT_EQ(services[0]->context().epoch, kNext);
+    EXPECT_FALSE(services[0]->dirty());
+
+    // The outgoing file is there, and it holds what this node accepted: a
+    // service rebuilt on epoch 1 reads the same records back.
+    ASSERT_TRUE(fs::exists(directory / "observations-1.json"));
+    EligibilityService reopened(network, ids[0], keys[0], directory);
+    ASSERT_NE(reopened.enter_epoch(kEpoch, ids), EligibilityRestore::Corrupt);
+    EXPECT_EQ(reopened.ledger().size(), held);
+    EXPECT_FALSE(reopened.dirty());
+}
+
+// A failed write leaves the store dirty, so the next attempt tries again
+// rather than losing the observations for good.
+TEST_F(ServiceMesh, AFailedFlushStaysDirty) {
+    if (::geteuid() == 0) {
+        GTEST_SKIP() << "running as root: file permissions do not bind";
+    }
+    const auto directory = directory_of(0);
+    fs::create_directories(directory);
+    ASSERT_EQ(0, ::chmod(directory.c_str(), S_IRUSR));
+
+    services[0]->record_verdict(verdict_for(ids[1], 1));
+    const auto observation = services[0]->observe_attestation(ids[1], 1, reference(1));
+    ASSERT_TRUE(observation.has_value());
+    ASSERT_TRUE(services[0]->dirty());
+
+    EXPECT_FALSE(services[0]->flush()) << "an unwritable directory must fail the flush";
+    EXPECT_TRUE(services[0]->dirty()) << "a failed write must stay pending";
+
+    // With the directory writable again the same observations still reach it.
+    ASSERT_EQ(0, ::chmod(directory.c_str(), S_IRWXU));
+    ASSERT_TRUE(services[0]->flush());
+    EXPECT_FALSE(services[0]->dirty());
+    EXPECT_TRUE(fs::exists(directory / "observations-1.json"));
+}
+
 // A restart brings observations back so the node can keep contributing. It does
 // not bring finality back: that has to be reached again through the mesh.
 TEST_F(ServiceMesh, RestartRestoresObservationsButNeverFinality) {
     observe_everything();
+    ASSERT_TRUE(services[0]->flush()) << "the test restarts, so write what it accepted";
     const Digest before = eligibility_commitment_digest(services[0]->compute_state(kNext));
     services[0]->finalize({.commitment = before,
                            .consensus_reference = reference(0xC0),
@@ -601,6 +716,11 @@ TEST_F(ServiceMesh, RestartRestoresObservationsButNeverFinality) {
 // eligibility history as a clean slate.
 TEST_F(ServiceMesh, CorruptDurableStateIsReportedAsCorrupt) {
     observe_everything();
+    // Write what the mesh actually said first. This tests damaged state, not
+    // absent state: an absent file is Fresh, and a damaged one is never read
+    // as a clean slate.
+    ASSERT_TRUE(services[0]->flush());
+    ASSERT_TRUE(services[1]->flush());
     {
         std::ofstream out(directory_of(0) / "observations-1.json");
         out << "{not json";

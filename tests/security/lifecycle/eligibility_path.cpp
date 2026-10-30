@@ -9,11 +9,23 @@
 #include "support/lifecycle_mesh.hpp"
 
 #include <algorithm>
+#include <optional>
+#include <sys/stat.h>
 
 namespace lifecycle_test {
 namespace {
 
 struct EligibilityPath : DriverMesh {};
+
+/// The inode of `path`, or nullopt when it cannot be read. A durable write
+/// renames a new file into place, so the inode changes on every write.
+[[nodiscard]] std::optional<ino_t> inode_of(const fs::path& path) {
+    struct stat status{};
+    if (::stat(path.c_str(), &status) != 0) {
+        return std::nullopt;
+    }
+    return status.st_ino;
+}
 
 // A node that verifies every peer itself is still one observer. Its statements
 // are published and counted, and they never reach the quorum alone, so nothing
@@ -96,6 +108,35 @@ TEST_F(EligibilityPath, QuorumObservationsCreateAFinalizedPool) {
     }
 }
 
+// Observations are accepted several times per consensus view, but the store
+// is written at most once per second. A 2.4 s window therefore replaces the
+// observations file no more than three times, and a dirty store still reaches
+// the disk inside that window.
+TEST_F(EligibilityPath, ObservationWritesAreCoalesced) {
+    bootstrap();
+    run_until_committed(1);
+    reattest_round(1);
+
+    Node* victim = founders[0];
+    const fs::path file = victim->dir / "security" / "eligibility" / "observations-1.json";
+    ASSERT_TRUE(victim->driver->eligibility().dirty())
+        << "the fixture must leave observations waiting for a write";
+
+    int replacements = 0;
+    auto seen = inode_of(file);
+    for (int i = 0; i < 12; ++i) {  // 2.4 s, one step per 200 ms
+        reattest_round(static_cast<uint8_t>(2 + i));
+        step(1);
+        if (const auto now = inode_of(file); now != seen) {
+            ++replacements;
+            seen = now;
+        }
+    }
+
+    EXPECT_LE(replacements, 3) << "one write per kEligibilityFlushIntervalMs";
+    EXPECT_GE(replacements, 1) << "a dirty store must still reach the disk";
+}
+
 // Rolling a node's durable observations back to an earlier point inside the
 // SAME epoch costs it availability and gives it nothing. Its recomputation no
 // longer reproduces what the mesh finalized, so no pool is released and it
@@ -108,9 +149,13 @@ TEST_F(EligibilityPath, SameEpochRollbackCannotRestoreAuthority) {
     const fs::path observations =
         victim->dir / "security" / "eligibility" / "observations-1.json";
 
-    // A snapshot from one round in, when continuity was still short.
+    // A snapshot from one round in, when continuity was still short. The
+    // driver writes at most once per kEligibilityFlushIntervalMs, so flush
+    // the waiting observations before copying: nothing ticks between the
+    // write and the copy, so the snapshot is exactly this much history.
     reattest_round(1);
     step(6);
+    victim->driver->flush_durable_state();
     ASSERT_TRUE(fs::exists(observations));
     const fs::path snapshot = root / "rolled-back.json";
     fs::copy_file(observations, snapshot, fs::copy_options::overwrite_existing);
@@ -157,6 +202,9 @@ TEST_F(EligibilityPath, RestartBeforeSelectionRequiresSyncThenRecovers) {
     step(6);
 
     Node* victim = founders[0];
+    // Write what this node has accepted before the restart, or the comparison
+    // below would read a file that never held the last second of observations.
+    victim->driver->flush_durable_state();
     const Digest before = commitment_of(*victim, 2);
     ASSERT_NE(eligibility_of(*victim).ledger().size(), 0u);
 

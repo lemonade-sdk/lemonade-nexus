@@ -420,6 +420,10 @@ void SecurityMeshService::on_stop() {
     if (!running_) {
         return;
     }
+    // Safe to write here rather than post to the executor: a service is only
+    // stopped once the io context has stopped, so no driver work runs at the
+    // same time.
+    driver_.flush_durable_state();
     running_ = false;
     timer_.cancel();
     // The transport must stop feeding a stack that is going away.

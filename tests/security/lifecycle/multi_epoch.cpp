@@ -778,6 +778,12 @@ TEST_F(MultiEpochMesh, AMemberRestartedAtTheBoundaryFollowsTheCommittedStages) {
 
     mesh.now_ms += constants::kTargetEpochSeconds * 1000;
     Node* restarted = founders[2];
+    // Observation writes are coalesced to one per second, so the verdicts
+    // from `observe` may still wait for a tick. Flush them: this scenario is
+    // a rolling release, where the service stops cleanly, and the restarted
+    // member has to rebuild the state the mesh already agreed on from its
+    // own durable facts.
+    restarted->driver->flush_durable_state();
     restart_node(*restarted);
     restarted->driver->start(mesh.now_ms);
     for (int i = 0; i < 200 && restarted->driver->phase() != DriverPhase::Active; ++i) {
