@@ -63,23 +63,25 @@ list(APPEND LN_TRUST_SRC "${LN_SERVER_SRC}/Tree/DeviceLabel.cpp")
 # OS keystore: the login keychain on macOS (Security and CoreFoundation),
 # DPAPI on Windows (crypt32), and libsecret on Linux, which is loaded at run
 # time with dlopen so there is no build-time or package dependency on it.
+# LAN-direct paths (LanPaths_windows.cpp) list the network adapters with
+# GetAdaptersAddresses on Windows (iphlpapi); POSIX uses getifaddrs from libc.
 if(APPLE)
-    set(LN_KEYSTORE_LIBS "-framework Security" "-framework CoreFoundation")
+    set(LN_PLATFORM_LIBS "-framework Security" "-framework CoreFoundation")
 elseif(WIN32)
-    set(LN_KEYSTORE_LIBS crypt32)
+    set(LN_PLATFORM_LIBS crypt32 iphlpapi ws2_32)
 else()
-    set(LN_KEYSTORE_LIBS ${CMAKE_DL_LIBS})
+    set(LN_PLATFORM_LIBS ${CMAKE_DL_LIBS})
 endif()
 
 if(TARGET LemonadeNexusSDK)
     target_sources(LemonadeNexusSDK PRIVATE "${LN_DATAPLANE_SRC}" ${LN_TRUST_SRC})
     target_include_directories(LemonadeNexusSDK PRIVATE "${LN_SERVER_INCLUDE}")
-    target_link_libraries(LemonadeNexusSDK PUBLIC virtual-netstack ${LN_KEYSTORE_LIBS})
+    target_link_libraries(LemonadeNexusSDK PUBLIC virtual-netstack ${LN_PLATFORM_LIBS})
 endif()
 if(TARGET LemonadeNexusSDKApp)
     target_sources(LemonadeNexusSDKApp PRIVATE "${LN_DATAPLANE_SRC}" ${LN_TRUST_SRC})
     target_include_directories(LemonadeNexusSDKApp PRIVATE "${LN_SERVER_INCLUDE}")
-    target_link_libraries(LemonadeNexusSDKApp PUBLIC virtual-netstack ${LN_KEYSTORE_LIBS})
+    target_link_libraries(LemonadeNexusSDKApp PUBLIC virtual-netstack ${LN_PLATFORM_LIBS})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -113,7 +115,7 @@ if(BUILD_SDK_SHARED)
             OpenSSL::Crypto
             boringtun-ffi
             virtual-netstack
-            ${LN_KEYSTORE_LIBS})
+            ${LN_PLATFORM_LIBS})
 
     # Tells the header which build this is (used for __declspec on MSVC if ever needed).
     target_compile_definitions(LemonadeNexusSDKShared PRIVATE LN_BUILD_SHARED)
