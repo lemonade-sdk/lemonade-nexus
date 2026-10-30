@@ -237,6 +237,13 @@ inline constexpr std::array<std::string_view, 2> kDefaultInvitePermissions = {
 [[nodiscard]] bool membership_reaches(const NodeMap& nodes, std::string_view member,
                                       const TreeNode& node);
 
+/// True when `member` holds a literal `connect_private` or `connect_shared`
+/// entry on group `group_id` itself or on a group above it: the devices placed
+/// in `group_id` are then reachable through an accepted invite
+/// (membership_reaches for a node placed directly in `group_id`).
+[[nodiscard]] bool membership_covers(const NodeMap& nodes, std::string_view member,
+                                     std::string_view group_id);
+
 /// The connect rule for endpoint `from`, acting as `principal`, to node `to`.
 /// It allows the connection when either:
 ///  - home scope: `to` is beneath `from`'s parent group and `principal` holds

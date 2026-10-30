@@ -3047,6 +3047,20 @@ protected:
         return ids;
     }
 
+    /// `m`'s device list of `group`, by node id.
+    std::map<std::string, json> devices(const Member& m, const std::string& group) {
+        auto res = get(m, "/api/tree/devices/" + group);
+        EXPECT_NE(res, nullptr);
+        if (!res) return {};
+        EXPECT_EQ(res->status, 200) << res->body;
+        std::map<std::string, json> out;
+        const auto body = json::parse(res->body);
+        for (const auto& d : body["devices"]) {
+            out.emplace(d["node_id"].get<std::string>(), d);
+        }
+        return out;
+    }
+
     /// Create a subgroup under `m`'s group as `m`; returns its id.
     std::string subgroup(const Member& m) {
         auto res = post(m, "/api/tree/node", {{"parent_id", m.group}, {"type", "customer"}});
@@ -3286,6 +3300,110 @@ TEST_F(InviteHttpTest, JoiningWithAnInviteAsAnExistingDeviceMakesAMember) {
     EXPECT_EQ(body["membership"]["node_id"], alice.group);
     EXPECT_EQ(tree->get_node(bob.node_id)->parent_id, bob.group) << "the device did not move";
     EXPECT_TRUE(peers(bob).count(alice.node_id));
+}
+
+// A device that joined on its own and then uses an invite code stays in its
+// own network as a member. The group's device list must still show it to the
+// group's devices, and show the group's devices to it.
+TEST_F(InviteHttpTest, TheGroupDeviceListShowsAMemberThatJoinedFromItsOwnNetwork) {
+    const auto alice = join();
+    const auto phone = join(invite_token(alice));  // a linked device of alice's
+    const auto bob = join();                       // joined without the code first
+    const auto bob2 = join(invite_token(bob));     // bob's other device, not a member
+    auto res = join_node(bob.kp, invite_token(alice));
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    ASSERT_EQ(json::parse(res->body)["membership"]["status"], "member") << res->body;
+    ASSERT_EQ(tree->get_node(bob.node_id)->parent_id, bob.group);
+
+    // The owner sees its devices and bob's device, marked as a member.
+    const auto owner_view = devices(alice, alice.group);
+    ASSERT_TRUE(owner_view.contains(alice.node_id));
+    ASSERT_TRUE(owner_view.contains(phone.node_id));
+    ASSERT_TRUE(owner_view.contains(bob.node_id));
+    EXPECT_FALSE(owner_view.contains(bob2.node_id)) << "bob's other device is not a member";
+    EXPECT_FALSE(owner_view.at(phone.node_id)["member"].get<bool>());
+    EXPECT_TRUE(owner_view.at(bob.node_id)["member"].get<bool>());
+    EXPECT_EQ(owner_view.at(bob.node_id)["parent_id"], bob.group);
+    EXPECT_TRUE(owner_view.at(bob.node_id)["can_connect"].get<bool>());
+    EXPECT_TRUE(owner_view.at(alice.node_id)["is_self"].get<bool>());
+    EXPECT_TRUE(owner_view.at(alice.node_id)["admin"].get<bool>());
+    EXPECT_FALSE(owner_view.at(bob.node_id)["admin"].get<bool>());
+
+    // A linked device of the owner (no edit right on the group) sees bob
+    // because it may connect to him.
+    const auto phone_view = devices(phone, alice.group);
+    ASSERT_TRUE(phone_view.contains(bob.node_id));
+    EXPECT_TRUE(phone_view.at(bob.node_id)["can_connect"].get<bool>());
+    EXPECT_TRUE(phone_view.at(phone.node_id)["is_self"].get<bool>());
+
+    // Bob sees the group's devices and himself as a member.
+    const auto bob_view = devices(bob, alice.group);
+    ASSERT_TRUE(bob_view.contains(alice.node_id));
+    ASSERT_TRUE(bob_view.contains(phone.node_id));
+    ASSERT_TRUE(bob_view.contains(bob.node_id));
+    EXPECT_TRUE(bob_view.at(bob.node_id)["is_self"].get<bool>());
+    EXPECT_TRUE(bob_view.at(bob.node_id)["member"].get<bool>());
+    EXPECT_TRUE(bob_view.at(alice.node_id)["can_connect"].get<bool>());
+}
+
+TEST_F(InviteHttpTest, TheGroupDeviceListHidesMembersFromOtherMembersAndOutsiders) {
+    const auto alice = join();
+    const auto bob = join();
+    const auto carol = join();
+    const auto dave = join();
+    for (const auto* m : {&bob, &carol}) {
+        auto res = post(*m, "/api/link/accept", {{"link_token", invite_token(alice)}});
+        ASSERT_NE(res, nullptr);
+        ASSERT_EQ(res->status, 200) << res->body;
+    }
+    // Two members of one group do not reach each other, so neither is listed
+    // to the other.
+    const auto carol_view = devices(carol, alice.group);
+    EXPECT_TRUE(carol_view.contains(alice.node_id));
+    EXPECT_TRUE(carol_view.contains(carol.node_id));
+    EXPECT_FALSE(carol_view.contains(bob.node_id));
+    // The owner lists both.
+    const auto owner_view = devices(alice, alice.group);
+    EXPECT_TRUE(owner_view.contains(bob.node_id));
+    EXPECT_TRUE(owner_view.contains(carol.node_id));
+    // An identity without a read right on the group gets nothing.
+    auto res = get(dave, "/api/tree/devices/" + alice.group);
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 403);
+    // A device is not a group.
+    res = get(alice, "/api/tree/devices/" + alice.node_id);
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 400);
+}
+
+TEST_F(InviteHttpTest, TheGroupDeviceListWalksTheSubgroupsTheCallerMayRead) {
+    const auto alice = join();
+    const auto sub = subgroup(alice);
+    const auto sub_device = join(invite_token(alice, {{"target_node_id", sub}}));
+    const auto bob = join();
+    auto res = post(bob, "/api/link/accept",
+                    {{"link_token", invite_token(alice, {{"target_node_id", sub}})}});
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+
+    // The owner walks into the subgroup: its device and its member.
+    const auto owner_view = devices(alice, alice.group);
+    ASSERT_TRUE(owner_view.contains(sub_device.node_id));
+    EXPECT_EQ(owner_view.at(sub_device.node_id)["group_id"], sub);
+    EXPECT_FALSE(owner_view.at(sub_device.node_id)["member"].get<bool>());
+    ASSERT_TRUE(owner_view.contains(bob.node_id));
+    EXPECT_EQ(owner_view.at(bob.node_id)["group_id"], sub);
+    EXPECT_TRUE(owner_view.at(bob.node_id)["member"].get<bool>());
+
+    // A member of the subgroup reads the subgroup, not the group above it.
+    res = get(bob, "/api/tree/devices/" + alice.group);
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 403);
+    const auto bob_view = devices(bob, sub);
+    EXPECT_TRUE(bob_view.contains(sub_device.node_id));
+    EXPECT_TRUE(bob_view.contains(bob.node_id));
+    EXPECT_FALSE(bob_view.contains(alice.node_id));
 }
 
 TEST_F(InviteHttpTest, AnInviteIsSingleUseAndARefusalDoesNotSpendIt) {

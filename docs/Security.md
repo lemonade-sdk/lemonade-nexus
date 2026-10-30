@@ -638,6 +638,16 @@ other groups. An `admin` entry is not a membership and gives no connect
 reach. The mesh peer list, the routing chokepoint (`resolve_authorized`), and
 the dataplane forwarding policy (`ForwardAuthorizer`) apply this one rule.
 
+**Listing.** `GET /api/tree/devices/{group}` lists a member's device with the
+group's devices (`member: true`), because the device stays in the member's own
+network and `GET /api/tree/children` never returns it. The route needs a read
+right on the group and walks only the subgroups the caller may read. It lists a
+member's device to callers that administer or edit the group (the readers that
+see every assignment), to callers whose device may connect to it (the peer-list
+rule above), and to the member itself. Two members of one group do not reach
+each other, so neither sees the other in the list. The member's other devices
+are never listed: their keys hold no entry on the group.
+
 **Leaving.** An admin of the group removes a member through
 `POST /api/tree/node/assignments/{id}` with an empty list. A member removes
 its own entry the same way without admin, but only on a group it has not
