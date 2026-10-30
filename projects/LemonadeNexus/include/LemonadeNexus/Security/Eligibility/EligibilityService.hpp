@@ -118,7 +118,7 @@ public:
         Height height, const Digest& state_reference);
 
     /// Records an observation from any observer, including this node's own.
-    /// Writing it to disk is a separate step: see persist().
+    /// An accepted observation marks the store dirty; flush() writes it.
     [[nodiscard]] ObservationOutcome accept(const EligibilityObservation& observation);
 
     /// Records proved misbehavior and writes the fault set at once, so a fault
@@ -146,11 +146,23 @@ public:
     /// this boundary AND this node's recomputation still matches it.
     [[nodiscard]] std::optional<Tier1Set> frozen_pool(EpochId next_epoch) const;
 
-    /// Writes the observations of the current epoch, and the fault set only
-    /// when it differs from the set last written. Callers write after every
-    /// accepted change, so a restart resumes from what the mesh actually said
-    /// without rewriting a fault file that has not changed.
-    [[nodiscard]] bool persist();
+    /// Writes what changed since the last write: the observations of the
+    /// current epoch when an accepted observation made them dirty, and the
+    /// fault set when it differs from the last written one. Returns false when
+    /// a needed write failed; the dirty state then stays set, so the next call
+    /// tries again.
+    ///
+    /// accept() only marks the observations dirty. The caller decides when to
+    /// write (SecurityDriver writes at most once per
+    /// kEligibilityFlushIntervalMs and on shutdown). A crash in between loses
+    /// at most the observations accepted since the last write. That is a
+    /// same-epoch rollback, which costs availability and never creates
+    /// authority (see the file comment). Faults are not delayed: record_fault()
+    /// writes them at once.
+    [[nodiscard]] bool flush();
+
+    /// True when accepted observations wait for flush().
+    [[nodiscard]] bool dirty() const { return observations_dirty_; }
 
     [[nodiscard]] Height max_observed_height() const {
         return ledger_.max_height(context_.epoch);
@@ -187,6 +199,10 @@ private:
 
     std::function<bool(const NodeId&)> certificate_source_;
     std::optional<FinalizedEligibility> finalized_;
+
+    /// True when accepted observations wait for flush(). Only flush() clears
+    /// it, so a failed write stays pending for the next attempt.
+    bool observations_dirty_ = false;
 
     /// The fault set as last written successfully. Empty optional means nothing
     /// is known to be on disk, so the next write writes the file once.

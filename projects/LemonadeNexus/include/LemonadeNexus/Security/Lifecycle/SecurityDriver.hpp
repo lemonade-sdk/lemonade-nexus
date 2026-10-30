@@ -28,6 +28,13 @@
 
 namespace nexus::security {
 
+/// Shortest time between two eligibility observation writes. Observations
+/// are accepted several times per consensus view; writing each one blocked
+/// the io thread that also carries consensus. A crash loses at most this
+/// much of accepted observations, which costs availability only
+/// (EligibilityService::flush). Liveness tuning, not a protocol rule.
+inline constexpr uint64_t kEligibilityFlushIntervalMs = 1000;
+
 enum class DriverPhase : uint16_t {
     Failed,
     Idle,
@@ -81,6 +88,10 @@ public:
     /// Time-driven work: sync windows, the pacemaker, re-attestation, and
     /// the epoch cadence.
     void tick(uint64_t now_ms);
+
+    /// Writes waiting eligibility state now. For a clean shutdown; call it on
+    /// the thread that runs tick(), or after that thread stopped.
+    void flush_durable_state();
 
     /// A peer became reachable. Genesis challenges candidates here.
     void on_peer(const NodeId& peer, uint64_t now_ms);
@@ -394,6 +405,10 @@ private:
     /// is never a clean slate.
     [[nodiscard]] bool enter_eligibility_epoch(EpochId epoch, const Tier1Set& members);
     [[nodiscard]] bool epoch_aged(uint64_t now_ms) const;
+    /// Writes the eligibility store on its own cadence, so accepted
+    /// observations reach disk within kEligibilityFlushIntervalMs without a
+    /// write per observation.
+    void maybe_flush_eligibility(uint64_t now_ms);
     void publish(const EligibilityObservation& observation, EpochId epoch);
     void begin_founding_observations();
     /// Paced retries (re-challenge, re-broadcast) that keep the bootstrap live.
@@ -459,6 +474,9 @@ private:
     // Consensus driving.
     Pacemaker pacemaker_;
     uint64_t last_progress_ms_ = 0;
+    /// When the eligibility store was last written. 0 means never, so the
+    /// first tick that finds the store dirty writes it.
+    uint64_t last_eligibility_flush_ms_ = 0;
     View last_proposed_view_ = 0;
     Digest last_committed_root_{};
     Height last_committed_height_ = 0;

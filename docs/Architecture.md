@@ -181,6 +181,12 @@ data/
 - **File-backed records** are signed JSON envelopes written through a durable
   write path (temporary file + rename + filesystem sync; the Windows branch
   commits the rename explicitly).
+- The eligibility store writes observations at most once per second, from the
+  driver tick, on epoch entry, and on a clean shutdown. Accepting an
+  observation only marks the store dirty. A crash inside that window loses at
+  most the observations accepted since the last write, which is a same-epoch
+  rollback and costs availability only. A proved fault is still written at
+  once.
 - **SQLite** backs the application ACL store.
 - The security stores treat corruption as a distinct state from absence:
   corrupt files fail closed; they are never silently treated as absent.

@@ -27,6 +27,13 @@ EligibilityService::EligibilityService(NetworkId network_id, NodeId self,
 // --- Context -----------------------------------------------------------------
 
 EligibilityRestore EligibilityService::install(EpochId epoch, MeshFactContext context) {
+    // Observations of the outgoing context that wait for a write belong to
+    // that epoch's file; write them before the ledger is replaced.
+    if (observations_dirty_) {
+        (void)flush();
+    }
+    observations_dirty_ = false;
+
     context_ = std::move(context);
     ledger_ = EligibilityLedger{};
     verdicts_.clear();
@@ -221,7 +228,12 @@ std::optional<EligibilityObservation> EligibilityService::sign_participation(
 ObservationOutcome EligibilityService::accept(const EligibilityObservation& observation) {
     const ObservationOutcome outcome = ledger_.record(observation, context_);
     if (outcome == ObservationOutcome::Accepted) {
-        (void)persist();
+        // Only mark the store dirty. Consensus runs on this thread, and one
+        // view accepts observations several times: writing each one held the
+        // io thread in fsync while votes and proposals queued behind it.
+        // SecurityDriver writes at most once per kEligibilityFlushIntervalMs,
+        // and on a clean shutdown.
+        observations_dirty_ = true;
     }
     return outcome;
 }
@@ -344,19 +356,26 @@ std::optional<Tier1Set> EligibilityService::frozen_pool(EpochId next_epoch) cons
     return Tier1Set::from_nodes(eligible_nodes(state));
 }
 
-bool EligibilityService::persist() {
-    const bool observations = store_.store(context_.epoch, ledger_.snapshot());
+bool EligibilityService::flush() {
+    bool ok = true;
+    if (observations_dirty_) {
+        if (store_.store(context_.epoch, ledger_.snapshot())) {
+            observations_dirty_ = false;
+        } else {
+            ok = false;
+        }
+    }
     // Faults change only when a fault is recorded or loaded, which is far less
     // often than observations arrive. Rewriting an unchanged 24-byte file cost
     // four device syncs each time.
-    if (faults_written_ && *faults_written_ == ledger_.faults()) {
-        return observations;
+    if (!faults_written_ || *faults_written_ != ledger_.faults()) {
+        if (store_.store_faults(ledger_.faults())) {
+            faults_written_ = ledger_.faults();
+        } else {
+            ok = false;
+        }
     }
-    if (!store_.store_faults(ledger_.faults())) {
-        return false;
-    }
-    faults_written_ = ledger_.faults();
-    return observations;
+    return ok;
 }
 
 }  // namespace nexus::security
