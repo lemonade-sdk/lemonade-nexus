@@ -136,6 +136,8 @@ void RelayFallback::release_unused(const std::string& pubkey, PeerState& state) 
                  short_key(pubkey));
 }
 
+void RelayFallback::set_window_clock(UnixClock clock) { window_clock_ = std::move(clock); }
+
 void RelayFallback::renew(const std::vector<std::string>& pubkeys, bool skip_grace) {
     const auto now = Clock::now();
     const int64_t now_unix = unix_now();
@@ -182,7 +184,8 @@ bool RelayFallback::open_channel(PeerState& state, const MeshPeer& peer,
                      ticket.error.empty() ? "request failed" : ticket.error);
         return false;
     }
-    const auto window = nexus::relay::relay_rendezvous_window(static_cast<uint64_t>(unix_now()));
+    const auto window = nexus::relay::relay_rendezvous_window(
+        static_cast<uint64_t>(window_clock_ ? window_clock_() : unix_now()));
     const auto rendezvous = mesh_.relay_rendezvous(peer.mesh_pubkey, relay.relay_id, window);
     if (!rendezvous) return false;
     auto allocate = relay_allocate_datagram(*rendezvous, ticket.value, 1);
@@ -203,6 +206,7 @@ bool RelayFallback::open_channel(PeerState& state, const MeshPeer& peer,
     state.channel = std::move(channel);
     state.relay_id = relay.relay_id;
     state.opened_unix = unix_now();
+    state.window = window;
     spdlog::info("[RelayFallback] peer {} has no direct path; allocating at relay {}",
                  short_key(peer.mesh_pubkey), state.channel->relay_endpoint());
     return true;
@@ -283,6 +287,23 @@ std::chrono::steady_clock::time_point RelayFallback::maintain(const std::vector<
                 handshake > state.stale_before) {
                 release_unused(pubkey, state);
                 continue;
+            }
+        }
+
+        if (state.channel && !state.applied) {
+            // The other side asks in the window its own clock shows now; a
+            // request from the previous window can never pair with it.
+            const auto st = state.channel->state();
+            const auto window_now = nexus::relay::relay_rendezvous_window(
+                static_cast<uint64_t>(window_clock_ ? window_clock_() : now_unix));
+            if ((st == RelayChannel::State::Allocating || st == RelayChannel::State::Waiting) &&
+                window_now != state.window) {
+                spdlog::info("[RelayFallback] rendezvous window ended for peer {}; asking again",
+                             short_key(pubkey));
+                state.channel->close();
+                state.channel.reset();
+                state.next_attempt = {};
+                if (open_count > 0) --open_count;
             }
         }
 
