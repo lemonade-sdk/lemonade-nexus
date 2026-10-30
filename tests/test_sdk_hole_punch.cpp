@@ -1092,3 +1092,65 @@ TEST_F(SdkHolePunchTest, ADirectAnswerClosesAnUnusedRelayRequest) {
     EXPECT_TRUE(bob_relay.relayed_peers().empty());
     EXPECT_EQ(status_of(alice.mesh_status(), bob_keys.second)->endpoint, *bob_reflexive);
 }
+
+// Two peers behind one NAT that does not hairpin: both have the same
+// address, and the endpoints the server lists for them never answer. While
+// renewals (a moved endpoint, a peer back online) and refresh bursts keep
+// coming, the relay pairs after the direct grace period, carries traffic,
+// and stays: the probes toward the dead endpoints neither break the relay
+// handshake nor pull the peers off the relay.
+TEST_F(SdkHolePunchTest, TwoPeersBehindOneNatKeepTheirRelayThroughRenewals) {
+    UdpSink alice_sink(io), bob_sink(io);
+    const auto candidates = [this] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}};
+    };
+    auto timing = fast_relay();
+    lnsdk::RelayFallback alice_relay(
+        alice, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("alice", relay_id), 200, ""};
+        },
+        candidates, timing);
+    lnsdk::RelayFallback bob_relay(
+        bob, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("bob", relay_id), 200, ""};
+        },
+        candidates, timing);
+    lnsdk::HolePuncher alice_punch(alice);
+    lnsdk::HolePuncher bob_punch(bob);
+    std::vector<lnsdk::MeshPeer> alice_peers = {
+        peer(bob_keys.second, "10.64.0.3/32", bob_sink.endpoint())};
+    std::vector<lnsdk::MeshPeer> bob_peers = {
+        peer(alice_keys.second, "10.64.0.2/32", alice_sink.endpoint())};
+    alice_peers[0].keepalive = bob_peers[0].keepalive = 25;
+    int n = 0;
+    const auto pass = [&] {
+        ASSERT_TRUE(alice.sync_peers(alice_peers).ok);
+        ASSERT_TRUE(bob.sync_peers(bob_peers).ok);
+        if (++n % 10 == 0) {  // about once a second
+            alice_punch.renew({bob_keys.second});
+            bob_punch.renew({alice_keys.second});
+            alice_relay.renew({bob_keys.second}, true);
+            bob_relay.renew({alice_keys.second}, true);
+            alice_punch.burst_now();
+            bob_punch.burst_now();
+        }
+        (void)alice_punch.maintain(alice_peers, alice_relay.relayed_peers(), true);
+        (void)bob_punch.maintain(bob_peers, bob_relay.relayed_peers(), true);
+        (void)alice_relay.maintain(alice_peers, true);
+        (void)bob_relay.maintain(bob_peers, true);
+    };
+    const auto online = [&] {
+        const auto a = status_of(alice.mesh_status(), bob_keys.second);
+        const auto b = status_of(bob.mesh_status(), alice_keys.second);
+        return a && b && a->last_rx > 0 && b->last_rx > 0 && !a->relay_endpoint.empty() &&
+               !b->relay_endpoint.empty();
+    };
+    ASSERT_TRUE(eventually(online, pass, 15s));
+    EXPECT_GT(alice_sink.received() + bob_sink.received(), 0) << "no probe toward the endpoints";
+    for (int i = 0; i < 100; ++i) {
+        pass();
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_TRUE(online()) << "the relay did not survive the renewals";
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
+}
