@@ -130,6 +130,15 @@ public:
     /// Thread-safe.
     void set_account_deleted_hook(std::function<void(const AccountDeletion&)> hook);
 
+    /// Set the function called after the tree may have changed: after
+    /// apply_op, apply_committed_ops, submit_local_op, replace_all, and
+    /// close(). It runs on the thread that changed the tree, after the tree
+    /// lock is released and after the removed-nodes and account-deleted
+    /// hooks, so it may read the tree. It carries no data: a reader compares
+    /// what it reads now with what it read before. Every server that applies
+    /// a committed block calls it. An empty function clears it. Thread-safe.
+    void set_changed_hook(std::function<void()> hook);
+
     /// A copy of every node, keyed by id. Thread-safe.
     [[nodiscard]] rules::NodeMap nodes_snapshot() const;
 
@@ -256,9 +265,17 @@ private:
     /// mutex_.
     void notify_accounts(const std::vector<AccountDeletion>& accounts) const;
 
+    /// replace_all without calling the changed hook. Takes mutex_.
+    [[nodiscard]] bool replace_all_unnotified(const rules::NodeMap& nodes,
+                                              const CommittedOpIds& committed);
+
+    /// Call the changed hook. Caller must not hold mutex_.
+    void notify_changed() const;
+
     mutable std::mutex removed_hook_mtx_;
     std::function<void(const std::vector<RemovedNode>&)> removed_hook_;
     std::function<void(const AccountDeletion&)> account_hook_;
+    std::function<void()> changed_hook_;
 
     /// Append an applied delta to the delta log and offer it to the retention
     /// sink. Neither failure rolls back the applied mutation. Returns the log

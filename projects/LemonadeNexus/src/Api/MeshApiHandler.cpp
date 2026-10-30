@@ -15,6 +15,8 @@
 #include <xxhash/xxhash.h>
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <regex>
 #include <unordered_map>
@@ -258,6 +260,42 @@ std::optional<std::vector<std::string>> parse_mesh_local_endpoints(const nlohman
     return out;
 }
 
+MeshApiHandler::MeshApiHandler(ApiContext& ctx) : ctx_(ctx) {
+    // Every Tier 1 server applies the same committed log, so each wakes its
+    // own waiters when a change may alter someone's peer list.
+    ctx_.tree.set_changed_hook([this] { waiters_.notify(); });
+}
+
+MeshApiHandler::~MeshApiHandler() {
+    ctx_.tree.set_changed_hook({});
+    waiters_.shutdown();
+}
+
+std::string MeshApiHandler::caller_peers_revision(const std::string& caller_pubkey,
+                                                  const tree::TreeNode& node,
+                                                  uint64_t now) const {
+    std::vector<tree::TreeNode> endpoints;
+    std::vector<tree::TreeNode> reachable;
+    std::vector<const tree::TreeNode*> relays;
+    std::unordered_map<std::string, std::vector<std::string>> local;
+    if (!node.parent_id.empty()) {
+        reachable = ctx_.tree.collect_subtree(node.parent_id);
+        endpoints = connectable_endpoints(ctx_.tree.nodes_snapshot(), caller_pubkey, node,
+                                          reachable);
+        for (const auto& n : reachable) {
+            if (n.type == tree::NodeType::Relay && mesh_peer_listed(ctx_.tree, caller_pubkey, n)) {
+                relays.push_back(&n);
+            }
+        }
+        for (const auto& n : endpoints) {
+            if (auto lan = local_endpoints_of(n.id, now); !lan.empty()) {
+                local.emplace(n.id, std::move(lan));
+            }
+        }
+    }
+    return peers_revision(endpoints, relays, build_mesh_handshake_map(ctx_.boringtun), local, now);
+}
+
 void MeshApiHandler::store_local_endpoints(const std::string& node_id,
                                            std::vector<std::string> endpoints, uint64_t now) {
     std::lock_guard lock(local_mtx_);
@@ -269,11 +307,16 @@ void MeshApiHandler::store_local_endpoints(const std::string& node_id,
         });
         local_pruned_at_ = now;
     }
+    bool changed = false;
     if (endpoints.empty()) {
-        local_endpoints_.erase(node_id);
-        return;
+        changed = local_endpoints_.erase(node_id) > 0;
+    } else {
+        auto& entry = local_endpoints_[node_id];
+        changed = entry.endpoints != endpoints;
+        entry = LocalEndpoints{std::move(endpoints), now};
     }
-    local_endpoints_[node_id] = LocalEndpoints{std::move(endpoints), now};
+    // notify() takes only the waiters' own lock, so it may run under this one.
+    if (changed) waiters_.notify();
 }
 
 std::vector<std::string> MeshApiHandler::local_endpoints_of(const std::string& node_id,
@@ -292,6 +335,11 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     using nexus::auth::require_auth;
     using nexus::auth::SessionClaims;
 
+    // Each held peer list long-poll occupies one worker of the server that
+    // serves the private routes, so that server gets room for every admitted
+    // waiter plus the other private requests.
+    priv.new_task_queue = [] { return new httplib::ThreadPool(kPrivateApiWorkerThreads); };
+
     // ========================================================================
     // GET /api/mesh/peers/:node_id (PRIVATE, auth required)
     //
@@ -308,6 +356,15 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // node (tree::rules::peer_permissions). Together they let the requesting
     // device attribute a connecting peer and decide what it may do; they
     // change nothing about who is listed.
+    //
+    // The answer carries `peers_revision`, the same value as the heartbeat
+    // answer. Query `wait_revision=<revision>` makes the request a long-poll:
+    // the server answers as soon as the caller's revision differs from it,
+    // or after `timeout` seconds (default kMeshPeerWaitDefaultSec, at most
+    // kMeshPeerWaitMaxSec) with the unchanged list. A committed tree change,
+    // a changed LAN endpoint list, or a changed live session wakes it.
+    // Beyond kMeshPeerWaitersMax held requests per server, or
+    // kMeshPeerWaitersPerCaller per device, it answers 429 with Retry-After.
     // ========================================================================
     priv.Get(R"(/api/mesh/peers/([a-zA-Z0-9_-]+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
@@ -325,7 +382,6 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             error_response(res, "node not found", 404);
             return;
         }
-        const auto& node = *node_opt;
 
         // Check that the authenticated user has Read permission on this node
         // Permission assignments are keyed by the caller's pubkey (see the join
@@ -337,6 +393,71 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             return;
         }
 
+        // Long-poll: with `wait_revision`, hold the request until this
+        // caller's peers_revision differs from it, or `timeout` seconds
+        // pass, then answer the list as usual. The wait changes nothing about
+        // who is listed: the answer is built after it, from the tree as it is
+        // then, under the same checks.
+        if (req.has_param("wait_revision")) {
+            const auto wait_for = req.get_param_value("wait_revision");
+            uint32_t timeout = kMeshPeerWaitDefaultSec;
+            if (req.has_param("timeout")) {
+                const auto text = req.get_param_value("timeout");
+                uint32_t value = 0;
+                const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+                if (ec != std::errc{} || ptr != text.data() + text.size() || value == 0) {
+                    error_response(res, "timeout must be a positive number of seconds", 400);
+                    return;
+                }
+                timeout = std::min(value, kMeshPeerWaitMaxSec);
+            }
+            if (wait_for.size() > 64) {
+                error_response(res, "wait_revision is too long", 400);
+                return;
+            }
+            MeshPeerWaiters::Refusal why = MeshPeerWaiters::Refusal::None;
+            const auto slot = waiters_.try_admit(caller_pubkey, why);
+            if (!slot) {
+                res.set_header("Retry-After", "5");
+                if (why == MeshPeerWaiters::Refusal::ShuttingDown) {
+                    error_response(res, "the server is stopping", 503);
+                } else {
+                    error_response(res, "too many waiting peer list requests", 429);
+                }
+                return;
+            }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+            for (;;) {
+                // Read the generation first, so a change during the check
+                // below wakes the wait instead of being lost.
+                const auto seen = waiters_.generation();
+                const auto current = ctx_.tree.get_node(node_id);
+                if (!current || waiters_.shutting_down() ||
+                    !ctx_.tree.check_permission(caller_pubkey, node_id, acl::Permission::Read) ||
+                    caller_peers_revision(caller_pubkey, *current, epoch_seconds()) != wait_for) {
+                    break;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) break;
+                // A peer's live session state follows handshake ages, which
+                // change without a notification, so check again at least
+                // every kMeshPeerRecheckMs.
+                const auto left =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+                waiters_.wait(seen, std::min(left, std::chrono::milliseconds(kMeshPeerRecheckMs)));
+            }
+            node_opt = ctx_.tree.get_node(node_id);
+            if (!node_opt) {
+                error_response(res, "node not found", 404);
+                return;
+            }
+            if (!ctx_.tree.check_permission(caller_pubkey, node_id, acl::Permission::Read)) {
+                error_response(res, "insufficient permissions", 403);
+                return;
+            }
+        }
+        const auto& node = *node_opt;
+
         // Find the parent group to get all sibling nodes
         if (node.parent_id.empty()) {
             // Root node has no siblings — return just the server peer
@@ -344,6 +465,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             j["node_id"] = node_id;
             j["peers"] = nlohmann::json::array();
             j["server_peer"] = build_server_peer();
+            j["peers_revision"] = caller_peers_revision(caller_pubkey, node, epoch_seconds());
             json_response(res, j);
             return;
         }
@@ -423,6 +545,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         j["parent_id"]   = node.parent_id;
         j["peers"]       = std::move(peers);
         j["server_peer"] = build_server_peer();
+        j["peers_revision"] = caller_peers_revision(caller_pubkey, node, now);
         json_response(res, j);
     }));
 
@@ -575,28 +698,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         j["status"]   = status;
         const auto caller_pubkey = normalize_pubkey(claims.pubkey);
         if (ctx_.tree.check_permission(caller_pubkey, hb_node_id, acl::Permission::Read)) {
-            std::vector<tree::TreeNode> endpoints;
-            std::vector<tree::TreeNode> reachable;
-            std::vector<const tree::TreeNode*> relays;
-            std::unordered_map<std::string, std::vector<std::string>> local;
-            if (!current->parent_id.empty()) {
-                reachable = ctx_.tree.collect_subtree(current->parent_id);
-                endpoints = connectable_endpoints(ctx_.tree.nodes_snapshot(), caller_pubkey,
-                                                  *current, reachable);
-                for (const auto& n : reachable) {
-                    if (n.type == tree::NodeType::Relay &&
-                        mesh_peer_listed(ctx_.tree, caller_pubkey, n)) {
-                        relays.push_back(&n);
-                    }
-                }
-                for (const auto& n : endpoints) {
-                    if (auto lan = local_endpoints_of(n.id, now); !lan.empty()) {
-                        local.emplace(n.id, std::move(lan));
-                    }
-                }
-            }
-            j["peers_revision"] = peers_revision(
-                endpoints, relays, build_mesh_handshake_map(ctx_.boringtun), local, now);
+            j["peers_revision"] = caller_peers_revision(caller_pubkey, *current, now);
         }
         // A member that the finalized next-epoch plan leaves out says so, so
         // the client moves its session before this server's authority ends.

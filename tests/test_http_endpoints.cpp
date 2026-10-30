@@ -2429,6 +2429,136 @@ TEST_F(MeshPeersConnectTest, HeartbeatPeersRevisionFollowsThePeerList) {
     EXPECT_EQ(revision("mc_no_read", stranger), "");
 }
 
+// GET /api/mesh/peers with wait_revision holds the request until the
+// caller's peers_revision changes: a tree change that adds a peer to the
+// caller's list answers it at once, a change outside the list does not, the
+// timeout answers with the same revision, and the caps answer 429.
+TEST_F(MeshPeersConnectTest, PeerListLongPollAnswersWhenTheListChanges) {
+    add("mc_peer", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    json body;
+    listed(&body);
+    ASSERT_TRUE(body.contains("peers_revision")) << body.dump();
+    const auto baseline = body["peers_revision"].get<std::string>();
+    ASSERT_FALSE(baseline.empty());
+
+    const auto wait = [this](const std::string& revision, int timeout, std::atomic<int>* status_out,
+                             std::string* revision_out) {
+        httplib::Client cli("127.0.0.1", mesh_port);
+        cli.set_read_timeout(timeout + 10);
+        httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(caller)}};
+        auto res = cli.Get("/api/mesh/peers/mc_self?wait_revision=" + revision +
+                               "&timeout=" + std::to_string(timeout), h);
+        *status_out = res ? res->status : 0;
+        if (res && res->status == 200) {
+            *revision_out = json::parse(res->body)["peers_revision"].get<std::string>();
+        }
+    };
+
+    // Unchanged list: the timeout answers with the same revision.
+    {
+        std::atomic<int> status{0};
+        std::string next;
+        const auto start = std::chrono::steady_clock::now();
+        wait(baseline, 1, &status, &next);
+        const auto took = std::chrono::steady_clock::now() - start;
+        EXPECT_EQ(status.load(), 200);
+        EXPECT_EQ(next, baseline);
+        EXPECT_GE(took, std::chrono::milliseconds(900));
+    }
+
+    // A stale revision answers at once.
+    {
+        std::atomic<int> status{0};
+        std::string next;
+        const auto start = std::chrono::steady_clock::now();
+        wait("0000000000000000", 20, &status, &next);
+        EXPECT_EQ(status.load(), 200);
+        EXPECT_EQ(next, baseline);
+        EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+    }
+
+    // A change outside the caller's list does not answer; a new listed peer does.
+    {
+        std::atomic<int> status{0};
+        std::string next;
+        std::thread waiter([&] { wait(baseline, 20, &status, &next); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        add("mc_unlisted", "mc_group", tree::NodeType::Endpoint,
+            {{principal(), {"connect_private"}}});
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        EXPECT_EQ(status.load(), 0) << "a change outside the caller's list answered the wait";
+        const auto added = std::chrono::steady_clock::now();
+        add("mc_second", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_shared"}}});
+        waiter.join();
+        EXPECT_LT(std::chrono::steady_clock::now() - added, std::chrono::seconds(2));
+        EXPECT_EQ(status.load(), 200);
+        EXPECT_FALSE(next.empty());
+        EXPECT_NE(next, baseline);
+    }
+
+    // Caps: a second wait of the same device beyond its limit gets 429.
+    mesh_handler->peer_waiters().set_limits_for_testing(8, 1);
+    {
+        std::atomic<int> first_status{0};
+        std::string first_next;
+        json now_body;
+        listed(&now_body);
+        const auto current = now_body["peers_revision"].get<std::string>();
+        std::thread holder([&] { wait(current, 3, &first_status, &first_next); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        std::atomic<int> status{0};
+        std::string next;
+        wait(current, 3, &status, &next);
+        EXPECT_EQ(status.load(), 429);
+        holder.join();
+        EXPECT_EQ(first_status.load(), 200);
+        EXPECT_EQ(mesh_handler->peer_waiters().waiting(), 0u) << "a finished wait kept its slot";
+    }
+
+    // A malformed timeout is refused.
+    {
+        httplib::Client cli("127.0.0.1", mesh_port);
+        httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(caller)}};
+        auto res = cli.Get("/api/mesh/peers/mc_self?wait_revision=" + baseline + "&timeout=abc", h);
+        ASSERT_NE(res, nullptr);
+        EXPECT_EQ(res->status, 400);
+    }
+}
+
+// MeshPeerWaiters on its own: a notify wakes a wait, the generation guards
+// against a lost wake-up, shutdown ends waits and refuses new ones.
+TEST(MeshPeerWaiters, NotifyWakesAndShutdownRefuses) {
+    api::MeshPeerWaiters waiters;
+    const auto seen = waiters.generation();
+    std::thread notifier([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        waiters.notify();
+    });
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_NE(waiters.wait(seen, std::chrono::seconds(5)), seen);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+    notifier.join();
+
+    // A notify between generation() and wait() is not lost.
+    const auto before = waiters.generation();
+    waiters.notify();
+    EXPECT_NE(waiters.wait(before, std::chrono::seconds(5)), before);
+
+    api::MeshPeerWaiters::Refusal why{};
+    auto slot = waiters.try_admit("dev", why);
+    ASSERT_NE(slot, nullptr);
+    EXPECT_EQ(waiters.waiting(), 1u);
+    waiters.shutdown();
+    EXPECT_EQ(waiters.try_admit("other", why), nullptr);
+    EXPECT_EQ(why, api::MeshPeerWaiters::Refusal::ShuttingDown);
+    const auto g = waiters.generation();
+    const auto t0 = std::chrono::steady_clock::now();
+    waiters.wait(g, std::chrono::seconds(5));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(1));
+    slot.reset();
+    EXPECT_EQ(waiters.waiting(), 0u);
+}
+
 // A heartbeat may report the device's LAN endpoints. The server accepts only
 // private "a.b.c.d:port" addresses from the node's own key, keeps them in
 // memory, and lists them only in the entries of callers that already list
