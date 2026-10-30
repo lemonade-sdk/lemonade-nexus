@@ -40,9 +40,13 @@ EligibilityRestore EligibilityService::install(EpochId epoch, MeshFactContext co
         if (*result == EligibilityLoadResult::Corrupt) {
             return EligibilityRestore::Corrupt;
         }
+        // Absent: no fault file is known on disk, so the next write writes it.
+        faults_written_.reset();
     } else {
-        ledger_.merge_faults(
-            std::get<std::map<NodeId, std::set<ObjectiveFault>>>(faults));
+        const auto& loaded = std::get<std::map<NodeId, std::set<ObjectiveFault>>>(faults);
+        ledger_.merge_faults(loaded);
+        // The loaded set is what the file holds, so nothing rewrites it.
+        faults_written_ = loaded;
     }
 
     const auto loaded = store_.load(epoch, context_, ledger_);
@@ -224,7 +228,11 @@ ObservationOutcome EligibilityService::accept(const EligibilityObservation& obse
 
 void EligibilityService::record_fault(const NodeId& subject, ObjectiveFault fault) {
     ledger_.record_fault(subject, fault);
-    (void)store_.store_faults(ledger_.faults());
+    // A fault is a permanent fact about a node: write it now rather than
+    // keeping it in a delay window.
+    if (store_.store_faults(ledger_.faults())) {
+        faults_written_ = ledger_.faults();
+    }
 }
 
 // --- State -------------------------------------------------------------------
@@ -338,8 +346,17 @@ std::optional<Tier1Set> EligibilityService::frozen_pool(EpochId next_epoch) cons
 
 bool EligibilityService::persist() {
     const bool observations = store_.store(context_.epoch, ledger_.snapshot());
-    const bool faults = store_.store_faults(ledger_.faults());
-    return observations && faults;
+    // Faults change only when a fault is recorded or loaded, which is far less
+    // often than observations arrive. Rewriting an unchanged 24-byte file cost
+    // four device syncs each time.
+    if (faults_written_ && *faults_written_ == ledger_.faults()) {
+        return observations;
+    }
+    if (!store_.store_faults(ledger_.faults())) {
+        return false;
+    }
+    faults_written_ = ledger_.faults();
+    return observations;
 }
 
 }  // namespace nexus::security

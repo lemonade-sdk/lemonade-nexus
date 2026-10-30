@@ -16,6 +16,8 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -159,6 +161,17 @@ struct ServiceMesh : ::testing::Test {
         std::vector<std::size_t> all(kMembers);
         for (std::size_t i = 0; i < kMembers; ++i) all[i] = i;
         return all;
+    }
+
+    /// The inode of `path`, or nullopt when it cannot be read. Comparing
+    /// inodes is how these tests tell "written again" from "left alone":
+    /// a durable write renames a new file into place.
+    [[nodiscard]] std::optional<ino_t> inode_of(const fs::path& path) const {
+        struct stat status{};
+        if (::stat(path.c_str(), &status) != 0) {
+            return std::nullopt;
+        }
+        return status.st_ino;
     }
 
     /// Drives the full mesh to the point where every member holds both facts.
@@ -575,6 +588,33 @@ TEST_F(ServiceMesh, AFaultDeniesEligibilityAndOutlivesARestart) {
     const auto& faults = services[0]->ledger().faults();
     ASSERT_NE(faults.find(ids[3]), faults.end());
     EXPECT_TRUE(faults.at(ids[3]).contains(ObjectiveFault::Equivocation));
+}
+
+// A proved fault is written the moment it is recorded, and a fault set that
+// has not changed is written once. Before this change every accepted
+// observation rewrote faults.json, which on these nodes held nothing at all.
+TEST_F(ServiceMesh, UnchangedFaultsAreNotRewritten) {
+    const fs::path faults_file = directory_of(0) / "faults.json";
+    services[0]->record_fault(ids[3], ObjectiveFault::Equivocation);
+    ASSERT_TRUE(fs::exists(faults_file));
+    const auto written = inode_of(faults_file);
+    ASSERT_TRUE(written.has_value());
+
+    // An accepted observation is a different file. The fault set has not
+    // changed, so nothing writes faults.json again.
+    services[0]->record_verdict(verdict_for(ids[1], 1));
+    const auto observation = services[0]->observe_attestation(ids[1], 1, reference(1));
+    ASSERT_TRUE(observation.has_value());
+    ASSERT_TRUE(services[0]->persist());
+    EXPECT_EQ(inode_of(faults_file), written)
+        << "an unchanged fault set must not be written again";
+
+    // A newly proved fault is a change, so it reaches the disk at once in a
+    // replacement file rather than staying in the one already written.
+    services[0]->record_fault(ids[3], ObjectiveFault::DuplicateIncarnation);
+    const auto rewritten = inode_of(faults_file);
+    ASSERT_TRUE(rewritten.has_value());
+    EXPECT_NE(*rewritten, *written) << "a new fault must reach the disk";
 }
 
 // A restart brings observations back so the node can keep contributing. It does

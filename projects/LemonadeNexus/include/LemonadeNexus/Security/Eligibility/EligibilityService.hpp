@@ -24,6 +24,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 namespace nexus::security {
@@ -86,6 +87,9 @@ public:
     /// Records the platform half of a verdict this node verified. Two passing
     /// verdicts in one epoch that disagree about the incarnation are objective
     /// evidence of a duplicate incarnation, and record it as a fault.
+    ///
+    /// A fault is a permanent fact about a node, so it is written at once and
+    /// never held in a write window.
     void record_verdict(const AttestationVerdict& verdict);
 
     /// Signs this node's statement about the attestation it verified for
@@ -114,8 +118,11 @@ public:
         Height height, const Digest& state_reference);
 
     /// Records an observation from any observer, including this node's own.
+    /// Writing it to disk is a separate step: see persist().
     [[nodiscard]] ObservationOutcome accept(const EligibilityObservation& observation);
 
+    /// Records proved misbehavior and writes the fault set at once, so a fault
+    /// never sits in a delay window.
     void record_fault(const NodeId& subject, ObjectiveFault fault);
 
     /// The state this node would finalize for the given boundary.
@@ -139,8 +146,10 @@ public:
     /// this boundary AND this node's recomputation still matches it.
     [[nodiscard]] std::optional<Tier1Set> frozen_pool(EpochId next_epoch) const;
 
-    /// Writes observations and faults. Called after every accepted change, so a
-    /// restart resumes from what the mesh actually said.
+    /// Writes the observations of the current epoch, and the fault set only
+    /// when it differs from the set last written. Callers write after every
+    /// accepted change, so a restart resumes from what the mesh actually said
+    /// without rewriting a fault file that has not changed.
     [[nodiscard]] bool persist();
 
     [[nodiscard]] Height max_observed_height() const {
@@ -178,6 +187,10 @@ private:
 
     std::function<bool(const NodeId&)> certificate_source_;
     std::optional<FinalizedEligibility> finalized_;
+
+    /// The fault set as last written successfully. Empty optional means nothing
+    /// is known to be on disk, so the next write writes the file once.
+    std::optional<std::map<NodeId, std::set<ObjectiveFault>>> faults_written_;
 };
 
 }  // namespace nexus::security
