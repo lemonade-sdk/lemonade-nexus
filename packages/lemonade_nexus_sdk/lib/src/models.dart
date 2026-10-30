@@ -440,6 +440,15 @@ class MeshPeer {
   final double? latencyMs;
   final int keepalive;
 
+  /// How traffic reaches the peer now: "lan" (its LAN address on this
+  /// network), "direct" (peer to peer after hole punching) or "relay".
+  /// Null from an SDK that does not report it.
+  final String? path;
+
+  /// The private LAN addresses the peer advertises ("ip:port"), shown only
+  /// to devices allowed to connect to it.
+  final List<String> localEndpoints;
+
   MeshPeer({
     required this.nodeId,
     this.hostname,
@@ -454,6 +463,8 @@ class MeshPeer {
     this.txBytes,
     this.latencyMs,
     required this.keepalive,
+    this.path,
+    this.localEndpoints = const [],
   });
 
   /// Parses a peer from the SDK's mesh output.
@@ -476,6 +487,10 @@ class MeshPeer {
         txBytes: (json['tx_bytes'] as num?)?.toInt(),
         latencyMs: (json['latency_ms'] as num?)?.toDouble(),
         keepalive: (json['keepalive'] as num?)?.toInt() ?? 0,
+        path: (json['path'] as String?)?.isEmpty ?? true ? null : json['path'] as String,
+        localEndpoints: [
+          for (final e in (json['local_endpoints'] as List? ?? const [])) '$e',
+        ],
       );
 
   Map<String, dynamic> toJson() => _$MeshPeerToJson(this);
