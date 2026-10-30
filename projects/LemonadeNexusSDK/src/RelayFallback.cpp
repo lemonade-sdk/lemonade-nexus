@@ -79,7 +79,8 @@ void RelayFallback::schedule_retry(PeerState& state) {
     state.next_attempt = Clock::now() + std::min(delay, timing_.backoff_max);
 }
 
-void RelayFallback::abandon(const std::string& pubkey, PeerState& state, bool blame_relay) {
+void RelayFallback::abandon(const std::string& pubkey, PeerState& state, bool blame_relay,
+                            bool peer_absent) {
     if (state.channel) {
         state.channel->close();
         state.channel.reset();
@@ -94,6 +95,11 @@ void RelayFallback::abandon(const std::string& pubkey, PeerState& state, bool bl
     state.stale_before = unix_now();
     if (blame_relay && !state.relay_id.empty()) {
         cooldown_[state.relay_id] = Clock::now() + timing_.relay_cooldown;
+    }
+    const auto now = Clock::now();
+    if (peer_absent && now < state.eager_until) {
+        state.next_attempt = now + timing_.absent_retry;
+        return;
     }
     schedule_retry(state);
 }
@@ -130,6 +136,8 @@ void RelayFallback::release_unused(const std::string& pubkey, PeerState& state) 
                  short_key(pubkey));
 }
 
+void RelayFallback::set_window_clock(UnixClock clock) { window_clock_ = std::move(clock); }
+
 void RelayFallback::renew(const std::vector<std::string>& pubkeys, bool skip_grace) {
     const auto now = Clock::now();
     const int64_t now_unix = unix_now();
@@ -139,6 +147,7 @@ void RelayFallback::renew(const std::vector<std::string>& pubkeys, bool skip_gra
         state.listed = true;
         state.stale_before = std::max(state.stale_before, now_unix);
         state.direct_since = skip_grace ? now - timing_.direct_grace : now;
+        state.eager_until = now + timing_.eager_period;
         // A retry delay earned while the peer was away (a relay request it
         // never joined) says nothing about its new path.
         state.next_attempt = {};
@@ -175,7 +184,8 @@ bool RelayFallback::open_channel(PeerState& state, const MeshPeer& peer,
                      ticket.error.empty() ? "request failed" : ticket.error);
         return false;
     }
-    const auto window = nexus::relay::relay_rendezvous_window(static_cast<uint64_t>(unix_now()));
+    const auto window = nexus::relay::relay_rendezvous_window(
+        static_cast<uint64_t>(window_clock_ ? window_clock_() : unix_now()));
     const auto rendezvous = mesh_.relay_rendezvous(peer.mesh_pubkey, relay.relay_id, window);
     if (!rendezvous) return false;
     auto allocate = relay_allocate_datagram(*rendezvous, ticket.value, 1);
@@ -196,6 +206,7 @@ bool RelayFallback::open_channel(PeerState& state, const MeshPeer& peer,
     state.channel = std::move(channel);
     state.relay_id = relay.relay_id;
     state.opened_unix = unix_now();
+    state.window = window;
     spdlog::info("[RelayFallback] peer {} has no direct path; allocating at relay {}",
                  short_key(peer.mesh_pubkey), state.channel->relay_endpoint());
     return true;
@@ -253,6 +264,7 @@ std::chrono::steady_clock::time_point RelayFallback::maintain(const std::vector<
         if (!state.listed) {
             state.listed = true;
             state.direct_since = now;
+            state.eager_until = now + timing_.eager_period;
         }
         const auto found = handshakes.find(pubkey);
         // The dataplane reports a handshake as now minus whole seconds
@@ -275,6 +287,23 @@ std::chrono::steady_clock::time_point RelayFallback::maintain(const std::vector<
                 handshake > state.stale_before) {
                 release_unused(pubkey, state);
                 continue;
+            }
+        }
+
+        if (state.channel && !state.applied) {
+            // The other side asks in the window its own clock shows now; a
+            // request from the previous window can never pair with it.
+            const auto st = state.channel->state();
+            const auto window_now = nexus::relay::relay_rendezvous_window(
+                static_cast<uint64_t>(window_clock_ ? window_clock_() : now_unix));
+            if ((st == RelayChannel::State::Allocating || st == RelayChannel::State::Waiting) &&
+                window_now != state.window) {
+                spdlog::info("[RelayFallback] rendezvous window ended for peer {}; asking again",
+                             short_key(pubkey));
+                state.channel->close();
+                state.channel.reset();
+                state.next_attempt = {};
+                if (open_count > 0) --open_count;
             }
         }
 
@@ -347,10 +376,17 @@ std::chrono::steady_clock::time_point RelayFallback::maintain(const std::vector<
                     break;
                 case RelayChannel::State::Failed: {
                     const auto why = state.channel->failure();
+                    // The relay ends a request that waited 30 s for the
+                    // other side and then answers SessionUnknown; the
+                    // channel's own pending limit reports PeerAbsent.
+                    const bool absent =
+                        why == RelayChannel::Failure::PeerAbsent ||
+                        (why == RelayChannel::Failure::SessionLost && !state.applied);
                     abandon(pubkey, state,
                             why == RelayChannel::Failure::NoReply ||
                                 why == RelayChannel::Failure::Refused ||
-                                why == RelayChannel::Failure::RelaySilent);
+                                why == RelayChannel::Failure::RelaySilent,
+                            absent);
                     break;
                 }
                 default:

@@ -192,6 +192,14 @@ The SDK moves a peer onto a relay when the dataplane cannot reach it directly:
   peers can derive (see [Security](Security#relay-sessions)).
 - After the relay pairs them, the peer's BoringTun traffic goes through the
   relay. The relay carries only ciphertext.
+- The relay pairs two requests only when both sides derived the rendezvous
+  in the same 300-second wall-clock window, and it ends a request that
+  waited 30 seconds for the other side. A request that is still waiting
+  when the window changes is asked again for the new window at once. A
+  request the other side did not join is asked again after one second for
+  five minutes after the peer appeared, moved, or came back, so a request is
+  waiting whenever the other side asks, on whatever schedule its SDK
+  version uses. After that, such a request backs off like a failure.
 
 A relay that refuses, does not answer, or gives no handshake is skipped for
 five minutes, and the peer is retried with backoff. Set `prefer_direct` to

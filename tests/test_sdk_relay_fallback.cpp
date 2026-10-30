@@ -507,3 +507,139 @@ TEST_F(SdkRelayFallbackTest, TheNextPassComesWhenTheGracePeriodEnds) {
     EXPECT_GE(next, before + F::kMaxPassGap - 50ms);
     EXPECT_LE(next, before + F::kMaxPassGap + 50ms);
 }
+
+// A peer on another SDK version asks the relay on its own schedule (the
+// previous release only after a 20 s grace period and its next 30 s peer
+// refresh), often after this side's first request expired at the relay. A
+// request the peer did not join is repeated at once during the eager
+// period, so a request is waiting whenever the peer asks; with the backoff
+// the two sides' windows missed each other again and again.
+TEST_F(SdkRelayFallbackTest, APeerThatAsksLateFindsARequestWaiting) {
+    const auto candidates = [this] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}};
+    };
+    auto early = fast_timing();
+    early.pending_limit = 1500ms;  // the relay ends a waiting request early here
+    early.backoff_base = 5s;
+    early.backoff_max = 60s;
+    early.absent_retry = 200ms;
+    auto late = early;
+    late.pending_limit = 3s;
+    lnsdk::RelayFallback alice_fallback(
+        alice, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("alice", relay_id), 200, ""};
+        },
+        candidates, early);
+    lnsdk::RelayFallback bob_fallback(
+        bob, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("bob", relay_id), 200, ""};
+        },
+        candidates, late);
+    const std::vector<lnsdk::MeshPeer> alice_peers = {peer(bob_keys.second, "10.64.0.3/32")};
+    const std::vector<lnsdk::MeshPeer> bob_peers = {peer(alice_keys.second, "10.64.0.2/32")};
+
+    // Alice asks at once; her first request expires unjoined.
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < 2500ms) {
+        alice_fallback.maintain(alice_peers, true);
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_TRUE(alice_fallback.relayed_peers().empty());
+
+    // Bob asks only now, and pairs with the request Alice repeated.
+    ASSERT_TRUE(eventually(
+        [&] {
+            return alice_fallback.relayed_peers().contains(bob_keys.second) &&
+                   bob_fallback.relayed_peers().contains(alice_keys.second);
+        },
+        [&] {
+            alice_fallback.maintain(alice_peers, true);
+            bob_fallback.maintain(bob_peers, true);
+        },
+        2500ms))
+        << "the late peer found no request waiting";
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong-through-relay");
+}
+
+// After the eager period, a request the peer did not join counts as a
+// failure and backs off: a peer that is not running costs a request only
+// every few minutes.
+TEST_F(SdkRelayFallbackTest, UnjoinedRequestsBackOffAfterTheEagerPeriod) {
+    const auto candidates = [this] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}};
+    };
+    const std::vector<lnsdk::MeshPeer> peers = {peer(alice_keys.second, "10.64.0.2/32")};
+    const auto requests_in = [&](std::chrono::milliseconds eager_period) {
+        auto timing = fast_timing();
+        timing.pending_limit = 500ms;
+        timing.backoff_base = 10s;
+        timing.backoff_max = 60s;
+        timing.absent_retry = 100ms;
+        timing.eager_period = eager_period;
+        std::atomic<int> tickets{0};
+        lnsdk::RelayFallback fallback(
+            bob, [&](const std::string& relay_id) {
+                ++tickets;
+                return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("bob", relay_id), 200, ""};
+            },
+            candidates, timing);
+        const auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < 2500ms) {
+            fallback.maintain(peers, true);
+            std::this_thread::sleep_for(50ms);
+        }
+        return tickets.load();
+    };
+    EXPECT_GE(requests_in(60s), 3) << "unjoined requests were not repeated in the eager period";
+    EXPECT_EQ(requests_in(0ms), 1) << "unjoined requests did not back off after the eager period";
+}
+
+// The rendezvous changes every 300 s of wall time, and the relay pairs only
+// requests of the same window. Two sides that ask on either side of the
+// boundary pair as soon as the earlier side's clock crosses it: its waiting
+// request is replaced by one for the new window. Before, both requests
+// waited until the relay ended them, about 35 s.
+TEST_F(SdkRelayFallbackTest, RequestsOnBothSidesOfAWindowBoundaryPair) {
+    const auto candidates = [this] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}};
+    };
+    auto timing = fast_timing();
+    timing.pending_limit = 30s;  // nothing expires within the test
+    lnsdk::RelayFallback alice_fallback(
+        alice, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("alice", relay_id), 200, ""};
+        },
+        candidates, timing);
+    lnsdk::RelayFallback bob_fallback(
+        bob, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("bob", relay_id), 200, ""};
+        },
+        candidates, timing);
+    const int64_t boundary = static_cast<int64_t>(
+        (now_s() / relay::kRelayRendezvousWindowSec + 1) * relay::kRelayRendezvousWindowSec);
+    std::atomic<int64_t> alice_clock{boundary - 1};
+    alice_fallback.set_window_clock([&] { return alice_clock.load(); });
+    bob_fallback.set_window_clock([&] { return boundary + 1; });
+    const std::vector<lnsdk::MeshPeer> alice_peers = {peer(bob_keys.second, "10.64.0.3/32")};
+    const std::vector<lnsdk::MeshPeer> bob_peers = {peer(alice_keys.second, "10.64.0.2/32")};
+    const auto pass = [&] {
+        alice_fallback.maintain(alice_peers, true);
+        bob_fallback.maintain(bob_peers, true);
+    };
+    const auto paired = [&] {
+        return alice_fallback.relayed_peers().contains(bob_keys.second) &&
+               bob_fallback.relayed_peers().contains(alice_keys.second);
+    };
+
+    // Alice asks just before the boundary, Bob just after it: no pairing.
+    for (int i = 0; i < 10; ++i) {
+        pass();
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_FALSE(paired());
+
+    // Alice's clock crosses the boundary.
+    alice_clock = boundary + 1;
+    EXPECT_TRUE(eventually(paired, pass, 3s)) << "the request from the old window was kept";
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong-through-relay");
+}
