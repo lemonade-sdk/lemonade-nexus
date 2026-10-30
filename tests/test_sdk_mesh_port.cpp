@@ -177,6 +177,7 @@ protected:
     TestServer local;
     TestServer slow;
     TestServer guarded;
+    TestServer second;  // serves PeerModel too: the auto router's fallback when peer dies
     std::mutex seen_mutex;
     std::string peer_authorization;
     std::string peer_model;
@@ -266,6 +267,17 @@ protected:
             res.set_content(json{{"served_by", "peer"}, {"model", body.value("model", "")}}.dump(), "application/json");
         });
         peer.start();
+        second.server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(R"({"status":"ok","all_models_loaded":[{"model_name":"PeerModel","is_busy":false}]})",
+                            "application/json");
+        });
+        second.server.Get("/api/v1/models", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(R"({"object":"list","data":[{"id":"PeerModel"}]})", "application/json");
+        });
+        second.server.Post("/api/v1/chat/completions", [](const httplib::Request& req, httplib::Response& res) {
+            const auto body = json::parse(req.body, nullptr, false);
+            res.set_content(json{{"served_by", "second"}, {"model", body.value("model", "")}}.dump(), "application/json");
+        });
 
         local.server.Get("/api/v1/models", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"object":"list","data":[{"id":"LocalModel"}]})", "application/json");
@@ -315,11 +327,13 @@ protected:
         const auto peer_port = static_cast<uint16_t>(peer.port);
         const auto slow_port = static_cast<uint16_t>(slow.port);
         const auto guarded_port = static_cast<uint16_t>(guarded.port);
+        const auto second_port = static_cast<uint16_t>(second.port);
         b.open_egress = [=](const std::string& ip, uint16_t vport) -> uint16_t {
             if (vport != lnsdk::kMeshPortPeerServicePort) return 0;
             if (ip == "10.64.0.3") return peer_port;
             if (ip == "10.64.0.8") return slow_port;
             if (ip == "10.64.0.9") return guarded_port;
+            if (ip == "10.64.0.10") return second_port;
             return 0;
         };
         b.close_egress = [this](const std::string&, uint16_t) { ++closed_egress; };
@@ -634,6 +648,37 @@ TEST_F(MeshPortTest, AutoRouter) {
     }
     EXPECT_TRUE(found);
     EXPECT_EQ(peer_model_listings.load(), listings);
+}
+
+TEST_F(MeshPortTest, AutoRouterFailsOverOnceWhenTheChosenDeviceGivesNoAnswer) {
+    second.start();
+    add_member("second", "Second box", "10.64.0.10");
+    start();
+    ASSERT_EQ(port->set_selection("auto", ""), 0);
+    httplib::Client client("127.0.0.1", number);
+    // Both devices have PeerModel loaded and idle; the ranking prefers the one
+    // with the lower latency (second: 5 ms, gpu: 20 ms).
+    auto first = chat(client, "PeerModel");
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->status, 200);
+    EXPECT_EQ(json::parse(first->body)["served_by"], "second");
+    EXPECT_EQ(port->status()["auto_failovers"], 0);
+
+    // The chosen device dies between requests. Its probe is still cached as
+    // loaded, so the ranking picks it again; the bridge gives no answer and the
+    // request is re-sent once to the next device.
+    second.server.stop();
+    auto moved = chat(client, "PeerModel");
+    ASSERT_TRUE(moved);
+    EXPECT_EQ(moved->status, 200) << moved->body;
+    EXPECT_EQ(json::parse(moved->body)["served_by"], "peer");
+    EXPECT_EQ(port->status()["auto_failovers"], 1);
+
+    // A request that named the dead device is not moved: the caller chose it.
+    auto named = chat(client, "Second box/PeerModel");
+    ASSERT_TRUE(named);
+    EXPECT_EQ(named->status, 502);
+    EXPECT_EQ(port->status()["auto_failovers"], 1);
 }
 
 TEST_F(MeshPortTest, AutoRouterSkipsDevicesThatRefuseTheKey) {
