@@ -90,6 +90,11 @@ public:
     /// Empty when inactive.
     [[nodiscard]] std::string server_endpoint() const;
 
+    /// The mesh's own address plane: the server peer's allowed IPs the
+    /// dataplane started with (for example "10.64.0.0/10"). Empty when
+    /// inactive.
+    [[nodiscard]] std::vector<std::string> tunnel_plane() const;
+
     /// Learn this device's reflexive address: send a STUN Binding request
     /// from the dataplane's own UDP socket to `stun_endpoint` ("a.b.c.d:port")
     /// and wait for the matching response. Because the request leaves from

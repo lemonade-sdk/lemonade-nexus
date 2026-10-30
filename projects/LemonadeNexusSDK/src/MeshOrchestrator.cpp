@@ -137,6 +137,8 @@ void MeshOrchestrator::stop() {
         stale_passes_.clear();
         last_status_ = {};
         our_endpoint_.clear();
+        our_local_endpoints_.clear();
+        own_lan_.clear();
     }
     peers_revision_.clear();
 
@@ -175,6 +177,16 @@ void MeshOrchestrator::set_wall_clock(WallClock clock) {
     wall_clock_ = std::move(clock);
 }
 
+void MeshOrchestrator::set_local_address_source(LocalAddressSource source) {
+    std::lock_guard lock(mutex_);
+    local_address_source_ = std::move(source);
+}
+
+std::vector<std::string> MeshOrchestrator::local_endpoints() const {
+    std::lock_guard lock(mutex_);
+    return our_local_endpoints_;
+}
+
 void MeshOrchestrator::run_loop() {
     using clock = std::chrono::steady_clock;
     using std::chrono::duration_cast;
@@ -187,6 +199,7 @@ void MeshOrchestrator::run_loop() {
     auto next_relay        = clock::now();
     auto next_monitor      = clock::now();
     auto next_cert_check   = clock::now();
+    auto next_lan          = clock::now();
 
     std::optional<std::chrono::system_clock::time_point> last_wall;
     milliseconds busy{0};
@@ -236,6 +249,15 @@ void MeshOrchestrator::run_loop() {
             // the address the server lists.
             if (do_stun_refresh()) next_heartbeat = now;
             next_stun = now + std::chrono::seconds(cfg.stun_refresh_interval_sec);
+        }
+
+        // LAN endpoints, after STUN (the reflexive address decides about a
+        // carrier NAT address) and before the heartbeat that reports them.
+        // A join, a refresh request (the app saw a network change), and a
+        // resume read them at once.
+        if (urgent || now >= next_lan) {
+            if (do_lan_refresh()) next_heartbeat = now;
+            next_lan = now + kLanRefreshInterval;
         }
 
         // Peer refresh
@@ -289,7 +311,7 @@ void MeshOrchestrator::run_loop() {
 
         // Sleep until next event or woken early
         auto next_wake = std::min({next_peer_refresh, next_stun, next_heartbeat, next_punch,
-                                   next_relay, next_monitor, next_cert_check});
+                                   next_relay, next_monitor, next_cert_check, next_lan});
         const auto pass_end = clock::now();
         busy = duration_cast<milliseconds>(pass_end - now);
         planned_wait = std::max(milliseconds{0}, duration_cast<milliseconds>(next_wake - pass_end));
@@ -394,12 +416,20 @@ void MeshOrchestrator::do_heartbeat() {
     // Until STUN gives one, the endpoint is empty and the server keeps what
     // it stored before.
     std::string endpoint;
+    std::vector<std::string> local;
     {
         std::lock_guard lock(mutex_);
         endpoint = our_endpoint_;
+        local = our_local_endpoints_;
     }
 
-    auto result = client_.mesh_heartbeat(node_id_, endpoint);
+    auto result = client_.mesh_heartbeat(node_id_, endpoint, local);
+    if (!result && result.http_status == 400 && !local.empty()) {
+        // A server that refuses the LAN list must still get the endpoint and
+        // the liveness signal; peers then use the public path and the relay.
+        spdlog::warn("[MeshOrchestrator] server refused the LAN endpoints: {}", result.error);
+        result = client_.mesh_heartbeat(node_id_, endpoint, std::vector<std::string>{});
+    }
     if (!result) {
         spdlog::debug("[MeshOrchestrator] heartbeat failed: {}", result.error);
         return;
@@ -444,6 +474,36 @@ bool MeshOrchestrator::do_stun_refresh() {
     if (our_endpoint_ == *reflexive) return false;
     spdlog::info("[MeshOrchestrator] reflexive endpoint {}", *reflexive);
     our_endpoint_ = *reflexive;
+    return true;
+}
+
+bool MeshOrchestrator::do_lan_refresh() {
+    LocalAddressSource source;
+    LocalEndpointRules rules;
+    {
+        std::lock_guard lock(mutex_);
+        source = local_address_source_;
+        rules.reflexive = our_endpoint_;
+    }
+    const auto interfaces = source ? source() : list_interface_addresses();
+    rules.mesh_ranges = mesh_.tunnel_plane();
+    if (rules.mesh_ranges.empty()) rules.mesh_ranges = {"10.64.0.0/10"};
+    // Loopback addresses reach a peer only on a single-host deployment, the
+    // same rule peer_endpoint_usable applies to listed endpoints.
+    rules.allow_loopback = endpoint_scope(mesh_.server_endpoint()) == AddressScope::Loopback;
+    auto lan = usable_lan_interfaces(interfaces, rules);
+    auto endpoints = select_local_endpoints(interfaces, mesh_.bound_port(), rules);
+
+    std::lock_guard lock(mutex_);
+    own_lan_ = std::move(lan);
+    if (endpoints == our_local_endpoints_) return false;
+    spdlog::info("[MeshOrchestrator] LAN endpoints: {}",
+                 endpoints.empty() ? std::string("none") : [&] {
+                     std::string text;
+                     for (const auto& e : endpoints) text += (text.empty() ? "" : ", ") + e;
+                     return text;
+                 }());
+    our_local_endpoints_ = std::move(endpoints);
     return true;
 }
 

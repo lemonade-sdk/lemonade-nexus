@@ -333,6 +333,10 @@ std::string BoringtunMesh::server_endpoint() const {
     return impl_->active.load() ? impl_->started_cfg.server_endpoint : std::string{};
 }
 
+std::vector<std::string> BoringtunMesh::tunnel_plane() const {
+    return impl_->active.load() ? impl_->started_cfg.allowed_ips : std::vector<std::string>{};
+}
+
 std::optional<std::string> BoringtunMesh::query_reflexive(const std::string& stun_endpoint,
                                                           std::chrono::milliseconds timeout,
                                                           uint32_t attempts) {

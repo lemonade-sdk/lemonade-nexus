@@ -1,6 +1,7 @@
 #pragma once
 
 #include <LemonadeNexusSDK/HolePunch.hpp>
+#include <LemonadeNexusSDK/LanPaths.hpp>
 #include <LemonadeNexusSDK/RelayFallback.hpp>
 #include <LemonadeNexusSDK/Types.hpp>
 
@@ -83,6 +84,11 @@ inline constexpr std::chrono::milliseconds kResumeGap{2 * kMonitorInterval};
 ///      stun_refresh_interval_sec (0 turns it off)
 ///   4. Reports that endpoint via heartbeat (POST /api/mesh/heartbeat). An
 ///      empty endpoint (none learned yet) leaves the stored endpoint as is.
+///      The heartbeat also reports this device's LAN endpoints
+///      (select_local_endpoints over list_interface_addresses, with the
+///      dataplane port), read again every kLanRefreshInterval and in every
+///      pass that an event below starts; a changed list goes out in a
+///      heartbeat at once.
 ///   5. Punches direct paths to peers at their listed endpoints (HolePuncher)
 ///   6. Monitors peer connectivity and fires state callbacks
 ///   7. Moves peers without a direct path onto a relay (RelayFallback): the
@@ -157,6 +163,17 @@ public:
     /// before start(). An empty function restores the system clock.
     void set_wall_clock(WallClock clock);
 
+    /// The source of this host's interface addresses.
+    using LocalAddressSource = std::function<std::vector<InterfaceAddress>()>;
+
+    /// Replace the interface list the LAN endpoints come from (tests use
+    /// fixed addresses). Call before start(). An empty function restores
+    /// list_interface_addresses().
+    void set_local_address_source(LocalAddressSource source);
+
+    /// The LAN endpoints this device reports now (thread-safe snapshot).
+    [[nodiscard]] std::vector<std::string> local_endpoints() const;
+
 private:
     /// Main orchestration loop (runs on background thread).
     void run_loop();
@@ -173,6 +190,10 @@ private:
     /// Learn our reflexive address from the session server's STUN service.
     /// Returns true when the address changed.
     bool do_stun_refresh();
+
+    /// Read this host's LAN addresses again and choose the LAN endpoints to
+    /// report. Returns true when the reported list changed.
+    bool do_lan_refresh();
 
     /// Run one hole-punch pass. Returns when the next probe is due.
     std::chrono::steady_clock::time_point do_punch();
@@ -197,6 +218,10 @@ private:
     /// Interval between certificate checks. The check reads local files only.
     static constexpr std::chrono::seconds kCertCheckInterval{300};
 
+    /// Interval between reads of the host's LAN addresses outside the
+    /// passes that read them at once. The read is local and cheap.
+    static constexpr std::chrono::seconds kLanRefreshInterval{60};
+
     /// Total wait for one STUN query, including its resends.
     static constexpr std::chrono::milliseconds kStunTimeout{1500};
 
@@ -215,6 +240,9 @@ private:
     MeshTunnelStatus         last_status_;
     StateCallback            callback_;
     std::string              our_endpoint_; // reflexive endpoint we publish ("" until learned)
+    std::vector<std::string> our_local_endpoints_;  // LAN endpoints we report
+    std::vector<InterfaceAddress> own_lan_;         // our usable LAN interfaces
+    LocalAddressSource       local_address_source_; // empty: list_interface_addresses
     bool                     refresh_requested_{false};  // set by refresh_now() and do_heartbeat()
     WallClock                wall_clock_;                // empty: the system clock
     std::string              peers_revision_;            // last heartbeat answer's; loop thread only

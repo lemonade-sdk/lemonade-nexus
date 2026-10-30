@@ -8,6 +8,7 @@
 
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
+#include <LemonadeNexusSDK/LanPaths.hpp>
 #include <LemonadeNexusSDK/MeshOrchestrator.hpp>
 #include <LemonadeNexusSDK/RelayFallback.hpp>
 #include <LemonadeNexusSDK/lemonade_nexus.h>
@@ -300,10 +301,16 @@ protected:
     }
     std::mutex               heartbeat_mtx;
     std::vector<std::string> heartbeat_endpoints;  // the "endpoint" of each heartbeat
+    // The "local_endpoints" of each heartbeat (null when absent).
+    std::vector<nlohmann::json> heartbeat_lan;
 
     std::vector<std::string> heartbeats() {
         std::lock_guard lock(heartbeat_mtx);
         return heartbeat_endpoints;
+    }
+    std::vector<nlohmann::json> heartbeat_local_endpoints() {
+        std::lock_guard lock(heartbeat_mtx);
+        return heartbeat_lan;
     }
 
     // POST /api/auth answers, and the Authorization header of each join
@@ -599,6 +606,9 @@ protected:
                 std::lock_guard lock(heartbeat_mtx);
                 heartbeat_endpoints.push_back(
                     body.is_object() ? body.value("endpoint", std::string{"<none>"}) : "<bad>");
+                heartbeat_lan.push_back(body.is_object() && body.contains("local_endpoints")
+                                            ? body["local_endpoints"]
+                                            : nlohmann::json(nullptr));
             }
             nlohmann::json answer{{"success", true}};
             if (const auto next_epoch = departure_next_epoch.load(); next_epoch != 0) {
@@ -1699,6 +1709,81 @@ TEST_F(SdkMeshPrivateApiTest, HeartbeatWithoutStunSendsAnEmptyEndpoint) {
     ASSERT_TRUE(wait_for([&] { return heartbeats().size() >= 2; }, std::chrono::seconds(10)));
     client->disable_mesh();
     for (const auto& endpoint : heartbeats()) EXPECT_EQ(endpoint, "");
+}
+
+// The heartbeat reports the device's LAN endpoints with the dataplane port.
+// The stand-in server is on loopback (a single-host deployment), so the
+// loopback address counts as a LAN address here; every entry is one the
+// server accepts.
+TEST_F(SdkMeshPrivateApiTest, HeartbeatReportsTheLanEndpoints) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::MeshConfig cfg;
+    cfg.heartbeat_interval_sec    = 1;
+    cfg.stun_refresh_interval_sec = 0;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return heartbeats().size() >= 2; }, std::chrono::seconds(10)));
+    client->disable_mesh();
+    for (const auto& lan : heartbeat_local_endpoints()) {
+        ASSERT_TRUE(lan.is_array()) << lan.dump();
+        EXPECT_LE(lan.size(), lnsdk::kMaxLocalEndpoints);
+        bool loopback = false;
+        for (const auto& entry : lan) {
+            ASSERT_TRUE(entry.is_string());
+            const auto text = entry.get<std::string>();
+            EXPECT_TRUE(lnsdk::lan_endpoint_usable(text, true)) << text;
+            loopback = loopback || text.rfind("127.0.0.1:", 0) == 0;
+        }
+        EXPECT_TRUE(loopback) << lan.dump();
+    }
+}
+
+// A refresh request (the app saw a network change) reads the LAN addresses
+// again, and a changed list goes out in a heartbeat at once, although the
+// heartbeat interval is an hour.
+TEST_F(SdkMeshPrivateApiTest, ANetworkChangeReportsTheNewLanEndpointsAtOnce) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::BoringtunMesh own;
+    const auto own_keys = lnsdk::BoringtunMesh::generate_keypair();
+    ASSERT_TRUE(own.start(mesh_config(own_keys, "10.64.0.9/32")));
+    std::mutex lan_mtx;
+    std::vector<lnsdk::InterfaceAddress> lan = {{"en0", "192.168.1.20", 24}};
+    {
+        lnsdk::MeshOrchestrator orchestrator(*client, own, kNodeId);
+        orchestrator.set_local_address_source([&] {
+            std::lock_guard lock(lan_mtx);
+            return lan;
+        });
+        lnsdk::MeshConfig cfg;
+        cfg.peer_refresh_interval_sec = 3600;
+        cfg.heartbeat_interval_sec    = 3600;
+        cfg.stun_refresh_interval_sec = 0;
+        orchestrator.start(cfg);
+        const auto port = std::to_string(own.bound_port());
+        const auto reported = [&](const std::string& endpoint) {
+            for (const auto& entry : heartbeat_local_endpoints()) {
+                if (entry == nlohmann::json::array({endpoint})) return true;
+            }
+            return false;
+        };
+        ASSERT_TRUE(wait_for([&] { return reported("192.168.1.20:" + port); },
+                             std::chrono::seconds(10)));
+        EXPECT_EQ(orchestrator.local_endpoints(),
+                  std::vector<std::string>{"192.168.1.20:" + port});
+
+        {
+            std::lock_guard lock(lan_mtx);
+            lan = {{"wlan0", "10.0.5.7", 16}, {"utun4", "10.8.0.2", 24}};
+        }
+        orchestrator.refresh_now();
+        EXPECT_TRUE(wait_for([&] { return reported("10.0.5.7:" + port); },
+                             std::chrono::seconds(3)))
+            << "the new LAN address did not go out at once";
+        orchestrator.stop();
+        EXPECT_TRUE(orchestrator.local_endpoints().empty());
+    }
+    own.stop();
 }
 
 // An invite is minted on the inviter's session server and replicates to the
