@@ -347,16 +347,34 @@ class NetworkJoinResponse {
   final String? sessionToken;
   final String? error;
 
+  /// The name set with setDeviceName fit a device of the group already, so
+  /// the join used the server's default name; [deviceNameSuggestion] is a
+  /// free name for a rename ("" when unknown).
+  final bool deviceNameRefused;
+  final String? deviceNameSuggestion;
+
   NetworkJoinResponse({
     required this.success,
     this.nodeId,
     this.tunnelIp,
     this.sessionToken,
     this.error,
+    this.deviceNameRefused = false,
+    this.deviceNameSuggestion,
   });
 
-  factory NetworkJoinResponse.fromJson(Map<String, dynamic> json) =>
-      _$NetworkJoinResponseFromJson(json);
+  factory NetworkJoinResponse.fromJson(Map<String, dynamic> json) {
+    final base = _$NetworkJoinResponseFromJson(json);
+    return NetworkJoinResponse(
+      success: base.success,
+      nodeId: base.nodeId,
+      tunnelIp: base.tunnelIp,
+      sessionToken: base.sessionToken,
+      error: base.error,
+      deviceNameRefused: json['device_name_refused'] == true,
+      deviceNameSuggestion: json['device_name_suggestion']?.toString(),
+    );
+  }
 
   Map<String, dynamic> toJson() => _$NetworkJoinResponseToJson(this);
 }

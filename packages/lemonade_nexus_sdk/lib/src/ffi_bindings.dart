@@ -925,6 +925,9 @@ class LemonadeNexusFfi {
       _LnGroupKeyUnwrapDart>('ln_group_key_unwrap');
   late final _lnSetLinkToken =
       _lib.lookupFunction<_LnSetLinkToken, _LnSetLinkTokenDart>('ln_set_link_token');
+  // Same shape as ln_set_link_token: (client, const char*) -> ln_error_t.
+  late final _lnSetDeviceName =
+      _lib.lookupFunction<_LnSetLinkToken, _LnSetLinkTokenDart>('ln_set_device_name');
   late final _lnSetSessionMovedCallback = _lib.lookupFunction<_LnSetSessionMovedCallback,
       _LnSetSessionMovedCallbackDart>('ln_set_session_moved_callback');
   late final _lnSetGenesisKey =
@@ -1096,6 +1099,7 @@ class LemonadeNexusFfi {
   /// the Dart layer, so these are what a stale build is missing.
   static const List<String> requiredSymbols = [
     'ln_set_link_token',
+    'ln_set_device_name',
     'ln_link_token_create',
     'ln_invite_create',
     'ln_check_device_name',
@@ -1404,6 +1408,15 @@ class LemonadeNexusFfi {
     final t = token.toNativeUtf8().cast<ffi.Char>();
     final result = _lnSetLinkToken(client, t);
     malloc.free(t);
+    return LnError.fromCode(result);
+  }
+
+  /// Set the name the next join_network gives a device it creates. See
+  /// ln_set_device_name.
+  LnError setDeviceName(LnClientHandle client, String name) {
+    final n = name.toNativeUtf8().cast<ffi.Char>();
+    final result = _lnSetDeviceName(client, n);
+    malloc.free(n);
     return LnError.fromCode(result);
   }
 

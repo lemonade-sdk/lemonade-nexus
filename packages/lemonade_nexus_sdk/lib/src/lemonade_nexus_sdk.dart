@@ -587,6 +587,23 @@ class LemonadeNexusSdk {
     }
   }
 
+  /// Names the device that the next [joinNetwork] creates, as part of that
+  /// join, instead of a rename afterwards. A device that joined already
+  /// keeps its name (rename it with [updateNode]). When another device of
+  /// the group holds the name, the join still succeeds under the server's
+  /// default name and reports [NetworkJoinResponse.deviceNameRefused] with
+  /// a suggestion. Throws [SdkException] with [LnError.rejected] for a name
+  /// the SDK refuses (over 64 bytes, a control or shell character, or no
+  /// letter or digit); nothing is stored then.
+  void setDeviceName(String name) {
+    _checkDisposed();
+    _checkConnected();
+    final error = _ffi.setDeviceName(_client!, name);
+    if (error != LnError.success) {
+      throw SdkException(error, message: 'The device name was refused');
+    }
+  }
+
   /// Mint a link token so another device can join this account's Cluster.
   /// Returns `{link_token, code, group_node_id, target_node_id, permissions,
   /// expires_at, code_expires_at}` (see [Invite.fromJson]). Requires the
