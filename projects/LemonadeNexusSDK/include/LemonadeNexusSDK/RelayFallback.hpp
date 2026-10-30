@@ -89,6 +89,18 @@ public:
         /// backoff_max.
         std::chrono::milliseconds backoff_base{5000};
         std::chrono::milliseconds backoff_max{120000};
+        /// Retry delay after a relay request that the peer did not join
+        /// (the relay ends a waiting request after 30 s), within the eager
+        /// period. Such a request is not a failure. Keeping a request waiting
+        /// at the relay all the time lets the peer pair whenever it asks, on
+        /// whatever schedule its own SDK version uses; with the backoff, the
+        /// two sides' 30 s windows could miss each other for minutes.
+        std::chrono::milliseconds absent_retry{1000};
+        /// How long after this device first lists or renews a peer a request
+        /// the peer did not join is repeated after absent_retry. Later, such a
+        /// request counts as a failure and backs off, so a peer that is not
+        /// running costs a request only every few minutes.
+        std::chrono::milliseconds eager_period{300000};
         /// How long a failed relay is skipped.
         std::chrono::milliseconds relay_cooldown{300000};
         /// How long a candidate list is reused.
@@ -131,8 +143,8 @@ public:
     /// device resumed. A handshake from before this call no longer proves a
     /// working direct path. With `skip_grace`, a peer without a working path
     /// may get a relay at the next pass; otherwise its direct grace period
-    /// starts again now. A pending retry delay ends; the failure count that
-    /// sets the next delay stays. An open relay channel stays as it is: a
+    /// starts again now. A pending retry delay ends, and the eager period
+    /// starts again; the failure count that sets the next backoff stays. An open relay channel stays as it is: a
     /// relay that carries traffic is kept (paired_action).
     void renew(const std::vector<std::string>& pubkeys, bool skip_grace);
 
@@ -188,6 +200,7 @@ private:
         std::unique_ptr<RelayChannel> channel;
         std::string                   relay_id;
         Clock::time_point             direct_since{};  ///< Start of the direct grace period
+        Clock::time_point             eager_until{};   ///< End of the eager period
         Clock::time_point             next_attempt{};
         Clock::time_point             paired_at{};
         int64_t                       opened_unix{0};   ///< Unix seconds the channel opened
@@ -204,8 +217,11 @@ private:
 
     /// Open a channel to the chosen relay for `peer`. False on failure.
     bool open_channel(PeerState& state, const MeshPeer& peer, const RelayCandidate& relay);
-    /// Close the peer's channel, undo its relay path, and schedule a retry.
-    void abandon(const std::string& pubkey, PeerState& state, bool blame_relay);
+    /// Close the peer's channel, undo its relay path, and schedule a retry:
+    /// after absent_retry when `peer_absent` (the peer never joined the
+    /// request) and the eager period runs, otherwise with backoff.
+    void abandon(const std::string& pubkey, PeerState& state, bool blame_relay,
+                 bool peer_absent = false);
     /// Close the peer's channel because its traffic moved to a direct path,
     /// keep that path, and do not count a failure.
     void promote_direct(const std::string& pubkey, PeerState& state,

@@ -79,7 +79,8 @@ void RelayFallback::schedule_retry(PeerState& state) {
     state.next_attempt = Clock::now() + std::min(delay, timing_.backoff_max);
 }
 
-void RelayFallback::abandon(const std::string& pubkey, PeerState& state, bool blame_relay) {
+void RelayFallback::abandon(const std::string& pubkey, PeerState& state, bool blame_relay,
+                            bool peer_absent) {
     if (state.channel) {
         state.channel->close();
         state.channel.reset();
@@ -94,6 +95,11 @@ void RelayFallback::abandon(const std::string& pubkey, PeerState& state, bool bl
     state.stale_before = unix_now();
     if (blame_relay && !state.relay_id.empty()) {
         cooldown_[state.relay_id] = Clock::now() + timing_.relay_cooldown;
+    }
+    const auto now = Clock::now();
+    if (peer_absent && now < state.eager_until) {
+        state.next_attempt = now + timing_.absent_retry;
+        return;
     }
     schedule_retry(state);
 }
@@ -139,6 +145,7 @@ void RelayFallback::renew(const std::vector<std::string>& pubkeys, bool skip_gra
         state.listed = true;
         state.stale_before = std::max(state.stale_before, now_unix);
         state.direct_since = skip_grace ? now - timing_.direct_grace : now;
+        state.eager_until = now + timing_.eager_period;
         // A retry delay earned while the peer was away (a relay request it
         // never joined) says nothing about its new path.
         state.next_attempt = {};
@@ -253,6 +260,7 @@ std::chrono::steady_clock::time_point RelayFallback::maintain(const std::vector<
         if (!state.listed) {
             state.listed = true;
             state.direct_since = now;
+            state.eager_until = now + timing_.eager_period;
         }
         const auto found = handshakes.find(pubkey);
         // The dataplane reports a handshake as now minus whole seconds
@@ -347,10 +355,17 @@ std::chrono::steady_clock::time_point RelayFallback::maintain(const std::vector<
                     break;
                 case RelayChannel::State::Failed: {
                     const auto why = state.channel->failure();
+                    // The relay ends a request that waited 30 s for the
+                    // other side and then answers SessionUnknown; the
+                    // channel's own pending limit reports PeerAbsent.
+                    const bool absent =
+                        why == RelayChannel::Failure::PeerAbsent ||
+                        (why == RelayChannel::Failure::SessionLost && !state.applied);
                     abandon(pubkey, state,
                             why == RelayChannel::Failure::NoReply ||
                                 why == RelayChannel::Failure::Refused ||
-                                why == RelayChannel::Failure::RelaySilent);
+                                why == RelayChannel::Failure::RelaySilent,
+                            absent);
                     break;
                 }
                 default:
