@@ -189,6 +189,14 @@ void SecurityDriver::install_authority(VerifiedEpochAuthority authority) {
     }
 }
 
+void SecurityDriver::append_link_or_alert(std::vector<uint8_t> encoded, uint64_t to_epoch) {
+    if (!store_.append_chain_link(encoded)) {
+        spdlog::error("[SecurityDriver] failed to persist the chain link into epoch {}; "
+                      "the served chain now stops at the last stored link until restart",
+                      to_epoch);
+    }
+}
+
 void SecurityDriver::start(uint64_t now_ms) {
     now_ms_ = now_ms;
 
@@ -2053,7 +2061,8 @@ void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
                     // anchor — nothing here is taken on this node's word.
                     auto advanced = advance_epoch_authority(*authority_, *record, *proof);
                     if (auto* next = std::get_if<VerifiedEpochAuthority>(&advanced)) {
-                        (void)store_.append_chain_link(encode_security_message(message));
+                        append_link_or_alert(encode_security_message(message),
+                                             record->to_epoch.underlying());
                         install_authority(std::move(*next));
                     }
                 }
@@ -2372,8 +2381,10 @@ bool SecurityDriver::follow_finalized_handoff(const EpochHandoffProofMsg& link) 
     for (const auto& [kind, handler] : payload_handlers_) {
         handler->on_consensus_reset();
     }
-    (void)store_.append_chain_link(encode_security_message(
-        router_.compose(SecurityMessageKind::EpochHandoffProof, link, handoff.to_epoch)));
+    append_link_or_alert(
+        encode_security_message(
+            router_.compose(SecurityMessageKind::EpochHandoffProof, link, handoff.to_epoch)),
+        handoff.to_epoch.underlying());
     install_authority(std::move(next));
     epoch_started_ms_ = now_ms_;
     last_progress_ms_ = now_ms_;
@@ -2501,6 +2512,12 @@ std::optional<AuthorityChainPage> SecurityDriver::chain_page(EpochId have_epoch,
         const auto* listing =
             std::get_if<std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>>>(&base);
         if (cert == nullptr || listing == nullptr) {
+            // The base is the one thing a serving replica must always hold:
+            // its absence (or a flaky load) is what turns a client's walk
+            // into a 404, so it goes to the log.
+            spdlog::debug("[SecurityDriver] authority chain page: the store holds {} "
+                          "(have_epoch=0)",
+                          cert == nullptr ? "no bootstrap certificate" : "no chain base");
             return std::nullopt;
         }
         page.has_base = true;
@@ -2528,6 +2545,14 @@ std::optional<AuthorityChainPage> SecurityDriver::chain_page(EpochId have_epoch,
         }
     }
     if (!page.has_base && page.links.empty()) {
+        if (const auto* stored = std::get_if<std::vector<std::vector<uint8_t>>>(&links);
+            stored && !stored->empty()) {
+            // Links exist but not the one after have_epoch: a gap, not an
+            // empty store. The two need different fixes.
+            spdlog::debug("[SecurityDriver] authority chain page: no contiguous link "
+                          "from epoch {} ({} stored link(s))", have_epoch.underlying(),
+                          stored->size());
+        }
         return std::nullopt;
     }
     return page;
@@ -2590,8 +2615,11 @@ void SecurityDriver::on_authority_chain_page(const AuthorityChainPage& page, con
         if (next == nullptr) {
             break;
         }
-        (void)store_.append_chain_link(encode_security_message(router_.compose(
-            SecurityMessageKind::EpochHandoffProof, link, link.handoff.to_epoch)));
+        append_link_or_alert(
+            encode_security_message(
+                router_.compose(SecurityMessageKind::EpochHandoffProof, link,
+                                link.handoff.to_epoch)),
+            link.handoff.to_epoch.underlying());
         install_authority(std::move(*next));
     }
     if (authority_->epoch > before) {
@@ -2902,8 +2930,10 @@ void SecurityDriver::on_epoch_handoff_proof(const EpochHandoffProofMsg& message)
     }
     // The link that activated this node joins its chain record, so it can
     // serve the walk to the next stranger.
-    (void)store_.append_chain_link(encode_security_message(
-        router_.compose(SecurityMessageKind::EpochHandoffProof, message, handoff.to_epoch)));
+    append_link_or_alert(
+        encode_security_message(
+            router_.compose(SecurityMessageKind::EpochHandoffProof, message, handoff.to_epoch)),
+        handoff.to_epoch.underlying());
     install_authority(std::move(*next_authority));
     pending_dkg_.reset();
     adoption_.reset();

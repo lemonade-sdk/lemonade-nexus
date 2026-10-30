@@ -1651,15 +1651,17 @@ class LemonadeNexusFfi {
     }
   }
 
-  String? authEd25519(LnClientHandle client) {
+  /// Authenticates with Ed25519 challenge-response.
+  ///
+  /// The C API fills the out JSON on success AND on failure (the failure
+  /// JSON carries the real reason in an "error" field), so both are
+  /// returned. [json] is null only when the native side produced nothing.
+  ({String? json, int code}) authEd25519(LnClientHandle client) {
     final outJson = calloc<ffi.Pointer<ffi.Char>>();
     try {
-      final result = _lnAuthEd25519(client, outJson);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
+      final code = _lnAuthEd25519(client, outJson);
+      final text = toStringAndFree(outJson.value);
+      return (json: text, code: code);
     } finally {
       calloc.free(outJson);
     }

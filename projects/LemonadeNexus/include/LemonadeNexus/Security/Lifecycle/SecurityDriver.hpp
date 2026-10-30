@@ -375,6 +375,11 @@ private:
     void abandon_boundary(const char* reason);
     /// Sets and persists the verified authority anchor.
     void install_authority(VerifiedEpochAuthority authority);
+    /// Persists one verified link. A failed durable write leaves the in-memory
+    /// authority ahead of the served chain: the page stops at the last stored
+    /// link, incoming pages skip epochs already passed in memory, and the
+    /// missing link is never re-appended. The failure must stay visible.
+    void append_link_or_alert(std::vector<uint8_t> encoded, uint64_t to_epoch);
     /// Asks the mesh for chain links when something hints this node is
     /// behind. The ask is idempotent and free of authority.
     void maybe_request_chain();

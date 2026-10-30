@@ -83,7 +83,9 @@ choose the key.
 
 The test client is `tests/live-e2e/nexus_e2e.cpp`. It is built only when
 `BUILD_TESTING` is on, so release builds do not include it. CTest runs only
-its offline self-test (`LiveE2E.SelfTest`).
+its offline self-test (`LiveE2E.SelfTest`). The `cross-server-join` command is
+not wired into any job: it creates devices and a group on the fleet, so run it
+by hand (see [Run the client by hand](#run-the-client-by-hand)).
 
 ### The invite bundle
 
@@ -246,3 +248,39 @@ build/tests/live-e2e/nexus-e2e discover
 ```
 
 `build/tests/live-e2e/nexus-e2e --help` lists every command and option.
+
+### Two servers, one group (cross-server join)
+
+```bash
+build/tests/live-e2e/nexus-e2e cross-server-join \
+  --identity-a /tmp/dev-a.json --identity-b /tmp/dev-b.json \
+  --run-id "$(date -u +%Y%m%dT%H%M%SZ)" --summary /tmp/cross-server.md
+```
+
+Two devices run in one process, each attached to a different Tier 1 server.
+Seeds come from DNS discovery (`--domain` / `--region`) or from `--seed`
+twice: the first is the creator's server, the second the joiner's. In cycle 1
+the creator joins without an invite, so it creates a group of its own, mints a
+single-use invite there, and the joiner accepts that code on the other server.
+The run then closes both clients, reloads the two stored key files, authenticates
+with them, and re-joins; cycle 2 must land both devices back on their own nodes
+and in the same group. Each cycle checks that:
+
+- both devices report the same group (`both devices are in the same group`),
+- each server's group lists both devices, and each peer list contains the other,
+- the two servers report the same tree mode, height, applied height, and state
+  root (`both servers hold the same tree`).
+
+Key files are created when missing, so a run uses two new devices instead of the
+persistent CI accounts. **The run changes the fleet:** it places two devices and
+creates one group. Nothing deletes them; run again with the same `--identity-*`
+files to reuse them.
+
+**What a run shows today.** On 2026-10-30 two runs against the `us-west` fleet
+reached epoch 72 and passed every check in cycle 1, including both devices on
+each side. The first run also passed cycle 2. On the second run, made with the
+same two keys after the group already existed, every check passed except
+`cycle 2: both servers hold the same tree`: the creator's server had applied
+height 627 and the joiner's 629, with different state roots, so one replica had
+not caught up. See `Outstanding-Work.md` section 7 for why that can happen and
+what a fix needs.

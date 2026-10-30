@@ -2359,7 +2359,10 @@ Result<IssuedCertBundle> LemonadeNexusClient::issue_certificate(const json& fiel
     body["client_pubkey"] = local_identity.pubkey_string();
 
     int status = 0;
-    auto resp = impl_->http_post("/api/certs/issue", body, status);
+    // Private-only route: the server registers /api/certs/issue on the private
+    // router, so the public socket answers 404 and the request must go over
+    // the mesh dataplane like every other private API call.
+    auto resp = impl_->private_http_post("/api/certs/issue", body, status);
     result.http_status = status;
 
     if (!resp) {

@@ -52,6 +52,27 @@ bool storage_kind(SecurityMessageKind kind) {
 
 }  // namespace
 
+std::string_view drop_reason_name(DropReason reason) {
+    switch (reason) {
+        case DropReason::Oversized: return "Oversized";
+        case DropReason::Flooded: return "Flooded";
+        case DropReason::Malformed: return "Malformed";
+        case DropReason::UnknownKind: return "UnknownKind";
+        case DropReason::SenderMismatch: return "SenderMismatch";
+        case DropReason::RulesetMismatch: return "RulesetMismatch";
+        case DropReason::NetworkMismatch: return "NetworkMismatch";
+        case DropReason::EpochOutOfWindow: return "EpochOutOfWindow";
+        case DropReason::Duplicate: return "Duplicate";
+        case DropReason::NoService: return "NoService";
+        case DropReason::NotMember: return "NotMember";
+        case DropReason::BudgetExceeded: return "BudgetExceeded";
+        case DropReason::SealFailure: return "SealFailure";
+        case DropReason::ServiceRejected: return "ServiceRejected";
+        case DropReason::WireVersionMismatch: return "WireVersionMismatch";
+    }
+    return "Unknown";
+}
+
 SecurityRouter::SecurityRouter(SecurityRouterConfig config, SecurityRuntime& runtime,
                                ISecurityTransport& transport, ISecurityEvents& events,
                                PairwiseSealer& sealer, IEvidenceProducer* evidence_producer)
@@ -66,21 +87,22 @@ SecurityRouter::SecurityRouter(SecurityRouterConfig config, SecurityRuntime& run
 RouteResult SecurityRouter::drop(DropReason reason, std::optional<uint16_t> code) {
     // Debug, not warn: the plane must stay quiet under flood.
     spdlog::debug("[security] route drop reason={} code={}",
-                  static_cast<uint16_t>(reason), code.value_or(0));
+                  drop_reason_name(reason), code.value_or(0));
     ++drop_counts_[reason];
     // One info line per (reason, code) and window; the flood stays countable
     // without becoming the flood.
     const std::pair<uint16_t, uint16_t> key{static_cast<uint16_t>(reason), code.value_or(0)};
+    const auto reason_name = drop_reason_name(reason);
     const auto it = drop_log_.find(key);
     if (it == drop_log_.end()) {
-        spdlog::info("[security] route drop reason={} code={}", key.first, key.second);
+        spdlog::info("[security] route drop reason={} code={}", reason_name, key.second);
         drop_log_.emplace(key, DropLogWindow{drop_now_ms_, 0});
     } else if (drop_now_ms_ - it->second.window_start_ms >= kDropLogWindowMs) {
         if (it->second.suppressed > 0) {
             spdlog::info("[security] route drop reason={} code={} ({} suppressed)",
-                         key.first, key.second, it->second.suppressed);
+                         reason_name, key.second, it->second.suppressed);
         } else {
-            spdlog::info("[security] route drop reason={} code={}", key.first, key.second);
+            spdlog::info("[security] route drop reason={} code={}", reason_name, key.second);
         }
         it->second = {drop_now_ms_, 0};
     } else {

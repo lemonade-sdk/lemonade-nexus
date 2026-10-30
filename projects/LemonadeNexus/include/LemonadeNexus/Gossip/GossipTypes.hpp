@@ -40,6 +40,42 @@ enum class GossipMsgType : uint8_t {
     LinkTokenSync         = 0x1B,  // "link token event" (backbone only, Tier 1 to Tier 1)
 };
 
+/// The log display of a wire message type: the enumerator name with the raw
+/// value ("Digest (0x01)"), or just the value when this build does not know
+/// the type.
+[[nodiscard]] inline std::string gossip_msg_type_name(uint8_t type) {
+    const auto hex = [](uint8_t v) {
+        static constexpr char kDigits[] = "0123456789abcdef";
+        std::string out = "0x";
+        out.push_back(kDigits[(v >> 4) & 0xF]);
+        out.push_back(kDigits[v & 0xF]);
+        return out;
+    };
+    std::string_view name;
+    switch (static_cast<GossipMsgType>(type)) {
+        case GossipMsgType::Digest: name = "Digest"; break;
+        case GossipMsgType::DeltaRequest: name = "DeltaRequest"; break;
+        case GossipMsgType::DeltaResponse: name = "DeltaResponse"; break;
+        case GossipMsgType::AntiEntropy: name = "AntiEntropy"; break;
+        case GossipMsgType::PeerExchange: name = "PeerExchange"; break;
+        case GossipMsgType::ServerHello: name = "ServerHello"; break;
+        case GossipMsgType::AclDelta: name = "AclDelta"; break;
+        case GossipMsgType::DnsRecordSync: name = "DnsRecordSync"; break;
+        case GossipMsgType::BackboneIpamSync: name = "BackboneIpamSync"; break;
+        case GossipMsgType::NsSlotClaim: name = "NsSlotClaim"; break;
+        case GossipMsgType::MisbehaviorProofBroadcast:
+            name = "MisbehaviorProofBroadcast";
+            break;
+        case GossipMsgType::SecurityEnvelope: name = "SecurityEnvelope"; break;
+        case GossipMsgType::SyncDigest: name = "SyncDigest"; break;
+        case GossipMsgType::SyncRequest: name = "SyncRequest"; break;
+        case GossipMsgType::AccountEnvelopeSync: name = "AccountEnvelopeSync"; break;
+        case GossipMsgType::TreeLogSync: name = "TreeLogSync"; break;
+        case GossipMsgType::LinkTokenSync: name = "LinkTokenSync"; break;
+    }
+    return name.empty() ? hex(type) : std::string(name) + " (" + hex(type) + ")";
+}
+
 // Compile-time pin on the retired range: a new enumerator inside [0x07, 0x10]
 // would revive wire values the removed authority protocol used, and old peers
 // would misparse it. Every live enumerator must stay outside the range.

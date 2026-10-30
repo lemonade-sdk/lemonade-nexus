@@ -162,12 +162,24 @@ class LemonadeNexusSdk {
       throw JsonParseException('null', 'Received null JSON response');
     }
     try {
-      final List<dynamic> list = jsonDecode(json) as List<dynamic>;
+      final dynamic decoded = jsonDecode(json);
+      if (decoded is Map<String, dynamic>) {
+        // A route answered with an error object (e.g. 429
+        // {"error":"rate limited"}) instead of the array: surface the
+        // server's message instead of a type-cast crash.
+        final message = decoded['error'];
+        throw SdkException(LnError.internal,
+            message: (message is String && message.isNotEmpty)
+                ? message
+                : 'Expected a JSON array');
+      }
+      final List<dynamic> list = decoded as List<dynamic>;
       return list
           .whereType<Map<String, dynamic>>()
           .map((m) => fromJson(m))
           .toList();
     } catch (e) {
+      if (e is SdkException) rethrow;
       throw JsonParseException(json, e.toString());
     }
   }
@@ -785,15 +797,31 @@ class LemonadeNexusSdk {
   }
 
   /// Authenticates using Ed25519 challenge-response.
+  ///
+  /// On failure the native JSON carries the real reason (e.g. a stale Tier 1
+  /// epoch or a missing verifiable authority chain); it is surfaced in the
+  /// [SdkException] message instead of a generic one.
   Future<AuthResponse> authEd25519() async {
     _checkDisposed();
     _checkConnected();
     _checkIdentity();
     final result = _ffi.authEd25519(_client!);
-    if (result == null) {
-      throw SdkException(LnError.auth, message: 'Ed25519 authentication failed');
+    Map<String, dynamic>? map;
+    if (result.json != null) {
+      try {
+        map = _parseJson<Map<String, dynamic>>(result.json, (m) => m);
+      } on JsonParseException {
+        // Unparseable native JSON: fall through to the generic message.
+      }
     }
-    return _parseJson(result, AuthResponse.fromJson);
+    if (result.code != 0 || map == null) {
+      final detail = map?['error'];
+      throw SdkException(LnError.auth,
+          message: (detail is String && detail.isNotEmpty)
+              ? detail
+              : 'Ed25519 authentication failed');
+    }
+    return AuthResponse.fromJson(map);
   }
 
   /// Registers a passkey credential.
@@ -1447,7 +1475,13 @@ class LemonadeNexusSdk {
     if (json == null) {
       throw SdkException(LnError.internal, message: '$method $path failed');
     }
-    return _parseJson<Map<String, dynamic>>(json, (m) => m);
+    final map = _parseJson<Map<String, dynamic>>(json, (m) => m);
+    // A bare {"error": "..."} body is the server's error object (e.g. a 429
+    // rate limit), not data: surface it as a typed failure.
+    if (map.length == 1 && map['error'] is String && (map['error'] as String).isNotEmpty) {
+      throw SdkException(LnError.internal, message: map['error'] as String);
+    }
+    return map;
   }
 
   /// Like [privateApiCall], for routes that answer with a JSON array (e.g.
