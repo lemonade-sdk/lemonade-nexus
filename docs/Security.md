@@ -278,6 +278,13 @@ cryptography is involved, and a punch grants no authority:
   is an opaque hash, present only when the caller holds Read on its node. A
   changed value only makes the SDK fetch the verified peer list sooner; it
   names no peer and no address.
+- **A peer list long-poll is bounded.** `wait_revision` needs Read on the
+  node, like the list itself, and the answer is built after the wait under
+  the same checks. A server holds at most 256 waiting requests in all and 2
+  per device key, and refuses more with `429` and `Retry-After`. A wait lasts
+  at most 30 seconds, and a revision longer than 64 characters is refused.
+  The private API has enough worker threads for every held wait plus the
+  normal requests.
 - **Probes are rate limited.** At most 16 peers are probed per pass, each
   probe goes to at most five addresses (four LAN endpoints and the listed
   endpoint), and passes are at least 250 ms apart. A peer gets a burst of five probes, then two

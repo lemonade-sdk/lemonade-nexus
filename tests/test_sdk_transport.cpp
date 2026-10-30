@@ -381,6 +381,10 @@ protected:
     std::mutex       revision_mtx;
     std::string      heartbeat_revision;
     std::atomic<int> relay_ticket_posts{0};
+    // Peer list long-polls the stand-in held, and a switch that ends them
+    // (TearDown) so the server can stop.
+    std::atomic<int>  peer_waits{0};
+    std::atomic<bool> stopping_waits{false};
 
     void set_heartbeat_revision(std::string revision) {
         std::lock_guard lock(revision_mtx);
@@ -560,7 +564,37 @@ protected:
 
     void add_private_routes(httplib::SSLServer& srv) {
         srv.Get(std::string("/api/mesh/peers/") + kNodeId,
-                [this](const httplib::Request&, httplib::Response& res) {
+                [this](const httplib::Request& req, httplib::Response& res) {
+            // A long-poll (wait_revision) holds until the stand-in's
+            // revision differs or the timeout passes. With no revision set
+            // the stand-in acts as an older server: it ignores the query and
+            // answers at once without peers_revision.
+            std::string revision;
+            {
+                std::lock_guard lock(revision_mtx);
+                revision = heartbeat_revision;
+            }
+            if (req.has_param("wait_revision") && !revision.empty()) {
+                ++peer_waits;
+                const auto wanted = req.get_param_value("wait_revision");
+                const int timeout = std::stoi(req.has_param("timeout")
+                                                  ? req.get_param_value("timeout") : "25");
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(timeout);
+                while (std::chrono::steady_clock::now() < deadline && !stopping_waits.load()) {
+                    {
+                        std::lock_guard lock(revision_mtx);
+                        revision = heartbeat_revision;
+                    }
+                    if (revision != wanted) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+                nlohmann::json body;
+                body["peers"] = nlohmann::json::array();
+                body["peers_revision"] = revision;
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
             ++peer_list_gets;
             if (peer_list_reply.load() == Reply::CutAfterHeaders) return cut_after_headers(res);
             nlohmann::json peer = {
@@ -804,6 +838,7 @@ protected:
     }
 
     void TearDown() override {
+        stopping_waits = true;
         if (pub) pub->stop();
         if (pub2) pub2->stop();
         if (pub3) pub3->stop();
@@ -1469,6 +1504,44 @@ TEST_F(SdkMeshPrivateApiTest, AChangedPeersRevisionRefreshesWithinOneHeartbeat) 
     EXPECT_LT(std::chrono::steady_clock::now() - changed,
               std::chrono::milliseconds(1000) + lnsdk::kDirectAnswerWindow);
     client->disable_mesh();
+}
+
+// The peer list long-poll: with a baseline revision from the first
+// heartbeat, the orchestrator holds GET /api/mesh/peers?wait_revision= open,
+// and a changed revision refreshes the peer list at once, although the next
+// heartbeat is an hour away.
+TEST_F(SdkMeshPrivateApiTest, APeerListLongPollRefreshesWithoutWaitingForAHeartbeat) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    set_heartbeat_revision("rev-1");
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 3600;
+    cfg.stun_refresh_interval_sec = 0;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return !heartbeats().empty() && peer_list_gets.load() >= 1; },
+                         std::chrono::seconds(10)));
+    ASSERT_TRUE(wait_for([&] { return peer_waits.load() >= 1; }, std::chrono::seconds(10)))
+        << "the orchestrator did not hold a peer list long-poll";
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const int gets = peer_list_gets.load();
+    const auto beats = heartbeats().size();
+    const int waits = peer_waits.load();
+
+    set_heartbeat_revision("rev-2");
+    const auto changed = std::chrono::steady_clock::now();
+    EXPECT_TRUE(wait_for([&] { return peer_list_gets.load() > gets; },
+                         std::chrono::milliseconds(2000)))
+        << "a changed revision did not refresh the peer list through the long-poll";
+    EXPECT_LT(std::chrono::steady_clock::now() - changed, std::chrono::milliseconds(2000));
+    EXPECT_EQ(heartbeats().size(), beats) << "the refresh waited for a heartbeat";
+    // The long-poll re-arms with the new revision.
+    EXPECT_TRUE(wait_for([&] { return peer_waits.load() > waits; }, std::chrono::seconds(5)));
+
+    // Stopping the mesh ends a held long-poll promptly.
+    const auto stop_started = std::chrono::steady_clock::now();
+    client->disable_mesh();
+    EXPECT_LT(std::chrono::steady_clock::now() - stop_started, std::chrono::seconds(5));
 }
 
 // A wall-clock gap between two loop passes (the process was suspended) runs

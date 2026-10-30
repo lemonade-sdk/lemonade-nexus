@@ -247,7 +247,14 @@ to the probed address.
 The heartbeat answer's `peers_revision` changes when a device's peer list
 changes, so the other side fetches a new or moved peer's endpoint within one
 heartbeat (5 seconds) and punches back at once, instead of at its next
-30-second peer refresh.
+30-second peer refresh. The SDK also holds a long-poll on the peer list
+(`GET /api/mesh/peers/<node_id>?wait_revision=`, up to 25 seconds): the
+server answers it as soon as the revision changes, when a tree change
+commits, a LAN endpoint list changes, or a live session changes. A peer on
+the same Tier 1 server is therefore seen without waiting for a heartbeat.
+Each server wakes only the requests that it holds; a change that arrives
+through consensus wakes them on every Tier 1 server, but live state (LAN
+endpoints, live sessions) stays on the server that received the heartbeat.
 
 The heartbeat also carries the device's private LAN addresses with its
 dataplane port (`local_endpoints`). The server keeps them in memory and

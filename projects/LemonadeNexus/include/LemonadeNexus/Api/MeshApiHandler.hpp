@@ -1,6 +1,7 @@
 #pragma once
 
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
+#include <LemonadeNexus/Api/MeshPeerWaiters.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 
@@ -61,16 +62,33 @@ class MeshApiHandler : public IRequestHandler<MeshApiHandler> {
     friend class IRequestHandler<MeshApiHandler>;
 
 public:
-    explicit MeshApiHandler(ApiContext& ctx) : ctx_(ctx) {}
+    /// Registers a tree changed hook that wakes the peer list long-polls;
+    /// the destructor clears it. One handler per tree.
+    explicit MeshApiHandler(ApiContext& ctx);
+    ~MeshApiHandler();
+    MeshApiHandler(const MeshApiHandler&)            = delete;
+    MeshApiHandler& operator=(const MeshApiHandler&) = delete;
+
+    /// The long-poll admission and wake-up state (tests read and tune it).
+    [[nodiscard]] MeshPeerWaiters& peer_waiters() { return waiters_; }
 
 private:
     void do_register_routes(httplib::Server& pub, httplib::Server& priv);
+
+    /// The peers_revision of `node`'s peer list for `caller_pubkey` at `now`
+    /// (Unix seconds), computed as the heartbeat answer and GET
+    /// /api/mesh/peers report it. `caller_pubkey` must be normalized and hold
+    /// Read on `node`. Thread-safe.
+    [[nodiscard]] std::string caller_peers_revision(const std::string& caller_pubkey,
+                                                    const tree::TreeNode& node,
+                                                    uint64_t now) const;
 
     /// Build the server peer JSON entry (always included in peer lists).
     [[nodiscard]] nlohmann::json build_server_peer() const;
 
     /// Store the LAN endpoints that `node_id`'s owner reported at `now`
-    /// (Unix seconds). An empty list removes the entry. Thread-safe.
+    /// (Unix seconds). An empty list removes the entry. Wakes the peer list
+    /// long-polls when the stored list changed. Thread-safe.
     void store_local_endpoints(const std::string& node_id, std::vector<std::string> endpoints,
                                uint64_t now);
 
@@ -91,6 +109,8 @@ private:
     mutable std::mutex                              local_mtx_;
     std::unordered_map<std::string, LocalEndpoints> local_endpoints_;
     uint64_t                                        local_pruned_at_{0};
+
+    MeshPeerWaiters waiters_;
 };
 
 } // namespace nexus::api

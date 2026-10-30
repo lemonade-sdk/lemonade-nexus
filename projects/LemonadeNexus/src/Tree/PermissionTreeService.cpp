@@ -88,14 +88,17 @@ void PermissionTreeService::on_stop() {
 }
 
 void PermissionTreeService::close() {
-    std::lock_guard lock(mutex_);
-    holds_files_ = false;
-    nodes_.clear();
-    identifier_index_.clear();
-    recent_deltas_.clear();
-    committed_ops_ = CommittedOpIds{};
-    committed_ops_unreadable_ = false;
+    {
+        std::lock_guard lock(mutex_);
+        holds_files_ = false;
+        nodes_.clear();
+        identifier_index_.clear();
+        recent_deltas_.clear();
+        committed_ops_ = CommittedOpIds{};
+        committed_ops_unreadable_ = false;
+    }
     spdlog::info("[{}] closed: the tree is no longer held in memory or written", name());
+    notify_changed();
 }
 
 bool PermissionTreeService::is_open() const {
@@ -434,6 +437,7 @@ TreeOpVerdict PermissionTreeService::submit_local_op(const TreeOp& op,
     }
     notify_removed(removed);
     notify_accounts(accounts);
+    notify_changed();
     return verdict;
 }
 
@@ -448,6 +452,7 @@ TreeOpVerdict PermissionTreeService::apply_op(const TreeOp& op) {
     }
     notify_removed(removed);
     notify_accounts(accounts);
+    notify_changed();
     return verdict;
 }
 
@@ -467,6 +472,7 @@ TreeOpVerdict PermissionTreeService::apply_committed_ops(const std::vector<TreeO
     }
     notify_removed(removed);
     notify_accounts(accounts);
+    notify_changed();
     return verdict;
 }
 
@@ -491,6 +497,20 @@ void PermissionTreeService::notify_accounts(const std::vector<AccountDeletion>& 
     }
     if (!hook) return;
     for (const auto& account : accounts) hook(account);
+}
+
+void PermissionTreeService::set_changed_hook(std::function<void()> hook) {
+    std::lock_guard lock(removed_hook_mtx_);
+    changed_hook_ = std::move(hook);
+}
+
+void PermissionTreeService::notify_changed() const {
+    std::function<void()> hook;
+    {
+        std::lock_guard lock(removed_hook_mtx_);
+        hook = changed_hook_;
+    }
+    if (hook) hook();
 }
 
 void PermissionTreeService::notify_removed(const std::vector<RemovedNode>& removed) const {
@@ -612,6 +632,13 @@ security::Digest PermissionTreeService::tree_digest() const {
 
 bool PermissionTreeService::replace_all(const rules::NodeMap& nodes,
                                         const CommittedOpIds& committed) {
+    const bool ok = replace_all_unnotified(nodes, committed);
+    notify_changed();
+    return ok;
+}
+
+bool PermissionTreeService::replace_all_unnotified(const rules::NodeMap& nodes,
+                                                   const CommittedOpIds& committed) {
     std::lock_guard lock(mutex_);
     committed_ops_ = committed;
     committed_ops_unreadable_ = false;

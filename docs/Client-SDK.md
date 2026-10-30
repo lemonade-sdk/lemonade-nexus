@@ -147,6 +147,20 @@ direct path to every peer before it uses a relay:
   or moved is therefore seen within one heartbeat. The value carries no peer
   data; peers still come only from `GET /api/mesh/peers`. Servers without
   the field leave the 30-second refresh as the only schedule.
+- The SDK also holds a long-poll on the peer list:
+  `GET /api/mesh/peers/<node_id>?wait_revision=<revision>&timeout=25` on its
+  own connection to the session server. The server answers as soon as the
+  device's `peers_revision` differs from the sent value, or after the
+  timeout with the unchanged list. A committed tree change, a changed LAN
+  endpoint list, or a changed live session wakes the waiting request, and the
+  server checks the live session state again every 5 seconds. A changed
+  answer makes the SDK refresh the peer list at once, so a peer that joins
+  or moves on the same Tier 1 server is seen in well under a second, without
+  waiting for a heartbeat. The SDK sends the next wait at once. After a
+  failure it waits 1 second, doubled up to 30 seconds; after a `429` it
+  waits 30 seconds; a server that answers without `peers_revision` does not
+  hold waits, and the SDK asks again only after 5 minutes. The heartbeat
+  stays the fallback in every case. `disable_mesh` closes the held request.
 - Peers receive the endpoint in the verified Tier 1 server's peer list
   (`GET /api/mesh/peers`). The SDK ignores a listed endpoint that is not a
   dotted IPv4 unicast address. It accepts a loopback endpoint only when the
@@ -214,8 +228,10 @@ public endpoints. They connect over the LAN instead:
   path or a relay. A relayed peer keeps getting upgrade probes at its LAN
   endpoints, and a refresh request probes them at once, so the LAN path
   returns when it answers.
-- Servers without the field ignore `local_endpoints`, and clients without it
-  change nothing. A server keeps the LAN endpoints of the devices whose
+- Servers without the field refuse a heartbeat that carries
+  `local_endpoints` (HTTP `400`). The SDK then sends the heartbeat again
+  without them, so the endpoint and the live session still reach the server.
+  Clients without the field change nothing. A server keeps the LAN endpoints of the devices whose
   heartbeats reach it; two devices with sessions on different Tier 1 servers
   do not see each other's LAN endpoints.
 
