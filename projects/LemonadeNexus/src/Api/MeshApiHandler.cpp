@@ -102,13 +102,15 @@ constexpr uint64_t kSessionLiveSec = 200;
 /// The peers_revision of a heartbeat answer: an opaque value that changes
 /// when the peer list that GET /api/mesh/peers gives the caller changes in a
 /// way that matters for a path: a peer added or removed, or a listed peer's
-/// mesh key, tunnel address, private subnet, endpoint, hostname, or live
-/// session state (kSessionLiveSec) changed. `endpoints` and `relays` are the
-/// listed peers in list order. XXH3 over length-prefixed fields; a change
-/// detector, not a security value.
+/// mesh key, tunnel address, private subnet, endpoint, LAN endpoints,
+/// hostname, or live session state (kSessionLiveSec) changed. `endpoints`
+/// and `relays` are the listed peers in list order; `local` holds the LAN
+/// endpoints of listed endpoints that have any. XXH3 over length-prefixed
+/// fields; a change detector, not a security value.
 std::string peers_revision(const std::vector<tree::TreeNode>& endpoints,
                            const std::vector<const tree::TreeNode*>& relays,
                            const std::unordered_map<std::string, uint64_t>& handshakes,
+                           const std::unordered_map<std::string, std::vector<std::string>>& local,
                            uint64_t now) {
     std::string buf;
     const auto field = [&buf](std::string_view text) {
@@ -129,6 +131,13 @@ std::string peers_revision(const std::vector<tree::TreeNode>& endpoints,
     for (const auto& n : endpoints) {
         const auto it = handshakes.find(strip_cidr(n.tunnel_ip));
         peer(n, 'E', it != handshakes.end() && now - it->second < kSessionLiveSec);
+        // Only a peer with LAN endpoints adds this part, so the revision of
+        // a list without any stays as servers without the field compute it.
+        if (const auto lan = local.find(n.id); lan != local.end() && !lan->second.empty()) {
+            buf += 'L';
+            buf += std::to_string(lan->second.size());
+            for (const auto& endpoint : lan->second) field(endpoint);
+        }
     }
     for (const auto* n : relays) peer(*n, 'R', true);
     char out[17];
@@ -185,7 +194,98 @@ bool is_valid_mesh_endpoint(const std::string& ep) {
         return false;
     }
 }
+/// A decimal number of 1 to `max_digits` digits without a leading zero, at
+/// most `max`.
+std::optional<uint32_t> strict_decimal(std::string_view text, std::size_t max_digits,
+                                       uint32_t max) {
+    if (text.empty() || text.size() > max_digits || (text.size() > 1 && text[0] == '0')) {
+        return std::nullopt;
+    }
+    uint32_t value = 0;
+    for (const char c : text) {
+        if (c < '0' || c > '9') return std::nullopt;
+        value = value * 10 + static_cast<uint32_t>(c - '0');
+    }
+    if (value > max) return std::nullopt;
+    return value;
+}
+
+/// A LAN endpoint "a.b.c.d:port" whose address is private (or loopback with
+/// `allow_loopback`). See parse_mesh_local_endpoints.
+bool local_endpoint_valid(std::string_view text, bool allow_loopback) {
+    const auto colon = text.find(':');
+    if (colon == std::string_view::npos || text.find(':', colon + 1) != std::string_view::npos) {
+        return false;
+    }
+    const auto port = strict_decimal(text.substr(colon + 1), 5, 65535);
+    if (!port || *port == 0) return false;
+    uint32_t ip = 0;
+    std::string_view rest = text.substr(0, colon);
+    for (int i = 0; i < 4; ++i) {
+        const auto dot = rest.find('.');
+        const bool last = i == 3;
+        if (last != (dot == std::string_view::npos)) return false;
+        const auto octet = strict_decimal(rest.substr(0, dot), 3, 255);
+        if (!octet) return false;
+        ip = (ip << 8) | *octet;
+        if (!last) rest = rest.substr(dot + 1);
+    }
+    const auto in = [ip](uint32_t network, int prefix) {
+        return (ip & (~uint32_t{0} << (32 - prefix))) == network;
+    };
+    if (in(0x0A000000, 8) || in(0xAC100000, 12) || in(0xC0A80000, 16) || in(0x64400000, 10)) {
+        return true;
+    }
+    return allow_loopback && in(0x7F000000, 8);
+}
+
+bool is_loopback_ipv4(const std::string& address) {
+    return address.rfind("127.", 0) == 0;
+}
+
 } // anonymous namespace
+
+std::optional<std::vector<std::string>> parse_mesh_local_endpoints(const nlohmann::json& value,
+                                                                   bool allow_loopback) {
+    if (!value.is_array() || value.size() > kMaxMeshLocalEndpoints) return std::nullopt;
+    std::vector<std::string> out;
+    for (const auto& entry : value) {
+        if (!entry.is_string()) return std::nullopt;
+        const auto& text = entry.get_ref<const std::string&>();
+        if (!local_endpoint_valid(text, allow_loopback)) return std::nullopt;
+        if (std::find(out.begin(), out.end(), text) == out.end()) out.push_back(text);
+    }
+    return out;
+}
+
+void MeshApiHandler::store_local_endpoints(const std::string& node_id,
+                                           std::vector<std::string> endpoints, uint64_t now) {
+    std::lock_guard lock(local_mtx_);
+    // Entries of devices that stopped sending heartbeats go once per TTL, so
+    // the map holds at most the devices heard from within two TTLs.
+    if (now - local_pruned_at_ >= kMeshLocalEndpointTtlSec) {
+        std::erase_if(local_endpoints_, [now](const auto& entry) {
+            return now - entry.second.reported_at >= kMeshLocalEndpointTtlSec;
+        });
+        local_pruned_at_ = now;
+    }
+    if (endpoints.empty()) {
+        local_endpoints_.erase(node_id);
+        return;
+    }
+    local_endpoints_[node_id] = LocalEndpoints{std::move(endpoints), now};
+}
+
+std::vector<std::string> MeshApiHandler::local_endpoints_of(const std::string& node_id,
+                                                            uint64_t now) const {
+    std::lock_guard lock(local_mtx_);
+    const auto found = local_endpoints_.find(node_id);
+    if (found == local_endpoints_.end() ||
+        now - found->second.reported_at >= kMeshLocalEndpointTtlSec) {
+        return {};
+    }
+    return found->second.endpoints;
+}
 
 void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                                         httplib::Server& priv) {
@@ -285,6 +385,9 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             peer["tunnel_ip"]        = sibling.tunnel_ip;
             peer["private_subnet"]   = sibling.private_subnet;
             peer["endpoint"]         = sibling.listen_endpoint;
+            // The peer's LAN addresses, from its own heartbeats to this
+            // server. Only a listed peer's entry carries them.
+            peer["local_endpoints"]  = local_endpoints_of(sibling.id, now);
             peer["relay_endpoint"]   = "";  // filled by relay discovery
             peer["is_online"]        = online;
             peer["last_seen"]        = last_seen;
@@ -332,13 +435,22 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // means the client has none to report (no STUN answer yet): the stored
     // endpoint stays as it is, so a heartbeat never erases a punch target.
     //
-    // Body: { "node_id": "...", "endpoint": "ip:port" }
+    // Body: { "node_id": "...", "endpoint": "ip:port",
+    //         "local_endpoints"?: ["192.168.1.20:41234", ...] }
+    // local_endpoints are the device's LAN addresses with its dataplane port
+    // (parse_mesh_local_endpoints): private IPv4 addresses only, at most
+    // kMaxMeshLocalEndpoints. A malformed list refuses the heartbeat. The
+    // server keeps them in memory, not in the tree, for
+    // kMeshLocalEndpointTtlSec, and lists them only in the peer entries of
+    // callers that already list this node. An empty array removes them; an
+    // absent field (an older client) leaves them as they are.
     // Response: { success, node_id, endpoint, status, peers_revision?,
     //             tier1_departure?: { next_epoch } }
     // peers_revision is an opaque string that changes when the caller's peer
     // list (GET /api/mesh/peers) gains or loses a peer, or when a listed
-    // peer's mesh key, tunnel address, private subnet, endpoint, hostname, or
-    // live session with this server changes (peers_revision()). It is
+    // peer's mesh key, tunnel address, private subnet, endpoint, LAN
+    // endpoints, hostname, or live session with this server changes
+    // (peers_revision()). It is
     // present when the caller holds Read on its node, as the peer list
     // requires. A client compares it with the previous answer and fetches
     // its peers at once on a change, so a peer that joined or moved is seen
@@ -368,6 +480,15 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             error_response(res, "invalid endpoint format (expected ip:port or hostname:port)");
             return;
         }
+        std::optional<std::vector<std::string>> hb_local;
+        if (const auto field = body.find("local_endpoints"); field != body.end()) {
+            hb_local = parse_mesh_local_endpoints(*field, is_loopback_ipv4(ctx_.server_public_ip));
+            if (!hb_local) {
+                error_response(res, "invalid local_endpoints (expected at most 4 private "
+                                    "a.b.c.d:port addresses)");
+                return;
+            }
+        }
 
         // Verify the node exists
         auto node_opt = ctx_.tree.get_node(hb_node_id);
@@ -381,6 +502,14 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         if (claims.user_id != hb_node_id) {
             spdlog::warn("[MeshAPI] Heartbeat ownership mismatch: caller={} node={}",
                           claims.user_id, hb_node_id);
+            error_response(res, "insufficient permissions", 403);
+            return;
+        }
+        // LAN endpoints follow the SetEndpoint rule: only the node's own
+        // management key reports them.
+        if (hb_local && (node_opt->mgmt_pubkey.empty() ||
+                         tree::canonical_principal(node_opt->mgmt_pubkey) !=
+                             tree::canonical_principal(normalize_pubkey(claims.pubkey)))) {
             error_response(res, "insufficient permissions", 403);
             return;
         }
@@ -436,6 +565,9 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             error_response(res, "node not found", 404);
             return;
         }
+        // The owner check above passed, so the list belongs to this node.
+        const auto now = epoch_seconds();
+        if (hb_local) store_local_endpoints(hb_node_id, std::move(*hb_local), now);
         nlohmann::json j;
         j["success"]  = true;
         j["node_id"]  = hb_node_id;
@@ -446,6 +578,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             std::vector<tree::TreeNode> endpoints;
             std::vector<tree::TreeNode> reachable;
             std::vector<const tree::TreeNode*> relays;
+            std::unordered_map<std::string, std::vector<std::string>> local;
             if (!current->parent_id.empty()) {
                 reachable = ctx_.tree.collect_subtree(current->parent_id);
                 endpoints = connectable_endpoints(ctx_.tree.nodes_snapshot(), caller_pubkey,
@@ -456,9 +589,14 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                         relays.push_back(&n);
                     }
                 }
+                for (const auto& n : endpoints) {
+                    if (auto lan = local_endpoints_of(n.id, now); !lan.empty()) {
+                        local.emplace(n.id, std::move(lan));
+                    }
+                }
             }
             j["peers_revision"] = peers_revision(
-                endpoints, relays, build_mesh_handshake_map(ctx_.boringtun), epoch_seconds());
+                endpoints, relays, build_mesh_handshake_map(ctx_.boringtun), local, now);
         }
         // A member that the finalized next-epoch plan leaves out says so, so
         // the client moves its session before this server's authority ends.

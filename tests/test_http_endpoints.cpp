@@ -2429,6 +2429,146 @@ TEST_F(MeshPeersConnectTest, HeartbeatPeersRevisionFollowsThePeerList) {
     EXPECT_EQ(revision("mc_no_read", stranger), "");
 }
 
+// A heartbeat may report the device's LAN endpoints. The server accepts only
+// private "a.b.c.d:port" addresses from the node's own key, keeps them in
+// memory, and lists them only in the entries of callers that already list
+// the node. A change in them changes peers_revision.
+TEST_F(MeshPeersConnectTest, HeartbeatLocalEndpointsReachOnlyListedPeers) {
+    const auto peer_key = principal();
+    add("mc_peer", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}},
+        peer_key);
+    const auto outsider = principal();
+    add("mc_outsider", "mc_group", tree::NodeType::Endpoint, {{outsider, {"read"}}});
+
+    const auto token = [this](const std::string& node, const std::string& pubkey) {
+        const auto now = std::chrono::system_clock::now();
+        return jwt::create()
+            .set_issuer("lemonade-nexus")
+            .set_subject(node)
+            .set_issued_at(now)
+            .set_expires_at(now + std::chrono::hours{1})
+            .set_payload_claim("pubkey", jwt::claim(pubkey))
+            .sign(jwt::algorithm::hs256{jwt_secret});
+    };
+    const auto heartbeat = [&](const std::string& node, const std::string& pubkey,
+                               const json& body) {
+        httplib::Client cli("127.0.0.1", mesh_port);
+        auto res = cli.Post("/api/mesh/heartbeat",
+                            {{"Authorization", "Bearer " + token(node, pubkey)}}, body.dump(),
+                            "application/json");
+        EXPECT_NE(res, nullptr);
+        return res ? res->status : 0;
+    };
+    const auto revision = [&] {
+        httplib::Client cli("127.0.0.1", mesh_port);
+        const json body = {{"node_id", "mc_self"}, {"endpoint", ""}};
+        auto res = cli.Post("/api/mesh/heartbeat",
+                            {{"Authorization", "Bearer " + token("mc_self", caller)}},
+                            body.dump(), "application/json");
+        EXPECT_NE(res, nullptr);
+        if (!res || res->status != 200) return std::string{"<refused>"};
+        return json::parse(res->body).value("peers_revision", std::string{});
+    };
+    const auto lan_of_peer = [&] {
+        json body;
+        listed(&body);
+        for (const auto& p : body["peers"]) {
+            if (p["node_id"] == "mc_peer") return p.value("local_endpoints", json::array());
+        }
+        return json(nullptr);
+    };
+
+    const auto before = revision();
+    EXPECT_EQ(lan_of_peer(), json::array()) << "a peer without a report lists LAN endpoints";
+
+    const json lan = json::array({"192.168.1.20:41234", "10.0.0.5:41234"});
+    ASSERT_EQ(heartbeat("mc_peer", peer_key, {{"node_id", "mc_peer"}, {"local_endpoints", lan}}),
+              200);
+    EXPECT_EQ(lan_of_peer(), lan);
+    const auto reported = revision();
+    EXPECT_NE(reported, before) << "a LAN endpoint change left peers_revision as it was";
+    EXPECT_EQ(revision(), reported);
+
+    // Every malformed or non-private list is refused, and the stored list stays.
+    const std::vector<json> refused = {
+        json::array({"8.8.8.8:41234"}),            // public
+        json::array({"203.0.113.5:41234"}),        // public (documentation range)
+        json::array({"127.0.0.1:41234"}),          // loopback on a non-loopback server
+        json::array({"169.254.1.1:41234"}),        // link-local
+        json::array({"192.168.1.20:0"}),           // port 0
+        json::array({"192.168.1.20:65536"}),       // port out of range
+        json::array({"192.168.1.20"}),             // no port
+        json::array({"192.168.01.20:41234"}),      // leading zero
+        json::array({"192.168.1.20:041234"}),      // leading zero in the port
+        json::array({"192.168.1.20:41234 "}),      // trailing space
+        json::array({"192.168.1.20:+41"}),         // sign
+        json::array({"192.168.1:41234"}),          // three octets
+        json::array({"[fd00::1]:41234"}),          // IPv6
+        json::array({"garbage"}),
+        json::array({41234}),                      // not a string
+        json::array({"10.0.0.1:1", "10.0.0.2:1", "10.0.0.3:1", "10.0.0.4:1",
+                     "10.0.0.5:1"}),               // more than four
+        json("192.168.1.20:41234"),                // not an array
+    };
+    for (const auto& bad : refused) {
+        EXPECT_EQ(heartbeat("mc_peer", peer_key, {{"node_id", "mc_peer"}, {"local_endpoints", bad}}),
+                  400)
+            << bad.dump();
+    }
+    EXPECT_EQ(lan_of_peer(), lan);
+
+    // Shared address space and the 172.16/12 block are private; a repeated
+    // entry counts once.
+    const json shared = json::array({"100.64.3.4:5000", "172.31.0.9:5000", "100.64.3.4:5000"});
+    ASSERT_EQ(heartbeat("mc_peer", peer_key,
+                        {{"node_id", "mc_peer"}, {"local_endpoints", shared}}),
+              200);
+    EXPECT_EQ(lan_of_peer(), json::array({"100.64.3.4:5000", "172.31.0.9:5000"}));
+
+    // A session for the node that holds another key reports nothing.
+    EXPECT_EQ(heartbeat("mc_peer", principal(), {{"node_id", "mc_peer"}, {"local_endpoints", lan}}),
+              403);
+    EXPECT_EQ(lan_of_peer(), json::array({"100.64.3.4:5000", "172.31.0.9:5000"}));
+
+    // A heartbeat without the field (an older client) keeps the list; an
+    // empty array removes it.
+    ASSERT_EQ(heartbeat("mc_peer", peer_key, {{"node_id", "mc_peer"}}), 200);
+    EXPECT_EQ(lan_of_peer(), json::array({"100.64.3.4:5000", "172.31.0.9:5000"}));
+    ASSERT_EQ(heartbeat("mc_peer", peer_key,
+                        {{"node_id", "mc_peer"}, {"local_endpoints", json::array()}}),
+              200);
+    EXPECT_EQ(lan_of_peer(), json::array());
+    EXPECT_EQ(revision(), before);
+
+    // A caller that does not list the peer sees neither the peer nor its
+    // LAN addresses.
+    ASSERT_EQ(heartbeat("mc_peer", peer_key, {{"node_id", "mc_peer"}, {"local_endpoints", lan}}),
+              200);
+    httplib::Client cli("127.0.0.1", mesh_port);
+    auto res = cli.Get("/api/mesh/peers/mc_outsider",
+                       {{"Authorization", "Bearer " + token("mc_outsider", outsider)}});
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_EQ(res->body.find("192.168.1.20"), std::string::npos) << res->body;
+    EXPECT_EQ(res->body.find("mc_peer"), std::string::npos) << res->body;
+}
+
+TEST(MeshLocalEndpoints, ParseRules) {
+    using api::parse_mesh_local_endpoints;
+    EXPECT_EQ(parse_mesh_local_endpoints(json::array(), false), std::vector<std::string>{});
+    EXPECT_EQ(parse_mesh_local_endpoints(json::array({"192.168.0.1:1", "10.255.255.255:65535"}),
+                                         false),
+              (std::vector<std::string>{"192.168.0.1:1", "10.255.255.255:65535"}));
+    EXPECT_FALSE(parse_mesh_local_endpoints(json::array({"172.32.0.1:1"}), false));
+    EXPECT_FALSE(parse_mesh_local_endpoints(json::array({"100.128.0.1:1"}), false));
+    EXPECT_FALSE(parse_mesh_local_endpoints(json::array({"256.1.1.1:1"}), false));
+    // Loopback only for a single-host deployment.
+    EXPECT_FALSE(parse_mesh_local_endpoints(json::array({"127.0.0.1:9"}), false));
+    EXPECT_EQ(parse_mesh_local_endpoints(json::array({"127.0.0.1:9"}), true),
+              std::vector<std::string>{"127.0.0.1:9"});
+    EXPECT_FALSE(parse_mesh_local_endpoints(json::array({"8.8.8.8:9"}), true));
+}
+
 // --- Review fixes: server-assigned fields, delete cleanup, link tokens, IPAM ---
 
 // A joined device holds add_child and edit_node on its endpoint and owns its
