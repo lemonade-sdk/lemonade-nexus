@@ -123,7 +123,8 @@ class ClusterEntry {
       );
 }
 
-/// A device (Endpoint node) in a Cluster, as reported by the server.
+/// A device (Endpoint node) of one of this identity's networks, as reported
+/// by the server.
 class ClusterDevice {
   final String nodeId;
   final String hostname;
@@ -139,9 +140,39 @@ class ClusterDevice {
   /// The device's management key ("ed25519:..."), which assignments name.
   final String mgmtPubkey;
 
-  /// True when this device's key holds `admin` on the Cluster group: it can
-  /// change who holds what in the group and on its devices.
+  /// True when this device's key holds `admin` on [groupId]: it can change
+  /// who holds what in the group and on its devices.
   final bool isAdmin;
+
+  /// A Lemonade inference server; false for a client device.
+  final bool isInference;
+
+  /// The device's identity joined [groupId] from its own network with an
+  /// invite. The device stays placed in its own network, outside [groupId].
+  final bool isMember;
+
+  /// This device may connect to it.
+  final bool canConnect;
+
+  /// The group the device was listed for. Empty when unknown.
+  final String groupId;
+
+  /// "home" when [groupId] is one of this identity's own networks, "member"
+  /// when it is a network this identity joined with an invite, null when the
+  /// server did not say.
+  final String? groupRole;
+
+  /// Display name of [groupId]. Empty when unknown.
+  final String networkName;
+
+  /// True when [groupId] is the network this device is placed in. False for
+  /// devices of networks this identity joined and of its other networks.
+  final bool inHomeNetwork;
+
+  /// True when the device is placed directly in the active Cluster group. The
+  /// key, access, and remove actions apply only to these devices; the server
+  /// refuses them for devices placed in other networks.
+  final bool placedInCluster;
 
   const ClusterDevice({
     required this.nodeId,
@@ -151,7 +182,18 @@ class ClusterDevice {
     this.tunnelIp,
     this.mgmtPubkey = '',
     this.isAdmin = false,
+    this.isInference = false,
+    this.isMember = false,
+    this.canConnect = false,
+    this.groupId = '',
+    this.groupRole,
+    this.networkName = '',
+    this.inHomeNetwork = true,
+    this.placedInCluster = true,
   });
+
+  /// True when [groupId] is a network this identity joined with an invite.
+  bool get inJoinedNetwork => groupRole == 'member';
 }
 
 /// Compare management keys by key bytes: the SDK writes url-safe unpadded

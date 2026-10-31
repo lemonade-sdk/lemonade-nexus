@@ -482,9 +482,11 @@ std::optional<AssignmentRuling> invite_acceptance_refusal(
     return std::nullopt;
 }
 
-bool membership_reaches(const NodeMap& nodes, std::string_view member, const TreeNode& node) {
-    std::unordered_set<std::string> visited{node.id};
-    std::string current = node.parent_id;
+namespace {
+
+/// The membership_reaches walk, from group `current` up to the root.
+bool covers_from(const NodeMap& nodes, std::string_view member, std::string current,
+                 std::unordered_set<std::string>& visited) {
     while (!current.empty() && visited.insert(current).second) {
         auto it = nodes.find(current);
         if (it == nodes.end()) return false;
@@ -494,6 +496,18 @@ bool membership_reaches(const NodeMap& nodes, std::string_view member, const Tre
         current = it->second.parent_id;
     }
     return false;
+}
+
+}  // namespace
+
+bool membership_reaches(const NodeMap& nodes, std::string_view member, const TreeNode& node) {
+    std::unordered_set<std::string> visited{node.id};
+    return covers_from(nodes, member, node.parent_id, visited);
+}
+
+bool membership_covers(const NodeMap& nodes, std::string_view member, std::string_view group_id) {
+    std::unordered_set<std::string> visited;
+    return covers_from(nodes, member, std::string(group_id), visited);
 }
 
 bool endpoint_may_connect(const NodeMap& nodes, std::string_view principal, const TreeNode& from,

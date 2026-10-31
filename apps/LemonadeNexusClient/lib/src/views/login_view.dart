@@ -2,7 +2,9 @@
 /// @description Passwordless Cluster picker. A Cluster is an account; a
 /// membership is a device Ed25519 key held in the keyring, so there is nothing
 /// to type to get back in. Three actions: Connect (tap a Cluster card),
-/// Register (a new Cluster) and Join (an invitation code from another device).
+/// Create (a new network) and Join (an invitation code from another device).
+/// Create and Join are tiles of equal weight, so a person who holds a code
+/// does not create a network by mistake.
 library;
 
 import 'package:flutter/material.dart';
@@ -89,24 +91,11 @@ class _LoginViewState extends ConsumerState<LoginView> {
                         _clusterCard(cluster, appState),
                         const SizedBox(height: 12),
                       ],
-                      _registerCard(appState),
+                      _actionTiles(appState),
                       if (_error != null) ...[
                         const SizedBox(height: 16),
                         _errorBox(_error!),
                       ],
-                      const SizedBox(height: 10),
-                      Center(
-                        child: TextButton(
-                          onPressed: appState.isLoading ? null : _showJoinDialog,
-                          style: TextButton.styleFrom(
-                            foregroundColor: AppTheme.lemonYellow,
-                            visualDensity: VisualDensity.compact,
-                          ),
-                          child: const Text('Have an invitation code?',
-                              style: TextStyle(
-                                  fontSize: 12, fontStyle: FontStyle.italic)),
-                        ),
-                      ),
                     ],
                   ),
                 ),
@@ -186,26 +175,67 @@ class _LoginViewState extends ConsumerState<LoginView> {
     return 'Last used ${_relativeTime(cluster.lastUsed!)}';
   }
 
-  Widget _registerCard(AppState appState) {
+  /// Create and Join side by side, with equal weight. While an action runs,
+  /// one tile with a spinner takes their place.
+  Widget _actionTiles(AppState appState) {
+    if (appState.isLoading) {
+      return _actionTile(
+        child: const SizedBox(
+            width: 22,
+            height: 22,
+            child: CircularProgressIndicator(strokeWidth: 2)),
+      );
+    }
+    return Row(
+      children: [
+        Expanded(
+          child: _actionTile(
+            onTap: _showRegisterDialog,
+            child: _tileContent(Icons.add_circle_outline, 'Create a new network'),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: _actionTile(
+            onTap: _showJoinDialog,
+            child: _tileContent(Icons.vpn_key_outlined, 'Join with an invite code'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _actionTile({required Widget child, VoidCallback? onTap}) {
     final scheme = Theme.of(context).colorScheme;
     return Material(
       color: scheme.surfaceContainerHighest.withValues(alpha: 0.5),
       borderRadius: BorderRadius.circular(12),
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
-        onTap: appState.isLoading ? null : _showRegisterDialog,
+        onTap: onTap,
         child: Container(
           height: 96,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
           alignment: Alignment.center,
-          child: appState.isLoading
-              ? const SizedBox(
-                  width: 22,
-                  height: 22,
-                  child: CircularProgressIndicator(strokeWidth: 2))
-              : Icon(Icons.add_circle_outline,
-                  size: 40, color: scheme.onSurfaceVariant),
+          child: child,
         ),
       ),
+    );
+  }
+
+  Widget _tileContent(IconData icon, String label) {
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 32, color: scheme.onSurfaceVariant),
+        const SizedBox(height: 6),
+        Text(label,
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
+      ],
     );
   }
 
@@ -216,9 +246,10 @@ class _LoginViewState extends ConsumerState<LoginView> {
 
   Future<void> _showRegisterDialog() async {
     final name = await _promptText(
-      title: 'New Cluster',
+      title: 'Create a new network',
       message: 'A Cluster is your account. This device becomes its owner — no '
-          'password needed.',
+          'password needed. To join a network someone shared with you, use an '
+          'invite code instead.',
       label: 'Cluster name',
       initial: '',
       action: 'Create',
@@ -559,14 +590,16 @@ class _JoinDialogState extends State<_JoinDialog> {
       shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
           side: BorderSide(color: scheme.outline)),
-      title: const Text('Join a Cluster'),
+      title: const Text('Join with an invite code'),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
             'Add Device on a device already in the Cluster gives you a code. '
-            'This device generates its own key — the code just authorizes it.',
+            'This device generates its own key — the code just authorizes it. '
+            'If this device already has its own network, it stays there and '
+            'joins the invited network as a member.',
             style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
           ),
           const SizedBox(height: 16),

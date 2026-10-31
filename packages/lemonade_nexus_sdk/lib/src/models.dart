@@ -353,6 +353,11 @@ class NetworkJoinResponse {
   final bool deviceNameRefused;
   final String? deviceNameSuggestion;
 
+  /// Set when the join carried an invite but this device already had a node:
+  /// the device stays in its own network and the invite made its identity a
+  /// member of the invite's group instead. Null otherwise.
+  final JoinMembership? membership;
+
   NetworkJoinResponse({
     required this.success,
     this.nodeId,
@@ -361,10 +366,12 @@ class NetworkJoinResponse {
     this.error,
     this.deviceNameRefused = false,
     this.deviceNameSuggestion,
+    this.membership,
   });
 
   factory NetworkJoinResponse.fromJson(Map<String, dynamic> json) {
     final base = _$NetworkJoinResponseFromJson(json);
+    final membership = json['membership'];
     return NetworkJoinResponse(
       success: base.success,
       nodeId: base.nodeId,
@@ -373,10 +380,123 @@ class NetworkJoinResponse {
       error: base.error,
       deviceNameRefused: json['device_name_refused'] == true,
       deviceNameSuggestion: json['device_name_suggestion']?.toString(),
+      membership: membership is Map<String, dynamic>
+          ? JoinMembership.fromJson(membership)
+          : null,
     );
   }
 
   Map<String, dynamic> toJson() => _$NetworkJoinResponseToJson(this);
+}
+
+/// What an invite became when it met a device that already had a node.
+class JoinMembership {
+  /// "member", "pending" (the membership commits shortly), or "refused".
+  final String status;
+
+  /// The invite's group.
+  final String groupId;
+
+  /// The server's reason when [status] is "refused".
+  final String? error;
+
+  const JoinMembership({required this.status, required this.groupId, this.error});
+
+  bool get isMember => status == 'member' || status == 'pending';
+
+  factory JoinMembership.fromJson(Map<String, dynamic> json) => JoinMembership(
+        status: json['status']?.toString() ?? '',
+        groupId: json['group_id']?.toString() ?? '',
+        error: json['error']?.toString(),
+      );
+
+  Map<String, dynamic> toJson() => {
+        'status': status,
+        'group_id': groupId,
+        if (error != null) 'error': error,
+      };
+}
+
+/// One device of a network, as [LemonadeNexusSdk.getGroupDevices] and
+/// [LemonadeNexusSdk.listNetworkDevices] return it.
+class NetworkDevice {
+  final String nodeId;
+  final String deviceName;
+
+  /// "10.x.y.z/32".
+  final String tunnelIp;
+  final String mgmtPubkey;
+
+  /// The group the device is placed in.
+  final String parentId;
+
+  /// The group this entry was listed for.
+  final String groupId;
+
+  /// "home" (this identity's own network) or "member" (a network it joined
+  /// with an invite). Set by listNetworkDevices only.
+  final String? groupRole;
+
+  /// A Lemonade inference server.
+  final bool isInference;
+
+  /// The device joined [groupId] from its own network with an invite; it is
+  /// placed in [parentId], outside [groupId].
+  final bool member;
+
+  /// This device.
+  final bool isSelf;
+
+  /// This device may connect to it.
+  final bool canConnect;
+
+  /// Its identity administers [groupId].
+  final bool admin;
+
+  const NetworkDevice({
+    required this.nodeId,
+    required this.deviceName,
+    this.tunnelIp = '',
+    this.mgmtPubkey = '',
+    this.parentId = '',
+    this.groupId = '',
+    this.groupRole,
+    this.isInference = false,
+    this.member = false,
+    this.isSelf = false,
+    this.canConnect = false,
+    this.admin = false,
+  });
+
+  factory NetworkDevice.fromJson(Map<String, dynamic> json) => NetworkDevice(
+        nodeId: json['node_id']?.toString() ?? '',
+        deviceName: json['device_name']?.toString() ?? '',
+        tunnelIp: json['tunnel_ip']?.toString() ?? '',
+        mgmtPubkey: json['mgmt_pubkey']?.toString() ?? '',
+        parentId: json['parent_id']?.toString() ?? '',
+        groupId: json['group_id']?.toString() ?? '',
+        groupRole: json['group_role']?.toString(),
+        isInference: json['is_inference'] == true,
+        member: json['member'] == true,
+        isSelf: json['is_self'] == true,
+        canConnect: json['can_connect'] == true,
+        admin: json['admin'] == true,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'node_id': nodeId,
+        'device_name': deviceName,
+        'tunnel_ip': tunnelIp,
+        'mgmt_pubkey': mgmtPubkey,
+        'parent_id': parentId,
+        'group_id': groupId,
+        if (groupRole != null) 'group_role': groupRole,
+        'is_inference': isInference,
+        'member': member,
+        'is_self': isSelf,
+        'can_connect': canConnect,
+        'admin': admin,
+      };
 }
 
 // =========================================================================

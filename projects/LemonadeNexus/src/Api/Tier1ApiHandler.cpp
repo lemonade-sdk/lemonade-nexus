@@ -4,10 +4,12 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Security/Epoch/Tier1Membership.hpp>
+#include <LemonadeNexus/Security/Transport/AuthorityChainCodec.hpp>
 
 #include <cctype>
 #include <optional>
 #include <string>
+#include <spdlog/spdlog.h>
 
 namespace nexus::api {
 
@@ -54,9 +56,24 @@ void Tier1ApiHandler::do_register_routes(httplib::Server& pub,
         }
         const auto page = ctx_.authority_chain_page(have_epoch);
         if (page.empty()) {
+            // The chain a client verifies against is served from the local
+            // store: a 404 is how an empty or stale replica announces
+            // itself, so the requested epoch goes to the log.
+            spdlog::debug("[Tier1Api] authority: no chain after have_epoch={}", have_epoch);
             error_response(res, "no authority chain after this epoch", 404);
             return;
         }
+        const auto decoded = security::decode_authority_chain_page(page);
+        uint64_t top = have_epoch;
+        if (decoded) {
+            if (decoded->has_base && decoded->links.empty()) top = 1;
+            if (!decoded->links.empty()) top = decoded->links.back().handoff.to_epoch.underlying();
+        }
+        // Debug: the route is public and unauthenticated, so an info line per
+        // request would let any caller fill the log.
+        spdlog::debug("[Tier1Api] authority: have_epoch={} served to epoch {} ({} links{})",
+                     have_epoch, top, decoded ? decoded->links.size() : 0u,
+                     decoded && decoded->has_base ? ", with base" : "");
         json_response(res, nlohmann::json{{"have_epoch", have_epoch},
                                           {"page", crypto::to_base64(page)}});
     });

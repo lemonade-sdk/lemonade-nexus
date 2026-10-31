@@ -74,22 +74,24 @@ say "new: $BIN"
 say "old: $OLD_BIN"
 
 # Drop reasons in SecurityRouter's DropReason: Malformed = 2, UnknownKind = 3,
-# WireVersionMismatch = 14. Only the per-drop debug lines are counted; the
+# WireVersionMismatch = 14. The drop log prints the reason by name, so each
+# pattern accepts the name and the number: a match on the number means a binary
+# that still logs the number. Only the per-drop debug lines are counted; the
 # rate-limited info lines repeat them.
 check_new_nodes_decode_old() {
     local pass_dir="$1" old_nodes="$2"
     for i in 0 1 2 3 4; do
         case " $old_nodes " in *" $i "*) continue ;; esac
         local bad skew
-        bad=$(grep -cE '\[debug\].*route drop reason=(2|3) ' "$pass_dir/n$i.log" || true)
+        bad=$(grep -cE '\[debug\].*route drop reason=(Malformed|UnknownKind|2|3) ' "$pass_dir/n$i.log" || true)
         [ "$bad" -eq 0 ] || fail "new-binary node n$i dropped $bad message(s) as malformed or unknown"
-        skew=$(grep -cE '\[debug\].*route drop reason=14 ' "$pass_dir/n$i.log" || true)
+        skew=$(grep -cE '\[debug\].*route drop reason=(WireVersionMismatch|14) ' "$pass_dir/n$i.log" || true)
         [ "$skew" -eq 0 ] || fail "new-binary node n$i dropped $skew message(s) of another security \
 wire version: the old binary is not a valid baseline (docs/Wire-Compatibility.md)"
     done
     for i in $old_nodes; do
         local unknown
-        unknown=$(grep -cE '\[debug\].*route drop reason=3 ' "$pass_dir/n$i.log" || true)
+        unknown=$(grep -cE '\[debug\].*route drop reason=(UnknownKind|3) ' "$pass_dir/n$i.log" || true)
         say "old-binary node n$i ignored $unknown message(s) of a newer kind (allowed: additions;" \
             "a binary older than this drop log reports 0)"
     done

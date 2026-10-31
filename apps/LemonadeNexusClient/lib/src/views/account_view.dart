@@ -14,6 +14,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/cluster_keyring.dart';
+import '../state/device_pills.dart';
 import 'invite_member_dialog.dart';
 import 'member_access_dialog.dart';
 import '../../theme/app_theme.dart';
@@ -358,16 +359,21 @@ class _AccountViewState extends ConsumerState<AccountView> {
 
   Widget _devicesSection(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final appState = ref.watch(appNotifierProvider);
     // Sharing seals OUR copy to another device, so only offer it when we hold
     // the key, and never for our own row.
-    final weHoldKey = ref.read(appNotifierProvider).activeCluster?.hasGroupKey ?? false;
-    final anyPending = _devices.any((d) => d.needsKey && !d.isThisDevice);
+    final weHoldKey = appState.activeCluster?.hasGroupKey ?? false;
+    // The account key, access, and remove actions concern the active Cluster
+    // only; devices of other networks are listed but not managed here.
+    final placed = _devices.where((d) => d.placedInCluster).toList();
+    final anyPending = placed.any((d) => d.needsKey && !d.isThisDevice);
+    final iAmAdmin = placed.any((d) => d.isThisDevice && d.isAdmin);
     // No device holds an envelope and this one has no key: the key was never
     // stored anywhere, so an admin may start a new one without splitting it.
     final keyLost = !weHoldKey &&
-        _devices.isNotEmpty &&
-        _devices.every((d) => d.needsKey) &&
-        _devices.any((d) => d.isThisDevice && d.isAdmin);
+        placed.isNotEmpty &&
+        placed.every((d) => d.needsKey) &&
+        iAmAdmin;
     return AppCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -408,7 +414,9 @@ class _AccountViewState extends ConsumerState<AccountView> {
           Text(
             'Each device has its own key. An invitation code lets a new device '
             'join; it can only read Cluster data once an existing device shares '
-            'the account key with it.',
+            'the account key with it. Devices that joined from their own '
+            'networks and devices of networks you joined are listed too; only '
+            'devices placed in this Cluster can be managed here.',
             style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
           ),
           const SizedBox(height: 12),
@@ -418,20 +426,29 @@ class _AccountViewState extends ConsumerState<AccountView> {
           else
             for (final device in _devices)
               _deviceRow(context, device, weHoldKey,
-                  iAmAdmin: _devices.any((d) => d.isThisDevice && d.isAdmin)),
+                  iAmAdmin: iAmAdmin,
+                  online: isDeviceOnline(device,
+                      peers: appState.meshPeers,
+                      meshUp: appState.isMeshEnabled)),
         ],
       ),
     );
   }
 
   Widget _deviceRow(BuildContext context, ClusterDevice device, bool weHoldKey,
-      {required bool iAmAdmin}) {
+      {required bool iAmAdmin, required bool online}) {
     final scheme = Theme.of(context).colorScheme;
+    final placed = device.placedInCluster;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
         children: [
-          Icon(device.isThisDevice ? Icons.computer : Icons.devices_other,
+          Icon(
+              device.isThisDevice
+                  ? Icons.computer
+                  : device.isInference
+                      ? Icons.dns_outlined
+                      : Icons.devices_other,
               size: 18,
               color: device.isThisDevice
                   ? AppTheme.lemonYellowDark
@@ -441,30 +458,25 @@ class _AccountViewState extends ConsumerState<AccountView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
+                Text(device.hostname,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        fontSize: 13, fontWeight: FontWeight.w500)),
+                const SizedBox(height: 4),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
                   children: [
-                    Flexible(
-                      child: Text(device.hostname,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              fontSize: 13, fontWeight: FontWeight.w500)),
-                    ),
-                    if (device.isThisDevice) ...[
-                      const SizedBox(width: 6),
-                      const LemonBadge(text: 'THIS DEVICE'),
-                    ],
-                    if (device.isAdmin) ...[
-                      const SizedBox(width: 6),
-                      const LemonBadge(text: 'ADMIN', color: AppTheme.lemonYellowDark),
-                    ],
-                    if (device.needsKey) ...[
-                      const SizedBox(width: 6),
-                      const LemonBadge(
-                          text: 'NEEDS KEY', color: AppTheme.errorColor),
-                    ],
+                    for (final pill in devicePills(device, online: online))
+                      Tooltip(
+                        message: pill.tooltip,
+                        child: LemonBadge(
+                            text: pill.label, color: _pillColor(pill.kind)),
+                      ),
                   ],
                 ),
+                const SizedBox(height: 2),
                 Text(device.tunnelIp?.isNotEmpty == true ? device.tunnelIp! : device.nodeId,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
@@ -475,28 +487,28 @@ class _AccountViewState extends ConsumerState<AccountView> {
               ],
             ),
           ),
-          if (device.needsKey && device.isThisDevice)
+          if (placed && device.needsKey && device.isThisDevice)
             IconButton(
               tooltip: 'Check for the account key',
               visualDensity: VisualDensity.compact,
               icon: const Icon(Icons.refresh, size: 16),
               onPressed: _isBusyDevices ? null : _load,
             )
-          else if (device.needsKey && weHoldKey)
+          else if (placed && device.needsKey && weHoldKey)
             IconButton(
               tooltip: 'Share the account key with this device',
               visualDensity: VisualDensity.compact,
               icon: const Icon(Icons.key, size: 16),
               onPressed: _isBusyDevices ? null : _shareKeyWithAll,
             ),
-          if (iAmAdmin && device.mgmtPubkey.isNotEmpty)
+          if (placed && iAmAdmin && device.mgmtPubkey.isNotEmpty)
             IconButton(
               tooltip: 'Manage access',
               visualDensity: VisualDensity.compact,
               icon: const Icon(Icons.admin_panel_settings_outlined, size: 16),
               onPressed: _isBusyDevices ? null : () => _manageAccess(device),
             ),
-          if (!device.isThisDevice)
+          if (placed && !device.isThisDevice)
             IconButton(
               tooltip: 'Remove device',
               visualDensity: VisualDensity.compact,
@@ -507,6 +519,28 @@ class _AccountViewState extends ConsumerState<AccountView> {
         ],
       ),
     );
+  }
+
+  static Color _pillColor(DevicePillKind kind) {
+    switch (kind) {
+      case DevicePillKind.thisDevice:
+      case DevicePillKind.online:
+        return AppTheme.lemonGreen;
+      case DevicePillKind.server:
+        return AppTheme.infoColor;
+      case DevicePillKind.client:
+        return Colors.grey;
+      case DevicePillKind.offline:
+      case DevicePillKind.needsKey:
+        return AppTheme.errorColor;
+      case DevicePillKind.member:
+        return AppTheme.nodeOrange;
+      case DevicePillKind.joinedNetwork:
+      case DevicePillKind.otherNetwork:
+        return AppTheme.lemonLime;
+      case DevicePillKind.admin:
+        return AppTheme.lemonYellowDark;
+    }
   }
 
   Future<void> _createAccountKey() async {
@@ -549,8 +583,11 @@ class _AccountViewState extends ConsumerState<AccountView> {
   }
 
   Future<void> _manageAccess(ClusterDevice device) async {
-    final saved =
-        await showMemberAccessDialog(context, device: device, devices: _devices);
+    // The dialog edits assignments on the Cluster group and its devices, so
+    // it gets only the devices placed there.
+    final saved = await showMemberAccessDialog(context,
+        device: device,
+        devices: _devices.where((d) => d.placedInCluster).toList());
     if (saved == true) {
       _toast('Access updated for ${device.hostname}');
       await _load();

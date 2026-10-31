@@ -275,6 +275,8 @@ struct Options {
     std::string bundle_out;
     std::string bundle;            // path of the sealed bundle
     std::string summary;           // Markdown summary file to append to
+    std::string identity_a;            // cross-server join: the creator's key file
+    std::string identity_b;            // cross-server join: the joiner's key file
     uint16_t    vport = kDefaultVport;
     uint32_t    ttl_sec = kDefaultInviteTtlSec;
     uint32_t    timeout_sec = 2400;
@@ -297,6 +299,9 @@ const std::map<std::string, std::set<std::string>>& command_options() {
         {"member",
          {"--identity", "--bundle", "--run-id", "--domain", "--region", "--seed",
           "--expect-genesis-key", "--summary"}},
+        {"cross-server-join",
+         {"--seed", "--identity-a", "--identity-b", "--run-id", "--ttl", "--domain",
+          "--region", "--expect-genesis-key", "--summary"}},
         {"cleanup-owner",
          {"--identity", "--domain", "--region", "--seed", "--expect-genesis-key", "--summary"}},
         {"cleanup-member",
@@ -324,6 +329,9 @@ void print_usage() {
         "  owner-invite     Owner: mint two invites and write a sealed bundle\n"
         "  owner-serve      Owner: serve the test service and control API over the mesh\n"
         "  member           Member: run join, direct, relay, leave, and removal checks\n"
+        "  cross-server-join  Two Tier 1 servers: one device creates a group, the other\n"
+        "                     joins it, then both reopen and authenticate again\n"
+        "                     (--seed twice, or DNS discovery, gives the two servers)\n"
         "  cleanup-owner    Owner: remove every other member entry from the CI group\n"
         "  cleanup-member   Member: leave every group entered through an invite\n"
         "\n"
@@ -338,6 +346,10 @@ void print_usage() {
         "Command options:\n"
         "  --identity-out PATH        setup-account: identity file to create (mode 0600)\n"
         "  --role owner|member        setup-account: account role to check\n"
+        "  --identity-a PATH          cross-server-join: the creator's key file\n"
+        "  --identity-b PATH          cross-server-join: the joiner's key file\n"
+        "                             (created when missing; the first --seed is the\n"
+        "                             creator's server, the second the joiner's)\n"
         "  --force                    setup-account: replace an existing identity file\n"
         "  --member-pubkey KEY        owner-*: the member account's ed25519 public key\n"
         "  --owner-pubkey KEY         cleanup-member: leave only this owner's groups\n"
@@ -400,6 +412,8 @@ std::optional<std::string> parse_args(const std::vector<std::string>& args, Opti
         else if (name == "--bundle-out") o.bundle_out = value;
         else if (name == "--bundle") o.bundle = value;
         else if (name == "--summary") o.summary = value;
+        else if (name == "--identity-a") o.identity_a = value;
+        else if (name == "--identity-b") o.identity_b = value;
         else if (name == "--seed") {
             auto ep = parse_endpoint(value);
             if (!ep) return "invalid --seed '" + value + "'";
@@ -445,6 +459,14 @@ std::optional<std::string> parse_args(const std::vector<std::string>& args, Opti
     }
     if (o.command == "member") {
         if ((err = need(o.bundle, "--bundle"))) return err;
+    }
+    if (o.command == "cross-server-join") {
+        if ((err = need(o.identity_a, "--identity-a"))) return err;
+        if ((err = need(o.identity_b, "--identity-b"))) return err;
+        if ((err = need(o.run_id, "--run-id"))) return err;
+        if (!valid_run_id(o.run_id)) {
+            return std::string{"--run-id may use only [A-Za-z0-9._-], at most 64"};
+        }
     }
     if (o.command == "owner-invite" || o.command == "owner-serve" || o.command == "member") {
         if ((err = need(o.run_id, "--run-id"))) return err;
@@ -815,8 +837,12 @@ bool wait_private_api(Session& s, std::chrono::seconds limit) {
 }
 
 /// Join with the session's identity (a returning device keeps its node) and
-/// bring up the mesh. `link_token` is used only by setup-account.
-bool join_and_mesh(Session& s, Report& report, const std::string& link_token = {}) {
+/// bring up the mesh. `link_token` is used only by setup-account, and
+/// `stage` labels the two checks so a per-cycle run stays readable.
+bool join_and_mesh(Session& s, Report& report, const std::string& link_token = {},
+                   const std::string& stage = {}) {
+    const auto join_label = stage.empty() ? std::string{"join"} : stage + " join";
+    const auto mesh_label = stage.empty() ? std::string{"mesh"} : stage + " mesh";
     SdkString pub(ln_identity_pubkey(s.identity));
     s.pubkey = pub.str();
     ln_set_identity(s.client, s.identity);
@@ -835,7 +861,7 @@ bool join_and_mesh(Session& s, Report& report, const std::string& link_token = {
         nap(std::chrono::seconds(5 * (attempt + 1)));
     }
     if (rc != LN_OK) {
-        report.add("join", Outcome::Fail,
+        report.add(join_label, Outcome::Fail,
                    "ln_join_network " + std::to_string(rc) + ": " +
                        joined.value("error", std::string{"no detail"}));
         return false;
@@ -843,20 +869,23 @@ bool join_and_mesh(Session& s, Report& report, const std::string& link_token = {
     s.node_id = joined.value("node_id", std::string{});
     s.tunnel_ip = joined.value("tunnel_ip", std::string{});
     if (s.node_id.empty() || s.tunnel_ip.empty()) {
-        report.add("join", Outcome::Fail, "the join returned no node id or tunnel address");
+        report.add(join_label, Outcome::Fail,
+                   "the join returned no node id or tunnel address");
         return false;
     }
-    report.add("join", Outcome::Pass, "node " + s.node_id + ", tunnel " + s.tunnel_ip);
+    report.add(join_label, Outcome::Pass,
+               "node " + s.node_id + ", tunnel " + s.tunnel_ip);
 
     if (!set_mesh_mode(s, true) || !ln_mesh_is_active(s.client)) {
-        report.add("mesh", Outcome::Fail, "the mesh dataplane did not start");
+        report.add(mesh_label, Outcome::Fail, "the mesh dataplane did not start");
         return false;
     }
     if (!wait_private_api(s, 180s)) {
-        report.add("mesh", Outcome::Fail, "the private API did not answer over the mesh in 180 s");
+        report.add(mesh_label, Outcome::Fail,
+                   "the private API did not answer over the mesh in 180 s");
         return false;
     }
-    report.add("mesh", Outcome::Pass, "private API reachable over the mesh");
+    report.add(mesh_label, Outcome::Pass, "private API reachable over the mesh");
     return true;
 }
 
@@ -1619,6 +1648,501 @@ int cmd_cleanup_member(const Options& o) {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-server join: two Tier 1 servers, two devices that must see each other
+//
+// A join is a tree operation, and each node answers a device list from the
+// tree it holds (collect_subtree plus connectable_endpoints). If the
+// operation never leaves the node that received it, the other node's list
+// never contains the new device and the two devices never see each other.
+// This check creates the group on one server and joins it through the other,
+// then closes both clients and opens them again from the stored keys — the
+// path a device takes after a restart, where the invite is spent and only the
+// device identity remains. The same checks run in both cycles, so a failure
+// says which server never got the operation.
+// ---------------------------------------------------------------------------
+
+/// One device in the cross-server check.
+struct DeviceSide {
+    std::string label;          // "creator" or "joiner"
+    Endpoint    server;         // the Tier 1 server this device attaches to
+    std::string identity_path;  // where its key is stored between cycles
+    std::string pubkey;         // "ed25519:<b64>"; the private key stays on disk
+    std::string node_id;        // the node its join created or reused
+    std::string group_id;       // the group that holds it
+    uint64_t epoch = 0;         // the epoch its verified Tier 1 list names
+    std::string user_id;        // the user id its key authenticated as
+};
+
+/// What one server lists as the children of a group, from the device attached
+/// to it. Only the caller-independent parts of each node are kept: the answer
+/// redacts the ACLs per caller, so assignments are not comparable between two
+/// callers, while the id, kind, owner key, parent, and tunnel address are.
+struct ChildList {
+    std::string host;
+    std::vector<std::string> ids;  // node ids, sorted
+    std::map<std::string, std::string> fingerprint;  // id -> "kind|owner|parent|address"
+    std::string error;             // why the read failed; empty when it worked
+
+    [[nodiscard]] bool ok() const { return error.empty(); }
+    [[nodiscard]] bool holds(const std::string& id) const {
+        return fingerprint.contains(id);
+    }
+    [[nodiscard]] std::string describe() const {
+        if (!ok()) return host + ": " + error;
+        std::string out = host + ":";
+        for (const auto& [id, node] : fingerprint) {
+            out += " " + (id.size() > 16 ? id.substr(0, 16) : id) + "[" + node + "]";
+        }
+        if (fingerprint.empty()) out += " (empty)";
+        return out;
+    }
+};
+
+/// What one server reports for the tree replica it holds (GET /api/tree/sync).
+struct TreeSync {
+    std::string host;
+    std::string mode{"?"};
+    std::string state_root{"?"};
+    std::string halt_reason;
+    std::string last_refusal;
+    uint64_t height = 0;
+    uint64_t applied_height = 0;
+    bool awaiting_merge = false;
+    bool healthy = false;
+    bool behind = false;
+    std::string error;  // why the read failed; empty when it worked
+
+    [[nodiscard]] bool ok() const { return error.empty(); }
+    [[nodiscard]] std::string describe() const {
+        if (!ok()) return host + ": " + error;
+        auto short_root = state_root.size() > 12 ? state_root.substr(0, 12) : state_root;
+        std::string out = host + ": " + mode + (healthy ? ", healthy" : ", NOT healthy") +
+                          ", height " + std::to_string(height) + ", applied " +
+                          std::to_string(applied_height) + ", root " + short_root;
+        if (behind) out += ", behind";
+        if (awaiting_merge) out += ", awaiting merge";
+        if (!halt_reason.empty()) out += ", halted: " + halt_reason;
+        if (!last_refusal.empty()) out += ", last refusal: " + last_refusal;
+        return out;
+    }
+};
+
+/// GET <path> from the server this client is attached to, through the private
+/// API over the mesh. A body that only carries an "error" string is a
+/// refusal, not data: the route answered, but it refused.
+std::optional<json> private_get(Session& s, const std::string& path, std::string& error) {
+    SdkString out;
+    const auto rc = ln_private_api_call(s.client, "GET", path.c_str(), "", out.out());
+    if (rc != LN_OK) {
+        error = "GET " + path + " -> " + std::to_string(rc) + ": " +
+                out.parsed().value("error", std::string{"no detail"});
+        return std::nullopt;
+    }
+    auto j = json::parse(out.str(), nullptr, false);
+    if (j.is_discarded()) {
+        error = "GET " + path + " answered unparseable JSON";
+        return std::nullopt;
+    }
+    if (j.is_object() && j.size() == 1 && j.contains("error") && j["error"].is_string()) {
+        error = "GET " + path + ": " + j["error"].get<std::string>();
+        return std::nullopt;
+    }
+    return j;
+}
+
+ChildList read_children(Session& s, const DeviceSide& side, const std::string& group) {
+    ChildList list;
+    list.host = side.server.host;
+    SdkString out;
+    const auto rc = ln_tree_get_children(s.client, group.c_str(), out.out());
+    if (rc != LN_OK) {
+        list.error = "GET /api/tree/children/" + group + " -> " + std::to_string(rc) + ": " +
+                     out.parsed().value("error", std::string{"no detail"});
+        return list;
+    }
+    const auto j = out.parsed();
+    if (!j.is_array()) {
+        list.error = "GET /api/tree/children/" + group + " answered " +
+                     (j.is_object() && j.contains("error")
+                          ? j["error"].get<std::string>()
+                          : std::string{"something that is not an array"});
+        return list;
+    }
+    list.fingerprint.clear();
+    for (const auto& c : j) {
+        if (!c.is_object()) continue;
+        const auto id = c.value("id", std::string{});
+        if (id.empty()) continue;
+        list.ids.push_back(id);
+        list.fingerprint[id] = c.value("type", std::string{"?"}) + "|" +
+                               c.value("mgmt_pubkey", std::string{"?"}) + "|" +
+                               c.value("parent_id", std::string{"?"}) + "|" +
+                               c.value("tunnel_ip", std::string{"?"});
+    }
+    std::sort(list.ids.begin(), list.ids.end());
+    return list;
+}
+
+TreeSync read_tree_sync(Session& s, const DeviceSide& side) {
+    TreeSync state;
+    state.host = side.server.host;
+    std::string error;
+    const auto body = private_get(s, "/api/tree/sync", error);
+    if (!body) {
+        state.error = error;
+        return state;
+    }
+    state.mode = body->value("mode", std::string{"?"});
+    state.awaiting_merge = body->value("awaiting_merge", false);
+    state.healthy = body->value("healthy", false);
+    state.height = body->value("height", uint64_t{0});
+    state.applied_height = body->value("applied_height", uint64_t{0});
+    state.state_root = body->value("state_root", std::string{});
+    state.behind = body->value("behind", false);
+    state.halt_reason = body->value("halt_reason", std::string{});
+    state.last_refusal = body->value("last_refusal", std::string{});
+    return state;
+}
+
+/// Load this device's stored key (creating it on first use), open its client
+/// on its own server, and verify Tier 1 from there.
+bool prepare_device(const Options& o, DeviceSide& side, Session& session, Report& report,
+                    const std::string& stage, const std::vector<Endpoint>& seeds) {
+    const auto label = stage + ": " + side.label + " key";
+    session.identity = ln_identity_load(side.identity_path.c_str());
+    const auto previous = side.pubkey;  // set in cycle 1, if there was one
+    if (!session.identity) {
+        session.identity = ln_identity_generate();
+        if (!session.identity) {
+            report.add(label, Outcome::Fail, "cannot create a device key");
+            return false;
+        }
+        if (ln_identity_save(session.identity, side.identity_path.c_str()) != LN_OK) {
+            report.add(label, Outcome::Fail,
+                       "cannot store the new device key in " + side.identity_path);
+            return false;
+        }
+    }
+    SdkString pub(ln_identity_pubkey(session.identity));
+    side.pubkey = pub.str();
+    if (side.pubkey.empty()) {
+        report.add(label, Outcome::Fail, "the key file has no public key");
+        return false;
+    }
+    if (!previous.empty() && side.pubkey != previous) {
+        report.add(label, Outcome::Fail,
+                   "the key file changed between cycles (" + side.pubkey + " != " + previous +
+                       ")");
+        return false;
+    }
+    report.add(label, Outcome::Pass,
+               previous.empty() ? side.label + " created a new device key in " + side.identity_path
+                                : side.label + " reloaded its stored device key");
+
+    const auto open_label = stage + ": " + side.label + " verifies Tier 1 from " + side.server.host;
+    session.client = ln_create_tls(side.server.host.c_str(), side.server.port);
+    if (!session.client) {
+        report.add(open_label, Outcome::Fail, "ln_create_tls returned NULL");
+        return false;
+    }
+    json hosts = json::array();
+    for (const auto& seed : seeds) {
+        hosts.push_back(json{{"host", seed.host}, {"port", seed.port}});
+    }
+    SdkString chain;
+    const auto rc = ln_discover_genesis_key(session.client, hosts.dump().c_str(), chain.out());
+    const auto found = chain.parsed();
+    if (rc != LN_OK) {
+        report.add(open_label, Outcome::Fail,
+                   "ln_discover_genesis_key " + std::to_string(rc) + ": " +
+                       found.value("error", std::string{"no detail"}));
+        return false;
+    }
+    session.genesis_key = found.value("genesis_pubkey", std::string{});
+    if (!o.expect_genesis_key.empty() && session.genesis_key != o.expect_genesis_key) {
+        report.add(open_label, Outcome::Fail,
+                   "discovered key " + session.genesis_key +
+                       " differs from --expect-genesis-key");
+        return false;
+    }
+    SdkString t1;
+    const auto t1rc = ln_tier1_refresh(session.client, t1.out());
+    const auto membership = t1.parsed();
+    if (t1rc != LN_OK) {
+        report.add(open_label, Outcome::Fail,
+                   "ln_tier1_refresh " + std::to_string(t1rc) + ": " +
+                       membership.value("error", std::string{"no detail"}));
+        return false;
+    }
+    side.epoch = membership.value("epoch", uint64_t{0});
+    std::string servers;
+    if (membership.contains("servers") && membership["servers"].is_array()) {
+        for (const auto& srv : membership["servers"]) {
+            servers += (servers.empty() ? "" : ", ") + srv.value("host", std::string{"?"});
+        }
+    }
+    if (membership.value("epoch", uint64_t{0}) == 0 || servers.empty()) {
+        report.add(open_label, Outcome::Fail,
+                   "no current Tier 1 list from " + side.server.host);
+        return false;
+    }
+    report.add(open_label, Outcome::Pass,
+               "epoch " + std::to_string(side.epoch) + ": " + servers);
+    return true;
+}
+
+/// Authenticate with the stored device key, as a reconnecting device does.
+bool authenticate_device(Session& s, DeviceSide& side, Report& report,
+                         const std::string& stage) {
+    const auto label = stage + ": " + side.label + " authenticates as its stored device";
+    ln_set_identity(s.client, s.identity);
+    SdkString out;
+    const auto rc = ln_auth_ed25519(s.client, out.out());
+    const auto j = out.parsed();
+    const auto user = j.value("user_id", std::string{});
+    const auto previous = side.user_id;  // set in cycle 1, if there was one
+    if (rc != LN_OK || !j.value("authenticated", false)) {
+        report.add(label, Outcome::Fail,
+                   "ln_auth_ed25519 " + std::to_string(rc) + ": " +
+                       j.value("error", std::string{"no detail"}));
+        return false;
+    }
+    if (user.empty()) {
+        report.add(label, Outcome::Fail, "authenticated without a user id");
+        return false;
+    }
+    if (!previous.empty() && user != previous) {
+        report.add(label, Outcome::Fail,
+                   "the same key authenticated as another user (" + user + " != " + previous +
+                       ")");
+        return false;
+    }
+    side.user_id = user;
+    report.add(label, Outcome::Pass, "authenticated as " + user);
+    return true;
+}
+
+/// One create/join cycle, then the same checks from closed and reopened
+/// clients. The Sessions live only inside a cycle, so each cycle is a real
+/// close and reopen.
+bool run_cross_server_cycle(int cycle, const Options& o, Report& report, DeviceSide& creator,
+                            DeviceSide& joiner, const std::vector<Endpoint>& seeds) {
+    const std::string stage = "cycle " + std::to_string(cycle);
+    // What this cycle must produce. In cycle 1 the creator makes the group, so
+    // the expectation is the group plan_join derives from its own device key;
+    // in cycle 2 the expectation is what cycle 1 recorded.
+    const std::string recorded_group = creator.group_id;  // empty until cycle 1 records one
+    const std::string recorded_creator_node = creator.node_id;
+    const std::string recorded_joiner_node = joiner.node_id;
+
+    Session a;  // the creator, attached to seeds[0]
+    Session b;  // the joiner, attached to seeds[1]
+    if (!prepare_device(o, creator, a, report, stage, seeds)) return false;
+    if (!prepare_device(o, joiner, b, report, stage, seeds)) return false;
+
+    bool ok = true;
+    std::string invite;         // single-use; wiped before it leaves scope
+    std::string expected_group;  // the group both devices must share
+    if (cycle == 1) {
+        // The creator joins with no invite, so it creates a group of its own.
+        if (!join_and_mesh(a, report, {}, stage)) return false;
+        if (a.node_id.empty()) return false;  // join_and_mesh already reported it
+        expected_group = "customer-" + a.node_id;  // what plan_join derives from the key
+
+        // The invite is minted on the creator's server and accepted on the
+        // other server, so the link-token event has to reach that server too.
+        SdkString out;
+        const auto rc = ln_invite_create(a.client, expected_group.c_str(), kInvitePermissions,
+                                         o.ttl_sec, out.out());
+        invite = out.parsed().value("link_token", std::string{});
+        if (rc != LN_OK || invite.empty()) {
+            report.add(stage + ": invite for the joiner", Outcome::Fail,
+                       "ln_invite_create " + std::to_string(rc) + ": " +
+                           out.parsed().value("error", std::string{"no code returned"}));
+            return false;
+        }
+        report.add(stage + ": invite for the joiner", Outcome::Pass,
+                   "single-use invite minted on " + creator.server.host + " for " +
+                       expected_group + " (the code is not printed)");
+        // The joiner joins through the other server with that code.
+        if (!join_and_mesh(b, report, invite, stage)) {
+            sodium_memzero(invite.data(), invite.size());
+            return false;
+        }
+        sodium_memzero(invite.data(), invite.size());
+    } else {
+        // Cycle 2: the invite is spent, so each device authenticates with its
+        // stored key and re-joins; it must land back on its own node and in
+        // the same group.
+        if (!authenticate_device(a, creator, report, stage)) return false;
+        if (!authenticate_device(b, joiner, report, stage)) return false;
+        if (!join_and_mesh(a, report, {}, stage)) return false;
+        if (!join_and_mesh(b, report, {}, stage)) return false;
+        expected_group = recorded_group;
+        // A re-opened device must land back on the node it had, not on a new
+        // one: a new node id means the tree that held it was not there.
+        const std::string nodes_label = stage + ": both devices are back on their own nodes";
+        std::vector<std::string> misplaced;
+        if (!recorded_creator_node.empty() && a.node_id != recorded_creator_node) {
+            misplaced.push_back("the creator's server put it on " + a.node_id + ", not " +
+                               recorded_creator_node);
+        }
+        if (!recorded_joiner_node.empty() && b.node_id != recorded_joiner_node) {
+            misplaced.push_back("the joiner's server put it on " + b.node_id + ", not " +
+                               recorded_joiner_node);
+        }
+        if (!misplaced.empty()) {
+            std::string detail;
+            for (const auto& problem : misplaced) {
+                detail += (detail.empty() ? "" : "; ") + problem;
+            }
+            report.add(nodes_label, Outcome::Fail, detail);
+            ok = false;
+        } else if (!recorded_creator_node.empty() && !recorded_joiner_node.empty()) {
+            report.add(nodes_label, Outcome::Pass,
+                       a.node_id.substr(0, 16) + " and " + b.node_id.substr(0, 16));
+        }
+    }
+
+    // 1. Both devices must sit in the same group, and that group must be the
+    //    one the creator made. Two groups mean the join never replicated.
+    creator.group_id = home_group(a);
+    joiner.group_id = home_group(b);
+    creator.node_id = a.node_id;
+    joiner.node_id = b.node_id;
+    if (expected_group.empty()) {
+        report.add(stage + ": both devices are in the same group", Outcome::Fail,
+                   "no group to compare: the creator's server reports '" + creator.group_id +
+                       "' and the joiner's reports '" + joiner.group_id + "'");
+        return false;
+    }
+    if (creator.group_id != expected_group || joiner.group_id != expected_group) {
+        report.add(stage + ": both devices are in the same group", Outcome::Fail,
+                   "expected " + expected_group + "; " + creator.server.host + " puts " +
+                       a.node_id + " in '" + creator.group_id + "' and " + b.node_id + " in '" +
+                       joiner.group_id + "'");
+        ok = false;
+    } else {
+        report.add(stage + ": both devices are in the same group", Outcome::Pass,
+                   expected_group + " holds " + a.node_id + " and " + b.node_id);
+    }
+    const std::string group = expected_group;
+
+    // 2. Each server must list both devices in that group: the device list is
+    //    computed from the tree this node holds, so a list with one device
+    //    means the join stayed on the other node.
+    const auto a_children = read_children(a, creator, group);
+    const auto b_children = read_children(b, joiner, group);
+    if (!a_children.ok() || !b_children.ok()) {
+        report.add(stage + ": the group lists both devices", Outcome::Fail,
+                   a_children.describe() + " | " + b_children.describe());
+        ok = false;
+    } else if (!a_children.holds(creator.node_id) || !a_children.holds(joiner.node_id) ||
+               !b_children.holds(creator.node_id) || !b_children.holds(joiner.node_id)) {
+        report.add(stage + ": the group lists both devices", Outcome::Fail,
+                   "expected " + creator.node_id.substr(0, 16) + " and " +
+                       joiner.node_id.substr(0, 16) + "; " + a_children.describe() + " | " +
+                       b_children.describe());
+        ok = false;
+    } else if (a_children.fingerprint != b_children.fingerprint) {
+        report.add(stage + ": the group lists both devices", Outcome::Fail,
+                   "the two servers answer that group differently: " + a_children.describe() +
+                       " | " + b_children.describe());
+        ok = false;
+    } else {
+        report.add(stage + ": the group lists both devices", Outcome::Pass,
+                   "both servers list " + creator.node_id.substr(0, 16) + " and " +
+                       joiner.node_id.substr(0, 16) + " in " + group);
+    }
+
+    // 3. Each device must be able to reach the other: the peer list has to
+    //    contain the other device and carry a path to it.
+    const bool peers = wait_until(240s, 5s, [&] {
+        ln_mesh_refresh(a.client);
+        ln_mesh_refresh(b.client);
+        return find_peer(a, b.node_id).has_value() && find_peer(b, a.node_id).has_value();
+    });
+    report.add(stage + ": each device lists the other", peers ? Outcome::Pass : Outcome::Fail,
+               peers ? "the creator lists " + joiner.node_id.substr(0, 16) + " and the joiner " +
+                           "lists " + creator.node_id.substr(0, 16)
+                     : "after 240 s one side still does not list the other device");
+    ok = peers && ok;
+
+    // 4. The two servers must hold the same tree: the same state root, the
+    //    same height, and neither behind, halted, or awaiting the merge. Each
+    //    read is a moment of a log that keeps committing, so one server can
+    //    be a block or two behind the other; only a difference that outlasts
+    //    replication is a divergence.
+    TreeSync a_sync;
+    TreeSync b_sync;
+    (void)wait_until(120s, 3s, [&] {
+        a_sync = read_tree_sync(a, creator);
+        b_sync = read_tree_sync(b, joiner);
+        return a_sync.ok() && b_sync.ok() && !a_sync.awaiting_merge && !b_sync.awaiting_merge &&
+               a_sync.healthy && b_sync.healthy && !a_sync.behind && !b_sync.behind &&
+               a_sync.state_root == b_sync.state_root && a_sync.height == b_sync.height &&
+               a_sync.applied_height == b_sync.applied_height;
+    });
+    if (!a_sync.ok() || !b_sync.ok()) {
+        report.add(stage + ": both servers hold the same tree", Outcome::Fail,
+                   a_sync.describe() + " | " + b_sync.describe());
+        ok = false;
+    } else if (a_sync.awaiting_merge || b_sync.awaiting_merge) {
+        report.add(stage + ": both servers hold the same tree", Outcome::Fail,
+                   "a server is still awaiting the tree merge, so it kept its old table: " +
+                       a_sync.describe() + " | " + b_sync.describe());
+        ok = false;
+    } else if (!a_sync.healthy || !b_sync.healthy || a_sync.behind || b_sync.behind ||
+               a_sync.state_root != b_sync.state_root || a_sync.height != b_sync.height ||
+               a_sync.applied_height != b_sync.applied_height) {
+        report.add(stage + ": both servers hold the same tree", Outcome::Fail,
+                   "after 120 s the two trees still differ: " + a_sync.describe() + " | " +
+                       b_sync.describe());
+        ok = false;
+    } else {
+        report.add(stage + ": both servers hold the same tree", Outcome::Pass,
+                   "height " + std::to_string(a_sync.height) + ", applied " +
+                       std::to_string(a_sync.applied_height) + ", state root " +
+                       a_sync.state_root.substr(0, 12));
+    }
+
+    // Both cycles decide on the same checks, so a failure in cycle 1 stays
+    // visible and cycle 2 shows whether a restart recovers the placement.
+    return ok;
+}
+
+int cmd_cross_server_join(const Options& o) {
+    Report report{"Cross-server join", {}};
+    // Seeds come from --seed (twice) or from DNS discovery: the first is the
+    // creator's server, the second the joiner's.
+    const auto seeds = discover_seeds(o, report);
+    if (seeds.size() < 2) {
+        report.add("two Tier 1 servers", Outcome::Fail,
+                   "found " + std::to_string(seeds.size()) +
+                       "; pass --seed twice or use DNS discovery with --domain/--region");
+        return finish(o, report);
+    }
+    if (seeds[0].host == seeds[1].host && seeds[0].port == seeds[1].port) {
+        report.add("two Tier 1 servers", Outcome::Fail,
+                   "both devices would use " + seeds[0].host + ":" +
+                       std::to_string(seeds[0].port));
+        return finish(o, report);
+    }
+    DeviceSide creator{"creator", seeds[0], o.identity_a};
+    DeviceSide joiner{"joiner", seeds[1], o.identity_b};
+    bool ok = true;
+    for (int cycle = 1; cycle <= 2 && !g_stop.load(); ++cycle) {
+        // A failed cycle still runs the next one: cycle 2 answers whether a
+        // restart recovers the placement or leaves both devices stranded.
+        if (!run_cross_server_cycle(cycle, o, report, creator, joiner, seeds)) {
+            warn("cycle " + std::to_string(cycle) + " failed; running the next cycle");
+            ok = false;
+        }
+    }
+    return finish(o, report);
+}
+
+// ---------------------------------------------------------------------------
 // Offline self-test
 // ---------------------------------------------------------------------------
 
@@ -1675,6 +2199,31 @@ int cmd_self_test() {
         expect(parse_args({"setup-account", "--identity-out", "x", "--role", "admin"}, n)
                    .has_value(),
                "an unknown role is refused");
+        Options cross;
+        expect(!parse_args({"cross-server-join", "--seed", "t1a.example", "--seed",
+                            "t1b.example:9101", "--identity-a", "a.json", "--identity-b",
+                            "b.json", "--run-id", "42-1", "--ttl", "600"}, cross)
+                    .has_value() &&
+                    cross.seeds.size() == 2 && cross.seeds[0].host == "t1a.example" &&
+                    cross.seeds[0].port == kDefaultApiPort && cross.seeds[1].port == 9101 &&
+                    cross.identity_a == "a.json" && cross.identity_b == "b.json" &&
+                    cross.ttl_sec == 600,
+               "cross-server-join takes two seeds and two keys");
+        Options noKeys;
+        expect(parse_args({"cross-server-join", "--seed", "t1a.example", "--seed",
+                           "t1b.example", "--run-id", "1"},
+                          noKeys)
+                    .has_value(),
+               "cross-server-join needs both key files");
+        Options noRun;
+        expect(parse_args({"cross-server-join", "--identity-a", "a", "--identity-b", "b"},
+                          noRun)
+                    .has_value(),
+               "cross-server-join needs --run-id");
+        Options wrongOption;
+        expect(parse_args({"cross-server-join", "--identity", "a"}, wrongOption)
+                   .has_value(),
+               "cross-server-join does not take --identity");
     }
 
     // Bundle sealing with throwaway identities (never saved).
@@ -1769,6 +2318,7 @@ int main(int argc, char* argv[]) {
     if (o.command == "owner-invite") return cmd_owner_invite(o);
     if (o.command == "owner-serve") return cmd_owner_serve(o);
     if (o.command == "member") return cmd_member(o);
+    if (o.command == "cross-server-join") return cmd_cross_server_join(o);
     if (o.command == "cleanup-owner") return cmd_cleanup_owner(o);
     if (o.command == "cleanup-member") return cmd_cleanup_member(o);
     return 2;

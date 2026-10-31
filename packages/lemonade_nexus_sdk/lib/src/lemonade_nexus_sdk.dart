@@ -162,12 +162,24 @@ class LemonadeNexusSdk {
       throw JsonParseException('null', 'Received null JSON response');
     }
     try {
-      final List<dynamic> list = jsonDecode(json) as List<dynamic>;
+      final dynamic decoded = jsonDecode(json);
+      if (decoded is Map<String, dynamic>) {
+        // A route answered with an error object (e.g. 429
+        // {"error":"rate limited"}) instead of the array: surface the
+        // server's message instead of a type-cast crash.
+        final message = decoded['error'];
+        throw SdkException(LnError.internal,
+            message: (message is String && message.isNotEmpty)
+                ? message
+                : 'Expected a JSON array');
+      }
+      final List<dynamic> list = decoded as List<dynamic>;
       return list
           .whereType<Map<String, dynamic>>()
           .map((m) => fromJson(m))
           .toList();
     } catch (e) {
+      if (e is SdkException) rethrow;
       throw JsonParseException(json, e.toString());
     }
   }
@@ -785,15 +797,31 @@ class LemonadeNexusSdk {
   }
 
   /// Authenticates using Ed25519 challenge-response.
+  ///
+  /// On failure the native JSON carries the real reason (e.g. a stale Tier 1
+  /// epoch or a missing verifiable authority chain); it is surfaced in the
+  /// [SdkException] message instead of a generic one.
   Future<AuthResponse> authEd25519() async {
     _checkDisposed();
     _checkConnected();
     _checkIdentity();
     final result = _ffi.authEd25519(_client!);
-    if (result == null) {
-      throw SdkException(LnError.auth, message: 'Ed25519 authentication failed');
+    Map<String, dynamic>? map;
+    if (result.json != null) {
+      try {
+        map = _parseJson<Map<String, dynamic>>(result.json, (m) => m);
+      } on JsonParseException {
+        // Unparseable native JSON: fall through to the generic message.
+      }
     }
-    return _parseJson(result, AuthResponse.fromJson);
+    if (result.code != 0 || map == null) {
+      final detail = map?['error'];
+      throw SdkException(LnError.auth,
+          message: (detail is String && detail.isNotEmpty)
+              ? detail
+              : 'Ed25519 authentication failed');
+    }
+    return AuthResponse.fromJson(map);
   }
 
   /// Registers a passkey credential.
@@ -1039,6 +1067,43 @@ class LemonadeNexusSdk {
       throw SdkException(LnError.notFound, message: 'Group not found: $nodeId');
     }
     return _parseJsonList(json, GroupMember.fromJson);
+  }
+
+  /// The devices of group [groupId] this identity may see: the devices
+  /// placed in it and in the subgroups it may read, and the devices of
+  /// identities that joined it from their own networks
+  /// ([NetworkDevice.member]). Online state is not part of it; see
+  /// [getMeshPeers]. Throws [SdkException] with the server's reason.
+  Future<List<NetworkDevice>> getGroupDevices(String groupId) async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread((f, c) => f.getGroupDevices(c, groupId));
+    return _deviceList(error, json);
+  }
+
+  /// Every device of this identity's networks: its own groups first, then
+  /// the groups it joined with an invite, each device once
+  /// ([NetworkDevice.groupRole]). Throws [SdkException] with the server's
+  /// reason.
+  Future<List<NetworkDevice>> listNetworkDevices() async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread((f, c) => f.listNetworkDevices(c));
+    return _deviceList(error, json);
+  }
+
+  List<NetworkDevice> _deviceList(LnError error, String? json) {
+    if (error != LnError.success || json == null) {
+      String? reason;
+      if (json != null) {
+        try {
+          reason = (jsonDecode(json) as Map<String, dynamic>)['error']?.toString();
+        } catch (_) {}
+      }
+      throw SdkException(error == LnError.success ? LnError.internal : error,
+          message: reason ?? 'The device list is not available', rawJson: json);
+    }
+    return _parseJsonList(json, NetworkDevice.fromJson);
   }
 
   /// Joins a group by creating an endpoint and allocating an IP.
@@ -1447,7 +1512,13 @@ class LemonadeNexusSdk {
     if (json == null) {
       throw SdkException(LnError.internal, message: '$method $path failed');
     }
-    return _parseJson<Map<String, dynamic>>(json, (m) => m);
+    final map = _parseJson<Map<String, dynamic>>(json, (m) => m);
+    // A bare {"error": "..."} body is the server's error object (e.g. a 429
+    // rate limit), not data: surface it as a typed failure.
+    if (map.length == 1 && map['error'] is String && (map['error'] as String).isNotEmpty) {
+      throw SdkException(LnError.internal, message: map['error'] as String);
+    }
+    return map;
   }
 
   /// Like [privateApiCall], for routes that answer with a JSON array (e.g.

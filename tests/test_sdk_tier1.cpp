@@ -382,6 +382,82 @@ TEST_F(SdkTier1Test, AStaleMembershipIsRefused) {
     EXPECT_NE(refreshed.error.find("stale"), std::string::npos) << refreshed.error;
 }
 
+TEST_F(SdkTier1Test, AnEmptyFirstSourceDoesNotAbortTheSweep) {
+    // A replica that lost its chain store answers 404. The next source
+    // holds the chain; the sweep must not settle for the empty copy.
+    net.servers["t2.example"].chain = nullptr;
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    const auto refreshed = dir.refresh(hosts({"t2.example", "t1a.example", "t1b.example"}));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    EXPECT_EQ(refreshed.value.epoch, 2u);
+}
+
+TEST_F(SdkTier1Test, AStaleFirstSourceBelowTheFloorDoesNotAbortTheSweep) {
+    // A replica whose store stopped at epoch 1 is first, and the client's
+    // floor is epoch 2. The later sources hold the epoch 2 handoff; the
+    // sweep must keep going instead of accepting the old chain.
+    net.servers["t2.example"].known_epochs = 1;
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key), 2));
+    const auto refreshed = dir.refresh(hosts({"t2.example", "t1a.example", "t1b.example"}));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    EXPECT_EQ(refreshed.value.epoch, 2u);
+}
+
+TEST_F(SdkTier1Test, ARefusedOrUnreachableSourceNeverEndsTheSweep) {
+    // The client already verified epoch 2, so its cached chain meets the epoch
+    // floor. A source that never answers, or serves a chain from another
+    // Genesis key, must not end the sweep: otherwise a reconnecting client
+    // keeps the chain it already has and never asks the next source for the
+    // newer one.
+    std::vector<std::string> asked;  // the sources the chain walk actually asked
+    auto dir = lnsdk::Tier1Directory(
+        [&](const lnsdk::ServerEndpoint& ep, const std::string& path) {
+            if (path.starts_with("/api/tier1/authority")) asked.push_back(ep.host);
+            std::lock_guard lock(mutex);
+            return net.get(ep, path);
+        });
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    ASSERT_TRUE(dir.refresh(seed("t1a.example")).ok);
+
+    // A source that is not there at all.
+    asked.clear();
+    const auto unreachable = dir.refresh(hosts({"gone.example", "t1a.example"}));
+    ASSERT_TRUE(unreachable.ok) << unreachable.error;
+    EXPECT_EQ(asked, (std::vector<std::string>{"gone.example", "t1a.example"}));
+
+    // A source that serves a chain three epochs deep under another Genesis
+    // key: the walk is refused, and the sweep still asks the next source.
+    auto epoch3 = std::vector<nexus::crypto::Ed25519Keypair>{
+        new_identity(), new_identity(), new_identity(), new_identity(), new_identity()};
+    auto forged = Chain::make({epoch1, epoch2, epoch3});
+    net.servers["evil.example"] =
+        FakeServer{epoch3[0], 3, &forged, 3, "", false};
+    asked.clear();
+    const auto refused = dir.refresh(hosts({"evil.example", "t1a.example"}));
+    ASSERT_TRUE(refused.ok) << refused.error;
+    EXPECT_EQ(asked, (std::vector<std::string>{"evil.example", "t1a.example"}));
+    EXPECT_EQ(dir.membership().epoch, 2u);
+}
+
+TEST_F(SdkTier1Test, AFailedSweepNamesTheSourcesItTried) {
+    // Every source withholds the chain: the failure keeps its stable message
+    // and names what each source offered.
+    net.servers["t2.example"].chain = nullptr;
+    net.servers["t1a.example"].chain = nullptr;
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    const auto refreshed = dir.refresh(hosts({"t2.example", "t1a.example"}));
+    EXPECT_FALSE(refreshed.ok);
+    EXPECT_EQ(refreshed.http_status, 0);
+    EXPECT_NE(refreshed.error.find("no server returned a verifiable authority chain"),
+              std::string::npos)
+        << refreshed.error;
+    EXPECT_NE(refreshed.error.find("t2.example"), std::string::npos) << refreshed.error;
+    EXPECT_NE(refreshed.error.find("t1a.example"), std::string::npos) << refreshed.error;
+}
+
 TEST_F(SdkTier1Test, AWithheldHandoffIsFetchedFromAMemberThatProvesTheNewerEpoch) {
     // The seed withholds epoch 2; the members hold it.
     net.servers["t2.example"].known_epochs = 1;

@@ -19,6 +19,8 @@
 #include <LemonadeNexus/Security/Transport/SecurityCodec.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityTransport.hpp>
 
+#include <string_view>
+
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -58,6 +60,10 @@ enum class DropReason : uint16_t {
     /// scripts/mixed-version-mesh.sh matches this number.
     WireVersionMismatch = 14,
 };
+
+/// The log name of a drop reason. The wire still carries the number; this
+/// only changes how the router displays it.
+[[nodiscard]] std::string_view drop_reason_name(DropReason reason);
 
 struct RouteResult {
     bool delivered = false;

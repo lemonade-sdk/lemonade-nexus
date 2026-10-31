@@ -1172,17 +1172,18 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
     if (via == Via::Public && backbone_only) {
         if (denial_log_allowed("public-backbone-only:" + sender_pubkey_b64,
                                std::chrono::steady_clock::now())) {
-            spdlog::warn("[{}] DENIED type 0x{:02X} from {}:{} on the public socket — "
+            spdlog::warn("[{}] DENIED type {} from {}:{} on the public socket — "
                          "accepted only on the backbone", name(),
-                         static_cast<uint8_t>(header.msg_type), from.address().to_string(),
+                         gossip::gossip_msg_type_name(static_cast<uint8_t>(header.msg_type)),
+                         from.address().to_string(),
                          from.port());
         }
         return;
     }
     if (via == Via::Backbone && !backbone_only &&
         header.msg_type != GossipMsgType::DnsRecordSync) {
-        spdlog::debug("[{}] dropped type 0x{:02X} on the backbone from {}",
-                      name(), static_cast<uint8_t>(header.msg_type),
+        spdlog::debug("[{}] dropped type {} on the backbone from {}",
+                      name(), gossip::gossip_msg_type_name(static_cast<uint8_t>(header.msg_type)),
                       from.address().to_string());
         return;
     }
@@ -2032,8 +2033,9 @@ bool GossipService::send_backbone_to(const std::string& dst_ip, uint16_t dst_por
     const auto packet = build_signed_packet(msg_type, payload);
     if (packet.empty()) return false;
     if (packet.size() > vnet_->max_udp_payload()) {
-        spdlog::warn("[{}] backbone packet type 0x{:02X} too large ({} > {} bytes); not sent",
-                     name(), static_cast<uint8_t>(msg_type), packet.size(),
+        spdlog::warn("[{}] backbone packet type {} too large ({} > {} bytes); not sent",
+                     name(), gossip::gossip_msg_type_name(static_cast<uint8_t>(msg_type)),
+                     packet.size(),
                      vnet_->max_udp_payload());
         return false;
     }

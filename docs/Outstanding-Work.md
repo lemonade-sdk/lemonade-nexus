@@ -184,6 +184,10 @@ section 2.
   CI uses the unprivileged `citest` user, where they behave.
 - Running as root makes the two `FileStorageTest` cases above fail for everyone, including anyone
   testing locally with sudo. Worth knowing so it is not read as a regression.
+- **`cross-server-join` is a manual check.** `nexus-e2e cross-server-join` drives two devices that
+  attach to two different Tier 1 servers, then reopen and authenticate again
+  (`Live-E2E.md`, "Two servers, one group"). No job runs it: it creates devices and a group on the
+  fleet.
 
 ## 5. Housekeeping
 
@@ -235,3 +239,13 @@ The rollout steps are in `Releasing.md` ("The tree operations release"). What re
   `apply_delta` cases of `test_permission_tree.cpp`, in a follow-up change.
 - **Not tested on the fleet.** The migration ran in unit and multi-server tests only. Nobody has run
   it against the encrypted production trees.
+- **A forwarded op is sent once.** `TreeConsensus::submit` queues the op in memory and calls
+  `broadcast_` once (`projects/LemonadeNexus/src/Tree/TreeConsensus.cpp:228`).
+  `TreeConsensus::receive_forwarded` drops the op when the receiving server is unhealthy or awaiting
+  a merge, when `validate_local_op` refuses it, or when it already has that op id, and nothing
+  re-sends it (`projects/LemonadeNexus/src/Tree/TreeConsensus.cpp:233`). `TreeOpPool` keeps pending
+  ops in memory only (`projects/LemonadeNexus/include/LemonadeNexus/Tree/TreeOpPool.hpp:94`), so a
+  restart loses whatever a server held. This affects liveness, not agreement: every replica applies
+  only committed blocks that chain on the previous state root (`TreeConsensus::on_committed`), so an
+  op that a leader never receives is never committed and its submitter times out. A fix needs a
+  durable pending pool or a re-publish path, with expiry and retry.

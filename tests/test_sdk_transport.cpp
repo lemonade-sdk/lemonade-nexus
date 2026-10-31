@@ -292,6 +292,12 @@ protected:
     std::atomic<bool>        device_name_taken{false};
     std::vector<nlohmann::json> name_checks_seen;  // device-name check bodies
 
+    // The join answers that the device already had a node and the invite made
+    // it a member (TreeApiHandler's /api/join for an existing device).
+    std::atomic<bool> join_answers_membership{false};
+    // The stand-in acts as a server from before GET /api/tree/devices.
+    std::atomic<bool> devices_route_missing{false};
+
     std::vector<std::string> join_hostnames() {
         std::lock_guard lock(join_mtx);
         return join_hostname_seen;
@@ -617,6 +623,57 @@ protected:
             body["peers"] = nlohmann::json::array({peer});
             res.set_content(body.dump(), "application/json");
         });
+        srv.Get("/api/tree/memberships", [](const httplib::Request&, httplib::Response& res) {
+            // The member group first: the SDK lists home groups first anyway.
+            res.set_content(nlohmann::json{{"memberships", nlohmann::json::array({
+                                {{"node_id", "customer-joined"}, {"role", "member"}},
+                                {{"node_id", "customer-home"}, {"role", "home"}},
+                            })}}.dump(),
+                            "application/json");
+        });
+        const auto device = [](const std::string& id, const std::string& group, bool member,
+                               bool self) {
+            return nlohmann::json{{"node_id", id}, {"device_name", id + "-name"},
+                                  {"tunnel_ip", "10.64.0.9/32"}, {"mgmt_pubkey", "ed25519:" + id},
+                                  {"parent_id", member ? "customer-elsewhere" : group},
+                                  {"group_id", group}, {"is_inference", id == "server-1"},
+                                  {"member", member}, {"is_self", self},
+                                  {"can_connect", !self}, {"admin", self}};
+        };
+        srv.Get(R"(/api/tree/devices/(.+))", [this, device](const httplib::Request& req,
+                                                            httplib::Response& res) {
+            if (devices_route_missing.load()) {
+                res.status = 404;  // cpp-httplib's answer for an unknown route
+                return;
+            }
+            const auto group = req.matches[1].str();
+            nlohmann::json list = nlohmann::json::array();
+            if (group == "customer-home") {
+                list.push_back(device(kNodeId, group, false, true));
+                list.push_back(device("member-1", group, true, false));
+            } else if (group == "customer-joined") {
+                list.push_back(device("server-1", group, false, false));
+                list.push_back(device("member-1", group, true, false));  // listed twice
+            }
+            res.set_content(nlohmann::json{{"group_id", group}, {"devices", list}}.dump(),
+                            "application/json");
+        });
+        srv.Get(R"(/api/tree/children/(.+))", [](const httplib::Request& req,
+                                                 httplib::Response& res) {
+            const auto group = req.matches[1].str();
+            nlohmann::json list = nlohmann::json::array();
+            if (group == "customer-home") {
+                list.push_back({{"id", kNodeId}, {"parent_id", group}, {"type", "endpoint"},
+                                {"hostname", "self"}});
+                list.push_back({{"id", "linked-1"}, {"parent_id", group}, {"type", "endpoint"},
+                                {"hostname", "linked"},
+                                {"assignments", nlohmann::json::array(
+                                    {{{"management_pubkey", "ed25519:other"},
+                                      {"permissions", {"read", "connect_private"}}}})}});
+                list.push_back({{"id", "sub-1"}, {"parent_id", group}, {"type", "customer"}});
+            }
+            res.set_content(list.dump(), "application/json");
+        });
         srv.Post(std::string("/api/tree/node/delete/") + kNodeId,
                  [this](const httplib::Request&, httplib::Response& res) {
             ++delete_posts;
@@ -833,6 +890,10 @@ protected:
             j["mesh_server_pubkey"]  = server_keys.second;
             j["mesh_endpoint"]       = "127.0.0.1:" + std::to_string(server_mesh.bound_port());
             j["tunnel_subnet"]       = "10.64.0.0/10";
+            if (join_answers_membership.load() && body.is_object() && body.contains("link_token")) {
+                j["membership"] = {{"node_id", "customer-joined"}, {"status", "member"},
+                                   {"permissions", {"read", "connect_private"}}};
+            }
             res.set_content(j.dump(), "application/json");
         });
     }
@@ -1583,6 +1644,105 @@ TEST_F(SdkMeshPrivateApiTest, ASuspensionGapRunsTheResumePath) {
         orchestrator.stop();
     }
     own.stop();
+}
+
+// A device that already has a node and joins with an invite stays in its own
+// network; the join reports the membership the invite became, through the C++
+// result and the C ABI JSON.
+TEST_F(SdkMeshPrivateApiTest, AJoinReportsTheMembershipAnInviteBecame) {
+    LN_REQUIRE_TEST_TRUST();
+    join_answers_membership = true;
+    lnsdk::ServerConfig cfg;
+    cfg.servers = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    client.set_session_token("session-token");
+    ASSERT_TRUE(client.set_link_token("12345678"));
+    const auto joined = client.join_network("user", "password");
+    ASSERT_TRUE(joined.ok) << joined.error;
+    EXPECT_EQ(joined.value.membership.status, "member");
+    EXPECT_EQ(joined.value.membership.group_id, "customer-joined");
+
+    ln_client_t* c = ln_create_tls("localhost", static_cast<uint16_t>(pub_port));
+    ASSERT_NE(c, nullptr);
+    struct Destroy {
+        ln_client_t* c;
+        ~Destroy() { ln_destroy(c); }
+    } destroy{c};
+    ASSERT_EQ(ln_set_genesis_key(c, nexus::crypto::to_base64(chain.genesis.public_key).c_str(), 0),
+              LN_OK);
+    ASSERT_EQ(ln_set_session_token(c, "session-token"), LN_OK);
+    ASSERT_EQ(ln_set_link_token(c, "12345678"), LN_OK);
+    char* out = nullptr;
+    ASSERT_EQ(ln_join_network(c, "user", "password", &out), LN_OK) << (out ? out : "");
+    const auto j = nlohmann::json::parse(out);
+    ln_free(out);
+    ASSERT_TRUE(j.contains("membership")) << j.dump();
+    EXPECT_EQ(j["membership"]["status"], "member");
+    EXPECT_EQ(j["membership"]["group_id"], "customer-joined");
+}
+
+// The network device list walks the home groups first, then the joined
+// groups, lists each device once, and tags the group role; the C ABI carries
+// the same list.
+TEST_F(SdkMeshPrivateApiTest, TheNetworkDeviceListWalksHomeThenJoinedGroupsOnce) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    const auto devices = client->list_network_devices();
+    ASSERT_TRUE(devices.ok) << devices.error;
+    ASSERT_EQ(devices.value.size(), 3u);
+    EXPECT_EQ(devices.value[0].node_id, kNodeId);
+    EXPECT_TRUE(devices.value[0].is_self);
+    EXPECT_EQ(devices.value[0].group_role, "home");
+    EXPECT_EQ(devices.value[1].node_id, "member-1");
+    EXPECT_TRUE(devices.value[1].member);
+    EXPECT_EQ(devices.value[1].group_id, "customer-home");
+    EXPECT_EQ(devices.value[2].node_id, "server-1");
+    EXPECT_EQ(devices.value[2].group_role, "member");
+    EXPECT_TRUE(devices.value[2].is_inference);
+    EXPECT_TRUE(devices.value[2].can_connect);
+
+    ln_client_t* c = ln_create_tls("localhost", static_cast<uint16_t>(pub_port));
+    ASSERT_NE(c, nullptr);
+    struct Destroy {
+        ln_client_t* c;
+        ~Destroy() { ln_destroy(c); }
+    } destroy{c};
+    ASSERT_EQ(ln_set_genesis_key(c, nexus::crypto::to_base64(chain.genesis.public_key).c_str(), 0),
+              LN_OK);
+    ASSERT_EQ(ln_set_session_token(c, "session-token"), LN_OK);
+    char* out = nullptr;
+    ASSERT_EQ(ln_join_network(c, "user", "password", &out), LN_OK) << (out ? out : "");
+    ln_free(out);
+    out = nullptr;
+    ASSERT_EQ(ln_list_network_devices(c, &out), LN_OK) << (out ? out : "");
+    const auto list = nlohmann::json::parse(out);
+    ln_free(out);
+    ASSERT_EQ(list.size(), 3u) << list.dump();
+    EXPECT_EQ(list[1]["member"], true);
+    EXPECT_EQ(list[2]["group_role"], "member");
+    EXPECT_EQ(list[2]["is_inference"], true);
+}
+
+// A server from before GET /api/tree/devices answers 404; the SDK lists the
+// group's placed devices from its children, with the connect check the mesh
+// port made before (an entry for this device's key).
+TEST_F(SdkMeshPrivateApiTest, AServerWithoutTheDeviceRouteListsTheGroupChildren) {
+    LN_REQUIRE_TEST_TRUST();
+    devices_route_missing = true;
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    const auto devices = client->get_group_devices("customer-home");
+    ASSERT_TRUE(devices.ok) << devices.error;
+    ASSERT_EQ(devices.value.size(), 2u);  // the subgroup is not a device
+    EXPECT_EQ(devices.value[0].node_id, kNodeId);
+    EXPECT_TRUE(devices.value[0].is_self);
+    EXPECT_EQ(devices.value[1].node_id, "linked-1");
+    EXPECT_FALSE(devices.value[1].member);
+    EXPECT_FALSE(devices.value[1].can_connect) << "the entry names another key";
 }
 
 // The peer list carries each peer's management key and the permissions its
