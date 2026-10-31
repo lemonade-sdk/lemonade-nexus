@@ -3023,7 +3023,9 @@ Result<std::vector<NetworkDevice>> LemonadeNexusClient::get_group_devices(
     int status = 0;
     const auto resp = impl_->private_http_get("/api/tree/devices/" + group_id, status);
     result.http_status = status;
-    if (status == 404 && !(resp && resp->contains("error"))) {
+    // An unknown route answers 404 without a JSON body, which the transport
+    // reports as {"error": "HTTP 404"}; the route's own 404s carry a message.
+    if (status == 404 && (!resp || resp->value("error", std::string{}) == "HTTP 404")) {
         // A server from before the route: the placed devices only, with the
         // connect check the mesh port made before (an entry for this key).
         const auto self = node_id();
