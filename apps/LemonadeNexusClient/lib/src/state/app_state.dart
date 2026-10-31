@@ -20,6 +20,7 @@ import 'package:lemonade_nexus_sdk/dns_discovery.dart';
 import '../services/passkey_manager.dart';
 import 'cluster_keyring.dart';
 import 'device_identity.dart';
+import 'join_outcome.dart';
 import 'session_policy.dart';
 
 /// Lightweight console logger for connection/state diagnostics.
@@ -472,6 +473,10 @@ class AppNotifier extends StateNotifier<AppState> {
   // machine's host name; the check needs the private API, so it waits for
   // the mesh. Reset at sign-out.
   bool _deviceNamed = false;
+
+  // The membership the last [_joinNetwork] reported: set when a join carried
+  // an invite but this device already had a node. [joinCluster] reads it.
+  JoinMembership? _lastJoinMembership;
 
   AppNotifier(this._sdk) : super(AppState.initial) {
     _sessionMoves = _sdk.sessionMoves.listen(_onSessionMoved);
@@ -1001,6 +1006,13 @@ class AppNotifier extends StateNotifier<AppState> {
 
   /// Join an existing Cluster with an invitation code. Can succeed without the
   /// group key — an owner device must seal it to us separately.
+  ///
+  /// When this device already has its own node, the server does not move it:
+  /// the device stays in its own network and the invite makes its identity a
+  /// member of the invite's group, or the server refuses that membership. The
+  /// saved entry then names the device's own network, which is what a later
+  /// Connect reaches. Returns false when the server refused the membership;
+  /// the session to the device's own network stays up.
   Future<bool> joinCluster(String inviteCode, {String name = 'Cluster'}) async {
     state = state.copyWith(isLoading: true, errorMessage: null);
     _log('joinCluster: name="$name"');
@@ -1009,9 +1021,15 @@ class AppNotifier extends StateNotifier<AppState> {
 
       await _activateIdentity();
       _sdk.setLinkToken(inviteCode.trim());
+      _lastJoinMembership = null;
       if (!await _authJoinAndLoad(name)) return false;
+      final membership = _lastJoinMembership;
+      _lastJoinMembership = null;
 
       final groupKey = await fetchGroupKey();
+      if (membership != null) {
+        return _finishMembershipJoin(name, membership, groupKey);
+      }
       final s = state.settings;
       await _saveActiveCluster(ClusterEntry(
         localId: _randomBase64(8),
@@ -1024,17 +1042,101 @@ class AppNotifier extends StateNotifier<AppState> {
         useTls: s.useTls,
         lastUsed: DateTime.now(),
       ));
-      addActivity(
-          ActivityLevel.success,
-          groupKey == null
-              ? 'Joined "$name" — waiting for the account key'
-              : 'Joined Cluster "$name"');
+      final outcome = describeJoinOutcome(
+          invitedName: name,
+          homeName: name,
+          membership: null,
+          hasGroupKey: groupKey != null);
+      addActivity(ActivityLevel.success, outcome.message);
       return true;
     } catch (e) {
       state = state.copyWith(errorMessage: 'Join failed: $e', isLoading: false);
       addActivity(ActivityLevel.error, 'Join failed: $e');
       return false;
     }
+  }
+
+  /// Saves and reports a join whose invite became a membership. This device
+  /// keeps its node in its own network, so the active entry names that
+  /// network: the entry this install already keeps for this device, or a new
+  /// entry named after the network. [invitedName] is the name typed for the
+  /// invite's group; the server's name for that group is used when known.
+  Future<bool> _finishMembershipJoin(
+      String invitedName, JoinMembership membership, String? groupKey) async {
+    final homeId = await clusterGroupId();
+    Map<String, dynamic>? home;
+    Map<String, dynamic>? invited;
+    try {
+      for (final m in await listMemberships()) {
+        final id = m['node_id']?.toString() ?? '';
+        if (id.isEmpty) continue;
+        if (homeId != null ? id == homeId : (home == null && m['role'] == 'home')) {
+          home = m;
+        }
+        if (id == membership.groupId) invited = m;
+      }
+    } catch (e) {
+      _log('joinCluster: membership list failed -> $e');
+    }
+    String nameOf(Map<String, dynamic>? m) => m?['hostname']?.toString() ?? '';
+
+    // One identity per OS user means one node: every entry with this user id
+    // reaches the same network. Prefer the entry already bound to it.
+    final userId = state.userId;
+    ClusterEntry? existing;
+    if (userId != null && userId.isNotEmpty) {
+      for (final c in state.clusters) {
+        if (c.userId != userId) continue;
+        if (homeId != null && c.clusterId == homeId) {
+          existing = c;
+          break;
+        }
+        existing ??= c;
+      }
+    }
+    final ownerKey = home?['owner_pubkey']?.toString() ?? '';
+    final selfKey = _sdk.identityPubkey ?? '';
+    final isOwner = ownerKey.isNotEmpty &&
+        selfKey.isNotEmpty &&
+        canonicalPrincipal(ownerKey) == canonicalPrincipal(selfKey);
+    final s = state.settings;
+    final entry = existing?.copyWith(
+          clusterId: homeId,
+          groupKeyB64: groupKey,
+          userId: userId,
+          lastUsed: DateTime.now(),
+        ) ??
+        ClusterEntry(
+          localId: _randomBase64(8),
+          clusterId: homeId ?? '',
+          name: nameOf(home).isNotEmpty ? nameOf(home) : 'Cluster',
+          role: isOwner ? 'owner' : 'member',
+          groupKeyB64: groupKey,
+          userId: userId,
+          serverHost: s.serverHost,
+          serverPort: s.serverPort,
+          useTls: s.useTls,
+          lastUsed: DateTime.now(),
+        );
+    await _saveActiveCluster(entry);
+    // _authJoinAndLoad labeled the session with the name typed for the invite.
+    state = state.copyWith(
+        authState: state.authState.copyWith(username: entry.name));
+    await _storeSessionToken();
+
+    final outcome = describeJoinOutcome(
+      invitedName: nameOf(invited).isNotEmpty ? nameOf(invited) : invitedName,
+      homeName: entry.name,
+      membership: membership,
+      hasGroupKey: groupKey != null,
+    );
+    if (outcome.isError) {
+      state = state.copyWith(errorMessage: outcome.message, isLoading: false);
+      addActivity(ActivityLevel.error, outcome.message);
+      return false;
+    }
+    addActivity(ActivityLevel.success, outcome.message);
+    return true;
   }
 
   /// Connect to a Cluster already in the keyring.
@@ -1397,18 +1499,28 @@ class AppNotifier extends StateNotifier<AppState> {
   /// authenticated but without a tunnel.
   ///
   /// Returns true once the server has issued a node id (the join is usable).
+  /// A join that carried an invite for a device that already had a node
+  /// keeps the device in its own network; the membership the invite produced
+  /// is left in [_lastJoinMembership] for [joinCluster] to report.
   Future<bool> _joinNetwork() async {
     try {
       final username = state.username ?? '';
       final join = await _sdk.joinNetwork(username: username, password: '');
       _log('joinNetwork: success=${join.success} nodeId=${join.nodeId} '
-          'tunnelIp=${join.tunnelIp}');
+          'tunnelIp=${join.tunnelIp} membership=${join.membership?.status}');
+      // Only set, never cleared here: another join running meanwhile must not
+      // erase the result [joinCluster] waits for.
+      if (join.membership != null) _lastJoinMembership = join.membership;
       if (join.nodeId != null) {
         await _sdk.setNodeId(join.nodeId!);
       }
       if (join.tunnelIp != null) {
-        addActivity(ActivityLevel.success,
-            'Joined network — tunnel IP: ${join.tunnelIp}');
+        addActivity(
+            ActivityLevel.success,
+            join.membership == null
+                ? 'Joined network — tunnel IP: ${join.tunnelIp}'
+                : 'Connected to this device\'s own network — tunnel IP: '
+                    '${join.tunnelIp}');
       } else if (!join.success) {
         addActivity(ActivityLevel.warning,
             'Network join incomplete: ${join.error ?? 'no tunnel IP assigned'}');
@@ -1730,12 +1842,42 @@ class AppNotifier extends StateNotifier<AppState> {
     }
   }
 
-  /// Devices (Endpoint nodes) in the active Cluster, each flagged with whether
-  /// it still needs the account group key.
+  /// Devices of this identity's networks: the devices of its own groups,
+  /// including devices of identities that joined them from their own
+  /// networks, then the devices of groups it joined with an invite. Each
+  /// device is flagged with whether it still needs the account group key and
+  /// whether it is placed in the active Cluster group, where the key, access,
+  /// and remove actions apply. Online state is not part of it; views merge
+  /// it from the mesh peers (`isDeviceOnline` in device_pills.dart). Throws
+  /// when the server refuses the list.
   Future<List<ClusterDevice>> listClusterDevices() async {
     final groupId = await clusterGroupId();
-    if (groupId == null) return [];
-    final children = await callPrivateApiList('GET', '/api/tree/children/$groupId');
+    List<NetworkDevice> listed;
+    try {
+      listed = await _sdk.listNetworkDevices();
+    } on SdkException catch (e) {
+      // One unreadable network fails the whole list; the active Cluster
+      // alone is still worth showing.
+      if (groupId == null) rethrow;
+      _log('listClusterDevices: network list failed, listing the Cluster -> $e');
+      listed = await _sdk.getGroupDevices(groupId);
+    }
+    final self = listed.where((d) => d.isSelf).firstOrNull;
+    final clusterGroup = groupId ?? self?.parentId;
+    final homeGroup = self?.groupId ?? clusterGroup;
+
+    final names = <String, String>{};
+    try {
+      for (final m in await listMemberships()) {
+        final id = m['node_id']?.toString() ?? '';
+        final name = m['hostname']?.toString() ?? '';
+        if (id.isNotEmpty && name.isNotEmpty) names[id] = name;
+      }
+    } catch (e) {
+      _log('listClusterDevices: membership lookup failed -> $e');
+    }
+    final activeName = state.activeCluster?.name;
+    if (homeGroup != null && activeName != null) names[homeGroup] = activeName;
 
     Set<String> waiting = {};
     try {
@@ -1747,40 +1889,52 @@ class AppNotifier extends StateNotifier<AppState> {
       _log('listClusterDevices: pending lookup failed -> $e');
     }
 
-    // Group admins, by key. A non-admin caller only sees its own entry, which
-    // still answers whether this device is an admin.
+    // Cluster group admins, by key. A server from before the device list
+    // route reports no admin flag, so these fill it in for the Cluster's own
+    // devices. A non-admin caller only sees its own entry, which still
+    // answers whether this device is an admin.
     final adminKeys = <String>{};
-    try {
-      for (final a in await nodeAssignments(groupId)) {
-        final perms = (a['permissions'] as List?)?.map((p) => p.toString()) ?? const [];
-        if (perms.contains('admin')) {
-          adminKeys.add(canonicalPrincipal(a['management_pubkey']?.toString() ?? ''));
+    if (clusterGroup != null) {
+      try {
+        for (final a in await nodeAssignments(clusterGroup)) {
+          final perms =
+              (a['permissions'] as List?)?.map((p) => p.toString()) ?? const [];
+          if (perms.contains('admin')) {
+            adminKeys.add(
+                canonicalPrincipal(a['management_pubkey']?.toString() ?? ''));
+          }
         }
+      } catch (e) {
+        _log('listClusterDevices: group assignments lookup failed -> $e');
       }
-    } catch (e) {
-      _log('listClusterDevices: group assignments lookup failed -> $e');
     }
 
-    final devices = <ClusterDevice>[];
-    for (final node in children) {
-      if ((node['node_type'] ?? node['type'])?.toString().toLowerCase() !=
-          'endpoint') {
-        continue;
-      }
-      final id = node['id']?.toString() ?? '';
-      if (id.isEmpty) continue;
-      final mgmt = node['mgmt_pubkey']?.toString() ?? '';
-      devices.add(ClusterDevice(
-        nodeId: id,
-        hostname: (node['hostname'] ?? node['data']?['hostname'])?.toString() ?? id,
-        tunnelIp: (node['tunnel_ip'] ?? node['data']?['tunnel_ip'])?.toString(),
-        needsKey: waiting.contains(id),
-        isThisDevice: id == state.userId,
-        mgmtPubkey: mgmt,
-        isAdmin: mgmt.isNotEmpty && adminKeys.contains(canonicalPrincipal(mgmt)),
-      ));
-    }
-    return devices;
+    return [
+      for (final d in listed)
+        if (d.nodeId.isNotEmpty)
+          ClusterDevice(
+            nodeId: d.nodeId,
+            hostname: d.deviceName.isEmpty ? d.nodeId : d.deviceName,
+            tunnelIp: d.tunnelIp.isEmpty ? null : d.tunnelIp,
+            needsKey: waiting.contains(d.nodeId),
+            isThisDevice: d.isSelf || d.nodeId == state.userId,
+            mgmtPubkey: d.mgmtPubkey,
+            isAdmin: d.admin ||
+                (d.groupId == homeGroup &&
+                    d.mgmtPubkey.isNotEmpty &&
+                    adminKeys.contains(canonicalPrincipal(d.mgmtPubkey))),
+            isInference: d.isInference,
+            isMember: d.member,
+            canConnect: d.canConnect,
+            groupId: d.groupId,
+            groupRole: d.groupRole,
+            networkName: names[d.groupId] ?? '',
+            inHomeNetwork: homeGroup == null || d.groupId == homeGroup,
+            placedInCluster: !d.member &&
+                clusterGroup != null &&
+                d.parentId == clusterGroup,
+          ),
+    ];
   }
 
   /// A node's assignments: every entry when this device can edit the node,

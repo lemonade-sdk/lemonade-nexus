@@ -169,7 +169,7 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
             else ...[
               Text(
                 'Share this code with the person you are inviting. On a new '
-                'device they choose "Have an invitation code?" on the sign-in '
+                'device they choose "Join with an invite code" on the sign-in '
                 'screen and enter it. A person who already has a network '
                 'enters it in "Join another network" and keeps their own '
                 'network. The code works once.',
