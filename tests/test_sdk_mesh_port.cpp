@@ -644,7 +644,8 @@ TEST_F(MeshPortTest, AutoRouterSkipsDevicesThatRefuseTheKey) {
     EXPECT_NE(refused->body.find("Guarded box"), std::string::npos) << refused->body;
     auto listing = client.Get("/api/v1/models");
     ASSERT_TRUE(listing);
-    for (const auto& model : json::parse(listing->body)["data"]) {
+    const auto models = json::parse(listing->body);
+    for (const auto& model : models["data"]) {
         EXPECT_NE(model["id"], "Guarded box/Guarded") << "a refused device lists no models";
     }
     auto still_peer = chat(client, "PeerModel");
