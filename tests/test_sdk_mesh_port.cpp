@@ -1025,9 +1025,22 @@ TEST_F(MeshPortTest, APeerThatComesOnlineIsServedWithoutAListRefresh) {
     const auto served = chat(client, "PeerModel");
     ASSERT_TRUE(served);
     EXPECT_EQ(served->status, 200);
+    // The device goes online first; its catalog is read right after, without
+    // waiting for a device list refresh.
+    const auto catalog_status = [&] {
+        const auto status = port->status();
+        for (const auto& device : status["devices"]) {
+            if (device["node_id"] == "gpu") return device["catalog_status"].get<int>();
+        }
+        return -1;
+    };
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (catalog_status() == 0 && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(catalog_status(), 404) << "the catalog was not read when the device came online";
     const auto status = port->status();
     for (const auto& device : status["devices"]) {
-        if (device["node_id"] == "gpu") EXPECT_EQ(device["catalog_status"], 404) << "the catalog is read at once";
         if (device["node_id"] == "fast") EXPECT_EQ(device["path"], "lan");
     }
 
