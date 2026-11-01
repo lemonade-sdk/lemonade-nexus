@@ -17,6 +17,9 @@ namespace nexus::api {
 /// API pool is sized above this cap (kPrivateApiWorkerThreads). A request
 /// beyond the cap gets 429 and the device keeps the heartbeat
 /// peers_revision as its signal.
+///
+/// An event socket (GET /api/events) counts as one waiter for as long as it
+/// is open.
 inline constexpr std::size_t kMeshPeerWaitersMax = 256;
 
 /// Most long-polls one device (the JWT subject) holds at once. Two allow a

@@ -2525,6 +2525,95 @@ TEST_F(MeshPeersConnectTest, PeerListLongPollAnswersWhenTheListChanges) {
     }
 }
 
+// GET /api/events upgrades to a WebSocket that sends the peers and devices
+// revisions when it opens and again when either changes. A tree change that
+// alters only the device list changes devices_revision alone.
+TEST_F(MeshPeersConnectTest, EventSocketSendsTheRevisionsAndEachChange) {
+    json body;
+    listed(&body);
+    const auto peers_baseline = body["peers_revision"].get<std::string>();
+
+    httplib::ws::WebSocketClient ws(
+        "ws://127.0.0.1:" + std::to_string(mesh_port) + "/api/events?node_id=mc_self",
+        httplib::Headers{{"Authorization", "Bearer " + make_jwt(caller)}});
+    ws.set_read_timeout(10, 0);
+    ASSERT_TRUE(ws.connect());
+    const auto next = [&ws]() -> json {
+        std::string message;
+        if (ws.read(message) != httplib::ws::Text) return {};
+        return json::parse(message);
+    };
+
+    const auto first = next();
+    ASSERT_EQ(first.value("event", ""), "revisions") << first.dump();
+    EXPECT_EQ(first["peers_revision"], peers_baseline);
+    const auto devices_baseline = first["devices_revision"].get<std::string>();
+    EXPECT_FALSE(devices_baseline.empty());
+    EXPECT_EQ(mesh_handler->event_sockets(), 1u);
+
+    // Read on the group makes it a membership: the device list changes.
+    auto group = tree->get_node("mc_group");
+    ASSERT_TRUE(group.has_value());
+    group->assignments = {{caller, {"read"}}};
+    ASSERT_TRUE(test_support::put_node(*tree, *group));
+    const auto member = next();
+    ASSERT_EQ(member.value("event", ""), "revisions") << member.dump();
+    EXPECT_NE(member["devices_revision"], devices_baseline);
+    EXPECT_EQ(member["peers_revision"], peers_baseline) << "no peer was added";
+
+    // A device the caller may connect to changes both.
+    add("mc_peer", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    const auto peer = next();
+    ASSERT_EQ(peer.value("event", ""), "revisions") << peer.dump();
+    EXPECT_NE(peer["peers_revision"], peers_baseline);
+    EXPECT_NE(peer["devices_revision"], member["devices_revision"]);
+    ws.close();
+}
+
+// The upgrade request gets the checks of GET /api/mesh/peers before the
+// protocol switches: no session 401, an unknown node 404, a node without Read
+// 403. A server without the route answers 404 with no JSON body.
+TEST_F(MeshPeersConnectTest, EventSocketRefusesBeforeTheUpgrade) {
+    add("mc_closed", "mc_group", tree::NodeType::Endpoint, {{principal(), {"read"}}});
+    const auto status = [this](const std::string& query, const httplib::Headers& headers) {
+        httplib::ws::WebSocketClient ws(
+            "ws://127.0.0.1:" + std::to_string(mesh_port) + "/api/events" + query, headers);
+        const auto result = ws.connect();
+        EXPECT_FALSE(result);
+        return result.status();
+    };
+    const httplib::Headers session{{"Authorization", "Bearer " + make_jwt(caller)}};
+    EXPECT_EQ(status("?node_id=mc_self", {}), 401);
+    EXPECT_EQ(status("?node_id=mc_self", {{"Authorization", "Bearer not-a-token"}}), 401);
+    EXPECT_EQ(status("", session), 400);
+    EXPECT_EQ(status("?node_id=mc_missing", session), 404);
+    EXPECT_EQ(status("?node_id=mc_closed", session), 403);
+    EXPECT_EQ(mesh_handler->event_sockets(), 0u);
+}
+
+// The socket is checked again on every pass: removing the caller's Read on
+// its node closes it.
+TEST_F(MeshPeersConnectTest, EventSocketClosesWhenTheGrantEnds) {
+    httplib::ws::WebSocketClient ws(
+        "ws://127.0.0.1:" + std::to_string(mesh_port) + "/api/events?node_id=mc_self",
+        httplib::Headers{{"Authorization", "Bearer " + make_jwt(caller)}});
+    ws.set_read_timeout(10, 0);
+    ASSERT_TRUE(ws.connect());
+    std::string message;
+    ASSERT_EQ(ws.read(message), httplib::ws::Text);
+
+    auto self = tree->get_node("mc_self");
+    ASSERT_TRUE(self.has_value());
+    self->assignments.clear();
+    ASSERT_TRUE(test_support::put_node(*tree, *self));
+    EXPECT_EQ(ws.read(message), httplib::ws::Fail) << "the socket stayed open: " << message;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (mesh_handler->event_sockets() != 0 && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(mesh_handler->event_sockets(), 0u);
+}
+
 // MeshPeerWaiters on its own: a notify wakes a wait, the generation guards
 // against a lost wake-up, shutdown ends waits and refuses new ones.
 TEST(MeshPeerWaiters, NotifyWakesAndShutdownRefuses) {

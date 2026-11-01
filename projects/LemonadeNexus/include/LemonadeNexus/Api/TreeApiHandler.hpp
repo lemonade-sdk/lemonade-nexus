@@ -2,6 +2,8 @@
 
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <memory>
 #include <optional>
 #include <string>
@@ -12,9 +14,39 @@ struct TreeNode;
 struct RemovedNode;
 } // namespace nexus::tree
 
+namespace nexus::tree {
+class PermissionTreeService;
+} // namespace nexus::tree
+
+namespace nexus::auth {
+struct SessionClaims;
+} // namespace nexus::auth
+
 namespace nexus::api {
 
 class PendingJoins;
+
+/// The answer of GET /api/tree/devices/{group} for a session.
+struct GroupDevicesAnswer {
+    int            status{200};  ///< 200, or 403, 404 or 400 with `error`
+    std::string    error;        ///< Empty on 200.
+    nlohmann::json body;         ///< {"group_id", "devices"} on 200.
+};
+
+/// The devices of `group_id` that the session `claims` may see, as GET
+/// /api/tree/devices/{group} answers them: the group's devices and those of
+/// its readable subgroups, and the member devices the caller administers,
+/// may edit, owns or may connect to. Reads a snapshot of `tree`; thread-safe.
+[[nodiscard]] GroupDevicesAnswer tree_group_devices(const tree::PermissionTreeService& tree,
+                                                    const auth::SessionClaims& claims,
+                                                    const std::string& group_id);
+
+/// The groups the session's identity belongs to, as GET /api/tree/memberships
+/// answers them: {"memberships": [{node_id, hostname, parent_id,
+/// owner_pubkey, role ("home" or "member"), permissions}]}, with only the
+/// identity's own permissions. Reads a snapshot of `tree`; thread-safe.
+[[nodiscard]] nlohmann::json tree_memberships(const tree::PermissionTreeService& tree,
+                                              const auth::SessionClaims& claims);
 
 /// Handles tree and IPAM endpoints: join and the device-name check (public),
 /// node/delta/children (private), IPAM allocate (private).
