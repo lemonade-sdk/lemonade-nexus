@@ -51,6 +51,15 @@ struct MeshPortMember {
     std::string path;
 };
 
+/// The mesh state of one peer device, as the mesh orchestrator last found it.
+struct MeshPortPeerState {
+    std::string node_id;
+    bool        is_online{false};
+    double      latency_ms{0.0};  ///< 0 when unknown
+    std::string relay_endpoint;   ///< See MeshPortMember::relay_endpoint.
+    std::string path;             ///< See MeshPortMember::path.
+};
+
 /// What a device's SDK answers at GET /.nexus/catalog: the app that registered
 /// its service catalog and the catalog's route families (see ServiceIngress).
 struct MeshPortPeerCatalog {
@@ -178,6 +187,11 @@ struct MeshPortBackend {
     /// Reads the group devices. Called only on the mesh port's refresh thread, so it
     /// may make network calls. Returns nullopt when the list cannot be read.
     std::function<std::optional<std::vector<MeshPortMember>>()> load_members;
+    /// Reads the mesh state of each peer device. Must not make network calls:
+    /// MeshPort::peers_changed() uses it to update the devices between two
+    /// load_members() calls. A device without an entry is not reachable. May be
+    /// empty: the devices then change only with load_members().
+    std::function<std::vector<MeshPortPeerState>()> load_peer_states;
     /// This device's node ID, or "" before it joins.
     std::function<std::string()> self_node_id;
     /// Opens or reuses a loopback bridge to a mesh peer. Returns the 127.0.0.1 port,
@@ -240,7 +254,8 @@ enum class MeshPortStartResult {
 class MeshPort {
 public:
     struct Options {
-        /// Interval between member list refreshes.
+        /// Interval between device list refreshes (MeshPortBackend::load_members). Peer
+        /// state changes between two refreshes arrive through peers_changed().
         std::chrono::milliseconds refresh_interval{std::chrono::seconds(10)};
         /// How long cached model lists stay fresh for the auto router and the merged
         /// model listing. A peer is probed at most once per interval and per peer key.
@@ -323,12 +338,21 @@ public:
     /// to TLS when one is due, now on the calling thread.
     void refresh_now();
 
+    /// Reports that the mesh state of a peer changed. The refresh thread then reads
+    /// MeshPortBackend::load_peer_states and updates only the devices whose online
+    /// state, path, relay or latency changed, without reading the device list again.
+    /// A device that became reachable has its catalog read again at once. Returns at
+    /// once; safe to call from any thread, a mesh state callback included.
+    void peers_changed();
+
 private:
     struct Tls;
     struct Listener;
 
     void refresh_loop();
     void refresh_members();
+    void refresh_peer_states();
+    void forget_catalogs(const std::vector<std::string>& node_ids);
     void refresh_catalogs();
     void check_certificate();
     void activate_pending_tls();
@@ -390,6 +414,7 @@ private:
     std::condition_variable wake_;
     bool stopping_{false};
     bool refresh_requested_{false};
+    bool peers_changed_{false};  // apply the peer states only; see peers_changed()
     std::thread refresh_thread_;
 
     struct CachedModels {

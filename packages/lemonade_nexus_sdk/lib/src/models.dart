@@ -497,6 +497,26 @@ class NetworkDevice {
         'can_connect': canConnect,
         'admin': admin,
       };
+
+  @override
+  bool operator ==(Object other) =>
+      other is NetworkDevice &&
+      other.nodeId == nodeId &&
+      other.deviceName == deviceName &&
+      other.tunnelIp == tunnelIp &&
+      other.mgmtPubkey == mgmtPubkey &&
+      other.parentId == parentId &&
+      other.groupId == groupId &&
+      other.groupRole == groupRole &&
+      other.isInference == isInference &&
+      other.member == member &&
+      other.isSelf == isSelf &&
+      other.canConnect == canConnect &&
+      other.admin == admin;
+
+  @override
+  int get hashCode => Object.hash(nodeId, deviceName, tunnelIp, mgmtPubkey, parentId, groupId,
+      groupRole, isInference, member, isSelf, canConnect, admin);
 }
 
 // =========================================================================

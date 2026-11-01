@@ -447,7 +447,11 @@ public:
     /// Callback type for mesh state changes.
     using MeshStateCallback = std::function<void(const MeshTunnelStatus&)>;
 
-    /// Set a callback to be notified on mesh state changes.
+    /// Set a callback to be notified on mesh state changes: the dataplane went
+    /// up or down, or a peer was added or removed or changed its is_online,
+    /// path or relay_endpoint (MeshOrchestrator::set_callback). It runs on the
+    /// mesh orchestrator thread. The C API sets it to update the mesh port
+    /// (MeshPort::peers_changed), so a C API client must not replace it.
     void set_mesh_callback(MeshStateCallback cb);
 
     /// Callback type for session moves.

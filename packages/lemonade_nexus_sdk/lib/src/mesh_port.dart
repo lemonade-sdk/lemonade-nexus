@@ -2,6 +2,8 @@
 /// @description Typed view of the ln_mesh_port_status JSON.
 library;
 
+import 'package:flutter/foundation.dart' show listEquals;
+
 /// One device URL served by the mesh port.
 class MeshPortUrl {
   final String nodeId;
@@ -22,6 +24,17 @@ class MeshPortUrl {
         url: json['url'] as String? ?? '',
         isSelf: json['self'] as bool? ?? false,
       );
+
+  @override
+  bool operator ==(Object other) =>
+      other is MeshPortUrl &&
+      other.nodeId == nodeId &&
+      other.deviceName == deviceName &&
+      other.url == url &&
+      other.isSelf == isSelf;
+
+  @override
+  int get hashCode => Object.hash(nodeId, deviceName, url, isSelf);
 }
 
 /// A Tier 3 device that can be selected.
@@ -44,6 +57,16 @@ class MeshPortDevice {
 
   /// The device name, or the node ID when the device has no name.
   String get label => deviceName.isEmpty ? nodeId : deviceName;
+
+  @override
+  bool operator ==(Object other) =>
+      other is MeshPortDevice &&
+      other.nodeId == nodeId &&
+      other.deviceName == deviceName &&
+      other.isOnline == isOnline;
+
+  @override
+  int get hashCode => Object.hash(nodeId, deviceName, isOnline);
 }
 
 /// State of the loopback mesh port.
@@ -112,4 +135,28 @@ class MeshPortStatus {
   }
 
   bool get tlsActive => tlsState == 'active';
+
+  /// Equal when every field is: a poll that read the same state compares
+  /// equal, so a caller can skip it.
+  @override
+  bool operator ==(Object other) =>
+      other is MeshPortStatus &&
+      other.running == running &&
+      other.port == port &&
+      other.scheme == scheme &&
+      other.localService == localService &&
+      other.error == error &&
+      other.selection == selection &&
+      other.peerKeySet == peerKeySet &&
+      other.tlsState == tlsState &&
+      other.tlsDomain == tlsDomain &&
+      other.tlsError == tlsError &&
+      other.tlsExpiresAt == tlsExpiresAt &&
+      listEquals(other.urls, urls) &&
+      listEquals(other.devices, devices);
+
+  @override
+  int get hashCode => Object.hash(running, port, scheme, localService, error, selection,
+      peerKeySet, tlsState, tlsDomain, tlsError, tlsExpiresAt, Object.hashAll(urls),
+      Object.hashAll(devices));
 }

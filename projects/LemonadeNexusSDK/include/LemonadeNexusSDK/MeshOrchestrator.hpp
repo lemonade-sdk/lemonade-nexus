@@ -181,7 +181,9 @@ public:
     /// is stopped.
     void refresh_now();
 
-    /// Set callback for mesh state changes.
+    /// Set the callback for mesh state changes. It runs on the loop thread after
+    /// a monitor pass in which the dataplane went up or down, or a peer's
+    /// is_online, path or relay_endpoint changed, or a peer was added or removed.
     void set_callback(StateCallback cb);
 
     /// The wall clock the loop reads to detect a suspension.
@@ -283,6 +285,15 @@ private:
     std::vector<MeshPeer>    known_peers_;
     std::map<std::string, uint32_t> stale_passes_;  // mesh key -> PeerLiveness::stale_passes
     MeshTunnelStatus         last_status_;
+    /// The peer state the last callback reported (see set_callback).
+    struct ReportedPeer {
+        std::string node_id;
+        bool        is_online{false};
+        std::string path;
+        std::string relay_endpoint;
+        bool operator==(const ReportedPeer&) const = default;
+    };
+    std::vector<ReportedPeer> reported_peers_;
     StateCallback            callback_;
     std::string              our_endpoint_; // reflexive endpoint we publish ("" until learned)
     std::vector<std::string> our_local_endpoints_;  // LAN endpoints we report

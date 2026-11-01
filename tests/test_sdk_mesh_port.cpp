@@ -187,6 +187,9 @@ protected:
     uint16_t number = 0;
     std::mutex members_mutex;
     std::vector<MeshPortMember> members = group_members();
+    std::vector<lnsdk::MeshPortPeerState> peer_states;
+    std::atomic<int> member_loads{0};
+    bool peers_reported = false;  // guarded by members_mutex
     MeshPort::Options options = [] {
         MeshPort::Options o;
         o.refresh_interval = std::chrono::hours(1);
@@ -280,8 +283,28 @@ protected:
     lnsdk::MeshPortBackend backend(std::function<std::optional<lnsdk::MeshPortCertificate>(const std::string&)> cert = {}) {
         lnsdk::MeshPortBackend b;
         b.load_members = [this]() -> std::optional<std::vector<MeshPortMember>> {
+            ++member_loads;
             std::lock_guard lock(members_mutex);
-            return members;
+            if (!peers_reported) return members;
+            // As the client backend does: the list carries the current peer states.
+            auto merged = members;
+            for (auto& member : merged) {
+                if (member.node_id == "self") continue;
+                member.is_online = false;
+                member.relay_endpoint.clear();
+                member.path.clear();
+                for (const auto& peer : peer_states) {
+                    if (peer.node_id != member.node_id) continue;
+                    member.is_online = peer.is_online;
+                    member.relay_endpoint = peer.relay_endpoint;
+                    member.path = peer.path;
+                }
+            }
+            return merged;
+        };
+        b.load_peer_states = [this] {
+            std::lock_guard lock(members_mutex);
+            return peer_states;
         };
         b.self_node_id = [] { return std::string("self"); };
         const auto peer_port = static_cast<uint16_t>(peer.port);
@@ -311,6 +334,29 @@ protected:
         const auto url = with_local ? "http://127.0.0.1:" + std::to_string(local.port) : std::string();
         ASSERT_EQ(port->start(number, url), MeshPortStartResult::Ok);
         port->refresh_now();
+    }
+
+    /// Waits until the status reports `node_id` with `online`.
+    bool wait_online(const std::string& node_id, bool online) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < until) {
+            const auto status = port->status();
+            for (const auto& device : status["devices"]) {
+                if (device["node_id"] == node_id && device["is_online"] == online) return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+
+    /// Sets the peer states that load_peer_states() reports and calls peers_changed().
+    void report_peers(std::vector<lnsdk::MeshPortPeerState> states) {
+        {
+            std::lock_guard lock(members_mutex);
+            peer_states = std::move(states);
+            peers_reported = true;
+        }
+        port->peers_changed();
     }
 
     template <typename HttpClient>
@@ -952,6 +998,57 @@ TEST_F(MeshPortTest, ARelayChangeClosesTheEgress) {
     set_relay("203.0.113.9:9103");
     port->refresh_now();
     EXPECT_EQ(closed_egress.load(), 2) << "a new relay allocation closes the bridge";
+}
+
+// A device that comes online between two device list refreshes is served as soon
+// as the mesh reports it, without reading the device list again, and its catalog
+// is read at once.
+TEST_F(MeshPortTest, APeerThatComesOnlineIsServedWithoutAListRefresh) {
+    {
+        std::lock_guard lock(members_mutex);
+        members[1].is_online = false;
+    }
+    start();
+    ASSERT_EQ(port->set_selection("gpu", ""), 0);
+    httplib::Client client("127.0.0.1", number);
+    const auto offline = chat(client, "PeerModel");
+    ASSERT_TRUE(offline);
+    EXPECT_EQ(offline->status, 409);
+    const auto loads = member_loads.load();
+
+    report_peers({{"gpu", true, 20.0, "", "direct"}, {"fast", true, 2.0, "", "lan"}});
+    ASSERT_TRUE(wait_online("gpu", true));
+    EXPECT_EQ(member_loads.load(), loads) << "a peer state change reads no device list";
+    const auto served = chat(client, "PeerModel");
+    ASSERT_TRUE(served);
+    EXPECT_EQ(served->status, 200);
+    const auto status = port->status();
+    for (const auto& device : status["devices"]) {
+        if (device["node_id"] == "gpu") EXPECT_EQ(device["catalog_status"], 404) << "the catalog is read at once";
+        if (device["node_id"] == "fast") EXPECT_EQ(device["path"], "lan");
+    }
+
+    report_peers({{"fast", true, 2.0, "", "lan"}});
+    EXPECT_TRUE(wait_online("gpu", false)) << "a device without a peer state is not reachable";
+}
+
+// A peer state change touches only the devices that changed: an unchanged
+// device keeps its bridge, and a relay change closes only that device's bridge.
+TEST_F(MeshPortTest, APeerStateChangeKeepsTheBridgesOfUnchangedDevices) {
+    start();
+    ASSERT_EQ(port->set_selection("gpu", ""), 0);
+    httplib::Client client("127.0.0.1", number);
+    report_peers({{"gpu", true, 20.0, "", "direct"}, {"fast", true, 2.0, "", "lan"}});
+    ASSERT_TRUE(chat(client, "PeerModel"));
+    report_peers({{"gpu", true, 20.0, "", "direct"}, {"fast", false, 0.0, "", ""}});
+    ASSERT_TRUE(wait_online("fast", false));
+    EXPECT_EQ(closed_egress.load(), 0) << "another device's change keeps the bridge";
+    report_peers({{"gpu", true, 20.0, "198.51.100.7:9103", "relay"}, {"fast", false, 0.0, "", ""}});
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (closed_egress.load() == 0 && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(closed_egress.load(), 1) << "moving onto a relay closes the bridge";
 }
 
 // A request whose bridge answers nothing at once gets a new bridge and is sent
