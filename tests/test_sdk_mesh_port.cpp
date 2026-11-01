@@ -580,10 +580,10 @@ TEST_F(MeshPortTest, PlainHttpSelection) {
     ASSERT_TRUE(unselected);
     EXPECT_EQ(unselected->status, 409);
 
-    auto foreign = client.Get("/api/v1/models", {{"Host", "attacker.example"}});
+    auto foreign = client.Get("/api/v1/models", httplib::Headers{{"Host", "attacker.example"}});
     ASSERT_TRUE(foreign);
     EXPECT_EQ(foreign->status, 421) << "a rebinding name is refused";
-    auto cross = client.Get("/api/v1/models", {{"Origin", "https://attacker.example"}});
+    auto cross = client.Get("/api/v1/models", httplib::Headers{{"Origin", "https://attacker.example"}});
     ASSERT_TRUE(cross);
     EXPECT_EQ(cross->status, 403);
 }
@@ -751,11 +751,9 @@ TEST_F(MeshPortTest, TlsReloadsTheCertificateInPlace) {
         long serial = 0;
         auto client = secure("my-laptop.team.lo.example");
         client->enable_server_certificate_verification(true);
-        client->set_server_certificate_verifier([&](SSL* ssl) {
-            X509* cert = SSL_get1_peer_certificate(ssl);
-            if (cert) {
-                serial = ASN1_INTEGER_get(X509_get0_serialNumber(cert));
-                X509_free(cert);
+        client->set_server_certificate_verifier([&](const httplib::tls::VerifyContext& ctx) {
+            if (ctx.depth == 0 && ctx.cert) {
+                serial = ASN1_INTEGER_get(X509_get0_serialNumber(static_cast<const X509*>(ctx.cert)));
             }
             return true;
         });

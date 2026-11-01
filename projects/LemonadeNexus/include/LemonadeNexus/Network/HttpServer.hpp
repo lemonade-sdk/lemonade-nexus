@@ -81,8 +81,9 @@ public:
     bool upgrade_to_tls(const std::string& cert_path, const std::string& key_path);
 
     /// Hot-reload TLS certificates on a running HTTPS server.
-    /// Uses httplib::SSLServer::update_certs() to atomically swap certs
-    /// without stopping the server.
+    /// Uses httplib::SSLServer::update_certs_pem() to swap the leaf
+    /// certificate and key under the server's context lock, without stopping
+    /// the server.
     /// Returns true if reload succeeded; false if not running TLS or certs failed to load.
     bool reload_tls_certs();
 

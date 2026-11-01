@@ -2676,7 +2676,7 @@ TEST_F(MeshPeersConnectTest, HeartbeatLocalEndpointsReachOnlyListedPeers) {
               200);
     httplib::Client cli("127.0.0.1", mesh_port);
     auto res = cli.Get("/api/mesh/peers/mc_outsider",
-                       {{"Authorization", "Bearer " + token("mc_outsider", outsider)}});
+                       httplib::Headers{{"Authorization", "Bearer " + token("mc_outsider", outsider)}});
     ASSERT_NE(res, nullptr);
     ASSERT_EQ(res->status, 200) << res->body;
     EXPECT_EQ(res->body.find("192.168.1.20"), std::string::npos) << res->body;

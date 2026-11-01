@@ -696,7 +696,7 @@ MeshPortStartResult MeshPort::bind_listener(uint16_t port, bool tls) {
     if (tls) {
         auto* state = tls_.get();
         listener->server = std::make_unique<httplib::SSLServer>(
-            [state](SSL_CTX& context) { return state->configure(context); });
+            [state](httplib::tls::ctx_t context) { return state->configure(*static_cast<SSL_CTX*>(context)); });
         if (!listener->server->is_valid()) return MeshPortStartResult::BindFailed;
     } else {
         listener->server = std::make_unique<httplib::Server>();
@@ -1223,8 +1223,7 @@ void MeshPort::handle(const httplib::Request& req, httplib::Response& res, bool 
         }
         std::string sni;
         if (tls && req.ssl) {
-            // req.ssl is `const SSL*` in cpp-httplib before 0.28 and an opaque
-            // `tls::const_session_t` (const void*) from 0.28 on; both cast.
+            // req.ssl is an opaque tls::const_session_t; the OpenSSL backend's is an SSL*.
             const auto* session = static_cast<const SSL*>(req.ssl);
             if (const char* name = SSL_get_servername(session, TLSEXT_NAMETYPE_host_name)) {
                 sni = name;

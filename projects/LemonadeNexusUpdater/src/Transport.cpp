@@ -69,7 +69,7 @@ std::optional<std::string> https_get(const std::string& url, std::size_t max_byt
         // Release assets redirect to a pre-signed URL whose query is already
         // percent-encoded and covered by the signature. Re-encoding it (for
         // example '+' to %2B) changes the signed value and the CDN answers 403.
-        client.set_url_encode(false);
+        client.set_path_encode(false);
         client.set_connection_timeout(30);
         client.set_read_timeout(120);
         const httplib::Headers headers = {

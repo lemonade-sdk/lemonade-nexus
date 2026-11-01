@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <openssl/crypto.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
@@ -13,6 +14,34 @@
 #include <utility>
 
 namespace nexus::network {
+
+namespace {
+
+/// Installs `cert` and `key` in the running server's context. The server
+/// takes PEM text, so both are written to memory first; the key's buffer is
+/// cleansed before it is freed. Returns false when the server refused them.
+bool install_certs(httplib::SSLServer& server, X509* cert, EVP_PKEY* key) {
+    BIO* cert_bio = BIO_new(BIO_s_mem());
+    BIO* key_bio = BIO_new(BIO_s_secmem());
+    bool installed = false;
+    if (cert_bio && key_bio && PEM_write_bio_X509(cert_bio, cert) == 1 &&
+        PEM_write_bio_PrivateKey(key_bio, key, nullptr, nullptr, 0, nullptr, nullptr) == 1) {
+        // BIO_get_mem_data does not terminate the text; update_certs_pem needs it.
+        BIO_write(cert_bio, "", 1);
+        BIO_write(key_bio, "", 1);
+        char* cert_pem = nullptr;
+        char* key_pem = nullptr;
+        BIO_get_mem_data(cert_bio, &cert_pem);
+        const long key_len = BIO_get_mem_data(key_bio, &key_pem);
+        installed = server.update_certs_pem(cert_pem, key_pem);
+        OPENSSL_cleanse(key_pem, static_cast<std::size_t>(key_len));
+    }
+    if (cert_bio) BIO_free(cert_bio);
+    if (key_bio) BIO_free(key_bio);
+    return installed;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Constructors / Destructor
@@ -145,12 +174,13 @@ bool HttpServer::reload_tls_certs(const std::string& cert_path,
 
     // SSLServer inherits from Server; downcast is safe because is_tls_ is true.
     auto* ssl_srv = static_cast<httplib::SSLServer*>(server_.get());
-    ssl_srv->update_certs(cert, pkey);
-
-    // update_certs takes ownership via SSL_CTX_use_certificate / SSL_CTX_use_PrivateKey
-    // which copy the cert/key into the SSL_CTX, so we must free our copies.
+    const bool installed = install_certs(*ssl_srv, cert, pkey);
     X509_free(cert);
     EVP_PKEY_free(pkey);
+    if (!installed) {
+        spdlog::error("HttpServer: the server refused the reloaded cert/key (cert={})", cert_path);
+        return false;
+    }
 
     tls_cert_path_ = cert_path;
     tls_key_path_ = key_path;
@@ -188,11 +218,11 @@ bool HttpServer::reload_tls_certs_inmemory_key(const std::string& cert_path,
                              : nullptr;
     if (key_bio) BIO_free(key_bio);
 
-    const bool usable = cert && pkey && X509_check_private_key(cert, pkey) == 1;
+    bool usable = cert && pkey && X509_check_private_key(cert, pkey) == 1;
     if (usable) {
         // SSLServer inherits from Server; downcast is safe because is_tls_ is true.
         auto* ssl_srv = static_cast<httplib::SSLServer*>(server_.get());
-        ssl_srv->update_certs(cert, pkey);
+        usable = install_certs(*ssl_srv, cert, pkey);
     }
     if (cert) X509_free(cert);
     if (pkey) EVP_PKEY_free(pkey);
@@ -287,12 +317,13 @@ std::unique_ptr<httplib::SSLServer> HttpServer::try_create_ssl_server_inmemory_k
 
     std::unique_ptr<httplib::SSLServer> srv;
     try {
-        std::function<bool(SSL_CTX&)> setup =
-            [cert_path, key](SSL_CTX& ctx) -> bool {
-                if (SSL_CTX_use_certificate_chain_file(&ctx, cert_path.c_str()) != 1) {
+        httplib::tls::ContextSetupCallback setup =
+            [cert_path, key](httplib::tls::ctx_t context) -> bool {
+                auto* ctx = static_cast<SSL_CTX*>(context);
+                if (SSL_CTX_use_certificate_chain_file(ctx, cert_path.c_str()) != 1) {
                     return false;
                 }
-                if (SSL_CTX_use_PrivateKey(&ctx, key) != 1) {
+                if (SSL_CTX_use_PrivateKey(ctx, key) != 1) {
                     return false;
                 }
                 return true;
