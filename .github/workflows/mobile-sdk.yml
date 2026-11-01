@@ -42,7 +42,7 @@ env:
 
 jobs:
   ios:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - name: Toolchain
@@ -68,7 +68,7 @@ jobs:
           if-no-files-found: error
 
   android:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - name: Toolchain

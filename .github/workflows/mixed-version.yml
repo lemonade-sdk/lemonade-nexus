@@ -26,7 +26,7 @@ on:
       runner:
         description: Runner label
         required: false
-        default: ubuntu-latest
+        default: ubuntu-24.04
   workflow_call:
     inputs:
       previous_tag:
@@ -44,7 +44,7 @@ on:
       runner:
         type: string
         required: false
-        default: ubuntu-latest
+        default: ubuntu-24.04
 
 permissions:
   contents: read

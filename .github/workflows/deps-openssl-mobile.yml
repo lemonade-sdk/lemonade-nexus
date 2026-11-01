@@ -63,7 +63,7 @@ jobs:
 
   ios:
     needs: source
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
@@ -83,7 +83,7 @@ jobs:
 
   android:
     needs: source
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4

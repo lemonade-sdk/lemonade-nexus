@@ -15,9 +15,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned: the static build needs Ubuntu 24.04's libssl-dev (OpenSSL
+          # 3.0.13), and ubuntu-latest moved to Ubuntu 26.
+          - os: ubuntu-24.04
             platform: linux-x86_64
-          - os: macos-14
+          - os: macos-15
             platform: darwin-arm64
           # TODO(windows): temporarily disabled. The security stores' durable
           # write is POSIX-only. Re-enable both entries once that is fixed;
