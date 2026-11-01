@@ -193,6 +193,10 @@ protected:
     bool peers_reported = false;  // guarded by members_mutex
     MeshPort::Options options;
 
+    // The port's refresh thread calls the backend, which reads the members
+    // above: stop it before they are destroyed (members go in reverse order).
+    void TearDown() override { port.reset(); }
+
     void SetUp() override {
         peer.server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"status":"ok","all_models_loaded":[{"model_name":"PeerModel","is_busy":false}]})",
