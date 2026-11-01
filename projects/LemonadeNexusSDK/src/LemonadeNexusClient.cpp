@@ -3677,17 +3677,17 @@ Result<bool> LemonadeNexusClient::run_mesh_events(
     if (const auto refusal = impl_->private_api_refusal(); !refusal.empty()) {
         return {false, false, 0, refusal};
     }
-    std::string fqdn;
-    uint16_t lp = 0;
-    {
-        std::lock_guard egress_lock(impl_->private_api_mtx);
-        if (!impl_->meshplane.is_active() || impl_->server_tunnel_ip.empty() ||
-            impl_->server_private_fqdn.empty()) {
-            return {false, false, 0, "the mesh is not up"};
-        }
-        fqdn = impl_->server_private_fqdn;
-        lp = impl_->meshplane.tcp_egress(impl_->server_tunnel_ip, impl_->private_port);
+    // The TLS handshake holds private_api_mtx like every private request: two
+    // handshakes through the netstack egress at once both fail, and the
+    // socket opens as the mesh starts, together with the first peer refresh.
+    // The open socket runs on its own connection without the lock.
+    std::unique_lock egress_lock(impl_->private_api_mtx);
+    if (!impl_->meshplane.is_active() || impl_->server_tunnel_ip.empty() ||
+        impl_->server_private_fqdn.empty()) {
+        return {false, false, 0, "the mesh is not up"};
     }
+    const auto fqdn = impl_->server_private_fqdn;
+    const auto lp = impl_->meshplane.tcp_egress(impl_->server_tunnel_ip, impl_->private_port);
     if (lp == 0) return {false, false, 0, "no egress to the session server"};
 
     // The private FQDN lands on the loopback egress, as for the other private
@@ -3710,6 +3710,7 @@ Result<bool> LemonadeNexusClient::run_mesh_events(
         if (impl_->events_ws == ws) impl_->events_ws.reset();
     };
     const auto opened = ws->connect();
+    egress_lock.unlock();
     if (!opened) {
         release();
         return {false, false, std::max(opened.status(), 0),
