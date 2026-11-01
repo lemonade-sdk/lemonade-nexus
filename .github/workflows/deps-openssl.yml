@@ -64,7 +64,7 @@ jobs:
 
   macos-arm64:
     needs: source
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       # The oldest macOS that runs on Apple silicon. The archive's objects must
       # not require a newer macOS than the binaries that link them.
