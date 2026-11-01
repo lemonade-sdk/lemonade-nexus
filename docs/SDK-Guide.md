@@ -727,6 +727,34 @@ A silent move issues a new server-bound session token; an application that
 stores the token reads `session_token()` / `ln_get_session_token()` again
 after the event.
 
+### Mesh events
+
+The SDK reports what may have changed in the mesh as it happens, so an
+application reads that state again instead of polling it. The session server
+pushes peer and device list changes over the event socket (`GET
+/api/events`); the SDK passes them on together with the mesh's own changes.
+
+C: `ln_set_mesh_event_callback(client, fn, user)` with
+`void fn(char* event_json, void* user)`. `event_json` is `{"event": name}`:
+
+| Event | Read again |
+| --- | --- |
+| `peers` | `ln_get_mesh_peers`, `ln_mesh_status`: a peer was added or removed, or changed its online state, path or relay |
+| `devices` | `ln_list_network_devices`: the server reported a device list change, the event socket opened again, or the mesh resumed after a suspension |
+| `port` | `ln_mesh_port_status`: the mesh port's devices changed |
+
+An event names no device and carries no data, and later versions may add
+names. The ownership and threading rules are those of the session-move
+callback. Dart: `LemonadeNexusSdk.meshEvents` (and `NexusWorker.meshEvents`)
+is a `Stream<MeshEvent>`; it stays empty with a native library older than
+`ln_set_mesh_event_callback`. In C++, `set_mesh_callback` and
+`set_mesh_devices_callback` report the same changes; the C API uses both, so
+a C API client does not set them.
+
+The mesh port reads its device list when it starts, on every `devices`
+change, and again after a failed read (from 2 seconds, doubled up to 60). It
+applies a `peers` change without reading the list.
+
 ### Mesh port
 
 The mesh port is a listener on `127.0.0.1:13306` that serves the devices of

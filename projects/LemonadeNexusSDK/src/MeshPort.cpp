@@ -836,24 +836,82 @@ void MeshPort::stop() {
 }
 
 void MeshPort::refresh_loop() {
-    auto next_full = std::chrono::steady_clock::now();
+    using clock = std::chrono::steady_clock;
+    // The device list is read at start, when it may have changed
+    // (devices_changed), and again after a failed read. Peer states arrive
+    // through peers_changed(); only the catalogs, which no server reports,
+    // are read on a schedule.
+    bool read_members = true;
+    auto retry = options_.members_retry_min;
+    std::optional<clock::time_point> retry_at;
+    auto next_catalogs = clock::now() + options_.catalog_ttl;
     while (true) {
-        bool peers_only = false;
+        if (read_members) {
+            read_members = false;
+            bool loaded = false;
+            {
+                std::lock_guard refresh(refresh_mutex_);
+                loaded = refresh_all();
+            }
+            if (loaded) {
+                retry = options_.members_retry_min;
+                retry_at.reset();
+            } else {
+                retry_at = clock::now() + retry;
+                retry = std::min(retry * 2, options_.members_retry_max);
+            }
+            next_catalogs = clock::now() + options_.catalog_ttl;
+        }
+        bool requested = false;
+        bool peers = false;
+        bool devices = false;
         {
             std::unique_lock lock(wake_mutex_);
-            wake_.wait_until(lock, next_full,
-                             [this] { return stopping_ || refresh_requested_ || peers_changed_; });
+            const auto until = retry_at ? std::min(next_catalogs, *retry_at) : next_catalogs;
+            wake_.wait_until(lock, until, [this] {
+                return stopping_ || refresh_requested_ || peers_changed_ || devices_changed_;
+            });
             if (stopping_) return;
-            peers_only = !refresh_requested_ && std::chrono::steady_clock::now() < next_full;
-            refresh_requested_ = false;
-            peers_changed_ = false;
+            requested = std::exchange(refresh_requested_, false);
+            peers = std::exchange(peers_changed_, false);
+            devices = std::exchange(devices_changed_, false);
         }
-        if (peers_only) {
-            refresh_peer_states();
+        const auto now = clock::now();
+        if (requested || devices || (retry_at && now >= *retry_at)) {
+            read_members = true;
             continue;
         }
-        refresh_now();
-        next_full = std::chrono::steady_clock::now() + options_.refresh_interval;
+        if (peers) refresh_peer_states();
+        if (now >= next_catalogs) {
+            {
+                std::lock_guard refresh(refresh_mutex_);
+                refresh_catalogs();
+            }
+            next_catalogs = now + options_.catalog_ttl;
+        }
+    }
+}
+
+void MeshPort::devices_changed() {
+    {
+        std::lock_guard lock(wake_mutex_);
+        devices_changed_ = true;
+    }
+    wake_.notify_all();
+}
+
+void MeshPort::set_change_callback(std::function<void()> callback) {
+    std::lock_guard lock(change_mutex_);
+    change_callback_ = std::move(callback);
+}
+
+void MeshPort::report_change() {
+    std::lock_guard lock(change_mutex_);
+    if (!change_callback_) return;
+    try {
+        change_callback_();
+    } catch (const std::exception& e) {
+        spdlog::warn("[MeshPort] change callback failed: {}", e.what());
     }
 }
 
@@ -876,6 +934,7 @@ void MeshPort::refresh_peer_states() {
         const auto self = backend_.self_node_id ? backend_.self_node_id() : std::string();
         std::vector<std::pair<std::string, std::string>> closed;
         std::vector<std::string> reachable;
+        bool changed = false;
         {
             std::lock_guard lock(state_mutex_);
             if (!running_) return;
@@ -894,11 +953,13 @@ void MeshPort::refresh_peer_states() {
                 }
                 if (!reachable_peer(member, self) && reachable_peer(updated, self)) reachable.push_back(member.node_id);
                 member = std::move(updated);
+                changed = true;
             }
         }
         if (backend_.close_egress) {
             for (const auto& [node, address] : closed) backend_.close_egress(address, kMeshPortPeerServicePort);
         }
+        if (changed) report_change();
         if (reachable.empty()) return;
         forget_catalogs(reachable);
         refresh_catalogs();
@@ -916,33 +977,50 @@ void MeshPort::forget_catalogs(const std::vector<std::string>& node_ids) {
 
 void MeshPort::refresh_now() {
     std::lock_guard refresh(refresh_mutex_);
+    refresh_all();
+}
+
+bool MeshPort::refresh_all() {
+    bool loaded = false;
     try {
         activate_pending_tls();
-        refresh_members();
+        loaded = refresh_members();
         refresh_catalogs();
         check_certificate();
     } catch (const std::exception& e) {
         spdlog::warn("[MeshPort] refresh failed: {}", e.what());
     }
+    return loaded;
 }
 
-void MeshPort::refresh_members() {
-    if (!backend_.load_members) return;
+bool MeshPort::refresh_members() {
+    if (!backend_.load_members) return true;
     auto loaded = backend_.load_members();
     std::vector<std::pair<std::string, std::string>> closed;
     std::vector<std::string> reachable;
+    bool changed = false;
     {
         std::lock_guard lock(state_mutex_);
-        if (!running_) return;
+        if (!running_) return true;
         if (!loaded) {
             // Keep the names, but refuse to forward until the list can be read again.
             const auto self = backend_.self_node_id ? backend_.self_node_id() : std::string();
             for (auto& member : members_) {
-                if (member.node_id != self) member.is_online = false;
+                if (member.node_id != self && member.is_online) {
+                    member.is_online = false;
+                    changed = true;
+                }
             }
             error_ = "Cannot read the group devices";
-            return;
         }
+    }
+    if (!loaded) {
+        if (changed) report_change();
+        return false;
+    }
+    {
+        std::lock_guard lock(state_mutex_);
+        if (!running_) return true;
         error_.clear();
         // A bridge carries virtual TCP connections over the mesh path that was
         // current when they opened. When the device's address or its relay
@@ -966,12 +1044,15 @@ void MeshPort::refresh_members() {
                 reachable.push_back(member.node_id);
             }
         }
+        changed = members_ != *loaded;
         members_ = std::move(*loaded);
     }
     if (backend_.close_egress) {
         for (const auto& [node, address] : closed) backend_.close_egress(address, kMeshPortPeerServicePort);
     }
     forget_catalogs(reachable);
+    if (changed) report_change();
+    return true;
 }
 
 // Runs once per start or directory change. The SDK certificate renewer owns the
@@ -1432,9 +1513,8 @@ std::vector<std::string> MeshPort::local_model_ids(const std::string& authorizat
 std::optional<MeshPortPeerCatalog> MeshPort::cached_catalog(const std::string& node_id) {
     std::lock_guard lock(cache_mutex_);
     const auto cached = catalog_cache_.find(node_id);
-    // An unanswered probe is kept only until the next device list refresh.
     const auto ttl = cached != catalog_cache_.end() && cached->second.catalog.status == 0
-                         ? std::min(options_.catalog_ttl, options_.refresh_interval)
+                         ? std::min(options_.catalog_ttl, options_.unanswered_catalog_ttl)
                          : options_.catalog_ttl;
     if (cached == catalog_cache_.end() || std::chrono::steady_clock::now() - cached->second.fetched >= ttl) {
         return std::nullopt;
@@ -1525,7 +1605,7 @@ void MeshPort::refresh_catalogs() {
                 catalog = fetch_catalog(*client);
             }
             probe.finish();
-            // A peer that did not answer is cached as unknown until the next interval.
+            // A peer that did not answer is cached as unknown for unanswered_catalog_ttl.
             store_catalog(probe.member->node_id, catalog);
         },
         [&](size_t index) { probes[index]->cancel(); });

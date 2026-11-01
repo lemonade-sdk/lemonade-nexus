@@ -49,6 +49,8 @@ struct MeshPortMember {
     /// The mesh path to the device (MeshPeer::path): "lan", "direct",
     /// "relay", or "" (this device, or no working path).
     std::string path;
+
+    bool operator==(const MeshPortMember&) const = default;
 };
 
 /// The mesh state of one peer device, as the mesh orchestrator last found it.
@@ -254,9 +256,15 @@ enum class MeshPortStartResult {
 class MeshPort {
 public:
     struct Options {
-        /// Interval between device list refreshes (MeshPortBackend::load_members). Peer
-        /// state changes between two refreshes arrive through peers_changed().
-        std::chrono::milliseconds refresh_interval{std::chrono::seconds(10)};
+        /// Pause before the device list (MeshPortBackend::load_members) is read again
+        /// after a failed read. It doubles after each failure up to
+        /// members_retry_max. Otherwise the list is read only at start() and on
+        /// devices_changed(); peer state changes arrive through peers_changed().
+        std::chrono::milliseconds members_retry_min{std::chrono::seconds(2)};
+        std::chrono::milliseconds members_retry_max{std::chrono::seconds(60)};
+        /// How long an unanswered catalog probe is kept before the device is probed
+        /// again.
+        std::chrono::milliseconds unanswered_catalog_ttl{std::chrono::seconds(10)};
         /// How long cached model lists stay fresh for the auto router and the merged
         /// model listing. A peer is probed at most once per interval and per peer key.
         std::chrono::milliseconds models_ttl{std::chrono::seconds(5)};
@@ -338,6 +346,18 @@ public:
     /// to TLS when one is due, now on the calling thread.
     void refresh_now();
 
+    /// Reports that the device list may have changed. The refresh thread reads it
+    /// again (MeshPortBackend::load_members) and updates the devices. Returns at
+    /// once; safe to call from any thread.
+    void devices_changed();
+
+    /// Sets the function the refresh thread calls after the devices changed: one
+    /// was added or removed, or changed its name, address, online state, path or
+    /// relay. It runs on the refresh thread without the port's state locks, so it
+    /// may call status(); it must not call refresh_now(). Empty clears it; the
+    /// previous function is not running when this returns.
+    void set_change_callback(std::function<void()> callback);
+
     /// Reports that the mesh state of a peer changed. The refresh thread then reads
     /// MeshPortBackend::load_peer_states and updates only the devices whose online
     /// state, path, relay or latency changed, without reading the device list again.
@@ -350,7 +370,12 @@ private:
     struct Listener;
 
     void refresh_loop();
-    void refresh_members();
+    /// refresh_now() without its lock. Returns false when the device list could
+    /// not be read.
+    bool refresh_all();
+    /// Returns false when the device list could not be read.
+    bool refresh_members();
+    void report_change();
     void refresh_peer_states();
     void forget_catalogs(const std::vector<std::string>& node_ids);
     void refresh_catalogs();
@@ -414,7 +439,10 @@ private:
     std::condition_variable wake_;
     bool stopping_{false};
     bool refresh_requested_{false};
-    bool peers_changed_{false};  // apply the peer states only; see peers_changed()
+    bool peers_changed_{false};    // apply the peer states only; see peers_changed()
+    bool devices_changed_{false};  // read the device list; see devices_changed()
+    std::mutex change_mutex_;      // held while change_callback_ runs
+    std::function<void()> change_callback_;
     std::thread refresh_thread_;
 
     struct CachedModels {

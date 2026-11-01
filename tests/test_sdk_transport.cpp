@@ -391,6 +391,17 @@ protected:
     // (TearDown) so the server can stop.
     std::atomic<int>  peer_waits{0};
     std::atomic<bool> stopping_waits{false};
+    // The event socket (GET /api/events): off, the stand-in answers 404 as
+    // a server without it does. On, it sends the heartbeat revision and
+    // devices_revision when the socket opens and on each change.
+    std::atomic<bool> serve_events{false};
+    std::atomic<int>  event_sockets{0};
+    std::string       devices_revision{"dev-1"};  // guarded by revision_mtx
+
+    void set_devices_revision(std::string revision) {
+        std::lock_guard lock(revision_mtx);
+        devices_revision = std::move(revision);
+    }
 
     void set_heartbeat_revision(std::string revision) {
         std::lock_guard lock(revision_mtx);
@@ -569,6 +580,41 @@ protected:
     }
 
     void add_private_routes(httplib::SSLServer& srv) {
+        srv.set_pre_request_handler([this](const httplib::Request& req, httplib::Response& res) {
+            if (req.matched_route != "/api/events") return httplib::Server::HandlerResponse::Unhandled;
+            if (!serve_events.load()) {
+                res.status = 404;
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            if (req.get_param_value("node_id") != kNodeId ||
+                req.get_header_value("Authorization").rfind("Bearer ", 0) != 0) {
+                res.status = 403;
+                res.set_content(R"({"error":"insufficient permissions"})", "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+        srv.WebSocket("/api/events", [this](const httplib::Request&, httplib::ws::WebSocket& ws) {
+            ++event_sockets;
+            std::string sent;
+            std::string message;
+            ws.set_read_timeout(0, 20000);
+            while (!stopping_waits.load()) {
+                std::string now;
+                nlohmann::json event;
+                {
+                    std::lock_guard lock(revision_mtx);
+                    event = {{"event", "revisions"},
+                             {"peers_revision", heartbeat_revision},
+                             {"devices_revision", devices_revision}};
+                }
+                now = event.dump();
+                if (now != sent && !ws.send(now)) break;
+                sent = now;
+                if (ws.read(message) == httplib::ws::Fail) break;
+            }
+            ws.close();
+        });
         srv.Get(std::string("/api/mesh/peers/") + kNodeId,
                 [this](const httplib::Request& req, httplib::Response& res) {
             // A long-poll (wait_revision) holds until the stand-in's
@@ -1603,6 +1649,47 @@ TEST_F(SdkMeshPrivateApiTest, APeerListLongPollRefreshesWithoutWaitingForAHeartb
     const auto stop_started = std::chrono::steady_clock::now();
     client->disable_mesh();
     EXPECT_LT(std::chrono::steady_clock::now() - stop_started, std::chrono::seconds(5));
+}
+
+// The event socket: the orchestrator holds GET /api/events open instead of
+// the long-poll. A new peers_revision refreshes the peer list at once, and
+// the devices callback runs when the socket opens and when devices_revision
+// changes.
+TEST_F(SdkMeshPrivateApiTest, AnEventSocketReplacesTheLongPoll) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    serve_events = true;
+    set_heartbeat_revision("rev-1");
+    std::atomic<int> device_changes{0};
+    client->set_mesh_devices_callback([&] { ++device_changes; });
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 3600;
+    cfg.stun_refresh_interval_sec = 0;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return event_sockets.load() >= 1 && device_changes.load() >= 1; },
+                         std::chrono::seconds(10)))
+        << "the orchestrator did not open the event socket";
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(peer_waits.load(), 0) << "a long-poll ran beside the event socket";
+    const int gets = peer_list_gets.load();
+    const int changes = device_changes.load();
+
+    set_heartbeat_revision("rev-2");
+    EXPECT_TRUE(wait_for([&] { return peer_list_gets.load() > gets; },
+                         std::chrono::milliseconds(2000)))
+        << "a new peers_revision did not refresh the peer list";
+    set_devices_revision("dev-2");
+    EXPECT_TRUE(wait_for([&] { return device_changes.load() > changes; },
+                         std::chrono::milliseconds(2000)))
+        << "a new devices_revision did not call the devices callback";
+    EXPECT_EQ(event_sockets.load(), 1);
+
+    // Stopping the mesh closes the socket promptly.
+    const auto stop_started = std::chrono::steady_clock::now();
+    client->disable_mesh();
+    EXPECT_LT(std::chrono::steady_clock::now() - stop_started, std::chrono::seconds(5));
+    client->set_mesh_devices_callback({});
 }
 
 // A wall-clock gap between two loop passes (the process was suspended) runs

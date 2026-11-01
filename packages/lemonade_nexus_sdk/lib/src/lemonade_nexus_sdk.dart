@@ -75,6 +75,45 @@ class LemonadeNexusSdk {
   final StreamController<SessionMoveEvent> _sessionMoves =
       StreamController<SessionMoveEvent>.broadcast();
 
+  /// What may have changed in the mesh, as it happens: read the named state
+  /// again instead of polling it (see [MeshEvent]). Empty with a native
+  /// library older than ln_set_mesh_event_callback.
+  Stream<MeshEvent> get meshEvents => _meshEvents.stream;
+
+  final StreamController<MeshEvent> _meshEvents = StreamController<MeshEvent>.broadcast();
+
+  /// The native callback behind [meshEvents]; see [_sessionMovedCallable].
+  ffi.NativeCallable<LnMeshEventNative>? _meshEventCallable;
+
+  void _installMeshEventCallback() {
+    final client = _client;
+    if (client == null || !_ffi.hasMeshEvents) return;
+    final callable = ffi.NativeCallable<LnMeshEventNative>.listener(_onMeshEvent)
+      ..keepIsolateAlive = false;
+    _meshEventCallable = callable;
+    _ffi.setMeshEventCallback(client, callable.nativeFunction, ffi.nullptr);
+  }
+
+  void _onMeshEvent(ffi.Pointer<ffi.Char> eventJson, ffi.Pointer<ffi.Void> user) {
+    final text = _ffi.toStringAndFree(eventJson);
+    if (text == null || _meshEvents.isClosed) return;
+    try {
+      _meshEvents.add(MeshEvent.fromJson(jsonDecode(text) as Map<String, dynamic>));
+    } catch (_) {
+      // A malformed event is dropped; the state it names is still readable.
+    }
+  }
+
+  /// Clears the native callback before [client] is destroyed; see
+  /// [_removeSessionMovedCallback].
+  void _removeMeshEventCallback(ffi.Pointer<ffi.Void> client) {
+    final callable = _meshEventCallable;
+    if (callable == null) return;
+    _meshEventCallable = null;
+    _ffi.setMeshEventCallback(client, ffi.nullptr, ffi.nullptr);
+    callable.close();
+  }
+
   /// The native callback behind [sessionMoves]. A listener callable may be
   /// called from any thread; it posts the event to this isolate. The SDK
   /// hands over the JSON text, so it is still valid when the event arrives.
@@ -228,6 +267,7 @@ class LemonadeNexusSdk {
       throw SdkException(LnError.connect, message: 'Failed to create client');
     }
     _installSessionMovedCallback();
+    _installMeshEventCallback();
   }
 
   /// Connects to a Lemonade Nexus server via TLS.
@@ -243,6 +283,7 @@ class LemonadeNexusSdk {
       throw SdkException(LnError.connect, message: 'Failed to create client');
     }
     _installSessionMovedCallback();
+    _installMeshEventCallback();
   }
 
   /// Tears down the active client (and, optionally, the identity) while keeping
@@ -268,6 +309,7 @@ class LemonadeNexusSdk {
     if (client == null) return;
     _client = null;
     _removeSessionMovedCallback(client);
+    _removeMeshEventCallback(client);
     if ((_inFlight[client.address] ?? 0) > 0) {
       _destroyPending.add(client.address);
     } else {
@@ -294,6 +336,7 @@ class LemonadeNexusSdk {
     _destroyIdentity();
     _destroyClient();
     _sessionMoves.close();
+    _meshEvents.close();
   }
 
   // =========================================================================

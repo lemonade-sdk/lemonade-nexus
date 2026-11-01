@@ -147,7 +147,19 @@ direct path to every peer before it uses a relay:
   or moved is therefore seen within one heartbeat. The value carries no peer
   data; peers still come only from `GET /api/mesh/peers`. Servers without
   the field leave the 30-second refresh as the only schedule.
-- The SDK also holds a long-poll on the peer list:
+- The SDK holds the event socket open to the session server:
+  `GET /api/events?node_id=<node_id>`, a WebSocket on the private API
+  connection with the session's bearer token. The server sends
+  `{"event":"revisions","peers_revision","devices_revision"}` when the socket
+  opens and again whenever either value changes. A new `peers_revision`
+  refreshes the peer list at once. A new `devices_revision`, every socket
+  that opens, and a resume after a suspension report a possible device list
+  change (`set_mesh_devices_callback`); the mesh port then reads its device
+  list again. The socket pings every 15 seconds and ends after two missed
+  answers. After a failure it waits 1 second, doubled up to 30 seconds. A
+  server without the socket answers `404`; the SDK then uses the long-poll
+  below for 5 minutes and tries the socket again.
+- Without the event socket, the SDK holds a long-poll on the peer list:
   `GET /api/mesh/peers/<node_id>?wait_revision=<revision>&timeout=25` on its
   own connection to the session server. The server answers as soon as the
   device's `peers_revision` differs from the sent value, or after the

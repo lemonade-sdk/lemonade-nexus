@@ -19,7 +19,7 @@ import 'dart:isolate';
 
 import 'lemonade_nexus_sdk.dart';
 import 'trust_store.dart';
-import 'models.dart' show SessionMoveEvent;
+import 'models.dart' show MeshEvent, SessionMoveEvent;
 
 class NexusWorker {
   NexusWorker._(this._isolate, this._commands, this._responses);
@@ -30,6 +30,7 @@ class NexusWorker {
   final Map<int, Completer<Object?>> _pending = {};
   final StreamController<SessionMoveEvent> _sessionMoves =
       StreamController<SessionMoveEvent>.broadcast();
+  final StreamController<MeshEvent> _meshEvents = StreamController<MeshEvent>.broadcast();
   int _nextId = 0;
   bool _closed = false;
 
@@ -62,6 +63,10 @@ class NexusWorker {
   /// [LemonadeNexusSdk.sessionMoves] of the worker's SDK, delivered on this
   /// isolate.
   Stream<SessionMoveEvent> get sessionMoves => _sessionMoves.stream;
+
+  /// [LemonadeNexusSdk.meshEvents] of the worker's SDK, delivered on this
+  /// isolate.
+  Stream<MeshEvent> get meshEvents => _meshEvents.stream;
 
   /// Runs [task] with the worker's SDK on the worker isolate and returns its
   /// result. Tasks run in the order they were submitted.
@@ -112,6 +117,7 @@ class NexusWorker {
     await done.future;
     _responses.close();
     await _sessionMoves.close();
+    await _meshEvents.close();
     for (final pending in _pending.values) {
       pending.completeError(StateError('NexusWorker closed'));
     }
@@ -121,6 +127,10 @@ class NexusWorker {
   void _onResponse(Object? message) {
     if (message is SessionMoveEvent) {
       if (!_sessionMoves.isClosed) _sessionMoves.add(message);
+      return;
+    }
+    if (message is MeshEvent) {
+      if (!_meshEvents.isClosed) _meshEvents.add(message);
       return;
     }
     final (id, ok, value, stack) = message as (int, bool, Object?, String?);
@@ -151,6 +161,7 @@ void _workerMain((SendPort, String?) args) {
   try {
     sdk = LemonadeNexusSdk(libraryPath: libraryPath);
     sdk.sessionMoves.listen(out.send);
+    sdk.meshEvents.listen(out.send);
   } catch (e) {
     loadError = e;
   }

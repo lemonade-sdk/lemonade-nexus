@@ -189,12 +189,9 @@ protected:
     std::vector<MeshPortMember> members = group_members();
     std::vector<lnsdk::MeshPortPeerState> peer_states;
     std::atomic<int> member_loads{0};
+    std::atomic<int> failing_loads{0};  // reads that fail before the list answers
     bool peers_reported = false;  // guarded by members_mutex
-    MeshPort::Options options = [] {
-        MeshPort::Options o;
-        o.refresh_interval = std::chrono::hours(1);
-        return o;
-    }();
+    MeshPort::Options options;
 
     void SetUp() override {
         peer.server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) {
@@ -284,6 +281,10 @@ protected:
         lnsdk::MeshPortBackend b;
         b.load_members = [this]() -> std::optional<std::vector<MeshPortMember>> {
             ++member_loads;
+            if (failing_loads.load() > 0) {
+                --failing_loads;
+                return std::nullopt;
+            }
             std::lock_guard lock(members_mutex);
             if (!peers_reported) return members;
             // As the client backend does: the list carries the current peer states.
@@ -834,7 +835,6 @@ TEST_F(MeshPortTest, ProvisionsTheCertificateOncePerStart) {
     std::mutex dir_mutex;
     std::string seen_dir;
     MeshPort::Options options;
-    options.refresh_interval = std::chrono::hours(1);
     port = std::make_unique<MeshPort>(backend([&](const std::string& dir) -> std::optional<lnsdk::MeshPortCertificate> {
         ++requests;
         std::lock_guard lock(dir_mutex);
@@ -1047,6 +1047,63 @@ TEST_F(MeshPortTest, APeerStateChangeKeepsTheBridgesOfUnchangedDevices) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     EXPECT_EQ(closed_egress.load(), 1) << "moving onto a relay closes the bridge";
+}
+
+// The device list is read at start and when it may have changed, not on a
+// timer, and each change of the devices is reported once.
+TEST_F(MeshPortTest, TheDeviceListIsReadWhenItMayHaveChanged) {
+    std::atomic<int> changes{0};
+    start();
+    port->set_change_callback([&] { ++changes; });
+    // start() reads the list on the refresh thread, and the fixture once more.
+    const auto started = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (member_loads.load() < 2 && std::chrono::steady_clock::now() < started) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const auto loads = member_loads.load();
+    ASSERT_EQ(loads, 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(member_loads.load(), loads) << "the list was read without a change";
+
+    add_member("new", "New box", "10.64.0.8");
+    port->devices_changed();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (changes.load() == 0 && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(member_loads.load(), loads + 1);
+    EXPECT_EQ(changes.load(), 1);
+    bool listed = false;
+    const auto status = port->status();
+    for (const auto& device : status["devices"]) listed = listed || device["node_id"] == "new";
+    EXPECT_TRUE(listed);
+
+    port->devices_changed();
+    while (member_loads.load() == loads + 1 && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(changes.load(), 1) << "an unchanged list is no change";
+    port->set_change_callback({});
+}
+
+// A failed read of the device list is retried with a growing pause until the
+// list answers.
+TEST_F(MeshPortTest, AFailedDeviceListReadIsRetried) {
+    options.members_retry_min = std::chrono::milliseconds(20);
+    options.members_retry_max = std::chrono::milliseconds(80);
+    failing_loads = 3;
+    port = std::make_unique<MeshPort>(backend(), options);
+    number = free_port();
+    ASSERT_EQ(port->start(number, ""), MeshPortStartResult::Ok);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (port->status()["error"] != "" || member_loads.load() < 4) {
+        if (std::chrono::steady_clock::now() > until) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(member_loads.load(), 4);
+    EXPECT_EQ(port->status()["error"], "");
+    EXPECT_TRUE(wait_online("gpu", true));
 }
 
 // A request whose bridge answers nothing at once gets a new bridge and is sent

@@ -247,11 +247,15 @@ to the probed address.
 The heartbeat answer's `peers_revision` changes when a device's peer list
 changes, so the other side fetches a new or moved peer's endpoint within one
 heartbeat (5 seconds) and punches back at once, instead of at its next
-30-second peer refresh. The SDK also holds a long-poll on the peer list
-(`GET /api/mesh/peers/<node_id>?wait_revision=`, up to 25 seconds): the
-server answers it as soon as the revision changes, when a tree change
-commits, a LAN endpoint list changes, or a live session changes. A peer on
-the same Tier 1 server is therefore seen without waiting for a heartbeat.
+30-second peer refresh. The SDK also holds an event socket open to its
+session server (`GET /api/events`, a WebSocket on the private API). The
+server sends the device's `peers_revision` and `devices_revision` when the
+socket opens and as soon as either changes: when a tree change commits, a
+LAN endpoint list changes, or a live session changes. A peer on the same
+Tier 1 server, and a change to the device list, are therefore seen without
+waiting for a heartbeat. A server without the socket gets the peer list
+long-poll instead (`GET /api/mesh/peers/<node_id>?wait_revision=`, up to 25
+seconds), which the server answers as soon as the revision changes.
 Each server wakes only the requests that it holds; a change that arrives
 through consensus wakes them on every Tier 1 server, but live state (LAN
 endpoints, live sessions) stays on the server that received the heartbeat.
