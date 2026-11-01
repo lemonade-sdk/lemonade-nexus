@@ -80,6 +80,9 @@ class LemonadeNexusSdk {
   /// library older than ln_set_mesh_event_callback.
   Stream<MeshEvent> get meshEvents => _meshEvents.stream;
 
+  /// Whether the native library reports [meshEvents]. Without them, poll.
+  bool get hasMeshEvents => _ffi.hasMeshEvents;
+
   final StreamController<MeshEvent> _meshEvents = StreamController<MeshEvent>.broadcast();
 
   /// The native callback behind [meshEvents]; see [_sessionMovedCallable].
