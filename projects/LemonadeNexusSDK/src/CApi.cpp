@@ -64,12 +64,17 @@ struct ln_client_s {
         client.set_cert_renewed_callback([this](const lnsdk::CertRenewedEvent& event) { on_cert_renewed(event); });
         client.set_session_moved_callback([this](const lnsdk::SessionMoveEvent& event) { on_session_moved(event); });
         client.set_ingress_denied_callback([this](const lnsdk::IngressDeniedEvent& event) { on_ingress_denied(event); });
+        client.set_mesh_callback([this](const lnsdk::MeshTunnelStatus&) { on_mesh_changed(); });
     }
     ~ln_client_s() {
         // Waits for a running callback, so none runs during member destruction.
         client.set_cert_renewed_callback({});
         client.set_session_moved_callback({});
         client.set_ingress_denied_callback({});
+        // Setting the mesh callback does not wait for a running one; stopping
+        // the orchestrator joins the thread that runs it.
+        client.disable_mesh();
+        client.set_mesh_callback({});
     }
     ln_client_s(const ln_client_s&) = delete;
     ln_client_s& operator=(const ln_client_s&) = delete;
@@ -77,6 +82,7 @@ struct ln_client_s {
     void on_cert_renewed(const lnsdk::CertRenewedEvent& event);
     void on_session_moved(const lnsdk::SessionMoveEvent& event);
     void on_ingress_denied(const lnsdk::IngressDeniedEvent& event);
+    void on_mesh_changed();
 };
 
 struct ln_identity_s {
@@ -672,6 +678,17 @@ ln_error_t ln_set_cert_renewed_callback(ln_client_t* client,
     } catch (...) {
         return LN_ERR_INTERNAL;
     }
+}
+
+// The mesh port updates its devices as the peers change, between its device
+// list refreshes.
+void ln_client_s::on_mesh_changed() {
+    lnsdk::MeshPort* port = nullptr;
+    {
+        std::lock_guard lock(mesh_port_mutex);
+        port = mesh_port.get();
+    }
+    if (port) port->peers_changed();
 }
 
 void ln_client_s::on_cert_renewed(const lnsdk::CertRenewedEvent& event) {

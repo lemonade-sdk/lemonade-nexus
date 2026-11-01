@@ -155,6 +155,7 @@ void MeshOrchestrator::stop() {
         known_peers_.clear();
         stale_passes_.clear();
         last_status_ = {};
+        reported_peers_.clear();
         our_endpoint_.clear();
         our_local_endpoints_.clear();
         own_lan_.clear();
@@ -747,9 +748,15 @@ void MeshOrchestrator::do_monitor(bool count_stale) {
     bool changed = false;
     {
         std::lock_guard lock(mutex_);
-        changed = (ms.peer_count   != last_status_.peer_count ||
-                   ms.online_count != last_status_.online_count ||
-                   ms.is_up        != last_status_.is_up);
+        // Per peer, not by count: one peer coming online while another goes
+        // offline, or a move between relay and direct, is a change too.
+        std::vector<ReportedPeer> reported;
+        reported.reserve(known_peers_.size());
+        for (const auto& peer : known_peers_) {
+            reported.push_back({peer.node_id, peer.is_online, peer.path, peer.relay_endpoint});
+        }
+        changed = ms.is_up != last_status_.is_up || reported != reported_peers_;
+        reported_peers_ = std::move(reported);
         last_status_ = ms;
         cb = callback_;
     }
