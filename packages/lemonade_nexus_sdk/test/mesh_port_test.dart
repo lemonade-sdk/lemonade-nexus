@@ -27,6 +27,15 @@ void main() {
         isNot(MeshPortStatus.fromJson(_status(gpuOnline: false))));
   });
 
+  test('mesh events name what to read again', () {
+    expect(MeshEvent.fromJson({'event': 'peers'}).kind, MeshEventKind.peers);
+    expect(MeshEvent.fromJson({'event': 'devices'}).kind, MeshEventKind.devices);
+    expect(MeshEvent.fromJson({'event': 'port'}).kind, MeshEventKind.port);
+    final later = MeshEvent.fromJson({'event': 'tunnel'});
+    expect(later.kind, MeshEventKind.other);
+    expect(later.name, 'tunnel');
+  });
+
   test('network devices compare by value', () {
     final json = {'node_id': 'gpu', 'device_name': 'GPU tower', 'can_connect': true};
     expect(NetworkDevice.fromJson(json), NetworkDevice.fromJson(json));

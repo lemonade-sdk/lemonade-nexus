@@ -235,6 +235,21 @@ typedef _LnSetSessionMovedCallbackDart = int Function(
   ffi.Pointer<ffi.NativeFunction<LnSessionMovedNative>> fn,
   ffi.Pointer<ffi.Void> user,
 );
+/// `ln_mesh_event_fn`: same contract as [LnSessionMovedNative].
+typedef LnMeshEventNative = ffi.Void Function(
+  ffi.Pointer<ffi.Char> eventJson,
+  ffi.Pointer<ffi.Void> user,
+);
+typedef _LnSetMeshEventCallback = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.NativeFunction<LnMeshEventNative>> fn,
+  ffi.Pointer<ffi.Void> user,
+);
+typedef _LnSetMeshEventCallbackDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.NativeFunction<LnMeshEventNative>> fn,
+  ffi.Pointer<ffi.Void> user,
+);
 typedef _LnLinkTokenCreate = ffi.Int32 Function(
   LnClientHandle client,
   ffi.Uint32 ttlSec,
@@ -949,6 +964,8 @@ class LemonadeNexusFfi {
       _lib.lookupFunction<_LnSetLinkToken, _LnSetLinkTokenDart>('ln_set_device_name');
   late final _lnSetSessionMovedCallback = _lib.lookupFunction<_LnSetSessionMovedCallback,
       _LnSetSessionMovedCallbackDart>('ln_set_session_moved_callback');
+  late final _lnSetMeshEventCallback = _lib.lookupFunction<_LnSetMeshEventCallback,
+      _LnSetMeshEventCallbackDart>('ln_set_mesh_event_callback');
   late final _lnSetGenesisKey =
       _lib.lookupFunction<_LnSetGenesisKey, _LnSetGenesisKeyDart>('ln_set_genesis_key');
   late final _lnTier1Refresh =
@@ -1455,6 +1472,20 @@ class LemonadeNexusFfi {
     ffi.Pointer<ffi.Void> user,
   ) {
     return LnError.fromCode(_lnSetSessionMovedCallback(client, fn, user));
+  }
+
+  /// Whether the native library has ln_set_mesh_event_callback (mobile SDK
+  /// 0.9.8.12 and later). Without it there are no mesh events.
+  bool get hasMeshEvents => _lib.providesSymbol('ln_set_mesh_event_callback');
+
+  /// Sets (or, with [fn] null, clears) the mesh event callback, with the
+  /// rules of [setSessionMovedCallback]. Requires [hasMeshEvents].
+  LnError setMeshEventCallback(
+    LnClientHandle client,
+    ffi.Pointer<ffi.NativeFunction<LnMeshEventNative>> fn,
+    ffi.Pointer<ffi.Void> user,
+  ) {
+    return LnError.fromCode(_lnSetMeshEventCallback(client, fn, user));
   }
 
   /// Mint a link token so another device can join this account. On success

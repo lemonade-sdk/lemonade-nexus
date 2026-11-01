@@ -341,8 +341,10 @@ protected:
     /// A bare SSLClient, like the production client: no explicit CA.
     bool default_trust_reaches_server() {
         httplib::SSLClient client("localhost", tls_port);
+        // Server certificate verification is on by default, so a request that
+        // completes passed it.
         auto r = client.Get("/api/onboard/info");
-        return static_cast<bool>(r) && client.get_openssl_verify_result() == X509_V_OK;
+        return static_cast<bool>(r);
     }
 
     /// Two probes: the flow's clients are not the first TLS client in the

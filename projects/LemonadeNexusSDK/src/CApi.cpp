@@ -59,12 +59,17 @@ struct ln_client_s {
     std::mutex ingress_callback_mutex;
     ln_ingress_denied_fn ingress_callback{nullptr};
     void* ingress_callback_user{nullptr};
+    // The application's mesh event callback, same rules.
+    std::mutex mesh_event_callback_mutex;
+    ln_mesh_event_fn mesh_event_callback{nullptr};
+    void* mesh_event_callback_user{nullptr};
 
     explicit ln_client_s(const lnsdk::ServerConfig& cfg) : client{cfg} {
         client.set_cert_renewed_callback([this](const lnsdk::CertRenewedEvent& event) { on_cert_renewed(event); });
         client.set_session_moved_callback([this](const lnsdk::SessionMoveEvent& event) { on_session_moved(event); });
         client.set_ingress_denied_callback([this](const lnsdk::IngressDeniedEvent& event) { on_ingress_denied(event); });
         client.set_mesh_callback([this](const lnsdk::MeshTunnelStatus&) { on_mesh_changed(); });
+        client.set_mesh_devices_callback([this] { on_mesh_devices_changed(); });
     }
     ~ln_client_s() {
         // Waits for a running callback, so none runs during member destruction.
@@ -75,6 +80,11 @@ struct ln_client_s {
         // the orchestrator joins the thread that runs it.
         client.disable_mesh();
         client.set_mesh_callback({});
+        client.set_mesh_devices_callback({});
+        // Waits for a running change report, as the setters above do.
+        if (mesh_port) mesh_port->set_change_callback({});
+        std::lock_guard lock(mesh_event_callback_mutex);
+        mesh_event_callback = nullptr;
     }
     ln_client_s(const ln_client_s&) = delete;
     ln_client_s& operator=(const ln_client_s&) = delete;
@@ -83,6 +93,9 @@ struct ln_client_s {
     void on_session_moved(const lnsdk::SessionMoveEvent& event);
     void on_ingress_denied(const lnsdk::IngressDeniedEvent& event);
     void on_mesh_changed();
+    void on_mesh_devices_changed();
+    /// Reports {"event": `name`} to the application's mesh event callback.
+    void emit_mesh_event(const char* name);
 };
 
 struct ln_identity_s {
@@ -680,8 +693,8 @@ ln_error_t ln_set_cert_renewed_callback(ln_client_t* client,
     }
 }
 
-// The mesh port updates its devices as the peers change, between its device
-// list refreshes.
+// The mesh port updates its devices as the peers change, and reads the device
+// list again when it may have changed.
 void ln_client_s::on_mesh_changed() {
     lnsdk::MeshPort* port = nullptr;
     {
@@ -689,6 +702,44 @@ void ln_client_s::on_mesh_changed() {
         port = mesh_port.get();
     }
     if (port) port->peers_changed();
+    emit_mesh_event("peers");
+}
+
+void ln_client_s::on_mesh_devices_changed() {
+    lnsdk::MeshPort* port = nullptr;
+    {
+        std::lock_guard lock(mesh_port_mutex);
+        port = mesh_port.get();
+    }
+    if (port) port->devices_changed();
+    emit_mesh_event("devices");
+}
+
+void ln_client_s::emit_mesh_event(const char* name) {
+    std::lock_guard lock(mesh_event_callback_mutex);
+    if (!mesh_event_callback) return;
+    try {
+        // The callback owns the text (see ln_mesh_event_fn).
+        char* text = strdup_json(json{{"event", name}});
+        if (!text) return;
+        mesh_event_callback(text, mesh_event_callback_user);
+    } catch (...) {
+        spdlog::warn("[CApi] mesh event not delivered");
+    }
+}
+
+ln_error_t ln_set_mesh_event_callback(ln_client_t* client, ln_mesh_event_fn fn, void* user) {
+    if (!client) return LN_ERR_NULL_ARG;
+    try {
+        // emit_mesh_event() calls the callback under this lock, so the old
+        // callback is not running when the lock is held here.
+        std::lock_guard lock(client->mesh_event_callback_mutex);
+        client->mesh_event_callback = fn;
+        client->mesh_event_callback_user = fn ? user : nullptr;
+        return LN_OK;
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
 }
 
 void ln_client_s::on_cert_renewed(const lnsdk::CertRenewedEvent& event) {
@@ -1956,6 +2007,7 @@ static lnsdk::MeshPort* ln_mesh_port(ln_client_t* client, bool create) {
     std::lock_guard lock(client->mesh_port_mutex);
     if (!client->mesh_port && create) {
         client->mesh_port = std::make_unique<lnsdk::MeshPort>(lnsdk::make_mesh_port_backend(client->client));
+        client->mesh_port->set_change_callback([client] { client->emit_mesh_event("port"); });
     }
     return client->mesh_port.get();
 }

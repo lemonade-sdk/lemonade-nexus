@@ -6,7 +6,9 @@
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -41,6 +43,16 @@ namespace nexus::api {
 /// Most LAN endpoints one heartbeat may report.
 inline constexpr std::size_t kMaxMeshLocalEndpoints = 4;
 
+/// Route of the private event socket (see MeshApiHandler).
+inline constexpr const char* kMeshEventsRoute = "/api/events";
+
+/// The devices revision of a session: an opaque value that changes when the
+/// device list the SDK reads for it changes, that is GET /api/tree/memberships
+/// and GET /api/tree/devices/{group} for each listed group. XXH3 over those
+/// answers; a change detector, not a security value.
+[[nodiscard]] std::string devices_revision(const tree::PermissionTreeService& tree,
+                                           const auth::SessionClaims& claims);
+
 /// How long the server lists the LAN endpoints of a heartbeat, in seconds.
 /// Every heartbeat of a current client reports them again, so they disappear
 /// from the peer lists this long after the device stops sending heartbeats.
@@ -71,6 +83,9 @@ public:
 
     /// The long-poll admission and wake-up state (tests read and tune it).
     [[nodiscard]] MeshPeerWaiters& peer_waiters() { return waiters_; }
+
+    /// Event sockets open now.
+    [[nodiscard]] std::size_t event_sockets() const;
 
 private:
     void do_register_routes(httplib::Server& pub, httplib::Server& priv);
@@ -111,6 +126,18 @@ private:
     uint64_t                                        local_pruned_at_{0};
 
     MeshPeerWaiters waiters_;
+
+    // Event sockets. One thread (events_loop) sends every socket's events;
+    // each socket's own server thread only reads, so a close is seen at once.
+    struct EventSocket;
+    void events_loop();
+    /// Checks one socket's session and revisions and sends what changed.
+    /// Returns false when the socket must close.
+    bool update_event_socket(EventSocket& socket, uint64_t now);
+    mutable std::mutex                        events_mtx_;
+    std::vector<std::shared_ptr<EventSocket>> event_sockets_;
+    bool                                      events_stopping_{false};  // guarded by events_mtx_
+    std::thread                               events_thread_;
 };
 
 } // namespace nexus::api

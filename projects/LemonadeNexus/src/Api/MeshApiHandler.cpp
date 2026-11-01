@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Api/MeshApiHandler.hpp>
+#include <LemonadeNexus/Api/TreeApiHandler.hpp>
 
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
@@ -260,15 +261,149 @@ std::optional<std::vector<std::string>> parse_mesh_local_endpoints(const nlohman
     return out;
 }
 
+std::string devices_revision(const tree::PermissionTreeService& tree,
+                             const auth::SessionClaims& claims) {
+    const auto memberships = tree_memberships(tree, claims);
+    std::string buf = memberships.dump();
+    for (const auto& m : memberships.value("memberships", nlohmann::json::array())) {
+        const auto answer = tree_group_devices(tree, claims, m.value("node_id", std::string{}));
+        buf += '\n';
+        buf += std::to_string(answer.status);
+        buf += answer.status == 200 ? answer.body.dump() : answer.error;
+    }
+    char out[17];
+    std::snprintf(out, sizeof out, "%016llx",
+                  static_cast<unsigned long long>(XXH3_64bits(buf.data(), buf.size())));
+    return out;
+}
+
+namespace {
+
+/// RFC 6455 close code 1013 (Try Again Later); cpp-httplib names no constant.
+constexpr auto kCloseTryAgainLater = static_cast<httplib::ws::CloseStatus>(1013);
+
+/// A request for the event socket that passed the checks: a valid session
+/// with Read on the device node it names.
+struct EventSocketRequest {
+    std::string        token;
+    std::string        node_id;
+    std::string        caller;  // normalized public key
+    int                status{200};
+    std::string        error;
+};
+
+EventSocketRequest check_event_socket_request(ApiContext& ctx, const httplib::Request& req) {
+    EventSocketRequest out;
+    const auto header = req.get_header_value("Authorization");
+    constexpr std::string_view bearer = "Bearer ";
+    if (header.size() <= bearer.size() || header.compare(0, bearer.size(), bearer) != 0) {
+        return {{}, {}, {}, 401, "authorization required"};
+    }
+    out.token = header.substr(bearer.size());
+    const auto claims = ctx.auth.validate_session_claims(out.token);
+    if (!claims) return {{}, {}, {}, 401, "invalid or expired token"};
+    out.node_id = req.get_param_value("node_id");
+    if (out.node_id.empty()) return {{}, {}, {}, 400, "node_id required"};
+    if (!ctx.tree.get_node(out.node_id)) return {{}, {}, {}, 404, "node not found"};
+    out.caller = normalize_pubkey(claims->pubkey);
+    if (!ctx.tree.check_permission(out.caller, out.node_id, acl::Permission::Read)) {
+        return {{}, {}, {}, 403, "insufficient permissions"};
+    }
+    return out;
+}
+
+}  // namespace
+
+struct MeshApiHandler::EventSocket {
+    std::mutex              mutex;              // held while the events thread uses ws
+    httplib::ws::WebSocket* ws{nullptr};        // null once the socket's thread is done
+    std::string             token;
+    std::string             node_id;
+    bool                    greeted{false};
+    std::string             peers_revision;     // as last sent
+    std::string             devices_revision;   // as last sent
+};
+
 MeshApiHandler::MeshApiHandler(ApiContext& ctx) : ctx_(ctx) {
     // Every Tier 1 server applies the same committed log, so each wakes its
     // own waiters when a change may alter someone's peer list.
     ctx_.tree.set_changed_hook([this] { waiters_.notify(); });
+    events_thread_ = std::thread([this] { events_loop(); });
 }
 
 MeshApiHandler::~MeshApiHandler() {
     ctx_.tree.set_changed_hook({});
+    {
+        std::lock_guard lock(events_mtx_);
+        events_stopping_ = true;
+        for (const auto& socket : event_sockets_) {
+            std::lock_guard socket_lock(socket->mutex);
+            if (socket->ws) socket->ws->close(httplib::ws::CloseStatus::GoingAway, "server stopping");
+        }
+    }
     waiters_.shutdown();
+    if (events_thread_.joinable()) events_thread_.join();
+}
+
+std::size_t MeshApiHandler::event_sockets() const {
+    std::lock_guard lock(events_mtx_);
+    return event_sockets_.size();
+}
+
+void MeshApiHandler::events_loop() {
+    for (;;) {
+        // Read the generation first, so a change during the pass below wakes
+        // the next wait instead of being lost.
+        const auto seen = waiters_.generation();
+        std::vector<std::shared_ptr<EventSocket>> sockets;
+        {
+            std::lock_guard lock(events_mtx_);
+            if (events_stopping_) return;
+            sockets = event_sockets_;
+        }
+        const auto now = epoch_seconds();
+        for (const auto& socket : sockets) {
+            std::lock_guard lock(socket->mutex);
+            if (!socket->ws) continue;
+            try {
+                if (!update_event_socket(*socket, now)) {
+                    socket->ws->close(httplib::ws::CloseStatus::PolicyViolation, "session ended");
+                }
+            } catch (const std::exception& e) {
+                spdlog::warn("[MeshApi] event socket update failed: {}", e.what());
+            }
+        }
+        // A peer's live session state follows handshake ages, which change
+        // without a notification, so check again at least every
+        // kMeshPeerRecheckMs.
+        waiters_.wait(seen, std::chrono::milliseconds(kMeshPeerRecheckMs));
+    }
+}
+
+bool MeshApiHandler::update_event_socket(EventSocket& socket, uint64_t now) {
+    // The session and the node's Read grant are checked on every pass, so a
+    // socket ends with the session or the grant it was opened under.
+    const auto claims = ctx_.auth.validate_session_claims(socket.token);
+    if (!claims) return false;
+    const auto caller = normalize_pubkey(claims->pubkey);
+    const auto node = ctx_.tree.get_node(socket.node_id);
+    if (!node || !ctx_.tree.check_permission(caller, socket.node_id, acl::Permission::Read)) {
+        return false;
+    }
+    auto peers = caller_peers_revision(caller, *node, now);
+    auto devices = devices_revision(ctx_.tree, *claims);
+    if (socket.greeted && peers == socket.peers_revision && devices == socket.devices_revision) {
+        return true;
+    }
+    const nlohmann::json event{{"event", "revisions"},
+                               {"peers_revision", peers},
+                               {"devices_revision", devices}};
+    // A failed send means the connection is gone; its thread sees that and ends.
+    if (!socket.ws->send(event.dump())) return true;
+    socket.greeted = true;
+    socket.peers_revision = std::move(peers);
+    socket.devices_revision = std::move(devices);
+    return true;
 }
 
 std::string MeshApiHandler::caller_peers_revision(const std::string& caller_pubkey,
@@ -339,6 +474,76 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // serves the private routes, so that server gets room for every admitted
     // waiter plus the other private requests.
     priv.new_task_queue = [] { return new httplib::ThreadPool(kPrivateApiWorkerThreads); };
+
+    // ========================================================================
+    // GET /api/events?node_id=<device node> (PRIVATE, auth required)
+    //
+    // A WebSocket on the private API connection. The upgrade request carries
+    // the session as "Authorization: Bearer <token>" and names the caller's
+    // device node; the checks of GET /api/mesh/peers apply (Read on the
+    // node). A failed check answers the upgrade request with 401, 400, 404
+    // or 403 with a JSON error and does not switch protocols. A server
+    // without the route answers 404 with no JSON body.
+    //
+    // The server sends text messages only:
+    //   {"event":"revisions","peers_revision":"...","devices_revision":"..."}
+    // once when the socket opens, and again whenever either value changes.
+    // peers_revision is the value GET /api/mesh/peers answers;
+    // devices_revision (devices_revision()) changes with the device list.
+    // A message names no device and grants nothing: the client reads the
+    // lists through the routes above, under their own checks. The client
+    // sends nothing the server uses.
+    //
+    // The session and the Read grant are checked again on every pass; the
+    // socket closes with 1008 when either ends. Each socket counts as one
+    // waiter (kMeshPeerWaitersMax, kMeshPeerWaitersPerCaller); beyond the
+    // caps it closes with 1013 (Try Again Later).
+    // ========================================================================
+    priv.set_pre_request_handler([this](const httplib::Request& req, httplib::Response& res) {
+        if (req.matched_route != kMeshEventsRoute) return httplib::Server::HandlerResponse::Unhandled;
+        const auto checked = check_event_socket_request(ctx_, req);
+        if (checked.status == 200) return httplib::Server::HandlerResponse::Unhandled;
+        error_response(res, checked.error, checked.status);
+        return httplib::Server::HandlerResponse::Handled;
+    });
+    priv.WebSocket(kMeshEventsRoute, [this](const httplib::Request& req, httplib::ws::WebSocket& ws) {
+        const auto checked = check_event_socket_request(ctx_, req);
+        if (checked.status != 200) {
+            ws.close(httplib::ws::CloseStatus::PolicyViolation, checked.error);
+            return;
+        }
+        MeshPeerWaiters::Refusal why = MeshPeerWaiters::Refusal::None;
+        const auto slot = waiters_.try_admit(checked.caller, why);
+        if (!slot) {
+            ws.close(kCloseTryAgainLater, why == MeshPeerWaiters::Refusal::ShuttingDown
+                                              ? "the server is stopping"
+                                              : "too many waiting requests");
+            return;
+        }
+        auto socket = std::make_shared<EventSocket>();
+        socket->ws = &ws;
+        socket->token = checked.token;
+        socket->node_id = checked.node_id;
+        {
+            std::lock_guard lock(events_mtx_);
+            if (events_stopping_) {
+                ws.close(httplib::ws::CloseStatus::GoingAway, "server stopping");
+                return;
+            }
+            event_sockets_.push_back(socket);
+        }
+        // The events thread sends the first message on its next pass.
+        waiters_.notify();
+        std::string message;
+        while (ws.read(message) != httplib::ws::Fail) {
+        }
+        {
+            std::lock_guard lock(socket->mutex);
+            socket->ws = nullptr;
+        }
+        std::lock_guard lock(events_mtx_);
+        std::erase(event_sockets_, socket);
+    });
 
     // ========================================================================
     // GET /api/mesh/peers/:node_id (PRIVATE, auth required)

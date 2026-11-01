@@ -417,6 +417,55 @@ class JoinMembership {
       };
 }
 
+/// What may have changed in the mesh, from [LemonadeNexusSdk.meshEvents].
+enum MeshEventKind {
+  /// A mesh peer was added or removed, or changed its online state, path or
+  /// relay: read [LemonadeNexusSdk.getMeshStatus] again.
+  peers,
+
+  /// The device list may have changed: read
+  /// [LemonadeNexusSdk.listNetworkDevices] again.
+  devices,
+
+  /// The mesh port's devices changed: read
+  /// [LemonadeNexusSdk.getMeshPortStatus] again.
+  port,
+
+  /// An event this version does not know.
+  other,
+}
+
+/// One mesh event. It names no device and carries no data; it says what to
+/// read again.
+class MeshEvent {
+  final MeshEventKind kind;
+
+  /// The event's name as the SDK sent it.
+  final String name;
+
+  const MeshEvent(this.kind, this.name);
+
+  factory MeshEvent.fromJson(Map<String, dynamic> json) {
+    final name = json['event']?.toString() ?? '';
+    final kind = switch (name) {
+      'peers' => MeshEventKind.peers,
+      'devices' => MeshEventKind.devices,
+      'port' => MeshEventKind.port,
+      _ => MeshEventKind.other,
+    };
+    return MeshEvent(kind, name);
+  }
+
+  @override
+  bool operator ==(Object other) => other is MeshEvent && other.name == name;
+
+  @override
+  int get hashCode => name.hashCode;
+
+  @override
+  String toString() => 'MeshEvent($name)';
+}
+
 /// One device of a network, as [LemonadeNexusSdk.getGroupDevices] and
 /// [LemonadeNexusSdk.listNetworkDevices] return it.
 class NetworkDevice {

@@ -285,6 +285,15 @@ cryptography is involved, and a punch grants no authority:
   at most 30 seconds, and a revision longer than 64 characters is refused.
   The private API has enough worker threads for every held wait plus the
   normal requests.
+- **An event socket is bounded and carries no authority.** `GET /api/events`
+  gets the checks of the peer list (a valid session, Read on the named node)
+  before the WebSocket upgrade, and a refused request does not switch
+  protocols. The server checks the session and the grant again on every pass
+  and closes the socket with 1008 when either ends. A socket counts against
+  the same caps as a long-poll (256 in all, 2 per device key) and closes with
+  1013 beyond them. A message carries only two opaque revisions: it names no
+  device and grants nothing, and the device reads its lists through the
+  routes under their own checks.
 - **Probes are rate limited.** At most 16 peers are probed per pass, each
   probe goes to at most five addresses (four LAN endpoints and the listed
   endpoint), and passes are at least 250 ms apart. A peer gets a burst of five probes, then two

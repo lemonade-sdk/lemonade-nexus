@@ -550,6 +550,149 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
 
 } // namespace
 
+GroupDevicesAnswer tree_group_devices(const tree::PermissionTreeService& tree,
+                                      const auth::SessionClaims& claims, const std::string& group_id) {
+    const auto caller = normalize_pubkey(claims.pubkey);
+    const auto caller_canon = tree::canonical_principal(caller);
+    const auto readable = [&](const std::string& id) {
+        return tree.administers(caller, id) ||
+               tree.check_permission(caller, id, acl::Permission::Read);
+    };
+    if (!readable(group_id)) return {403, "no read permission", {}};
+    const auto nodes = tree.nodes_snapshot();
+    const auto group = nodes.find(group_id);
+    if (group == nodes.end()) return {404, "node not found", {}};
+    if (group->second.type != tree::NodeType::Customer) return {400, "not a group", {}};
+    // The caller's own device: the node its session identity joined as.
+    const tree::TreeNode* self = nullptr;
+    if (const auto it = nodes.find(claims.user_id);
+        it != nodes.end() && it->second.type == tree::NodeType::Endpoint &&
+        tree::canonical_principal(it->second.mgmt_pubkey) == caller_canon) {
+        self = &it->second;
+    }
+
+    std::vector<const tree::TreeNode*> endpoints;
+    std::map<std::string, std::vector<std::string>> subgroups;  // parent -> groups, sorted
+    for (const auto& [id, n] : nodes) {
+        if (n.type == tree::NodeType::Endpoint) endpoints.push_back(&n);
+        if (n.type == tree::NodeType::Customer) subgroups[n.parent_id].push_back(id);
+    }
+    std::sort(endpoints.begin(), endpoints.end(),
+              [](const auto* a, const auto* b) { return a->id < b->id; });
+    for (auto& [parent, ids] : subgroups) std::sort(ids.begin(), ids.end());
+
+    // The walk: breadth first from the group, into readable subgroups.
+    std::vector<std::string> walked{group_id};
+    std::set<std::string> in_walk{group_id};
+    for (std::size_t i = 0; i < walked.size(); ++i) {
+        const auto it = subgroups.find(walked[i]);
+        if (it == subgroups.end()) continue;
+        for (const auto& sub : it->second) {
+            if (in_walk.contains(sub) || !readable(sub)) continue;
+            in_walk.insert(sub);
+            walked.push_back(sub);
+        }
+    }
+
+    const auto beneath_group = [&](const tree::TreeNode& n) {
+        std::unordered_set<std::string> visited;
+        for (auto current = n.parent_id; !current.empty() && visited.insert(current).second;) {
+            if (current == group_id) return true;
+            const auto it = nodes.find(current);
+            if (it == nodes.end()) return false;
+            current = it->second.parent_id;
+        }
+        return false;
+    };
+
+    nlohmann::json devices = nlohmann::json::array();
+    std::set<std::string> listed;
+    const auto add = [&](const tree::TreeNode& d, const std::string& in_group, bool member) {
+        if (!listed.insert(d.id).second) return;
+        devices.push_back({
+            {"node_id", d.id},
+            {"device_name", d.hostname},
+            {"tunnel_ip", d.tunnel_ip},
+            {"mgmt_pubkey", d.mgmt_pubkey},
+            {"parent_id", d.parent_id},
+            {"group_id", in_group},
+            {"is_inference", d.is_inference},
+            {"member", member},
+            {"is_self", self != nullptr && d.id == self->id},
+            {"can_connect",
+             self != nullptr && tree::rules::endpoint_may_connect(nodes, caller, *self, d)},
+            {"admin", !d.mgmt_pubkey.empty() && tree.administers(d.mgmt_pubkey, in_group)},
+        });
+    };
+    for (const auto& g : walked) {
+        for (const auto* n : endpoints) {
+            if (n->parent_id == g) add(*n, g, false);
+        }
+        const bool full_view = tree.administers(caller, g) ||
+                               tree.check_permission(caller, g, acl::Permission::EditNode);
+        for (const auto* n : endpoints) {
+            // A device placed beneath the listed group is never a member,
+            // also when a subgroup it sits in is not readable.
+            if (n->mgmt_pubkey.empty() || beneath_group(*n)) continue;
+            if (!tree::rules::membership_covers(nodes, n->mgmt_pubkey, g)) continue;
+            const bool own = tree::canonical_principal(n->mgmt_pubkey) == caller_canon;
+            const bool reachable = self != nullptr &&
+                                   tree::rules::endpoint_may_connect(nodes, caller, *self, *n);
+            if (full_view || own || reachable) add(*n, g, true);
+        }
+    }
+    return {200, {}, {{"group_id", group_id}, {"devices", std::move(devices)}}};
+}
+
+nlohmann::json tree_memberships(const tree::PermissionTreeService& tree,
+                                const auth::SessionClaims& claims) {
+    const auto caller = normalize_pubkey(claims.pubkey);
+    const auto caller_canon = tree::canonical_principal(caller);
+    const auto nodes = tree.nodes_snapshot();
+
+    auto own_permissions = [&](const tree::TreeNode& n) {
+        std::vector<std::string> perms;
+        for (const auto& a : n.assignments) {
+            if (tree::canonical_principal(a.management_pubkey) != caller_canon) continue;
+            perms.insert(perms.end(), a.permissions.begin(), a.permissions.end());
+        }
+        std::sort(perms.begin(), perms.end());
+        perms.erase(std::unique(perms.begin(), perms.end()), perms.end());
+        return perms;
+    };
+
+    std::map<std::string, std::string> role_of;  // group id -> role, sorted
+    for (const auto& [id, n] : nodes) {
+        if (tree::canonical_principal(n.mgmt_pubkey) != caller_canon) continue;
+        if (n.type == tree::NodeType::Customer) {
+            role_of[id] = "home";
+        } else if (n.type == tree::NodeType::Endpoint) {
+            auto parent = nodes.find(n.parent_id);
+            if (parent != nodes.end() && parent->second.type == tree::NodeType::Customer) {
+                role_of[parent->first] = "home";
+            }
+        }
+    }
+    for (const auto& [id, n] : nodes) {
+        if (n.type != tree::NodeType::Customer || role_of.contains(id)) continue;
+        if (own_permissions(n).empty()) continue;
+        role_of[id] = tree::rules::principal_joined_under(nodes, id, caller) ? "home"
+                                                                             : "member";
+    }
+
+    nlohmann::json list = nlohmann::json::array();
+    for (const auto& [id, role] : role_of) {
+        const auto& n = nodes.at(id);
+        list.push_back({{"node_id", id},
+                        {"hostname", n.hostname},
+                        {"parent_id", n.parent_id},
+                        {"owner_pubkey", n.mgmt_pubkey},
+                        {"role", role},
+                        {"permissions", own_permissions(n)}});
+    }
+    return {{"memberships", std::move(list)}};
+}
+
 // Applied tree operations call the hook on every server that applies them, so
 // per-server cleanup of a removed node runs everywhere, once.
 TreeApiHandler::TreeApiHandler(ApiContext& ctx)
@@ -1097,106 +1240,12 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     priv.Get(R"(/api/tree/devices/(.+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
                const SessionClaims& claims) {
-        const auto group_id = req.matches[1].str();
-        const auto caller = normalize_pubkey(claims.pubkey);
-        const auto caller_canon = tree::canonical_principal(caller);
-        const auto readable = [&](const std::string& id) {
-            return ctx_.tree.administers(caller, id) ||
-                   ctx_.tree.check_permission(caller, id, acl::Permission::Read);
-        };
-        if (!readable(group_id)) {
-            error_response(res, "no read permission", 403);
+        auto answer = tree_group_devices(ctx_.tree, claims, req.matches[1].str());
+        if (answer.status != 200) {
+            error_response(res, answer.error, answer.status);
             return;
         }
-        const auto nodes = ctx_.tree.nodes_snapshot();
-        const auto group = nodes.find(group_id);
-        if (group == nodes.end()) {
-            error_response(res, "node not found", 404);
-            return;
-        }
-        if (group->second.type != tree::NodeType::Customer) {
-            error_response(res, "not a group", 400);
-            return;
-        }
-        // The caller's own device: the node its session identity joined as.
-        const tree::TreeNode* self = nullptr;
-        if (const auto it = nodes.find(claims.user_id);
-            it != nodes.end() && it->second.type == tree::NodeType::Endpoint &&
-            tree::canonical_principal(it->second.mgmt_pubkey) == caller_canon) {
-            self = &it->second;
-        }
-
-        std::vector<const tree::TreeNode*> endpoints;
-        std::map<std::string, std::vector<std::string>> subgroups;  // parent -> groups, sorted
-        for (const auto& [id, n] : nodes) {
-            if (n.type == tree::NodeType::Endpoint) endpoints.push_back(&n);
-            if (n.type == tree::NodeType::Customer) subgroups[n.parent_id].push_back(id);
-        }
-        std::sort(endpoints.begin(), endpoints.end(),
-                  [](const auto* a, const auto* b) { return a->id < b->id; });
-        for (auto& [parent, ids] : subgroups) std::sort(ids.begin(), ids.end());
-
-        // The walk: breadth first from the group, into readable subgroups.
-        std::vector<std::string> walked{group_id};
-        std::set<std::string> in_walk{group_id};
-        for (std::size_t i = 0; i < walked.size(); ++i) {
-            const auto it = subgroups.find(walked[i]);
-            if (it == subgroups.end()) continue;
-            for (const auto& sub : it->second) {
-                if (in_walk.contains(sub) || !readable(sub)) continue;
-                in_walk.insert(sub);
-                walked.push_back(sub);
-            }
-        }
-
-        const auto beneath_group = [&](const tree::TreeNode& n) {
-            std::unordered_set<std::string> visited;
-            for (auto current = n.parent_id; !current.empty() && visited.insert(current).second;) {
-                if (current == group_id) return true;
-                const auto it = nodes.find(current);
-                if (it == nodes.end()) return false;
-                current = it->second.parent_id;
-            }
-            return false;
-        };
-
-        nlohmann::json devices = nlohmann::json::array();
-        std::set<std::string> listed;
-        const auto add = [&](const tree::TreeNode& d, const std::string& in_group, bool member) {
-            if (!listed.insert(d.id).second) return;
-            devices.push_back({
-                {"node_id", d.id},
-                {"device_name", d.hostname},
-                {"tunnel_ip", d.tunnel_ip},
-                {"mgmt_pubkey", d.mgmt_pubkey},
-                {"parent_id", d.parent_id},
-                {"group_id", in_group},
-                {"is_inference", d.is_inference},
-                {"member", member},
-                {"is_self", self != nullptr && d.id == self->id},
-                {"can_connect",
-                 self != nullptr && tree::rules::endpoint_may_connect(nodes, caller, *self, d)},
-                {"admin", !d.mgmt_pubkey.empty() && ctx_.tree.administers(d.mgmt_pubkey, in_group)},
-            });
-        };
-        for (const auto& g : walked) {
-            for (const auto* n : endpoints) {
-                if (n->parent_id == g) add(*n, g, false);
-            }
-            const bool full_view = ctx_.tree.administers(caller, g) ||
-                                   ctx_.tree.check_permission(caller, g, acl::Permission::EditNode);
-            for (const auto* n : endpoints) {
-                // A device placed beneath the listed group is never a member,
-                // also when a subgroup it sits in is not readable.
-                if (n->mgmt_pubkey.empty() || beneath_group(*n)) continue;
-                if (!tree::rules::membership_covers(nodes, n->mgmt_pubkey, g)) continue;
-                const bool own = tree::canonical_principal(n->mgmt_pubkey) == caller_canon;
-                const bool reachable = self != nullptr &&
-                                       tree::rules::endpoint_may_connect(nodes, caller, *self, *n);
-                if (full_view || own || reachable) add(*n, g, true);
-            }
-        }
-        json_response(res, {{"group_id", group_id}, {"devices", std::move(devices)}});
+        json_response(res, std::move(answer.body));
     }));
 
     // ========================================================================
@@ -1525,51 +1574,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     // ========================================================================
     priv.Get("/api/tree/memberships", require_auth(ctx_.auth,
         [this](const httplib::Request&, httplib::Response& res, const SessionClaims& claims) {
-        const auto caller = normalize_pubkey(claims.pubkey);
-        const auto caller_canon = tree::canonical_principal(caller);
-        const auto nodes = ctx_.tree.nodes_snapshot();
-
-        auto own_permissions = [&](const tree::TreeNode& n) {
-            std::vector<std::string> perms;
-            for (const auto& a : n.assignments) {
-                if (tree::canonical_principal(a.management_pubkey) != caller_canon) continue;
-                perms.insert(perms.end(), a.permissions.begin(), a.permissions.end());
-            }
-            std::sort(perms.begin(), perms.end());
-            perms.erase(std::unique(perms.begin(), perms.end()), perms.end());
-            return perms;
-        };
-
-        std::map<std::string, std::string> role_of;  // group id -> role, sorted
-        for (const auto& [id, n] : nodes) {
-            if (tree::canonical_principal(n.mgmt_pubkey) != caller_canon) continue;
-            if (n.type == tree::NodeType::Customer) {
-                role_of[id] = "home";
-            } else if (n.type == tree::NodeType::Endpoint) {
-                auto parent = nodes.find(n.parent_id);
-                if (parent != nodes.end() && parent->second.type == tree::NodeType::Customer) {
-                    role_of[parent->first] = "home";
-                }
-            }
-        }
-        for (const auto& [id, n] : nodes) {
-            if (n.type != tree::NodeType::Customer || role_of.contains(id)) continue;
-            if (own_permissions(n).empty()) continue;
-            role_of[id] = tree::rules::principal_joined_under(nodes, id, caller) ? "home"
-                                                                                 : "member";
-        }
-
-        nlohmann::json list = nlohmann::json::array();
-        for (const auto& [id, role] : role_of) {
-            const auto& n = nodes.at(id);
-            list.push_back({{"node_id", id},
-                            {"hostname", n.hostname},
-                            {"parent_id", n.parent_id},
-                            {"owner_pubkey", n.mgmt_pubkey},
-                            {"role", role},
-                            {"permissions", own_permissions(n)}});
-        }
-        json_response(res, {{"memberships", std::move(list)}});
+        json_response(res, tree_memberships(ctx_.tree, claims));
     }));
 
     // ========================================================================

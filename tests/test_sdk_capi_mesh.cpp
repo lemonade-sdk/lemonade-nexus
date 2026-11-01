@@ -150,6 +150,24 @@ void count_session_move(char* event_json, void* user) {
 }
 }  // namespace
 
+// The mesh event callback: argument checks, and set/clear. Without a joined
+// mesh nothing changes, so it never runs, and none runs after ln_destroy.
+TEST(SdkCapiMesh, MeshEventCallbackIsSetAndCleared) {
+    int calls = 0;
+    EXPECT_EQ(ln_set_mesh_event_callback(nullptr, count_session_move, &calls), LN_ERR_NULL_ARG);
+    {
+        Client client;
+        ASSERT_NE(client.c, nullptr);
+        EXPECT_EQ(ln_set_mesh_event_callback(client.c, count_session_move, &calls), LN_OK);
+        EXPECT_EQ(ln_set_mesh_event_callback(client.c, nullptr, nullptr), LN_OK);
+        EXPECT_EQ(ln_set_mesh_event_callback(client.c, count_session_move, &calls), LN_OK);
+        char* status = nullptr;
+        ASSERT_EQ(ln_mesh_port_status(client.c, &status), LN_OK);
+        ln_free(status);
+    }
+    EXPECT_EQ(calls, 0);
+}
+
 // The session-move callback: argument checks, and set/clear without a move
 // in flight. Before any join there is no session to move, so the callback
 // never runs.
