@@ -181,8 +181,11 @@ public:
     /// to `remote`. A second request joins it only when its proof opens the
     /// first request's commitment, its commitment matches the first request's
     /// proof, it comes from another ticket holder, and it comes from another
-    /// endpoint. A repeat from the same side and endpoint returns the same
-    /// session. Every accepted request consumes its ticket. Thread-safe.
+    /// endpoint. A later request from a side of the session, with a fresh
+    /// ticket of that side's holder, returns the same session and moves the
+    /// side to `remote`: a device that restarted or resumed from suspension
+    /// keeps its session, waiting or paired. Every accepted request consumes
+    /// its ticket. Thread-safe.
     [[nodiscard]] RelayRendezvousResult allocate_rendezvous(const RelayAllocateRequest& request,
                                                             const asio::ip::udp::endpoint& remote);
 
@@ -260,9 +263,10 @@ private:
     mutable std::mutex mutex_;
     SessionMap sessions_;
 
-    // Waiting sessions by rendezvous id (hex). An entry exists only while its
-    // session waits for its second side.
-    std::unordered_map<std::string, SessionId> pending_;
+    // Rendezvous sessions by rendezvous id (hex), waiting and paired. An entry
+    // lives as long as its session, so a side that returns with a fresh ticket
+    // from a new endpoint finds its session.
+    std::unordered_map<std::string, SessionId> rendezvous_sessions_;
 
     // Sessions each ticket holder is bound to. An entry exists only while the
     // count is nonzero, so the map is bounded by twice max_sessions.

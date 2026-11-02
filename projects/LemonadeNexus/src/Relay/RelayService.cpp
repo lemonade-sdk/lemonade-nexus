@@ -101,7 +101,7 @@ void RelayService::on_stop() {
     std::lock_guard lock(mutex_);
     const auto session_count = sessions_.size();
     sessions_.clear();
-    pending_.clear();
+    rendezvous_sessions_.clear();
     holder_sessions_.clear();
     spdlog::info("[{}] cleared {} sessions", name(), session_count);
 }
@@ -130,9 +130,9 @@ RelayService::SessionMap::iterator RelayService::erase_session_locked(SessionMap
     }
     if (session.has_rendezvous) {
         const auto key = crypto::to_hex(std::span<const uint8_t>(session.rendezvous));
-        auto pending = pending_.find(key);
-        if (pending != pending_.end() && pending->second == session.session_id) {
-            pending_.erase(pending);
+        auto entry = rendezvous_sessions_.find(key);
+        if (entry != rendezvous_sessions_.end() && entry->second == session.session_id) {
+            rendezvous_sessions_.erase(entry);
         }
     }
     return sessions_.erase(it);
@@ -237,9 +237,9 @@ RelayRendezvousResult RelayService::allocate_rendezvous(const RelayAllocateReque
     }
 
     const auto rendezvous_key = crypto::to_hex(std::span<const uint8_t>(request.rendezvous));
-    const auto pending = pending_.find(rendezvous_key);
+    const auto existing = rendezvous_sessions_.find(rendezvous_key);
 
-    if (pending == pending_.end()) {
+    if (existing == rendezvous_sessions_.end()) {
         if (sessions_.size() >= limits_.max_sessions) {
             return refuse(RelayErrorCode::CapacityExceeded, "session limit reached");
         }
@@ -262,29 +262,52 @@ RelayRendezvousResult RelayService::allocate_rendezvous(const RelayAllocateReque
         result.session_id = session->session_id;
         seen_tickets_.emplace(key, SeenTicket{request.ticket.expires_at, session->session_id, remote});
         add_holder_locked(holder);
-        pending_.emplace(rendezvous_key, session->session_id);
+        rendezvous_sessions_.emplace(rendezvous_key, session->session_id);
         sessions_.emplace(session->session_id, std::move(session));
         spdlog::debug("[{}] session waiting for its second side (holder={})", name(), holder);
         return result;
     }
 
-    auto it = sessions_.find(pending->second);
+    auto it = sessions_.find(existing->second);
     if (it == sessions_.end()) {
-        pending_.erase(pending);
+        rendezvous_sessions_.erase(existing);
         return refuse(RelayErrorCode::RendezvousBusy, "rendezvous state lost; retry");
     }
     auto& session = *it->second;
+    const bool paired = session.peer_a_bound && session.peer_b_bound;
+    const bool side_a = equal_ct(own_commitment, session.a_commitment) &&
+                        equal_ct(request.peer_commitment, session.b_expected);
+    const bool side_b = paired && equal_ct(own_commitment, session.b_expected) &&
+                        equal_ct(request.peer_commitment, session.a_commitment);
 
-    if (equal_ct(own_commitment, session.a_commitment)) {
-        // The waiting side again, with a fresh ticket. Only its own holder at
-        // its own endpoint may repeat; anyone who merely saw its request may not.
-        if (holder != session.holder_a || remote != session.peer_a_endpoint) {
+    if (side_a || side_b) {
+        // A side of this session again, with a fresh ticket: its device
+        // restarted, resumed from suspension, or moved to another network,
+        // so the request may come from a new endpoint. The side moves there.
+        // Only the side's own holder may do this: a copy of the side's earlier
+        // request carries a used ticket (refused above), and a ticket naming
+        // the holder is issued only to that holder.
+        const auto& side_holder = side_a ? session.holder_a : session.holder_b;
+        auto& side_endpoint = side_a ? session.peer_a_endpoint : session.peer_b_endpoint;
+        if (holder != side_holder) {
             return refuse(RelayErrorCode::RendezvousBusy, "rendezvous slot is taken");
+        }
+        if (paired && remote == (side_a ? session.peer_b_endpoint : session.peer_a_endpoint)) {
+            return refuse(RelayErrorCode::RendezvousBusy, "both sides use the same endpoint");
+        }
+        if (side_endpoint != remote) {
+            side_endpoint = remote;
+            spdlog::info("[{}] relay session side {} moved to a new endpoint", name(),
+                         side_a ? 'a' : 'b');
         }
         seen_tickets_.emplace(key, SeenTicket{request.ticket.expires_at, session.session_id, remote});
         session.last_activity_ms.store(steady_ms(now));
         result.session_id = session.session_id;
+        result.paired = paired;
         return result;
+    }
+    if (paired) {
+        return refuse(RelayErrorCode::RendezvousBusy, "rendezvous slot is taken");
     }
 
     if (!equal_ct(own_commitment, session.b_expected) ||
@@ -307,7 +330,6 @@ RelayRendezvousResult RelayService::allocate_rendezvous(const RelayAllocateReque
     session.last_activity_ms.store(steady_ms(now));
     seen_tickets_.emplace(key, SeenTicket{request.ticket.expires_at, session.session_id, remote});
     add_holder_locked(holder);
-    pending_.erase(pending);
 
     result.session_id = session.session_id;
     result.paired = true;
