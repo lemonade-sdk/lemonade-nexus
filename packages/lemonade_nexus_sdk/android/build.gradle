@@ -44,12 +44,22 @@ android {
 }
 
 def jniDir = file('src/main/jniLibs')
+// "release <sha256>" or "local <version>" (scripts/build-sdk-mobile.sh). Libraries
+// that are not the pinned archive and not a local build are replaced, so a new
+// pin never leaves an older SDK in the app.
+def stampFile = file('../native/installed-android')
 
 tasks.register('fetchLemonadeNexusSdk') {
-    onlyIf { !new File(jniDir, 'arm64-v8a/liblemonade_nexus_sdk.so').exists() }
+    def manifest = new groovy.json.JsonSlurper().parse(file('../native/manifest.json'))
+    def entry = manifest.android
+    def stamp = stampFile.exists() ? stampFile.text.trim() : ''
+    def present = new File(jniDir, 'arm64-v8a/liblemonade_nexus_sdk.so').exists()
+    if (present && stamp.startsWith('local ')) {
+        logger.warn("lemonade_nexus_sdk: using a local build (${stamp.substring(6)}), not the " +
+            "pinned ${manifest.version}. Delete android/src/main/jniLibs to use the pin.")
+    }
+    onlyIf { !(present && stamp.startsWith('local ')) && (!present || stamp != "release ${entry.sha256}") }
     doLast {
-        def manifest = new groovy.json.JsonSlurper().parse(file('../native/manifest.json'))
-        def entry = manifest.android
         if (!entry.sha256) {
             throw new GradleException("lemonade_nexus_sdk: no Android archive is published for " +
                 "${manifest.version}. Build it with scripts/build-sdk-mobile.sh in lemonade-nexus.")
@@ -62,10 +72,12 @@ tasks.register('fetchLemonadeNexusSdk') {
         if (actual != entry.sha256) {
             throw new GradleException("lemonade_nexus_sdk: ${entry.file} has SHA-256 ${actual}, expected ${entry.sha256}")
         }
+        project.delete(jniDir)
         project.copy {
             from zipTree(zip)
             into jniDir
         }
+        stampFile.text = "release ${entry.sha256}\n"
     }
 }
 

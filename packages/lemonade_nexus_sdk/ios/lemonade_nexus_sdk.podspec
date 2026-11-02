@@ -3,13 +3,21 @@ require 'digest'
 require 'net/http'
 require 'tmpdir'
 
-# The XCFramework comes from scripts/build-sdk-mobile.sh (a local build) or,
-# when it is missing, from the release archive pinned in native/manifest.json.
+# The XCFramework comes from the release archive pinned in native/manifest.json,
+# or from scripts/build-sdk-mobile.sh (a local build). native/installed-ios
+# records which: "release <sha256>" or "local <version>". A framework that is
+# not the pinned archive and not a local build is replaced, so a new pin never
+# leaves an older SDK in the app.
 framework_dir = File.join(__dir__, 'Frameworks')
 framework = File.join(framework_dir, 'lemonade_nexus_sdk.xcframework')
-unless File.directory?(framework)
-  manifest = JSON.parse(File.read(File.join(__dir__, '..', 'native', 'manifest.json')))
-  entry = manifest['ios']
+manifest = JSON.parse(File.read(File.join(__dir__, '..', 'native', 'manifest.json')))
+entry = manifest['ios']
+stamp_file = File.join(__dir__, '..', 'native', 'installed-ios')
+stamp = File.exist?(stamp_file) ? File.read(stamp_file).strip : ''
+if File.directory?(framework) && stamp.start_with?('local ')
+  Pod::UI.warn "lemonade_nexus_sdk: using a local build (#{stamp.delete_prefix('local ')}), " \
+               "not the pinned #{manifest['version']}. Delete ios/Frameworks to use the pin."
+elsif !File.directory?(framework) || stamp != "release #{entry['sha256']}"
   if entry['sha256'].to_s.empty?
     raise "lemonade_nexus_sdk: no iOS archive is published for #{manifest['version']}. " \
           'Build it with scripts/build-sdk-mobile.sh in lemonade-nexus.'
@@ -32,9 +40,11 @@ unless File.directory?(framework)
   Dir.mktmpdir do |tmp|
     zip = File.join(tmp, entry['file'])
     File.binwrite(zip, body)
+    FileUtils.rm_rf(framework_dir)
     FileUtils.mkdir_p(framework_dir)
     system('ditto', '-x', '-k', zip, framework_dir, exception: true)
   end
+  File.write(stamp_file, "release #{entry['sha256']}\n")
 end
 
 Pod::Spec.new do |s|

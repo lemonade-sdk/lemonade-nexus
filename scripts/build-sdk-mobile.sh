@@ -136,6 +136,8 @@ if [[ -d "$DIST/ios/lemonade_nexus_sdk.xcframework" ]]; then
   rm -rf "$PKG/ios/Frameworks"
   mkdir -p "$PKG/ios/Frameworks"
   cp -R "$DIST/ios/lemonade_nexus_sdk.xcframework" "$PKG/ios/Frameworks/"
+  # The podspec keeps a local build instead of fetching the pinned archive.
+  echo "local $version" > "$PKG/native/installed-ios"
   rm -f "$DIST/lemonade_nexus_sdk-ios-$version.zip"
   (cd "$DIST/ios" && ditto -c -k --keepParent lemonade_nexus_sdk.xcframework \
     "$DIST/lemonade_nexus_sdk-ios-$version.zip")
@@ -144,6 +146,7 @@ if [[ -d "$DIST/android/jniLibs" ]]; then
   rm -rf "$PKG/android/src/main/jniLibs"
   mkdir -p "$PKG/android/src/main"
   cp -R "$DIST/android/jniLibs" "$PKG/android/src/main/"
+  echo "local $version" > "$PKG/native/installed-android"
   rm -f "$DIST/lemonade_nexus_sdk-android-$version.zip"
   (cd "$DIST/android/jniLibs" && zip -qr "$DIST/lemonade_nexus_sdk-android-$version.zip" .)
 fi
