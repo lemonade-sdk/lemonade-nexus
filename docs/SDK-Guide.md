@@ -546,7 +546,14 @@ C ABI equivalents: `ln_mesh_enable`, `ln_mesh_enable_config`,
 `ln_private_api_call` for generic authenticated private routes.
 `ln_mesh_peers` and the `peers` of `ln_mesh_status` carry every `MeshPeer`
 field, including `peer_permissions`, `mgmt_pubkey`, `last_seen`, `last_rx`,
-`local_endpoints` and `path`.
+`local_endpoints`, `path` and `server_online`.
+
+**Server online bit.** `server_online` is the server's `is_online` for the
+peer, as of the last peer refresh: the peer is connected to the network. It
+is kept apart from `is_online`, which says whether this device has a working
+path to the peer. A peer with `server_online` and no working path is still
+connecting; a peer without `server_online` is offline. A change of either
+bit fires the mesh state callback (the `peers` mesh event).
 
 **Peer liveness.** A monitor pass every 5 s sets each peer's `is_online`
 (`lnsdk::peer_signal_fresh` and `lnsdk::next_peer_liveness` in

@@ -344,6 +344,9 @@ protected:
         return client_mesh_pubkey;
     }
 
+    // The server's online bit for the other endpoint in the peer list.
+    std::atomic<bool> listed_peer_online{false};
+
     // The tunnel address the peer list gives the other endpoint.
     std::mutex  listed_peer_mtx;
     std::string listed_peer_ip{"10.64.0.4/32"};
@@ -659,6 +662,7 @@ protected:
                 {"tunnel_ip", listed_peer_tunnel_ip()},
                 {"endpoint", listed_peer_endpoint()},
                 {"last_seen", 0},
+                {"is_online", listed_peer_online.load()},
                 {"mgmt_pubkey", "ed25519:cGVlci1tZ210LWtleQ=="},
                 // What the peer's key holds on this device: one malformed
                 // entry, which the client must drop.
@@ -1889,7 +1893,8 @@ TEST_F(SdkMeshPrivateApiTest, CApiPeerListCarriesPermissionsKeyAndTimestamps) {
     EXPECT_EQ(peer["node_id"], kPeerId);
     EXPECT_EQ(peer["mgmt_pubkey"], "ed25519:cGVlci1tZ210LWtleQ==");
     EXPECT_EQ(peer["peer_permissions"], nlohmann::json::array({"read", "svc:inference"}));
-    for (const char* field : {"last_seen", "last_rx", "last_handshake", "is_online"}) {
+    for (const char* field :
+         {"last_seen", "last_rx", "last_handshake", "is_online", "server_online"}) {
         EXPECT_TRUE(peer.contains(field)) << field << " missing: " << peer.dump();
     }
 
@@ -1904,6 +1909,38 @@ TEST_F(SdkMeshPrivateApiTest, CApiPeerListCarriesPermissionsKeyAndTimestamps) {
         EXPECT_TRUE(p.contains("peer_permissions") && p.contains("last_rx")) << p.dump();
     }
     ln_mesh_disable(c);
+}
+
+// The server's online bit says the peer is connected to the network; the
+// orchestrator's is_online says this device has a working path to it. A peer
+// the server lists online with no path yet is connecting, so the SDK keeps
+// the two apart, and a flip of the server's bit fires the state callback.
+TEST_F(SdkMeshPrivateApiTest, APeerKeepsTheServersOnlineBitApartFromItsPath) {
+    LN_REQUIRE_TEST_TRUST();
+    listed_peer_online = true;
+    auto client = joined_client();
+    std::atomic<int> callbacks{0};
+    client->set_mesh_callback([&](const lnsdk::MeshTunnelStatus&) { ++callbacks; });
+    lnsdk::MeshConfig cfg;
+    cfg.heartbeat_interval_sec = 3600;
+    cfg.peer_refresh_interval_sec = 3600;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] {
+        const auto peers = client->get_mesh_peers();
+        return peers.size() == 1 && peers[0].server_online;
+    }, std::chrono::seconds(10)));
+    EXPECT_TRUE(client->get_mesh_peers()[0].path.empty()) << "no packet has crossed a path yet";
+
+    const int before = callbacks.load();
+    listed_peer_online = false;
+    client->refresh_mesh_peers();
+    EXPECT_TRUE(wait_for([&] {
+        const auto peers = client->get_mesh_peers();
+        return peers.size() == 1 && !peers[0].server_online;
+    }, std::chrono::seconds(10))) << "the server's bit did not reach the peer";
+    EXPECT_TRUE(wait_for([&] { return callbacks.load() > before; }, std::chrono::seconds(10)))
+        << "the flip did not fire the state callback";
+    client->disable_mesh();
 }
 
 // A mesh state callback runs on the orchestrator thread and may call back into
