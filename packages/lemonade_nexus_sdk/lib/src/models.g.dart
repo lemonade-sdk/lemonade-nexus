@@ -219,6 +219,11 @@ NetworkJoinResponse _$NetworkJoinResponseFromJson(Map<String, dynamic> json) =>
       tunnelIp: json['tunnel_ip'] as String?,
       sessionToken: json['session_token'] as String?,
       error: json['error'] as String?,
+      deviceNameRefused: json['device_name_refused'] as bool? ?? false,
+      deviceNameSuggestion: json['device_name_suggestion'] as String?,
+      membership: json['membership'] == null
+          ? null
+          : JoinMembership.fromJson(json['membership'] as Map<String, dynamic>),
     );
 
 Map<String, dynamic> _$NetworkJoinResponseToJson(
@@ -229,6 +234,9 @@ Map<String, dynamic> _$NetworkJoinResponseToJson(
       'tunnel_ip': instance.tunnelIp,
       'session_token': instance.sessionToken,
       'error': instance.error,
+      'device_name_refused': instance.deviceNameRefused,
+      'device_name_suggestion': instance.deviceNameSuggestion,
+      'membership': instance.membership,
     };
 
 ServerLatency _$ServerLatencyFromJson(Map<String, dynamic> json) =>
@@ -284,6 +292,12 @@ MeshPeer _$MeshPeerFromJson(Map<String, dynamic> json) => MeshPeer(
       txBytes: (json['tx_bytes'] as num?)?.toInt(),
       latencyMs: (json['latency_ms'] as num?)?.toDouble(),
       keepalive: (json['keepalive'] as num).toInt(),
+      path: json['path'] as String?,
+      localEndpoints: (json['local_endpoints'] as List<dynamic>?)
+              ?.map((e) => e as String)
+              .toList() ??
+          const [],
+      lastSeen: (json['last_seen'] as num?)?.toInt() ?? 0,
     );
 
 Map<String, dynamic> _$MeshPeerToJson(MeshPeer instance) => <String, dynamic>{
@@ -300,6 +314,9 @@ Map<String, dynamic> _$MeshPeerToJson(MeshPeer instance) => <String, dynamic>{
       'tx_bytes': instance.txBytes,
       'latency_ms': instance.latencyMs,
       'keepalive': instance.keepalive,
+      'path': instance.path,
+      'local_endpoints': instance.localEndpoints,
+      'last_seen': instance.lastSeen,
     };
 
 MeshStatus _$MeshStatusFromJson(Map<String, dynamic> json) => MeshStatus(

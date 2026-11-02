@@ -656,6 +656,11 @@ class MeshPeer {
   /// to devices allowed to connect to it.
   final List<String> localEndpoints;
 
+  /// Unix seconds of the peer's last heartbeat at the server, as of this
+  /// device's last peer refresh; 0 when the server has none. A device that
+  /// heartbeats is up, whether or not this device has a path to it yet.
+  final int lastSeen;
+
   MeshPeer({
     required this.nodeId,
     this.hostname,
@@ -672,6 +677,7 @@ class MeshPeer {
     required this.keepalive,
     this.path,
     this.localEndpoints = const [],
+    this.lastSeen = 0,
   });
 
   /// Parses a peer from the SDK's mesh output.
@@ -698,6 +704,7 @@ class MeshPeer {
         localEndpoints: [
           for (final e in (json['local_endpoints'] as List? ?? const [])) '$e',
         ],
+        lastSeen: (json['last_seen'] as num?)?.toInt() ?? 0,
       );
 
   Map<String, dynamic> toJson() => _$MeshPeerToJson(this);
