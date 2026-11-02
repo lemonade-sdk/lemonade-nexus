@@ -2,6 +2,8 @@
 # build time (native/manifest.json). Never committed.
 ios/Frameworks/
 android/src/main/jniLibs/
+native/installed-ios
+native/installed-android
 
 .dart_tool/
 build/
