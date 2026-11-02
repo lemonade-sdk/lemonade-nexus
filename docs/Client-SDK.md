@@ -353,8 +353,9 @@ find_library(LEMONADE_NEXUS_SDK liblemonade_nexus_sdk REQUIRED)
 target_link_libraries(myapp PRIVATE ${LEMONADE_NEXUS_SDK})
 ```
 
-The shared library is self-contained: OpenSSL, libsodium, BoringTun, and the
-netstack are embedded.
+libsodium, BoringTun, and the netstack are embedded in the shared library.
+On Linux it links the system OpenSSL 3 (`libssl.so.3`); on macOS, Windows,
+iOS, and Android it embeds the pinned static OpenSSL.
 
 ## Platform Notes
 

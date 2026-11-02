@@ -209,9 +209,11 @@ a library that neither binary needs. The approval requires each pinned path in
 the IMA log, so a pinned library that is never loaded would fail attestation
 on every server.
 
-The `sdk` job builds the Linux SDK shared library with the same static
-OpenSSL and fails when it needs `libssl`, `libcrypto`, `libz`, `libzstd`, or
-`libsodium`. The SDK keeps the C++ runtime of its host process.
+The `sdk` job builds the SDK alone (`LEMONADE_NEXUS_SDK_ONLY`). Attestation
+does not measure the SDK, so the Linux SDK shared library links the system
+OpenSSL 3 (`libssl.so.3`, `libcrypto.so.3`). The job fails when the library
+needs `libz`, `libzstd`, or `libsodium`, or an OpenSSL symbol newer than
+OpenSSL 3.0. The SDK keeps the C++ runtime of its host process.
 
 The macOS arm64 and Windows x64 builds link a static OpenSSL archive that
 `.github/workflows/deps-openssl.yml` builds from the official source tarball

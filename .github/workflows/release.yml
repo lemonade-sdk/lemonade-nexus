@@ -549,11 +549,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libssl-dev pkg-config libjson-c-dev libcurl4-openssl-dev uuid-dev
 
+      # The SDK alone. On Linux it links the system OpenSSL 3; on macOS the
+      # pinned static archive.
       - name: Build the shared SDK
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DBUILD_TESTING=OFF \
+            -DLEMONADE_NEXUS_SDK_ONLY=ON \
             -DBUILD_SDK_SHARED=ON \
             -DGIT_TAG_OVERRIDE="$TAG"
           cmake --build build --target LemonadeNexusSDKShared --parallel
@@ -561,14 +564,20 @@ jobs:
           cp "build/projects/LemonadeNexusSDK/${{ matrix.library }}" \
             "out/lemonade-nexus-sdk-${TAG}-${{ matrix.platform }}-${{ matrix.library }}"
 
-      # OpenSSL, libsodium, and the Rust crates are linked into the library.
+      # libsodium and the Rust crates are linked into the library. The
+      # system OpenSSL 3 stays shared; built against OpenSSL 3.0, the library
+      # needs only OPENSSL_3.0.0 symbols, so it loads with any OpenSSL 3.
       - name: Check the SDK library's shared libraries (Linux)
         if: runner.os == 'Linux'
         run: |
           so="build/projects/LemonadeNexusSDK/${{ matrix.library }}"
           readelf -d "$so" | grep NEEDED
-          if readelf -d "$so" | grep NEEDED | grep -E 'libssl|libcrypto|libz\.|libzstd|libsodium'; then
+          if readelf -d "$so" | grep NEEDED | grep -E 'libz\.|libzstd|libsodium'; then
             echo "::error::the SDK library links a shared library that it must embed"
+            exit 1
+          fi
+          if objdump -T "$so" | grep -oE 'OPENSSL_[0-9.]+' | sort -u | grep -vx 'OPENSSL_3\.0\.0'; then
+            echo "::error::the SDK library needs symbols newer than OpenSSL 3.0"
             exit 1
           fi
 

@@ -47,7 +47,9 @@ hash of each shared library the server loads, so an OS update of OpenSSL,
 zlib, zstd, or the C++ runtime cannot change what attestation measures (see
 [Releasing](Releasing#embedded-libraries)). On another distribution, or for a
 distribution package, configure with `-DLEMONADE_NEXUS_STATIC_DEPS=OFF`. The
-build then uses the system OpenSSL.
+build then uses the system OpenSSL. A client SDK build
+(`-DLEMONADE_NEXUS_SDK_ONLY=ON`) always uses the system OpenSSL 3 on Linux:
+attestation measures only the fleet executables.
 
 On macOS arm64 and Windows x64, `LEMONADE_NEXUS_STATIC_DEPS=ON` downloads a
 pinned static OpenSSL archive, checks its SHA-256, and links it. The build
@@ -197,7 +199,7 @@ source of truth for versions.
 | Component | Sourcing | Purpose |
 |-----------|----------|---------|
 | libsodium | FetchContent (1.0.20) | Ed25519, X25519, AEAD, HKDF, random |
-| OpenSSL | Linux: Ubuntu 24.04 `libssl-dev` 3.0.13, linked statically; macOS arm64 / Windows x64: pinned static archive (3.5.9), checked by SHA-256; `LEMONADE_NEXUS_STATIC_DEPS=OFF`: system package | TLS, ACME client |
+| OpenSSL | Linux: Ubuntu 24.04 `libssl-dev` 3.0.13, linked statically (client SDK build: system OpenSSL 3); macOS arm64 / Windows x64: pinned static archive (3.5.9), checked by SHA-256; `LEMONADE_NEXUS_STATIC_DEPS=OFF`: system package | TLS, ACME client |
 | TPM2-TSS (FAPI) | Source build (4.1.3), Linux | TPM access for the evidence helper |
 | asio | FetchContent (1.34.2) | Async I/O (UDP, timers) |
 | cpp-httplib | FetchContent (0.18.3) | HTTP/HTTPS server and client |
