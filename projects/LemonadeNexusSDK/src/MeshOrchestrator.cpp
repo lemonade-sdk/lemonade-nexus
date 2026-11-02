@@ -691,13 +691,18 @@ std::chrono::steady_clock::time_point MeshOrchestrator::do_punch() {
     return hole_puncher_->maintain(peers, relay_fallback_->relayed_peers(), prefer_direct);
 }
 
+bool MeshOrchestrator::tier1_recheck_due(std::size_t servers, std::size_t members,
+                                         std::chrono::steady_clock::duration since_check) {
+    if (servers == 0) return true;
+    return since_check >= (servers < members ? kTier1RecheckMissing : kTier1Recheck);
+}
+
 std::vector<RelayCandidate> MeshOrchestrator::relay_candidates() {
     std::vector<RelayCandidate> out;
     auto membership = client_.tier1_membership();
     const auto now = std::chrono::steady_clock::now();
-    const bool missing = membership.servers.size() < membership.members.size();
-    if (membership.servers.empty() ||
-        now - tier1_checked_ >= (missing ? kTier1RecheckMissing : kTier1Recheck)) {
+    if (tier1_recheck_due(membership.servers.size(), membership.members.size(),
+                          now - tier1_checked_)) {
         tier1_checked_ = now;
         auto refreshed = client_.refresh_tier1();
         if (refreshed.ok) {

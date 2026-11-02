@@ -214,6 +214,23 @@ public:
     /// The LAN endpoints this device reports now (thread-safe snapshot).
     [[nodiscard]] std::vector<std::string> local_endpoints() const;
 
+    /// Interval between verifications of the Tier 1 servers that relay
+    /// choice ranks. Tree calls also verify them, but a device that makes
+    /// none would otherwise keep its first answer.
+    static constexpr std::chrono::seconds kTier1Recheck{300};
+    /// The same while a verified member was not reachable at the last
+    /// verification. Both sides of a pair rank the servers they reached;
+    /// one missed member (a server restarting) puts the two sides on
+    /// different relays until it is verified again.
+    static constexpr std::chrono::seconds kTier1RecheckMissing{60};
+
+    /// True when relay choice must verify the Tier 1 servers again: none is
+    /// verified, kTier1Recheck passed since the last verification, or
+    /// kTier1RecheckMissing passed while fewer servers than members were
+    /// reachable. Pure.
+    [[nodiscard]] static bool tier1_recheck_due(std::size_t servers, std::size_t members,
+                                                std::chrono::steady_clock::duration since_check);
+
 private:
     /// Main orchestration loop (runs on background thread).
     void run_loop();
@@ -264,16 +281,6 @@ private:
     /// Interval between reads of the host's LAN addresses outside the
     /// passes that read them at once. The read is local and cheap.
     static constexpr std::chrono::seconds kLanRefreshInterval{60};
-
-    /// Interval between verifications of the Tier 1 servers that relay
-    /// choice ranks. Tree calls also verify them, but a device that makes
-    /// none would otherwise keep its first answer.
-    static constexpr std::chrono::seconds kTier1Recheck{300};
-    /// The same while a verified member was not reachable at the last
-    /// verification. Both sides of a pair rank the servers they reached;
-    /// one missed member (a server restarting) puts the two sides on
-    /// different relays until it is verified again.
-    static constexpr std::chrono::seconds kTier1RecheckMissing{60};
 
     /// Total wait for one STUN query, including its resends.
     static constexpr std::chrono::milliseconds kStunTimeout{1500};

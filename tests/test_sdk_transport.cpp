@@ -2420,3 +2420,19 @@ TEST(SdkMeshConfig, TheHeartbeatComesBeforeTheServerClosesAnIdleConnection) {
     EXPECT_LT(static_cast<time_t>(lnsdk::MeshConfig{}.heartbeat_interval_sec),
               nexus::network::HttpServer::kKeepAliveTimeoutSec);
 }
+
+// Relay choice ranks the Tier 1 servers this device verified as reachable;
+// its peer ranks its own. A member missed once (a server restarting) put the
+// two sides on different relays for as long as the device kept that answer,
+// which was indefinitely for an app that makes no tree calls.
+TEST(SdkMeshTier1Recheck, AMissedMemberIsVerifiedAgainWithinAMinute) {
+    using O = lnsdk::MeshOrchestrator;
+    using std::chrono::seconds;
+    EXPECT_TRUE(O::tier1_recheck_due(0, 5, seconds(0)));
+    EXPECT_FALSE(O::tier1_recheck_due(4, 5, O::kTier1RecheckMissing - seconds(1)));
+    EXPECT_TRUE(O::tier1_recheck_due(4, 5, O::kTier1RecheckMissing));
+    EXPECT_FALSE(O::tier1_recheck_due(5, 5, O::kTier1RecheckMissing));
+    EXPECT_FALSE(O::tier1_recheck_due(5, 5, O::kTier1Recheck - seconds(1)));
+    EXPECT_TRUE(O::tier1_recheck_due(5, 5, O::kTier1Recheck));
+    EXPECT_LE(O::kTier1RecheckMissing, seconds(60));
+}
