@@ -38,6 +38,7 @@ enum class GossipMsgType : uint8_t {
     AccountEnvelopeSync   = 0x19,  // "account group-key envelope stored" (backbone only, Tier 1 origin)
     TreeLogSync           = 0x1A,  // "one chunk of a committed tree log entry" (backbone only, from Tier 1)
     LinkTokenSync         = 0x1B,  // "link token event" (backbone only, Tier 1 to Tier 1)
+    PresenceSync          = 0x1C,  // "devices present here" (backbone only, Tier 1 to Tier 1; a hint, never authority)
 };
 
 /// The log display of a wire message type: the enumerator name with the raw
@@ -72,6 +73,7 @@ enum class GossipMsgType : uint8_t {
         case GossipMsgType::AccountEnvelopeSync: name = "AccountEnvelopeSync"; break;
         case GossipMsgType::TreeLogSync: name = "TreeLogSync"; break;
         case GossipMsgType::LinkTokenSync: name = "LinkTokenSync"; break;
+        case GossipMsgType::PresenceSync: name = "PresenceSync"; break;
     }
     return name.empty() ? hex(type) : std::string(name) + " (" + hex(type) + ")";
 }
@@ -101,7 +103,8 @@ static_assert(detail::outside_retired_range(GossipMsgType::Digest) &&
               detail::outside_retired_range(GossipMsgType::SyncRequest) &&
               detail::outside_retired_range(GossipMsgType::AccountEnvelopeSync) &&
               detail::outside_retired_range(GossipMsgType::TreeLogSync) &&
-              detail::outside_retired_range(GossipMsgType::LinkTokenSync),
+              detail::outside_retired_range(GossipMsgType::LinkTokenSync) &&
+              detail::outside_retired_range(GossipMsgType::PresenceSync),
               "gossip wire values 0x07-0x10 are retired and reserved forever");
 
 #pragma pack(push, 1)

@@ -108,6 +108,16 @@ the old binary as an invalid baseline.
   generation 2). The new files (`link_tokens/ledger.json`,
   `link_replica/replica.json`) are storage-vault files; an earlier release
   does not read them.
+- **Device presence.** Gossip type `PresenceSync` (0x1C) is new. Tier 1
+  servers send it to each other on the backbone. A release from before it
+  drops the datagram as an unknown type. During a rollout, a server on N+1
+  reports a device on an earlier server as online only while that device
+  also reaches an N+1 server. The peer list fields do not change shape:
+  `is_online` and `last_seen` keep their names and types. Their source
+  changes from the server's own BoringTun handshake with the device to the
+  device's heartbeat and event socket presence at any Tier 1 server, so
+  `last_seen` now advances with every heartbeat. An SDK of any release reads
+  them as before.
 - **Tree op link extension.** A `Join` with a link token and an
   `AcceptInvite` from N+1 append a link extension to the canonical op
   encoding. An op without it encodes exactly as before, and N+1

@@ -555,7 +555,10 @@ included, within three keepalive intervals plus 5 s keeps it online. Before
 the first packet, a live WireGuard session (handshake under 200 s; BoringTun
 rejects a session after 180 s) or a recent server contact (`last_seen`
 within 15 s plus one peer refresh interval) counts. A relayed peer also
-stays online while the server's `last_seen` is that recent. An online peer
+stays online while the server's `last_seen` is that recent. The server's
+`last_seen` is the peer's latest heartbeat or event socket presence at any
+Tier 1 server, so it is current for a peer on another server too. An
+online peer
 reads offline only after two stale passes in a row, so one late keepalive
 or peer refresh does not flip it. The mesh port routes only to online peers.
 

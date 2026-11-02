@@ -134,14 +134,19 @@ direct path to every peer before it uses a relay:
   could have observed it: a public address from any server, a private address
   only from a private or loopback server, and a loopback address only from a
   loopback server.
-- The heartbeat (`POST /api/mesh/heartbeat`, every 5 seconds) publishes the
-  address. The server stores it as the node's endpoint. A heartbeat with an
-  empty endpoint (no STUN answer yet) keeps the stored endpoint. A new
-  address goes out in a heartbeat at once, not at the next interval.
+- The heartbeat (`POST /api/mesh/heartbeat`, every 3 seconds by default,
+  `heartbeat_interval_sec`) publishes the address. The server stores it as
+  the node's endpoint. A heartbeat with an empty endpoint (no STUN answer
+  yet) keeps the stored endpoint. A new address goes out in a heartbeat at
+  once, not at the next interval.
+- Each accepted heartbeat, and the device's own open event socket, makes
+  the device present at the server. Tier 1 servers share presence, so a
+  peer list on any Tier 1 server reports the device's `is_online` (present
+  within 10 seconds) and `last_seen` (the latest presence time).
 - The heartbeat answer carries `peers_revision`, an opaque string that
   changes when the device's peer list changes: a peer joins or leaves, or a
   listed peer's mesh key, tunnel address, private subnet, endpoint,
-  hostname, or live session with the server changes. When the value differs
+  hostname, or online state (`is_online`) changes. When the value differs
   from the previous answer, the SDK fetches the peer list at once instead of
   at the next `peer_refresh_interval_sec` (default 30). A peer that joined
   or moved is therefore seen within one heartbeat. The value carries no peer
@@ -164,8 +169,9 @@ direct path to every peer before it uses a relay:
   own connection to the session server. The server answers as soon as the
   device's `peers_revision` differs from the sent value, or after the
   timeout with the unchanged list. A committed tree change, a changed LAN
-  endpoint list, or a changed live session wakes the waiting request, and the
-  server checks the live session state again every 5 seconds. A changed
+  endpoint list, or a listed peer going online or offline wakes the waiting
+  request, and the server checks the LAN endpoint lists again every 5
+  seconds. A changed
   answer makes the SDK refresh the peer list at once, so a peer that joins
   or moves on the same Tier 1 server is seen in well under a second, without
   waiting for a heartbeat. The SDK sends the next wait at once. After a
@@ -242,7 +248,8 @@ public endpoints. They connect over the LAN instead:
   returns when it answers.
 - Servers without the field refuse a heartbeat that carries
   `local_endpoints` (HTTP `400`). The SDK then sends the heartbeat again
-  without them, so the endpoint and the live session still reach the server.
+  without them, so the endpoint and the device's presence still reach the
+  server.
   Clients without the field change nothing. A server keeps the LAN endpoints of the devices whose
   heartbeats reach it; two devices with sessions on different Tier 1 servers
   do not see each other's LAN endpoints.

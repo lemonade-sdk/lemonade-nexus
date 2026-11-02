@@ -75,6 +75,8 @@ struct GossipBallotTestAccess {
     static void run_gossip_tick(GossipService& g) { g.on_gossip_tick(); }
     // DNS catch-up runs on a 30 s cadence; tests send a digest round directly.
     static void send_sync_digests(GossipService& g) { g.send_sync_digests(); }
+    // Presence sharing runs on a 3 s cadence; tests send one round directly.
+    static void send_presence_sync(GossipService& g) { g.send_presence_sync(); }
     // v0.9.4 fix 4: the PeerExchange initiator runs on steady_clock, which no
     // datagram can advance; the cadence tests set these clocks directly.
     static void set_last_peer_exchange(GossipService& g,
