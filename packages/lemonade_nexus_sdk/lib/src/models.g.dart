@@ -219,6 +219,11 @@ NetworkJoinResponse _$NetworkJoinResponseFromJson(Map<String, dynamic> json) =>
       tunnelIp: json['tunnel_ip'] as String?,
       sessionToken: json['session_token'] as String?,
       error: json['error'] as String?,
+      deviceNameRefused: json['device_name_refused'] as bool? ?? false,
+      deviceNameSuggestion: json['device_name_suggestion'] as String?,
+      membership: json['membership'] == null
+          ? null
+          : JoinMembership.fromJson(json['membership'] as Map<String, dynamic>),
     );
 
 Map<String, dynamic> _$NetworkJoinResponseToJson(
@@ -229,6 +234,9 @@ Map<String, dynamic> _$NetworkJoinResponseToJson(
       'tunnel_ip': instance.tunnelIp,
       'session_token': instance.sessionToken,
       'error': instance.error,
+      'device_name_refused': instance.deviceNameRefused,
+      'device_name_suggestion': instance.deviceNameSuggestion,
+      'membership': instance.membership,
     };
 
 ServerLatency _$ServerLatencyFromJson(Map<String, dynamic> json) =>
@@ -279,11 +287,17 @@ MeshPeer _$MeshPeerFromJson(Map<String, dynamic> json) => MeshPeer(
       endpoint: json['endpoint'] as String?,
       relayEndpoint: json['relay_endpoint'] as String?,
       isOnline: json['is_online'] as bool,
+      serverOnline: json['server_online'] as bool? ?? false,
       lastHandshake: json['last_handshake'] as String?,
       rxBytes: (json['rx_bytes'] as num?)?.toInt(),
       txBytes: (json['tx_bytes'] as num?)?.toInt(),
       latencyMs: (json['latency_ms'] as num?)?.toDouble(),
       keepalive: (json['keepalive'] as num).toInt(),
+      path: json['path'] as String?,
+      localEndpoints: (json['local_endpoints'] as List<dynamic>?)
+              ?.map((e) => e as String)
+              .toList() ??
+          const [],
     );
 
 Map<String, dynamic> _$MeshPeerToJson(MeshPeer instance) => <String, dynamic>{
@@ -295,11 +309,14 @@ Map<String, dynamic> _$MeshPeerToJson(MeshPeer instance) => <String, dynamic>{
       'endpoint': instance.endpoint,
       'relay_endpoint': instance.relayEndpoint,
       'is_online': instance.isOnline,
+      'server_online': instance.serverOnline,
       'last_handshake': instance.lastHandshake,
       'rx_bytes': instance.rxBytes,
       'tx_bytes': instance.txBytes,
       'latency_ms': instance.latencyMs,
       'keepalive': instance.keepalive,
+      'path': instance.path,
+      'local_endpoints': instance.localEndpoints,
     };
 
 MeshStatus _$MeshStatusFromJson(Map<String, dynamic> json) => MeshStatus(

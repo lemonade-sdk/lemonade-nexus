@@ -640,7 +640,13 @@ class MeshPeer {
   final String? privateSubnet;
   final String? endpoint;
   final String? relayEndpoint;
+  /// Whether this device has a working path to the peer.
   final bool isOnline;
+
+  /// The server's online bit for the peer, as of the SDK's last peer
+  /// refresh: the peer is connected to the network. Online at the server
+  /// without a working path ([isOnline] false) means still connecting.
+  final bool serverOnline;
   final String? lastHandshake;
   final int? rxBytes;
   final int? txBytes;
@@ -665,6 +671,7 @@ class MeshPeer {
     this.endpoint,
     this.relayEndpoint,
     required this.isOnline,
+    this.serverOnline = false,
     this.lastHandshake,
     this.rxBytes,
     this.txBytes,
@@ -689,6 +696,7 @@ class MeshPeer {
         endpoint: json['endpoint']?.toString(),
         relayEndpoint: json['relay_endpoint']?.toString(),
         isOnline: (json['is_online'] as bool?) ?? false,
+        serverOnline: (json['server_online'] as bool?) ?? false,
         lastHandshake: json['last_handshake']?.toString(),
         rxBytes: (json['rx_bytes'] as num?)?.toInt(),
         txBytes: (json['tx_bytes'] as num?)?.toInt(),
