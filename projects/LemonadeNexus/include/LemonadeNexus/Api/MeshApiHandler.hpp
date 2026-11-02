@@ -70,12 +70,20 @@ inline constexpr uint64_t kMeshLocalEndpointTtlSec = 120;
     const nlohmann::json& value, bool allow_loopback);
 
 /// Handles mesh networking endpoints: peer discovery and heartbeat reporting.
+///
+/// A device is present at this server while it sends authenticated
+/// heartbeats or holds an open event socket; the gossip service's
+/// DevicePresence table holds that time and the times other Tier 1 servers
+/// share. The peer list reports a listed device's `is_online` and
+/// `last_seen` from that table, so a device on another Tier 1 server reads
+/// online too.
 class MeshApiHandler : public IRequestHandler<MeshApiHandler> {
     friend class IRequestHandler<MeshApiHandler>;
 
 public:
-    /// Registers a tree changed hook that wakes the peer list long-polls;
-    /// the destructor clears it. One handler per tree.
+    /// Registers a tree changed hook and a device presence hook that wake the
+    /// peer list long-polls and the event sockets; the destructor clears
+    /// both. One handler per tree and gossip service.
     explicit MeshApiHandler(ApiContext& ctx);
     ~MeshApiHandler();
     MeshApiHandler(const MeshApiHandler&)            = delete;
@@ -131,7 +139,8 @@ private:
     // each socket's own server thread only reads, so a close is seen at once.
     struct EventSocket;
     void events_loop();
-    /// Checks one socket's session and revisions and sends what changed.
+    /// Checks one socket's session and revisions and sends what changed. A
+    /// socket whose session owns its node counts as that device's presence.
     /// Returns false when the socket must close.
     bool update_event_socket(EventSocket& socket, uint64_t now);
     mutable std::mutex                        events_mtx_;

@@ -208,6 +208,7 @@ GossipService::GossipService(asio::io_context& io, uint16_t port,
                                crypto::SodiumCryptoService& crypto)
     : socket_{io, udp::endpoint{udp::v4(), port}}
     , gossip_timer_{io}
+    , presence_timer_{io}
     , storage_{storage}
     , crypto_{crypto}
     , port_{port}
@@ -326,6 +327,7 @@ void GossipService::on_start() {
     // Start async receive loop and gossip timer after initial ServerHello
     start_receive();
     start_gossip_timer();
+    start_presence_timer();
 }
 
 void GossipService::send_startup_server_hello() {
@@ -371,6 +373,7 @@ void GossipService::on_stop() {
 
     backbone_alive_->store(false);
     gossip_timer_.cancel();
+    presence_timer_.cancel();
     save_dns_replica();
     save_account_replica();
     save_link_replica();
@@ -1168,7 +1171,8 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
         header.msg_type == GossipMsgType::SyncRequest ||
         header.msg_type == GossipMsgType::AccountEnvelopeSync ||
         header.msg_type == GossipMsgType::TreeLogSync ||
-        header.msg_type == GossipMsgType::LinkTokenSync;
+        header.msg_type == GossipMsgType::LinkTokenSync ||
+        header.msg_type == GossipMsgType::PresenceSync;
     if (via == Via::Public && backbone_only) {
         if (denial_log_allowed("public-backbone-only:" + sender_pubkey_b64,
                                std::chrono::steady_clock::now())) {
@@ -1243,6 +1247,9 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
             break;
         case GossipMsgType::LinkTokenSync:
             handle_link_token_sync(from, sender_pubkey_b64, payload, payload_len, via);
+            break;
+        case GossipMsgType::PresenceSync:
+            handle_presence_sync(from, sender_pubkey_b64, payload, payload_len, via);
             break;
         default:
             spdlog::warn("[{}] unknown message type 0x{:02X} from {}:{}",
@@ -4016,6 +4023,86 @@ void GossipService::load_account_replica() {
     account_replica_saved_version_ = account_replica_->version();
     spdlog::info("[{}] restored {} account envelope(s) from disk ({} refused)", name(),
                  restored, refused);
+}
+
+// ---------------------------------------------------------------------------
+// Device presence (backbone only, Tier 1 to Tier 1)
+// ---------------------------------------------------------------------------
+
+bool GossipService::record_device_presence(const std::string& node_id, uint64_t now) {
+    const auto result = presence_.record_local(node_id, now);
+    if (!result.locally_new || !self_is_tier1()) return result.became_online;
+    // A device that arrives here is announced at once, so a peer on another
+    // Tier 1 server sees it within one round trip instead of one interval.
+    auto payloads = encode_presence_sync({{node_id, now}});
+    auto targets = backbone_targets(true);
+    if (payloads.empty() || targets.empty()) return result.became_online;
+    // Called from HTTP threads; the socket and peer sends belong to the io
+    // thread. A lost datagram is repeated by the next periodic send.
+    asio::post(socket_.get_executor(), [this, alive = backbone_alive_,
+                                        targets = std::move(targets),
+                                        payloads = std::move(payloads)] {
+        if (!alive->load()) return;
+        for (const auto& p : targets) {
+            for (const auto& payload : payloads) {
+                (void)send_backbone_packet(p, GossipMsgType::PresenceSync, payload);
+            }
+        }
+    });
+    return result.became_online;
+}
+
+void GossipService::start_presence_timer() {
+    presence_timer_.expires_after(chrono::seconds(kPresenceSyncIntervalSec));
+    presence_timer_.async_wait([this](const asio::error_code& ec) {
+        if (ec) return;  // cancelled at shutdown
+        send_presence_sync();
+        start_presence_timer();
+    });
+}
+
+void GossipService::send_presence_sync() {
+    // Each server sends only what it heard itself, to every Tier 1 peer
+    // directly, so presence is never relayed and a time is never refreshed
+    // by anyone but the server that heard the device.
+    if (!self_is_tier1()) return;
+    const auto entries = presence_.local_online(unix_ms() / 1000);
+    if (entries.empty()) return;
+    const auto targets = backbone_targets(true);
+    if (targets.empty()) return;
+    const auto payloads = encode_presence_sync(entries);
+    for (const auto& p : targets) {
+        for (const auto& payload : payloads) {
+            (void)send_backbone_packet(p, GossipMsgType::PresenceSync, payload);
+        }
+    }
+}
+
+void GossipService::handle_presence_sync(const asio::ip::udp::endpoint& sender,
+                                         const std::string& sender_pubkey,
+                                         const uint8_t* payload, std::size_t payload_len,
+                                         Via via) {
+    if (!backbone_sender_verified(sender, sender_pubkey, via, "PresenceSync")) return;
+    if (!is_tier1(sender_pubkey)) {
+        deny_sync(sender, sender_pubkey, "PresenceSync", "sender is not a current Tier 1 member");
+        return;
+    }
+    if (!self_is_tier1()) {
+        deny_sync(sender, sender_pubkey, "PresenceSync",
+                  "this server is not Tier 1 and keeps no shared presence");
+        return;
+    }
+    const auto entries = decode_presence_sync(std::span<const uint8_t>(payload, payload_len));
+    if (!entries) {
+        deny_sync(sender, sender_pubkey, "PresenceSync", "malformed or oversized payload");
+        return;
+    }
+    const auto merged = presence_.merge_remote(*entries, unix_ms() / 1000);
+    if (merged.ahead > 0) {
+        deny_sync(sender, sender_pubkey, "PresenceSync",
+                  std::to_string(merged.ahead) +
+                      " presence time(s) ahead of this server's clock beyond the allowed skew");
+    }
 }
 
 // ---------------------------------------------------------------------------

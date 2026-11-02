@@ -3,6 +3,7 @@
 #include <LemonadeNexus/ACL/ACLService.hpp>
 #include <LemonadeNexus/Auth/LinkTokenLedger.hpp>
 #include <LemonadeNexus/Core/IService.hpp>
+#include <LemonadeNexus/Gossip/DevicePresence.hpp>
 #include <LemonadeNexus/Gossip/IGossipProvider.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
@@ -145,7 +146,8 @@ public:
     /// DeltaRequest, DeltaResponse; retired in tree ops mode) while this
     /// server holds the tree (set_tree_role), catch-up sync (SyncDigest,
     /// SyncRequest, catch-up DnsRecordSync, TreeLogSync),
-    /// AccountEnvelopeSync, and LinkTokenSync (Tier 1 to Tier 1 only).
+    /// AccountEnvelopeSync, and LinkTokenSync and PresenceSync (Tier 1 to
+    /// Tier 1 only).
     /// Without a backbone path to a peer, no tree
     /// records move to or from it. Tier 1 servers serve catch-up to every
     /// certified server; Tier 2 servers catch up from Tier 1 and never feed
@@ -270,6 +272,13 @@ private:
     // Gossip timer: fires every 5 seconds to pick a random peer and send digest
     void start_gossip_timer();
     void on_gossip_tick();
+
+    // Device presence sharing (backbone only, Tier 1 to Tier 1)
+    void start_presence_timer();
+    /// Send the presence this server heard locally within the online window
+    /// to every Tier 1 peer with a backbone path. Only a Tier 1 server sends.
+    /// io thread.
+    void send_presence_sync();
 
     // Peer persistence
     void load_peers();
@@ -514,6 +523,13 @@ private:
     void save_link_replica();
     void load_link_replica();
 
+    /// Presence from another Tier 1 server. Accepted only on the backbone,
+    /// from a certified current Tier 1 member, by a Tier 1 server; merged
+    /// into presence_ by maximum.
+    void handle_presence_sync(const asio::ip::udp::endpoint& sender,
+                              const std::string& sender_pubkey, const uint8_t* payload,
+                              std::size_t payload_len, Via via);
+
     /// Sign and persist a replica snapshot as <category>/replica.json.
     bool save_replica_file(const sync::OriginReplica& replica, const std::string& category,
                            const std::string& type);
@@ -658,6 +674,7 @@ private:
     asio::ip::udp::socket    socket_;
     asio::ip::udp::endpoint  remote_endpoint_;
     asio::steady_timer       gossip_timer_;
+    asio::steady_timer       presence_timer_;
     std::array<uint8_t, 65536> recv_buffer_{};
 
     storage::FileStorageService& storage_;
@@ -827,6 +844,8 @@ private:
     uint64_t                              link_replica_saved_version_{0};
     bool                                  link_replica_loaded_{false};
     std::function<bool(const auth::LinkTokenEvent&)> link_token_sink_;
+    // Device presence heard here and from other Tier 1 servers.
+    DevicePresence                        presence_;
     std::chrono::steady_clock::time_point last_tombstone_prune_{};
     // Last SyncRequest served per "<stream>|<peer>", for rate limiting (io
     // thread only).
@@ -967,6 +986,22 @@ public:
     /// Forget every replicated link token event and delete the replica file
     /// (this server left Tier 1). Thread-safe.
     void purge_link_tokens();
+
+    /// Device presence: the devices present at this server and, on a Tier 1
+    /// server, at the other Tier 1 servers (PresenceSync). A liveness hint
+    /// for display and path decisions; it grants nothing.
+    [[nodiscard]] DevicePresence& device_presence() { return presence_; }
+    [[nodiscard]] const DevicePresence& device_presence() const { return presence_; }
+
+    /// Record that device `node_id` reached this server at `now` (Unix
+    /// seconds): an authenticated heartbeat or event socket of the session
+    /// that owns the node. The caller must have checked that ownership. When
+    /// this server had not heard the device within kDevicePresenceOnlineSec
+    /// and is Tier 1, it sends the entry to every Tier 1 peer at once instead
+    /// of at the next kPresenceSyncIntervalSec. Returns true when the device
+    /// became online. Thread-safe: the send runs on the io thread.
+    bool record_device_presence(const std::string& node_id, uint64_t now);
+
     /// Drop the replicated envelopes of a deleted account: every envelope of a
     /// group in `group_ids`, and every envelope addressed to a canonical key
     /// in `recipients`. No tombstone is sent. Each Tier 1 server that applies

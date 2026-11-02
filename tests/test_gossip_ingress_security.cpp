@@ -3147,6 +3147,192 @@ TEST_F(GossipIngressSecurityTest, AccountEnvelopesReplicateOverTheBackbone) {
     for (auto* v : {&va, &vb, &vc}) v->stop();
 }
 
+// Device presence is shared between Tier 1 servers over the backbone only. A
+// device that reaches A is announced to B at once, and A repeats what it heard
+// on each round. Tier 2 neither receives nor sends it. The public socket, a
+// sender outside Tier 1, a malformed or oversized payload, and a time ahead
+// of the receiver's clock beyond the skew are refused.
+TEST_F(GossipIngressSecurityTest, DevicePresenceIsSharedBetweenTier1ServersOnly) {
+    auto root_kp = kc->ed25519_keygen();
+    auto a_kp    = kc->ed25519_keygen();
+    auto b_kp    = kc->ed25519_keygen();
+    auto c_kp    = kc->ed25519_keygen();
+    const auto a_b64  = crypto::to_base64(a_kp.public_key);
+    const auto b_b64  = crypto::to_base64(b_kp.public_key);
+    const auto c_b64  = crypto::to_base64(c_kp.public_key);
+    const auto a_cert = issue_cert(a_b64, "srv-a", root_kp);
+    const auto b_cert = issue_cert(b_b64, "srv-b", root_kp);
+    const auto c_cert = issue_cert(c_b64, "srv-c", root_kp);
+    const std::set<std::string> members{a_b64, b_b64};  // C is Tier 2
+    const auto seed_own_cert = [](Node& n, const std::string& cert) {
+        storage::SignedEnvelope env;
+        env.type = "server_certificate";
+        env.data = cert;
+        ASSERT_TRUE(n.storage->write_file("identity", "server_cert.json", env));
+    };
+    const auto configure = [&](Node& n) {
+        n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+        n.gossip->set_ipam(n.ipam.get());
+        n.gossip->set_tier1_membership_source(
+            [&members](const std::string& pk) { return members.count(pk) > 0; });
+    };
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_keypair(*n.storage, a_kp);
+            seed_own_cert(n, a_cert);
+            attach_ipam(n);
+            seed_peers(*n.storage, nlohmann::json::array(
+                {peer_entry(b_b64, "127.0.0.1:9", b_cert), peer_entry(c_b64, "127.0.0.1:10", c_cert)}));
+        },
+        configure);
+    const auto make_late = [&](const std::string& tag, const crypto::Ed25519Keypair& kp,
+                               const std::string& cert) -> Node& {
+        return make_node(
+            tag,
+            [&](Node& n) {
+                seed_keypair(*n.storage, kp);
+                seed_own_cert(n, cert);
+                attach_ipam(n);
+                seed_peers(*n.storage, nlohmann::json::array({peer_entry(a_b64, a.endpoint(), a_cert)}));
+            },
+            configure);
+    };
+    auto& b = make_late("b", b_kp, b_cert);
+    auto& c = make_late("c", c_kp, c_cert);
+    a.gossip->add_peer(b.endpoint(), b_b64);
+    a.gossip->add_peer(c.endpoint(), c_b64);
+
+    network::VirtualNetService va, vb, vc;
+    std::map<std::string, network::VirtualNetService*> by_ip{
+        {"172.16.0.1", &va}, {"172.16.0.2", &vb}, {"172.16.0.3", &vc}};
+    const auto route = [&by_ip](std::span<const uint8_t> p) {
+        if (p.size() < 20) return;
+        const std::string dst = std::to_string(p[16]) + "." + std::to_string(p[17]) + "." +
+                                std::to_string(p[18]) + "." + std::to_string(p[19]);
+        if (auto it = by_ip.find(dst); it != by_ip.end()) it->second->deliver_inbound_ip_packet(p);
+    };
+    const auto mesh_key = [](uint8_t fill) {
+        std::array<uint8_t, crypto::kX25519PublicKeySize> k{};
+        k.fill(fill);
+        return crypto::to_base64(std::span<const uint8_t>(k.data(), k.size()));
+    };
+    struct Wire { Node* n; network::VirtualNetService* v; const char* ip; const char* id; uint8_t key; };
+    for (const auto& w : {Wire{&a, &va, "172.16.0.1", "node-a", 0xA1},
+                          Wire{&b, &vb, "172.16.0.2", "node-b", 0xB2},
+                          Wire{&c, &vc, "172.16.0.3", "node-c", 0xC3}}) {
+        w.v->start();
+        w.v->set_outbound_sink(route);
+        ASSERT_TRUE(w.v->add_local_ip(std::string(w.ip) + "/22"));
+        w.n->gossip->set_our_mesh_pubkey(mesh_key(w.key));
+        w.n->gossip->set_our_backbone_claim(w.id, w.ip);
+        w.n->gossip->set_virtual_net(w.v);
+    }
+    const auto status_for = [](Node& n, const std::string& pk) {
+        const auto status = n.gossip->account_sync_status();
+        for (const auto& p : status["peers"]) {
+            if (p["pubkey"] == pk) return p;
+        }
+        return nlohmann::json::object();
+    };
+    for (Node* n : {&a, &b, &c}) gossip::GossipBallotTestAccess::run_gossip_tick(*n->gossip);
+    ASSERT_TRUE(pump_until([&] {
+        return status_for(a, b_b64).value("mesh_key_known", false) &&
+               status_for(a, c_b64).value("mesh_key_known", false) &&
+               status_for(b, a_b64).value("mesh_key_known", false) &&
+               status_for(c, a_b64).value("mesh_key_known", false);
+    }));
+
+    const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    const auto online = [&](Node& n, const std::string& device) {
+        return n.gossip->device_presence().status(device, now).online;
+    };
+
+    // Live: a device that reaches A is announced to B at once, not to C.
+    EXPECT_TRUE(a.gossip->record_device_presence("dev1", now));
+    ASSERT_TRUE(pump_until([&] { return online(b, "dev1"); }));
+    EXPECT_EQ(b.gossip->device_presence().status("dev1", now).last_seen, now);
+    EXPECT_TRUE(b.gossip->device_presence().local_online(now).empty())
+        << "gossiped presence counted as heard locally, so B would relay it";
+
+    // A periodic round carries what A heard without the prompt send.
+    (void)a.gossip->device_presence().record_local("dev2", now);
+    pump_for(std::chrono::milliseconds(200));
+    EXPECT_FALSE(online(b, "dev2"));
+    gossip::GossipBallotTestAccess::send_presence_sync(*a.gossip);
+    ASSERT_TRUE(pump_until([&] { return online(b, "dev2"); }));
+
+    // Tier 2 shares nothing: C keeps a device that reaches it to itself.
+    EXPECT_TRUE(c.gossip->record_device_presence("dev3", now));
+    gossip::GossipBallotTestAccess::send_presence_sync(*c.gossip);
+
+    // Hand-built payloads straight over the backbone.
+    const auto a_port = gossip::GossipBallotTestAccess::port(*a.gossip);
+    const auto b_port = gossip::GossipBallotTestAccess::port(*b.gossip);
+    const auto c_port = gossip::GossipBallotTestAccess::port(*c.gossip);
+    const auto over_backbone = [&](network::VirtualNetService& from_stack, const char* from_ip,
+                                   uint16_t from_port, const crypto::Ed25519Keypair& sender,
+                                   const char* to_ip, uint16_t to_port,
+                                   const std::vector<uint8_t>& payload) {
+        const auto pkt = build_packet(sender, gossip::GossipMsgType::PresenceSync, payload);
+        ASSERT_TRUE(from_stack.send_udp(from_ip, from_port, to_ip, to_port, pkt));
+    };
+    const auto presence_of = [](std::vector<std::pair<std::string, uint64_t>> entries,
+                                const std::string& pad = {}) {
+        nlohmann::json list = nlohmann::json::array();
+        for (const auto& [id, seen] : entries) list.push_back({{"node_id", id}, {"seen", seen}});
+        nlohmann::json doc{{"entries", list}};
+        if (!pad.empty()) doc["pad"] = pad;
+        return msgpack_of(doc);
+    };
+
+    // Positive control for the path below.
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  presence_of({{"dev4", now}}));
+    ASSERT_TRUE(pump_until([&] { return online(b, "dev4"); }));
+
+    // Refused: malformed (one bad id spoils the message), not msgpack, and
+    // over the byte bound.
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  presence_of({{"dev5", now}, {"bad/id", now}}));
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port, bytes_of("not msgpack"));
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  presence_of({{"dev6", now}}, std::string(gossip::kPresenceSyncMaxPayloadBytes, 'x')));
+    // Refused: a time ahead of B's clock beyond the skew.
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  presence_of({{"dev7", now + gossip::kDevicePresenceMaxSkewSec + 60}}));
+    // Refused: a sender outside Tier 1.
+    over_backbone(vc, "172.16.0.3", c_port, c_kp, "172.16.0.1", a_port,
+                  presence_of({{"dev8", now}}));
+    // Refused: a receiver outside Tier 1.
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.3", c_port,
+                  presence_of({{"dev9", now}}));
+    // Refused: the public socket, even from Tier 1.
+    inject(build_packet(a_kp, gossip::GossipMsgType::PresenceSync, presence_of({{"dev10", now}})),
+           b);
+    pump_for(std::chrono::milliseconds(400));
+    EXPECT_FALSE(online(b, "dev5"));
+    EXPECT_FALSE(online(b, "dev6"));
+    EXPECT_EQ(b.gossip->device_presence().status("dev7", now).last_seen, 0u);
+    EXPECT_FALSE(online(a, "dev8"));
+    EXPECT_FALSE(online(c, "dev9"));
+    EXPECT_FALSE(online(b, "dev10"));
+    EXPECT_FALSE(online(c, "dev1"));
+    EXPECT_FALSE(online(c, "dev2"));
+    EXPECT_EQ(c.gossip->device_presence().size(), 1u) << "C took presence from Tier 1";
+    EXPECT_FALSE(online(a, "dev3"));
+    EXPECT_FALSE(online(b, "dev3"));
+
+    // Positive control after the refusals: the same path still applies.
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  presence_of({{"dev11", now}}));
+    ASSERT_TRUE(pump_until([&] { return online(b, "dev11"); }));
+
+    for (auto* v : {&va, &vb, &vc}) v->stop();
+}
+
 // Link tokens (invites) replicate between Tier 1 servers over the backbone:
 // a token minted on A is redeemed on B, a spend on one server reaches the
 // other, a refund restores the token everywhere, and two concurrent spends

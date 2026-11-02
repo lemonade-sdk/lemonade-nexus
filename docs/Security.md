@@ -294,6 +294,19 @@ cryptography is involved, and a punch grants no authority:
   1013 beyond them. A message carries only two opaque revisions: it names no
   device and grants nothing, and the device reads its lists through the
   routes under their own checks.
+- **Presence is a hint, not authority.** `is_online` and `last_seen` in the
+  peer list come from device presence (`gossip::DevicePresence`). Only the
+  node's own session makes a device present: a heartbeat that passes the
+  ownership check, or an event socket whose session subject is the named
+  node. A socket that only holds Read on another device's node watches it
+  and does not hold it online. Tier 1 servers share presence with
+  `PresenceSync`, accepted only on the encrypted backbone, only from a
+  certified current Tier 1 member, and only by a Tier 1 server. A message
+  holds at most 256 entries and 16 KiB, and a malformed one is refused
+  whole. A time more than 5 seconds ahead of the receiver's clock is
+  ignored, so a sender cannot hold a device online with a future time. Each
+  server sends only what it heard itself, so presence is never relayed. No
+  authorization decision reads presence.
 - **Probes are rate limited.** At most 16 peers are probed per pass, each
   probe goes to at most five addresses (four LAN endpoints and the listed
   endpoint), and passes are at least 250 ms apart. A peer gets a burst of five probes, then two

@@ -2697,6 +2697,9 @@ TEST_F(MeshPeersConnectTest, HeartbeatLocalEndpointsReachOnlyListedPeers) {
         return json(nullptr);
     };
 
+    // A heartbeat makes the peer present (is_online is part of the revision),
+    // so the baseline is taken once it is online and before any LAN report.
+    ASSERT_EQ(heartbeat("mc_peer", peer_key, {{"node_id", "mc_peer"}}), 200);
     const auto before = revision();
     EXPECT_EQ(lan_of_peer(), json::array()) << "a peer without a report lists LAN endpoints";
 
@@ -2770,6 +2773,223 @@ TEST_F(MeshPeersConnectTest, HeartbeatLocalEndpointsReachOnlyListedPeers) {
     ASSERT_EQ(res->status, 200) << res->body;
     EXPECT_EQ(res->body.find("192.168.1.20"), std::string::npos) << res->body;
     EXPECT_EQ(res->body.find("mc_peer"), std::string::npos) << res->body;
+}
+
+// ---------------------------------------------------------------------------
+// Device presence in the peer list: `is_online` and `last_seen` come from the
+// DevicePresence table, which holds heartbeats and event sockets at this
+// server and the presence other Tier 1 servers share (PresenceSync).
+// ---------------------------------------------------------------------------
+
+// The tests below let a presence expire within two seconds. The push must
+// follow the expiry, not the kMeshPeerRecheckMs (5 s) period, so it must
+// come within this bound.
+constexpr int64_t kMeshPeerExpiryBoundMs = 4000;
+static_assert(kMeshPeerExpiryBoundMs < api::kMeshPeerRecheckMs);
+
+class MeshPresenceTest : public MeshPeersConnectTest {
+protected:
+    gossip::DevicePresence& presence() { return gossip->device_presence(); }
+
+    /// A session whose subject is `node`, as the join flow issues one.
+    std::string owner_token(const std::string& node, const std::string& pubkey) {
+        const auto now = std::chrono::system_clock::now();
+        return jwt::create()
+            .set_issuer("lemonade-nexus")
+            .set_subject(node)
+            .set_issued_at(now)
+            .set_expires_at(now + std::chrono::hours{1})
+            .set_payload_claim("pubkey", jwt::claim(pubkey))
+            .sign(jwt::algorithm::hs256{jwt_secret});
+    }
+
+    /// The caller's peer list entry for `node_id` (null when not listed).
+    json entry_of(const std::string& node_id, std::string* revision = nullptr) {
+        json body;
+        listed(&body);
+        if (revision) *revision = body.value("peers_revision", std::string{});
+        for (const auto& p : body["peers"]) {
+            if (p["node_id"] == node_id) return p;
+        }
+        return nullptr;
+    }
+
+    std::string revision() {
+        std::string out;
+        (void)entry_of("", &out);
+        return out;
+    }
+
+    uint32_t status_online_count() {
+        httplib::Client cli("127.0.0.1", mesh_port);
+        auto res = cli.Get("/api/mesh/status/mc_self",
+                           httplib::Headers{{"Authorization", "Bearer " + make_jwt(caller)}});
+        EXPECT_NE(res, nullptr);
+        if (!res) return 0;
+        EXPECT_EQ(res->status, 200) << res->body;
+        return json::parse(res->body)["online_count"].get<uint32_t>();
+    }
+};
+
+// A device present only at another Tier 1 server (gossiped presence) reads
+// online here, with that presence time, and offline once the time is older
+// than the online window. The server's own dataplane plays no part.
+TEST_F(MeshPresenceTest, PeerListReportsPresenceFromAnotherServer) {
+    add("mc_peer", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    add("mc_old", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    auto peer = entry_of("mc_peer");
+    ASSERT_TRUE(peer.is_object());
+    EXPECT_EQ(peer["is_online"], false);
+    EXPECT_EQ(peer["last_seen"], 0u);
+    EXPECT_EQ(status_online_count(), 0u);
+
+    const auto now = api::epoch_seconds();
+    const auto stale = now - gossip::kDevicePresenceOnlineSec - 1;
+    (void)presence().merge_remote({{"mc_peer", now}, {"mc_old", stale}}, now);
+    EXPECT_TRUE(presence().local_online(now).empty()) << "gossiped presence counted as local";
+
+    peer = entry_of("mc_peer");
+    EXPECT_EQ(peer["is_online"], true) << peer.dump();
+    EXPECT_EQ(peer["last_seen"], now);
+    const auto old = entry_of("mc_old");
+    EXPECT_EQ(old["is_online"], false) << "a time older than the window read online";
+    EXPECT_EQ(old["last_seen"], stale);
+    EXPECT_EQ(status_online_count(), 1u);
+}
+
+// peers_revision changes when a listed peer goes online or offline, and not
+// when an online peer's presence time is renewed (the change that a handshake
+// renewal was) or when an unlisted device's presence changes. Going offline
+// needs no new input: the server wakes at the expiry and answers a held wait.
+TEST_F(MeshPresenceTest, PeersRevisionFollowsOnlineStateNotPresenceTime) {
+    add("mc_peer", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    add("mc_brief", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    add("mc_unlisted", "mc_group", tree::NodeType::Endpoint,
+        {{principal(), {"connect_private"}}});
+    const auto baseline = revision();
+    ASSERT_FALSE(baseline.empty());
+
+    auto now = api::epoch_seconds();
+    (void)presence().merge_remote({{"mc_unlisted", now}}, now);
+    EXPECT_EQ(revision(), baseline) << "an unlisted device's presence changed the revision";
+
+    (void)presence().merge_remote({{"mc_peer", now}}, now);
+    const auto online = revision();
+    EXPECT_NE(online, baseline) << "a listed peer going online left the revision as it was";
+
+    // A renewed presence time of an online peer changes last_seen only.
+    (void)presence().record_local("mc_peer", now + 1);
+    EXPECT_EQ(entry_of("mc_peer")["last_seen"], now + 1);
+    EXPECT_EQ(revision(), online) << "a renewed presence time changed the revision";
+
+    // mc_brief goes online now and offline within two seconds.
+    now = api::epoch_seconds();
+    (void)presence().merge_remote({{"mc_brief", now - gossip::kDevicePresenceOnlineSec + 2}}, now);
+    const auto brief = revision();
+    EXPECT_NE(brief, online);
+
+    // A held long-poll answers at the expiry, before the 5 s recheck.
+    const auto started = std::chrono::steady_clock::now();
+    httplib::Client cli("127.0.0.1", mesh_port);
+    cli.set_read_timeout(15, 0);
+    auto res = cli.Get("/api/mesh/peers/mc_self?wait_revision=" + brief + "&timeout=10",
+                       httplib::Headers{{"Authorization", "Bearer " + make_jwt(caller)}});
+    const auto waited = std::chrono::steady_clock::now() - started;
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    const auto answer = json::parse(res->body);
+    EXPECT_EQ(answer["peers_revision"], online) << "the revision did not return after the expiry";
+    EXPECT_LT(waited, std::chrono::milliseconds(kMeshPeerExpiryBoundMs));
+    EXPECT_EQ(entry_of("mc_brief")["is_online"], false);
+}
+
+// The event socket pushes a listed peer going online at once, and going
+// offline at its expiry.
+TEST_F(MeshPresenceTest, EventSocketPushesPresenceChanges) {
+    add("mc_peer", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    httplib::ws::WebSocketClient ws(
+        "ws://127.0.0.1:" + std::to_string(mesh_port) + "/api/events?node_id=mc_self",
+        httplib::Headers{{"Authorization", "Bearer " + make_jwt(caller)}});
+    ws.set_read_timeout(10, 0);
+    ASSERT_TRUE(ws.connect());
+    const auto next = [&ws]() -> json {
+        std::string message;
+        if (ws.read(message) != httplib::ws::Text) return {};
+        return json::parse(message);
+    };
+    const auto first = next();
+    ASSERT_EQ(first.value("event", ""), "revisions") << first.dump();
+
+    const auto now = api::epoch_seconds();
+    const auto started = std::chrono::steady_clock::now();
+    (void)presence().merge_remote({{"mc_peer", now - gossip::kDevicePresenceOnlineSec + 2}}, now);
+    const auto up = next();
+    ASSERT_EQ(up.value("event", ""), "revisions") << up.dump();
+    EXPECT_NE(up["peers_revision"], first["peers_revision"]);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(1));
+
+    const auto down = next();
+    ASSERT_EQ(down.value("event", ""), "revisions") << down.dump();
+    EXPECT_EQ(down["peers_revision"], first["peers_revision"]);
+    EXPECT_LT(std::chrono::steady_clock::now() - started,
+              std::chrono::milliseconds(kMeshPeerExpiryBoundMs));
+    ws.close();
+}
+
+// A heartbeat of the node's own session makes the device present here, and
+// so does an open event socket of that session. A refused heartbeat, and a
+// socket that only watches another device's node, do not.
+TEST_F(MeshPresenceTest, HeartbeatAndOwnEventSocketMakeTheDevicePresent) {
+    const auto peer_key = principal();
+    add("mc_peer", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}},
+        peer_key);
+    httplib::Client cli("127.0.0.1", mesh_port);
+    const auto heartbeat = [&](const std::string& subject, const std::string& pubkey) {
+        const json body = {{"node_id", "mc_peer"}, {"endpoint", ""}};
+        auto res = cli.Post("/api/mesh/heartbeat",
+                            {{"Authorization", "Bearer " + owner_token(subject, pubkey)}},
+                            body.dump(), "application/json");
+        EXPECT_NE(res, nullptr);
+        return res ? res->status : 0;
+    };
+
+    // Refused: the session does not own the node.
+    EXPECT_EQ(heartbeat("mc_other", peer_key), 403);
+    EXPECT_EQ(entry_of("mc_peer")["is_online"], false);
+
+    const auto before = api::epoch_seconds();
+    ASSERT_EQ(heartbeat("mc_peer", peer_key), 200);
+    const auto peer = entry_of("mc_peer");
+    EXPECT_EQ(peer["is_online"], true) << peer.dump();
+    EXPECT_GE(peer["last_seen"].get<uint64_t>(), before);
+    const auto local = presence().local_online(api::epoch_seconds());
+    ASSERT_EQ(local.size(), 1u);
+    EXPECT_EQ(local[0].node_id, "mc_peer");
+
+    // An event socket of the node's own session.
+    const auto sock_key = principal();
+    add("mc_sock", "mc_group", tree::NodeType::Endpoint,
+        {{sock_key, {"read"}}, {caller, {"connect_private"}}}, sock_key);
+    httplib::ws::WebSocketClient own(
+        "ws://127.0.0.1:" + std::to_string(mesh_port) + "/api/events?node_id=mc_sock",
+        httplib::Headers{{"Authorization", "Bearer " + owner_token("mc_sock", sock_key)}});
+    own.set_read_timeout(10, 0);
+    ASSERT_TRUE(own.connect());
+    std::string message;
+    ASSERT_EQ(own.read(message), httplib::ws::Text);
+    EXPECT_EQ(entry_of("mc_sock")["is_online"], true);
+
+    // The caller watches its own node through a session whose subject is its
+    // key, not the node: that socket holds no presence for mc_self.
+    httplib::ws::WebSocketClient watcher(
+        "ws://127.0.0.1:" + std::to_string(mesh_port) + "/api/events?node_id=mc_self",
+        httplib::Headers{{"Authorization", "Bearer " + make_jwt(caller)}});
+    watcher.set_read_timeout(10, 0);
+    ASSERT_TRUE(watcher.connect());
+    ASSERT_EQ(watcher.read(message), httplib::ws::Text);
+    EXPECT_FALSE(presence().status("mc_self", api::epoch_seconds()).online);
+    own.close();
+    watcher.close();
 }
 
 TEST(MeshLocalEndpoints, ParseRules) {

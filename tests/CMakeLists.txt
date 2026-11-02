@@ -174,6 +174,9 @@ add_nexus_test(test_gossip_security_transport test_gossip_security_transport.cpp
 # Origin-sequenced replica used by DNS catch-up: ordering, tombstones, digest
 # comparison, catch-up planning and the bounded wire codec.
 add_nexus_test(test_origin_replica test_origin_replica.cpp)
+# Device presence: online window, merge by maximum, clock skew, and the
+# bounded PresenceSync codec.
+add_nexus_test(test_device_presence test_device_presence.cpp)
 add_nexus_test(test_security_mesh_service test_security_mesh_service.cpp)
 
 # --- Security overhaul tests (mirror include/LemonadeNexus/Security/) ---

@@ -9,6 +9,8 @@
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
+#include <LemonadeNexus/Gossip/DevicePresence.hpp>
+#include <LemonadeNexus/Gossip/GossipService.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -24,32 +26,6 @@
 #include <unordered_set>
 
 namespace nexus::api {
-
-namespace {
-/// Staleness threshold: 3 missed 5-second keepalives = offline.
-constexpr uint64_t kStaleThresholdSec = 15;
-
-/// Strip CIDR prefix from tunnel IP (e.g. "10.64.0.3/32" -> "10.64.0.3")
-std::string strip_cidr(const std::string& ip) {
-    auto slash = ip.find('/');
-    return (slash != std::string::npos) ? ip.substr(0, slash) : ip;
-}
-
-/// Build a map from tunnel address to the last Noise handshake epoch.
-/// Used to determine peer liveness from the boringtun layer.
-std::unordered_map<std::string, uint64_t> build_mesh_handshake_map(
-    nexus::boringtun::BoringtunService* dataplane) {
-    std::unordered_map<std::string, uint64_t> m;
-    if (!dataplane) return m;
-    for (const auto& peer : dataplane->get_peers()) {
-        auto ip = strip_cidr(peer.allowed_ips);
-        if (!ip.empty() && peer.last_handshake > 0) {
-            m[ip] = peer.last_handshake;
-        }
-    }
-    return m;
-}
-} // anonymous namespace
 
 bool mesh_peer_listed(const tree::PermissionTreeService& tree,
                       std::string_view caller_pubkey,
@@ -94,25 +70,18 @@ std::vector<tree::TreeNode> connectable_endpoints(const tree::rules::NodeMap& no
     return out;
 }
 
-/// A server handshake younger than this means the server holds a live session
-/// with the peer: BoringTun's REJECT_AFTER_TIME (180 s), one retry, and
-/// jitter. peers_revision uses it, not is_online (a handshake within
-/// kStaleThresholdSec): a working session renews its handshake only about
-/// every two minutes, so is_online flips twice per rekey without any change
-/// in reachability, and each flip would make every client fetch its peers.
-constexpr uint64_t kSessionLiveSec = 200;
-
 /// The peers_revision of a heartbeat answer: an opaque value that changes
 /// when the peer list that GET /api/mesh/peers gives the caller changes in a
 /// way that matters for a path: a peer added or removed, or a listed peer's
 /// mesh key, tunnel address, private subnet, endpoint, LAN endpoints,
-/// hostname, or live session state (kSessionLiveSec) changed. `endpoints`
-/// and `relays` are the listed peers in list order; `local` holds the LAN
-/// endpoints of listed endpoints that have any. XXH3 over length-prefixed
-/// fields; a change detector, not a security value.
+/// hostname, or online state (`is_online`, from `presence`) changed. The
+/// presence time itself is left out, so a device that stays online changes
+/// nothing. `endpoints` and `relays` are the listed peers in list order;
+/// `local` holds the LAN endpoints of listed endpoints that have any. XXH3
+/// over length-prefixed fields; a change detector, not a security value.
 std::string peers_revision(const std::vector<tree::TreeNode>& endpoints,
                            const std::vector<const tree::TreeNode*>& relays,
-                           const std::unordered_map<std::string, uint64_t>& handshakes,
+                           const gossip::DevicePresence& presence,
                            const std::unordered_map<std::string, std::vector<std::string>>& local,
                            uint64_t now) {
     std::string buf;
@@ -121,7 +90,7 @@ std::string peers_revision(const std::vector<tree::TreeNode>& endpoints,
         buf += ':';
         buf += text;
     };
-    const auto peer = [&](const tree::TreeNode& n, char kind, bool live) {
+    const auto peer = [&](const tree::TreeNode& n, char kind, bool online) {
         buf += kind;
         field(n.id);
         field(n.mesh_pubkey);
@@ -129,11 +98,10 @@ std::string peers_revision(const std::vector<tree::TreeNode>& endpoints,
         field(n.private_subnet);
         field(n.listen_endpoint);
         field(n.hostname);
-        buf += live ? '1' : '0';
+        buf += online ? '1' : '0';
     };
     for (const auto& n : endpoints) {
-        const auto it = handshakes.find(strip_cidr(n.tunnel_ip));
-        peer(n, 'E', it != handshakes.end() && now - it->second < kSessionLiveSec);
+        peer(n, 'E', presence.status(n.id, now).online);
         // Only a peer with LAN endpoints adds this part, so the revision of
         // a list without any stays as servers without the field compute it.
         if (const auto lan = local.find(n.id); lan != local.end() && !lan->second.empty()) {
@@ -282,6 +250,23 @@ namespace {
 /// RFC 6455 close code 1013 (Try Again Later); cpp-httplib names no constant.
 constexpr auto kCloseTryAgainLater = static_cast<httplib::ws::CloseStatus>(1013);
 
+/// How long the events loop sleeps before its next pass: kMeshPeerRecheckMs,
+/// or less when a device goes offline sooner. `next_expiry` is the Unix
+/// second at which the first online device goes offline (0 when none is
+/// online). The pass wakes just after that second starts, so the offline
+/// push follows the online window instead of the recheck period.
+std::chrono::milliseconds events_wait(uint64_t next_expiry) {
+    constexpr std::chrono::milliseconds recheck(kMeshPeerRecheckMs);
+    if (next_expiry == 0) return recheck;
+    constexpr int64_t kMarginMs = 20;
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    const auto until = static_cast<int64_t>(next_expiry) * 1000 - now_ms + kMarginMs;
+    return std::clamp(std::chrono::milliseconds(until), std::chrono::milliseconds(kMarginMs),
+                      recheck);
+}
+
 /// A request for the event socket that passed the checks: a valid session
 /// with Read on the device node it names.
 struct EventSocketRequest {
@@ -328,11 +313,15 @@ MeshApiHandler::MeshApiHandler(ApiContext& ctx) : ctx_(ctx) {
     // Every Tier 1 server applies the same committed log, so each wakes its
     // own waiters when a change may alter someone's peer list.
     ctx_.tree.set_changed_hook([this] { waiters_.notify(); });
+    // A device that becomes online, here or at another Tier 1 server, flips
+    // its is_online in the peer lists that hold it.
+    ctx_.gossip.device_presence().set_changed_hook([this] { waiters_.notify(); });
     events_thread_ = std::thread([this] { events_loop(); });
 }
 
 MeshApiHandler::~MeshApiHandler() {
     ctx_.tree.set_changed_hook({});
+    ctx_.gossip.device_presence().set_changed_hook({});
     {
         std::lock_guard lock(events_mtx_);
         events_stopping_ = true;
@@ -352,6 +341,10 @@ std::size_t MeshApiHandler::event_sockets() const {
 
 void MeshApiHandler::events_loop() {
     for (;;) {
+        // A device goes offline with time alone, with no notify(). The sweep
+        // finds it, and the notify wakes the held long-polls too.
+        const auto sweep = ctx_.gossip.device_presence().sweep(epoch_seconds());
+        if (sweep.went_offline) waiters_.notify();
         // Read the generation first, so a change during the pass below wakes
         // the next wait instead of being lost.
         const auto seen = waiters_.generation();
@@ -373,10 +366,10 @@ void MeshApiHandler::events_loop() {
                 spdlog::warn("[MeshApi] event socket update failed: {}", e.what());
             }
         }
-        // A peer's live session state follows handshake ages, which change
-        // without a notification, so check again at least every
-        // kMeshPeerRecheckMs.
-        waiters_.wait(seen, std::chrono::milliseconds(kMeshPeerRecheckMs));
+        // LAN endpoints expire with time and without a notification, so
+        // check again at least every kMeshPeerRecheckMs, and at the next
+        // presence expiry when that comes sooner.
+        waiters_.wait(seen, events_wait(sweep.next_expiry));
     }
 }
 
@@ -389,6 +382,13 @@ bool MeshApiHandler::update_event_socket(EventSocket& socket, uint64_t now) {
     const auto node = ctx_.tree.get_node(socket.node_id);
     if (!node || !ctx_.tree.check_permission(caller, socket.node_id, acl::Permission::Read)) {
         return false;
+    }
+    // The heartbeat's ownership rule: only the node's own session makes it
+    // present. Read on another device's node lets a socket watch it, not
+    // hold it online. A pass runs at least every kMeshPeerRecheckMs, well
+    // within kDevicePresenceOnlineSec.
+    if (claims->user_id == socket.node_id) {
+        (void)ctx_.gossip.record_device_presence(socket.node_id, now);
     }
     auto peers = caller_peers_revision(caller, *node, now);
     auto devices = devices_revision(ctx_.tree, *claims);
@@ -428,7 +428,7 @@ std::string MeshApiHandler::caller_peers_revision(const std::string& caller_pubk
             }
         }
     }
-    return peers_revision(endpoints, relays, build_mesh_handshake_map(ctx_.boringtun), local, now);
+    return peers_revision(endpoints, relays, ctx_.gossip.device_presence(), local, now);
 }
 
 void MeshApiHandler::store_local_endpoints(const std::string& node_id,
@@ -488,6 +488,8 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // The server sends text messages only:
     //   {"event":"revisions","peers_revision":"...","devices_revision":"..."}
     // once when the socket opens, and again whenever either value changes.
+    // A listed peer that goes online or offline changes peers_revision; the
+    // server sends it within about a second (DevicePresence).
     // peers_revision is the value GET /api/mesh/peers answers;
     // devices_revision (devices_revision()) changes with the device list.
     // A message names no device and grants nothing: the client reads the
@@ -498,6 +500,11 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // socket closes with 1008 when either ends. Each socket counts as one
     // waiter (kMeshPeerWaitersMax, kMeshPeerWaitersPerCaller); beyond the
     // caps it closes with 1013 (Try Again Later).
+    //
+    // While a socket whose session owns the named node (the session subject
+    // is the node id, as for the heartbeat) is open, the device counts as
+    // present at this server on every pass, so a device that holds the
+    // socket reads online without a heartbeat.
     // ========================================================================
     priv.set_pre_request_handler([this](const httplib::Request& req, httplib::Response& res) {
         if (req.matched_route != kMeshEventsRoute) return httplib::Server::HandlerResponse::Unhandled;
@@ -553,6 +560,13 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // subtree, or an invite membership), and the relays in that subtree that
     // mesh_peer_listed admits. Read on the requesting node lets the caller ask.
     //
+    // Each endpoint entry carries `is_online` and `last_seen` (Unix seconds,
+    // 0 when unknown): the device's latest presence (DevicePresence), from
+    // its authenticated heartbeats or open event socket at this server or at
+    // another Tier 1 server (PresenceSync). `is_online` is true while that
+    // time is within kDevicePresenceOnlineSec (10 s). It is a liveness hint
+    // and grants nothing. Relay entries are always `is_online`.
+    //
     // Each peer entry carries `mgmt_pubkey`, the peer node's management
     // public key as the tree stores it, and `peer_permissions`: the sorted,
     // de-duplicated permission names (tree names and `svc:` service
@@ -567,7 +581,8 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // the server answers as soon as the caller's revision differs from it,
     // or after `timeout` seconds (default kMeshPeerWaitDefaultSec, at most
     // kMeshPeerWaitMaxSec) with the unchanged list. A committed tree change,
-    // a changed LAN endpoint list, or a changed live session wakes it.
+    // a changed LAN endpoint list, or a listed device going online or
+    // offline wakes it.
     // Beyond kMeshPeerWaitersMax held requests per server, or
     // kMeshPeerWaitersPerCaller per device, it answers 429 with Retry-After.
     // ========================================================================
@@ -644,9 +659,10 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                 }
                 const auto now = std::chrono::steady_clock::now();
                 if (now >= deadline) break;
-                // A peer's live session state follows handshake ages, which
-                // change without a notification, so check again at least
-                // every kMeshPeerRecheckMs.
+                // LAN endpoints expire with time and without a
+                // notification, so check again at least every
+                // kMeshPeerRecheckMs. The events loop notifies when a
+                // device goes offline.
                 const auto left =
                     std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
                 waiters_.wait(seen, std::min(left, std::chrono::milliseconds(kMeshPeerRecheckMs)));
@@ -681,8 +697,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         const auto nodes = ctx_.tree.nodes_snapshot();
         const auto endpoints = connectable_endpoints(nodes, caller_pubkey, node, reachable);
 
-        // Use Noise handshake activity to determine peer liveness.
-        auto mesh_handshakes = build_mesh_handshake_map(ctx_.boringtun);
+        const auto& presence = ctx_.gossip.device_presence();
         auto now = epoch_seconds();
 
         // What the peer's key holds toward the requesting node; the peer is
@@ -694,17 +709,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         // Build peer list: every endpoint the caller's node may connect to
         nlohmann::json peers = nlohmann::json::array();
         for (const auto& sibling : endpoints) {
-
-            // Determine online status from the last Noise handshake.
-            auto sip = strip_cidr(sibling.tunnel_ip);
-            uint64_t last_seen = 0;
-            bool online = false;
-            auto it = mesh_handshakes.find(sip);
-            if (it != mesh_handshakes.end()) {
-                last_seen = it->second;
-                online = (now - last_seen) < kStaleThresholdSec;
-            }
-
+            const auto seen = presence.status(sibling.id, now);
             nlohmann::json peer;
             peer["node_id"]          = sibling.id;
             peer["hostname"]         = sibling.hostname;
@@ -716,8 +721,8 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             // server. Only a listed peer's entry carries them.
             peer["local_endpoints"]  = local_endpoints_of(sibling.id, now);
             peer["relay_endpoint"]   = "";  // filled by relay discovery
-            peer["is_online"]        = online;
-            peer["last_seen"]        = last_seen;
+            peer["is_online"]        = seen.online;
+            peer["last_seen"]        = seen.last_seen;
             peer["mgmt_pubkey"]      = sibling.mgmt_pubkey;
             peer["peer_permissions"] = names_toward_caller(sibling);
             peers.push_back(std::move(peer));
@@ -757,11 +762,17 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // ========================================================================
     // POST /api/mesh/heartbeat (PRIVATE, auth required)
     //
-    // Client reports its current public endpoint (learned via STUN) and
-    // online status.  The server updates the node's listen_endpoint in the
-    // tree so that other peers can discover it. An empty or absent endpoint
-    // means the client has none to report (no STUN answer yet): the stored
-    // endpoint stays as it is, so a heartbeat never erases a punch target.
+    // Client reports its current public endpoint (learned via STUN). The
+    // server updates the node's listen_endpoint in the tree so that other
+    // peers can discover it. An empty or absent endpoint means the client
+    // has none to report (no STUN answer yet): the stored endpoint stays as
+    // it is, so a heartbeat never erases a punch target.
+    //
+    // A heartbeat that passes the ownership checks makes the device present
+    // at this server (GossipService::record_device_presence), even when the
+    // endpoint write is refused. Tier 1 servers share presence
+    // (PresenceSync), so the device reads `is_online` in the peer lists of
+    // every Tier 1 server for kDevicePresenceOnlineSec after it.
     //
     // Body: { "node_id": "...", "endpoint": "ip:port",
     //         "local_endpoints"?: ["192.168.1.20:41234", ...] }
@@ -777,7 +788,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // peers_revision is an opaque string that changes when the caller's peer
     // list (GET /api/mesh/peers) gains or loses a peer, or when a listed
     // peer's mesh key, tunnel address, private subnet, endpoint, LAN
-    // endpoints, hostname, or live session with this server changes
+    // endpoints, hostname, or online state (`is_online`) changes
     // (peers_revision()). It is
     // present when the caller holds Read on its node, as the peer list
     // requires. A client compares it with the previous answer and fetches
@@ -841,6 +852,9 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             error_response(res, "insufficient permissions", 403);
             return;
         }
+        // The owner's own session reached this server: the device is
+        // present, whatever happens to the endpoint write below.
+        (void)ctx_.gossip.record_device_presence(hb_node_id, epoch_seconds());
 
         // The endpoint write is a SetEndpoint tree operation. A heartbeat
         // does not wait for the commit: it is periodic and best-effort,
@@ -954,16 +968,13 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         if (!node.parent_id.empty()) {
             // Count the same peers that GET /api/mesh/peers lists.
             auto reachable = ctx_.tree.collect_subtree(node.parent_id);
-            auto mesh_handshakes = build_mesh_handshake_map(ctx_.boringtun);
+            // online_count uses the is_online rule of the peer list.
+            const auto& presence = ctx_.gossip.device_presence();
             auto now = epoch_seconds();
             for (const auto& s : connectable_endpoints(ctx_.tree.nodes_snapshot(), caller_pubkey,
                                                        node, reachable)) {
                 ++peer_count;
-                auto sip = strip_cidr(s.tunnel_ip);
-                auto it = mesh_handshakes.find(sip);
-                if (it != mesh_handshakes.end() && (now - it->second) < kStaleThresholdSec) {
-                    ++online_count;
-                }
+                if (presence.status(s.id, now).online) ++online_count;
             }
             for (const auto& s : reachable) {
                 if (s.type != tree::NodeType::Relay) continue;

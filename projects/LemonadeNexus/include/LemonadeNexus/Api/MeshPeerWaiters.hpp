@@ -38,8 +38,11 @@ inline constexpr uint32_t kMeshPeerWaitMaxSec     = 30;
 inline constexpr uint32_t kMeshPeerWaitDefaultSec = 25;
 
 /// Longest a held long-poll sleeps before it computes its revision again, in
-/// milliseconds. A peer's live session state follows handshake ages, which
-/// change without a notify(), so a waiter also checks on this period.
+/// milliseconds. LAN endpoints expire with time (kMeshLocalEndpointTtlSec)
+/// without a notify(), so a waiter also checks on this period. Presence
+/// changes do not depend on it: a device that becomes online notifies at
+/// once, and the events loop wakes at each presence expiry and notifies when
+/// a device goes offline.
 inline constexpr int64_t kMeshPeerRecheckMs = 5000;
 
 /// Change notification and admission for the peer list long-polls of one
@@ -47,8 +50,9 @@ inline constexpr int64_t kMeshPeerRecheckMs = 5000;
 ///
 /// Anything that can change a peer list or its peers_revision calls notify():
 /// an applied tree change (every Tier 1 server applies the same committed
-/// log, so each wakes its own waiters), a changed LAN endpoint list or live
-/// session of a device, and runtime state from another Tier 1 server. A
+/// log, so each wakes its own waiters), a changed LAN endpoint list, and a
+/// device going online or offline, at this server or at another Tier 1
+/// server (DevicePresence). A
 /// waiter then recomputes its own peers_revision and answers only when it
 /// differs from the one it waits on, so a change outside its peer set does
 /// not answer it. notify() carries no data and decides nothing about access.
