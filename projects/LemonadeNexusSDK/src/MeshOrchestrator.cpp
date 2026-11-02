@@ -118,6 +118,8 @@ void MeshOrchestrator::start(const MeshConfig& config) {
         config_ = config;
     }
 
+    // The join just verified the Tier 1 servers.
+    tier1_checked_ = std::chrono::steady_clock::now();
     running_ = true;
     client_.begin_mesh_peer_waits();
     thread_ = std::thread([this] { run_loop(); });
@@ -691,8 +693,21 @@ std::chrono::steady_clock::time_point MeshOrchestrator::do_punch() {
 
 std::vector<RelayCandidate> MeshOrchestrator::relay_candidates() {
     std::vector<RelayCandidate> out;
+    auto membership = client_.tier1_membership();
+    const auto now = std::chrono::steady_clock::now();
+    const bool missing = membership.servers.size() < membership.members.size();
+    if (membership.servers.empty() ||
+        now - tier1_checked_ >= (missing ? kTier1RecheckMissing : kTier1Recheck)) {
+        tier1_checked_ = now;
+        auto refreshed = client_.refresh_tier1();
+        if (refreshed.ok) {
+            membership = std::move(refreshed.value);
+        } else {
+            spdlog::debug("[MeshOrchestrator] Tier 1 verification failed: {}", refreshed.error);
+        }
+    }
     // Verified Tier 1 servers: their relay id is their node identity.
-    for (const auto& server : client_.tier1_membership().servers) {
+    for (const auto& server : membership.servers) {
         out.push_back({server.node_id, server.host, kRelayPort});
     }
     // Relays the session's server lists. Tier 2 relays appear here.
