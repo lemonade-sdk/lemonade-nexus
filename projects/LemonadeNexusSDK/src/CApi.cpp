@@ -1790,12 +1790,8 @@ ln_error_t ln_mesh_enable_config(ln_client_t* client, const char* config_json) {
     lnsdk::MeshConfig cfg;
     if (config_json) {
         try {
-            auto j = json::parse(config_json);
-            cfg.peer_refresh_interval_sec = j.value("peer_refresh_interval_sec", 30u);
-            cfg.heartbeat_interval_sec    = j.value("heartbeat_interval_sec", 15u);
-            cfg.stun_refresh_interval_sec = j.value("stun_refresh_interval_sec", 60u);
-            cfg.prefer_direct             = j.value("prefer_direct", true);
-            cfg.auto_connect              = j.value("auto_connect", true);
+            // A key that is left out keeps its MeshConfig default.
+            cfg = json::parse(config_json).get<lnsdk::MeshConfig>();
         } catch (...) {
             return LN_ERR_INTERNAL;
         }

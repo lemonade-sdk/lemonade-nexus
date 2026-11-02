@@ -449,7 +449,9 @@ ln_error_t ln_mesh_enable(ln_client_t* client);
 
 /** Enable mesh networking with custom config (JSON string).
  *  Config JSON keys: peer_refresh_interval_sec, heartbeat_interval_sec,
- *  stun_refresh_interval_sec, prefer_direct, auto_connect.
+ *  stun_refresh_interval_sec, prefer_direct, auto_connect. A key that is
+ *  left out keeps the default of ln_mesh_enable (heartbeat_interval_sec 3,
+ *  peer_refresh_interval_sec 30).
  *  stun_refresh_interval_sec (default 60) sets how often the client learns
  *  its reflexive address from the server's STUN service and publishes it for
  *  hole punching; 0 turns this off. prefer_direct (default true) keeps

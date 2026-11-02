@@ -418,6 +418,61 @@ TEST_F(SdkRelayFallbackTest, ARefusingRelayIsSkippedForTheNextOne) {
     EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong-through-relay");
 }
 
+// A restarted app, or one resumed behind a new NAT mapping, leaves its earlier
+// request at the relay. The relay refuses the new request with RendezvousBusy,
+// and the peer may pair with the dead request first. Neither is the relay's
+// fault: both sides keep the relay they share and pair once the dead request
+// is gone. A cooldown on one side only put the two sides on different relays.
+TEST_F(SdkRelayFallbackTest, ADeadEarlierRequestMovesNeitherSideOffTheRelay) {
+    const auto window = relay::relay_rendezvous_window(now_s());
+    const auto rendezvous = alice.relay_rendezvous(bob_keys.second, "relay-1", window);
+    ASSERT_TRUE(rendezvous);
+    const auto allocate =
+        lnsdk::relay_allocate_datagram(*rendezvous, sdk_ticket("alice", "relay-1"), 1);
+    ASSERT_FALSE(allocate.empty());
+    asio::io_context dead_io;
+    asio::ip::udp::socket dead(
+        dead_io, asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+    dead.send_to(asio::buffer(allocate),
+                 asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), r->local_port()));
+    ASSERT_TRUE(eventually([&] { return r->session_count() == 1u; }, [] {}, 5s));
+
+    const auto candidates = [&] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}};
+    };
+    const auto issuer = [&](const std::string& holder) {
+        return [&, holder](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket(holder, relay_id), 200, ""};
+        };
+    };
+    auto timing = fast_timing();
+    timing.handshake_grace = 2s;
+    lnsdk::RelayFallback alice_fallback(alice, issuer("alice"), candidates, timing);
+    lnsdk::RelayFallback bob_fallback(bob, issuer("bob"), candidates, timing);
+    const std::vector<lnsdk::MeshPeer> alice_peers = {peer(bob_keys.second, "10.64.0.3/32")};
+    const std::vector<lnsdk::MeshPeer> bob_peers = {peer(alice_keys.second, "10.64.0.2/32")};
+
+    // Alice asks first and meets her own dead request.
+    for (int i = 0; i < 10; ++i) {
+        alice_fallback.maintain(alice_peers, true);
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_TRUE(alice_fallback.relayed_peers().empty());
+
+    // Bob then pairs with the dead request, which carries nothing.
+    const auto pass = [&] {
+        alice_fallback.maintain(alice_peers, true);
+        bob_fallback.maintain(bob_peers, true);
+    };
+    ASSERT_TRUE(eventually(
+        [&] {
+            return alice_fallback.relayed_peers().contains(bob_keys.second) &&
+                   bob_fallback.relayed_peers().contains(alice_keys.second);
+        },
+        pass, 30s));
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong-through-relay");
+}
+
 TEST_F(SdkRelayFallbackTest, NoTicketMeansNoChannelAndBackoff) {
     std::atomic<int> requests{0};
     lnsdk::RelayFallback::Timing timing = fast_timing();

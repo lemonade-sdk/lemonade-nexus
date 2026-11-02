@@ -214,6 +214,23 @@ public:
     /// The LAN endpoints this device reports now (thread-safe snapshot).
     [[nodiscard]] std::vector<std::string> local_endpoints() const;
 
+    /// Interval between verifications of the Tier 1 servers that relay
+    /// choice ranks. Tree calls also verify them, but a device that makes
+    /// none would otherwise keep its first answer.
+    static constexpr std::chrono::seconds kTier1Recheck{300};
+    /// The same while a verified member was not reachable at the last
+    /// verification. Both sides of a pair rank the servers they reached;
+    /// one missed member (a server restarting) puts the two sides on
+    /// different relays until it is verified again.
+    static constexpr std::chrono::seconds kTier1RecheckMissing{60};
+
+    /// True when relay choice must verify the Tier 1 servers again: none is
+    /// verified, kTier1Recheck passed since the last verification, or
+    /// kTier1RecheckMissing passed while fewer servers than members were
+    /// reachable. Pure.
+    [[nodiscard]] static bool tier1_recheck_due(std::size_t servers, std::size_t members,
+                                                std::chrono::steady_clock::duration since_check);
+
 private:
     /// Main orchestration loop (runs on background thread).
     void run_loop();
@@ -249,6 +266,9 @@ private:
     std::chrono::steady_clock::time_point do_relay_maintenance();
 
     /// The relays the client may use: verified Tier 1 servers and listed relays.
+    /// Verifies the Tier 1 servers again when kTier1Recheck has passed, or
+    /// kTier1RecheckMissing while a member was not reachable. Blocks on
+    /// network I/O. Loop thread only.
     std::vector<RelayCandidate> relay_candidates();
 
     /// Start a certificate renewal thread when a registered certificate is
@@ -331,6 +351,7 @@ private:
     std::string              our_endpoint_; // reflexive endpoint we publish ("" until learned)
     std::vector<std::string> our_local_endpoints_;  // LAN endpoints we report
     std::vector<InterfaceAddress> own_lan_;         // our usable LAN interfaces
+    std::chrono::steady_clock::time_point tier1_checked_{};  // loop thread only
     LocalAddressSource       local_address_source_; // empty: list_interface_addresses
     bool                     refresh_requested_{false};  // set by refresh_now() and do_heartbeat()
     WallClock                wall_clock_;                // empty: the system clock

@@ -45,7 +45,7 @@ std::optional<bool> peer_signal_fresh(const MeshPeer& peer, int64_t now_unix,
     // server's last_seen arrives only with the peer list, so it may be one
     // peer refresh old.
     constexpr int64_t kSessionLive    = 200;  // REJECT_AFTER_TIME 180 s, a retry, jitter
-    constexpr int64_t kHeartbeatStale = 15;   // 3 missed 5 s heartbeats
+    constexpr int64_t kHeartbeatStale = 15;   // 5 missed 3 s heartbeats, 3 at 5 s
     constexpr int64_t kMonitorTick    = 5;
     const auto last_seen = static_cast<int64_t>(peer.last_seen);
     const bool seen_recently =
@@ -118,6 +118,8 @@ void MeshOrchestrator::start(const MeshConfig& config) {
         config_ = config;
     }
 
+    // The join just verified the Tier 1 servers.
+    tier1_checked_ = std::chrono::steady_clock::now();
     running_ = true;
     client_.begin_mesh_peer_waits();
     thread_ = std::thread([this] { run_loop(); });
@@ -689,10 +691,28 @@ std::chrono::steady_clock::time_point MeshOrchestrator::do_punch() {
     return hole_puncher_->maintain(peers, relay_fallback_->relayed_peers(), prefer_direct);
 }
 
+bool MeshOrchestrator::tier1_recheck_due(std::size_t servers, std::size_t members,
+                                         std::chrono::steady_clock::duration since_check) {
+    if (servers == 0) return true;
+    return since_check >= (servers < members ? kTier1RecheckMissing : kTier1Recheck);
+}
+
 std::vector<RelayCandidate> MeshOrchestrator::relay_candidates() {
     std::vector<RelayCandidate> out;
+    auto membership = client_.tier1_membership();
+    const auto now = std::chrono::steady_clock::now();
+    if (tier1_recheck_due(membership.servers.size(), membership.members.size(),
+                          now - tier1_checked_)) {
+        tier1_checked_ = now;
+        auto refreshed = client_.refresh_tier1();
+        if (refreshed.ok) {
+            membership = std::move(refreshed.value);
+        } else {
+            spdlog::debug("[MeshOrchestrator] Tier 1 verification failed: {}", refreshed.error);
+        }
+    }
     // Verified Tier 1 servers: their relay id is their node identity.
-    for (const auto& server : client_.tier1_membership().servers) {
+    for (const auto& server : membership.servers) {
         out.push_back({server.node_id, server.host, kRelayPort});
     }
     // Relays the session's server lists. Tier 2 relays appear here.

@@ -951,7 +951,7 @@ struct LemonadeNexusClient::Impl {
                          server_private_fqdn);
             return std::nullopt;
         }
-        // The breaker throttles the periodic callers (heartbeat every 5s, peer
+        // The breaker throttles the periodic callers (heartbeat every 3 s, peer
         // refresh) so a down tunnel can't block them repeatedly. Callers acting
         // on a user request skip it: otherwise a failing heartbeat keeps the
         // breaker armed and starves every interactive call.
