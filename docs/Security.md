@@ -195,6 +195,11 @@ sender's proof, and a commitment to the other side's proof.
   commitment that the other made, the two tickets name different holders, and
   the two requests come from different endpoints. A copy of the first request
   with another ticket is refused.
+- A side may return with a fresh ticket of its own holder, from a new endpoint
+  (a device that restarted or resumed from suspension). The relay moves that
+  side of the waiting or paired session to the new endpoint. A Tier 1 server
+  issues a ticket only for the caller's own identity, and each ticket
+  allocates once, so a copy of a side's earlier request cannot move it.
 - The relay forwards data only between the two bound endpoints. It drops data
   from any other sender, and data that starts with the relay magic, so a peer
   cannot forge relay control messages for the other peer.

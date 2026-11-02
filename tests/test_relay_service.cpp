@@ -459,13 +459,110 @@ TEST_F(RelayServiceTest, OnlyTheRealSecondSideCanJoin) {
     ASSERT_TRUE(paired.notify.has_value());
     EXPECT_EQ(*paired.notify, alice_ep);
 
-    // Once paired, the slot is closed: a third valid request starts a new
-    // waiting session instead of joining this one.
-    const auto late = r->allocate_rendezvous(request(bob_rv, ticket("bob")),
+    // Once paired, another holder with a side's proof cannot take that side.
+    const auto late = r->allocate_rendezvous(request(bob_rv, ticket("mallory")),
                                              ep("198.51.100.3", 3333));
-    ASSERT_FALSE(late.error);
-    EXPECT_NE(late.session_id, waiting.session_id);
-    EXPECT_FALSE(late.paired);
+    ASSERT_TRUE(late.error.has_value());
+    EXPECT_EQ(*late.error, relay::RelayErrorCode::RendezvousBusy);
+    const auto late_a = r->allocate_rendezvous(request(alice_rv, ticket("mallory")),
+                                               ep("198.51.100.3", 3333));
+    ASSERT_TRUE(late_a.error.has_value());
+    EXPECT_EQ(*late_a.error, relay::RelayErrorCode::RendezvousBusy);
+    EXPECT_EQ(r->session_count(), 1u);
+}
+
+TEST_F(RelayServiceTest, AWaitingSideThatMovedKeepsItsSlot) {
+    start_relay();
+    const auto alice_rv = rendezvous(alice_keys, bob_keys);
+    const auto first_ticket = ticket("alice");
+    const auto waiting =
+        r->allocate_rendezvous(request(alice_rv, first_ticket), ep("198.51.100.1", 1111));
+    ASSERT_FALSE(waiting.error);
+
+    // Alice's device resumed from suspension on a new port and asks again with
+    // a fresh ticket: she keeps her waiting session at the new endpoint.
+    const auto alice_new = ep("198.51.100.1", 1112);
+    const auto moved = r->allocate_rendezvous(request(alice_rv, ticket("alice")), alice_new);
+    ASSERT_FALSE(moved.error) << moved.error_message;
+    EXPECT_EQ(moved.session_id, waiting.session_id);
+    EXPECT_FALSE(moved.paired);
+
+    // A copy of her first request, from anywhere, is a replay; another holder
+    // with her proof cannot move her side.
+    const auto replay =
+        r->allocate_rendezvous(request(alice_rv, first_ticket), ep("203.0.113.9", 4444));
+    ASSERT_TRUE(replay.error.has_value());
+    EXPECT_EQ(*replay.error, relay::RelayErrorCode::TicketReplayed);
+    const auto stolen =
+        r->allocate_rendezvous(request(alice_rv, ticket("mallory")), ep("203.0.113.9", 4444));
+    ASSERT_TRUE(stolen.error.has_value());
+    EXPECT_EQ(*stolen.error, relay::RelayErrorCode::RendezvousBusy);
+
+    // Bob joins, and the relay tells Alice at her new endpoint.
+    const auto paired = r->allocate_rendezvous(request(rendezvous(bob_keys, alice_keys),
+                                                       ticket("bob")),
+                                               ep("198.51.100.2", 2222));
+    ASSERT_FALSE(paired.error) << paired.error_message;
+    EXPECT_TRUE(paired.paired);
+    EXPECT_EQ(paired.session_id, waiting.session_id);
+    ASSERT_TRUE(paired.notify.has_value());
+    EXPECT_EQ(*paired.notify, alice_new);
+    EXPECT_EQ(r->session_count(), 1u);
+}
+
+TEST_F(RelayServiceTest, APairedSideThatMovedRejoinsItsSessionOverTheWire) {
+    start_relay();
+    WireClient alice(io, r->local_port());
+    WireClient bob(io, r->local_port());
+
+    alice.send(relay::make_relay_allocate(rendezvous(alice_keys, bob_keys),
+                                          relay::relay_ticket_to_json(ticket("alice")), 1));
+    auto first = alice.reply();
+    ASSERT_TRUE(first.has_value());
+    const auto sid = first->first.session_id;
+    bob.send(relay::make_relay_allocate(rendezvous(bob_keys, alice_keys),
+                                        relay::relay_ticket_to_json(ticket("bob")), 1));
+    ASSERT_TRUE(bob.reply().has_value());
+    ASSERT_TRUE(alice.reply().has_value());  // Bound
+
+    // Alice's process restarts on a new port with a fresh ticket. She rejoins
+    // the same session, already paired, without Bob doing anything.
+    WireClient alice_again(io, r->local_port());
+    alice_again.send(relay::make_relay_allocate(rendezvous(alice_keys, bob_keys),
+                                                relay::relay_ticket_to_json(ticket("alice")), 1));
+    auto rejoined = alice_again.reply();
+    ASSERT_TRUE(rejoined.has_value());
+    ASSERT_EQ(rejoined->first.msg_type, relay::RelayMsgType::Allocated);
+    EXPECT_EQ(rejoined->first.session_id, sid);
+    EXPECT_EQ(relay::decode_relay_allocated(rejoined->second)->state,
+              relay::RelayAllocationState::Paired);
+
+    // Bob's data reaches Alice's new endpoint, not the old one, and the old
+    // endpoint can no longer send into the session.
+    bob.send(relay::make_relay_datagram(relay::RelayMsgType::Data, sid, 2, bytes("to-alice")));
+    auto at_alice = alice_again.receive();
+    ASSERT_TRUE(at_alice.has_value());
+    EXPECT_EQ(*at_alice, bytes("to-alice"));
+    EXPECT_FALSE(alice.receive(200ms).has_value());
+    alice.send(relay::make_relay_datagram(relay::RelayMsgType::Data, sid, 3, bytes("stale")));
+    EXPECT_FALSE(bob.receive(200ms).has_value());
+    alice_again.send(relay::make_relay_datagram(relay::RelayMsgType::Data, sid, 3, bytes("to-bob")));
+    auto at_bob = bob.receive();
+    ASSERT_TRUE(at_bob.has_value());
+    EXPECT_EQ(*at_bob, bytes("to-bob"));
+
+    // Bob moves too: the session follows him.
+    WireClient bob_again(io, r->local_port());
+    bob_again.send(relay::make_relay_allocate(rendezvous(bob_keys, alice_keys),
+                                              relay::relay_ticket_to_json(ticket("bob")), 1));
+    auto bob_rejoined = bob_again.reply();
+    ASSERT_TRUE(bob_rejoined.has_value());
+    EXPECT_EQ(bob_rejoined->first.session_id, sid);
+    alice_again.send(relay::make_relay_datagram(relay::RelayMsgType::Data, sid, 4, bytes("moved")));
+    auto at_bob_again = bob_again.receive();
+    ASSERT_TRUE(at_bob_again.has_value());
+    EXPECT_EQ(*at_bob_again, bytes("moved"));
+    EXPECT_EQ(r->session_count(), 1u);
 }
 
 TEST_F(RelayServiceTest, AllocationsAreBounded) {
