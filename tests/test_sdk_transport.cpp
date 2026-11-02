@@ -15,6 +15,7 @@
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Network/HttpServer.hpp>
 #include <LemonadeNexus/Network/StunService.hpp>
 #include <LemonadeNexus/Security/Epoch/Tier1Membership.hpp>
 #include <LemonadeNexus/Security/Transport/AuthorityChainCodec.hpp>
@@ -263,6 +264,8 @@ protected:
     std::thread priv_thread;
     int pub_port  = 0;
     int priv_port = 0;  // the private listener's port, kept across a restart
+    // The private listener's keep-alive timeout, applied when it starts.
+    time_t priv_keep_alive_sec = nexus::network::HttpServer::kKeepAliveTimeoutSec;
     fs::path cert_file;
     fs::path key_file;
 
@@ -561,6 +564,7 @@ protected:
         priv = std::make_unique<httplib::SSLServer>(cert_file.string().c_str(),
                                                     key_file.string().c_str());
         ASSERT_TRUE(priv->is_valid());
+        priv->set_keep_alive_timeout(priv_keep_alive_sec);
         add_private_routes(*priv);
         if (priv_port == 0) {
             priv_port = priv->bind_to_any_port("127.0.0.1");
@@ -2080,6 +2084,29 @@ TEST_F(SdkMeshPrivateApiTest, HeartbeatReportsTheLanEndpoints) {
     }
 }
 
+// A private POST on the pooled keep-alive connection is answered also when
+// the server closed that connection for idleness just before, or closes it
+// as the request arrives. A POST is not sent twice, so a heartbeat that met
+// a closing connection was lost; the phone lost them this way.
+TEST_F(SdkMeshPrivateApiTest, APrivatePostAroundTheServersIdleCloseIsAnswered) {
+    LN_REQUIRE_TEST_TRUST();
+    stop_private_listener();
+    priv_keep_alive_sec = 1;
+    ASSERT_NO_FATAL_FAILURE(start_private_listener());
+    auto client = joined_client();
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 3600;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return peer_list_gets.load() >= 1; }, std::chrono::seconds(10)));
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    for (const int idle_ms : {900, 950, 1000, 1050, 1100, 1500, 2500}) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(idle_ms));
+        EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok) << "after " << idle_ms << " ms idle";
+    }
+    client->disable_mesh();
+}
+
 // A refresh request (the app saw a network change) reads the LAN addresses
 // again, and a changed list goes out in a heartbeat at once, although the
 // heartbeat interval is an hour.
@@ -2367,4 +2394,29 @@ TEST_F(SdkMeshPrivateApiTest, MembersThatRefusedAnInviteAreNotAskedAgain) {
     EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, true}));
     EXPECT_EQ(third_auth_posts.load(), 0);
     EXPECT_FALSE(client.is_mesh_active());
+}
+
+// A JSON mesh config (ln_mesh_enable_config) keeps the MeshConfig default of
+// every key it leaves out. The C API once used other defaults (a 15 s
+// heartbeat) than ln_mesh_enable.
+TEST(SdkMeshConfig, AJsonConfigKeepsTheDefaultOfEachKeyItLeavesOut) {
+    const lnsdk::MeshConfig d;
+    const auto empty = nlohmann::json::object().get<lnsdk::MeshConfig>();
+    EXPECT_EQ(empty.peer_refresh_interval_sec, d.peer_refresh_interval_sec);
+    EXPECT_EQ(empty.heartbeat_interval_sec, d.heartbeat_interval_sec);
+    EXPECT_EQ(empty.stun_refresh_interval_sec, d.stun_refresh_interval_sec);
+    EXPECT_EQ(empty.prefer_direct, d.prefer_direct);
+    EXPECT_EQ(empty.auto_connect, d.auto_connect);
+
+    const auto partial = nlohmann::json{{"peer_refresh_interval_sec", 7}}.get<lnsdk::MeshConfig>();
+    EXPECT_EQ(partial.peer_refresh_interval_sec, 7u);
+    EXPECT_EQ(partial.heartbeat_interval_sec, d.heartbeat_interval_sec);
+}
+
+// The heartbeat keeps the private API connection in use: it must come before
+// the server closes an idle keep-alive connection, or each heartbeat meets a
+// connection the server is closing.
+TEST(SdkMeshConfig, TheHeartbeatComesBeforeTheServerClosesAnIdleConnection) {
+    EXPECT_LT(static_cast<time_t>(lnsdk::MeshConfig{}.heartbeat_interval_sec),
+              nexus::network::HttpServer::kKeepAliveTimeoutSec);
 }

@@ -27,6 +27,11 @@ namespace nexus::network {
 class HttpServer : public core::IService<HttpServer> {
     friend class core::IService<HttpServer>;
 public:
+    /// How long an idle keep-alive connection stays open, in seconds. A
+    /// periodic client request (the mesh heartbeat) must come more often, or
+    /// each one meets a connection the server is closing.
+    static constexpr time_t kKeepAliveTimeoutSec = 5;
+
     /// Construct a plain HTTP server.
     explicit HttpServer(uint16_t port, std::string bind_address = "0.0.0.0");
 

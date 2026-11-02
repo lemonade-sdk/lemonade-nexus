@@ -45,7 +45,7 @@ std::optional<bool> peer_signal_fresh(const MeshPeer& peer, int64_t now_unix,
     // server's last_seen arrives only with the peer list, so it may be one
     // peer refresh old.
     constexpr int64_t kSessionLive    = 200;  // REJECT_AFTER_TIME 180 s, a retry, jitter
-    constexpr int64_t kHeartbeatStale = 15;   // 3 missed 5 s heartbeats
+    constexpr int64_t kHeartbeatStale = 15;   // 5 missed 3 s heartbeats, 3 at 5 s
     constexpr int64_t kMonitorTick    = 5;
     const auto last_seen = static_cast<int64_t>(peer.last_seen);
     const bool seen_recently =

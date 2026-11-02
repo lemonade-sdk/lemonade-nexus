@@ -516,7 +516,7 @@ own.
 ```cpp
 lnsdk::MeshConfig cfg;
 cfg.peer_refresh_interval_sec = 30;
-cfg.heartbeat_interval_sec = 5;
+cfg.heartbeat_interval_sec = 3;
 cfg.prefer_direct = true;
 client.enable_mesh(cfg);
 
