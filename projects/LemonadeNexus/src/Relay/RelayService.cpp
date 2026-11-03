@@ -517,6 +517,14 @@ std::size_t RelayService::session_count() const {
     return sessions_.size();
 }
 
+std::size_t RelayService::paired_session_count() const {
+    std::lock_guard lock(mutex_);
+    return static_cast<std::size_t>(
+        std::count_if(sessions_.begin(), sessions_.end(), [](const auto& entry) {
+            return entry.second->peer_a_bound && entry.second->peer_b_bound;
+        }));
+}
+
 bool RelayService::touch_if_bound(const SessionId& session_id,
                                   const asio::ip::udp::endpoint& from) {
     std::lock_guard lock(mutex_);

@@ -486,6 +486,7 @@ TEST_F(RelayServiceTest, AWaitingSideThatMovedKeepsItsSlot) {
     ASSERT_FALSE(moved.error) << moved.error_message;
     EXPECT_EQ(moved.session_id, waiting.session_id);
     EXPECT_FALSE(moved.paired);
+    EXPECT_EQ(r->paired_session_count(), 0u);
 
     // A copy of her first request, from anywhere, is a replay; another holder
     // with her proof cannot move her side.
@@ -508,6 +509,7 @@ TEST_F(RelayServiceTest, AWaitingSideThatMovedKeepsItsSlot) {
     ASSERT_TRUE(paired.notify.has_value());
     EXPECT_EQ(*paired.notify, alice_new);
     EXPECT_EQ(r->session_count(), 1u);
+    EXPECT_EQ(r->paired_session_count(), 1u);
 }
 
 TEST_F(RelayServiceTest, APairedSideThatMovedRejoinsItsSessionOverTheWire) {

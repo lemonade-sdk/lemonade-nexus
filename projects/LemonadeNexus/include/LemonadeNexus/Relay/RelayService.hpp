@@ -199,6 +199,9 @@ public:
     /// Number of live sessions. Thread-safe.
     [[nodiscard]] std::size_t session_count() const;
 
+    /// Number of live sessions with both sides bound. Thread-safe.
+    [[nodiscard]] std::size_t paired_session_count() const;
+
 private:
     using SessionMap = std::unordered_map<SessionId, std::shared_ptr<RelaySession>, SessionIdHash>;
 

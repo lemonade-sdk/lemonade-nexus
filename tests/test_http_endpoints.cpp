@@ -29,6 +29,7 @@
 #include <LemonadeNexus/Api/RoutingApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshRekey.hpp>
+#include <LemonadeNexus/Api/PublicApiHandler.hpp>
 #include <LemonadeNexus/Api/AccountDataApiHandler.hpp>
 #include <LemonadeNexus/Auth/AccountDeletionProof.hpp>
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
@@ -2990,6 +2991,99 @@ TEST_F(MeshPresenceTest, HeartbeatAndOwnEventSocketMakeTheDevicePresent) {
     EXPECT_FALSE(presence().status("mc_self", api::epoch_seconds()).online);
     own.close();
     watcher.close();
+}
+
+// GET /api/stats on the public API: aggregate counts, nothing that names a
+// device, account, group, or address.
+class PublicStatsTest : public MeshPresenceTest {
+protected:
+    httplib::Server pub_srv;
+    std::thread pub_thread;
+    int pub_port = 0;
+    std::unique_ptr<api::PublicApiHandler> public_handler;
+
+    void SetUp() override {
+        MeshPresenceTest::SetUp();
+        if (HasFatalFailure()) return;
+        public_handler = std::make_unique<api::PublicApiHandler>(*test_api::current().ctx);
+        public_handler->register_routes(pub_srv, pub_srv);
+        pub_port = pub_srv.bind_to_any_port("127.0.0.1");
+        ASSERT_GT(pub_port, 0);
+        pub_thread = std::thread([this] { pub_srv.listen_after_bind(); });
+        pub_srv.wait_until_ready();
+    }
+
+    void TearDown() override {
+        pub_srv.stop();
+        if (pub_thread.joinable()) pub_thread.join();
+        public_handler.reset();
+        MeshPresenceTest::TearDown();
+    }
+
+    void make_tier1() {
+        test_api::current().ctx->tier1_identity = [] {
+            return std::optional<api::Tier1Identity>{api::Tier1Identity{}};
+        };
+    }
+
+    json stats() {
+        httplib::Client cli("127.0.0.1", pub_port);
+        auto res = cli.Get("/api/stats");
+        EXPECT_NE(res, nullptr);
+        if (!res) return nullptr;
+        EXPECT_EQ(res->status, 200) << res->body;
+        return json::parse(res->body);
+    }
+};
+
+// A Tier 1 member counts devices, online devices from shared presence (the
+// same rule as the peer lists), groups and relays, and leaves out every id.
+TEST_F(PublicStatsTest, ATier1MemberReportsAggregateNetworkCounts) {
+    make_tier1();
+    add("ps_on", "mc_group", tree::NodeType::Endpoint, {});
+    add("ps_off", "mc_group", tree::NodeType::Endpoint, {});
+    add("ps_relay", "mc_group", tree::NodeType::Relay, {});
+    const auto now = api::epoch_seconds();
+    (void)presence().merge_remote(
+        {{"ps_on", now}, {"ps_off", now - gossip::kDevicePresenceOnlineSec - 1}}, now);
+
+    const auto body = stats();
+    ASSERT_TRUE(body.contains("network")) << body.dump();
+    const auto& network = body["network"];
+    // mc_self, ps_on and ps_off are devices; only ps_on is present in the window.
+    EXPECT_EQ(network["devices_registered"], 3u);
+    EXPECT_EQ(network["devices_online"], 1u);
+    EXPECT_EQ(network["devices_offline"], 2u);
+    EXPECT_EQ(network["groups"], 1u);
+    EXPECT_EQ(network["relays"], 1u);
+    EXPECT_EQ(body["relay_sessions"]["paired"], 0u);
+    EXPECT_EQ(body["relay_sessions"]["waiting"], 0u);
+    EXPECT_EQ(body["service"], "lemonade-nexus");
+
+    const auto text = body.dump();
+    for (const auto* id : {"ps_on", "ps_off", "ps_relay", "mc_self", "mc_group"}) {
+        EXPECT_EQ(text.find(id), std::string::npos) << id << " in " << text;
+    }
+}
+
+// The counts are reused for kNetworkCountsCacheSec, so a burst of public
+// requests costs one tree snapshot; count_network itself is exact.
+TEST_F(PublicStatsTest, CountsAreReusedWithinTheCacheWindow) {
+    make_tier1();
+    EXPECT_EQ(stats()["network"]["devices_registered"], 1u);
+    add("ps_new", "mc_group", tree::NodeType::Endpoint, {});
+    EXPECT_EQ(stats()["network"]["devices_registered"], 1u) << "recomputed within the window";
+    const auto counts = api::count_network(tree->nodes_snapshot(), presence(), api::epoch_seconds());
+    EXPECT_EQ(counts.devices, 2u);
+}
+
+// A server that is not a current Tier 1 member holds no shared presence, so
+// it reports no network counts rather than zeros.
+TEST_F(PublicStatsTest, AServerOutsideTier1ReportsNoNetworkCounts) {
+    const auto body = stats();
+    EXPECT_FALSE(body.contains("network")) << body.dump();
+    EXPECT_TRUE(body.contains("relay_sessions"));
+    EXPECT_TRUE(body.contains("peer_count"));
 }
 
 TEST(MeshLocalEndpoints, ParseRules) {

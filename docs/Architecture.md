@@ -210,6 +210,22 @@ listener object is swapped when TLS is activated in the background:
 | `OnboardApiHandler` | `/api/onboard/info`, `challenge`, `request`, `poll`, `ack` | `/api/onboard/pending`, `approve/{id}`, `deny/{id}`, `token` |
 | `MeshApiHandler`, `RoutingApiHandler`, `RelayApiHandler`, `CertApiHandler`, `AccountDataApiHandler`, `AdminApiHandler` | (discovery reads where applicable) | Authenticated application operations |
 
+`GET /api/stats` reports aggregate counts only, with no node id, key, name,
+address, or owner:
+
+| Field | Meaning |
+|---|---|
+| `service`, `peer_count`, `private_api_enabled` | This server: its service name, gossip peers, and whether the private API is enabled |
+| `relay_sessions.paired`, `relay_sessions.waiting` | This server's relay: sessions with both sides bound, and sessions waiting for their second side |
+| `network.devices_registered` | Device (endpoint) nodes in the tree |
+| `network.devices_online`, `network.devices_offline` | Devices whose presence is younger than `kDevicePresenceOnlineSec` (10 s), and the rest |
+| `network.groups`, `network.relays` | Group and relay nodes in the tree |
+
+Only a current Tier 1 member includes `network`: the counts come from the
+tree and from the presence that Tier 1 members share. A server reuses its
+counts for `kNetworkCountsCacheSec` (5 s), so the public route costs at most
+one tree snapshot per interval.
+
 A pre-routing gate runs before every handler: on a server that does not
 hold the tree, each tree route answers `421` before its handler runs (see
 [The tree on Tier 1 only](#the-tree-on-tier-1-only)).

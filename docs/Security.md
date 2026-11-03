@@ -312,6 +312,11 @@ cryptography is involved, and a punch grants no authority:
   ignored, so a sender cannot hold a device online with a future time. Each
   server sends only what it heard itself, so presence is never relayed. No
   authorization decision reads presence.
+- **Public counts reveal network size, nothing else.** `GET /api/stats`
+  needs no session. It reports how many devices, groups and relays the tree
+  holds and how many devices are online, with no id, key, name, or address.
+  Anyone can therefore watch the network's size and, in a small network,
+  when a device comes online or goes offline.
 - **Probes are rate limited.** At most 16 peers are probed per pass, each
   probe goes to at most five addresses (four LAN endpoints and the listed
   endpoint), and passes are at least 250 ms apart. A peer gets a burst of five probes, then two
