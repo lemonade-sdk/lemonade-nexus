@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 namespace lnsdk {
 
@@ -24,8 +25,15 @@ namespace sec = nexus::security;
 using json = nlohmann::json;
 
 /// Pages one refresh walks before it gives up. Each page holds at most
-/// kMaxHandoffChainLinks links, so this bounds the epochs per refresh.
+/// kMaxHttpChainLinks links, so this bounds the epochs per refresh.
 constexpr int kMaxChainPages = 4096;
+/// Links a chain page request asks for. A server that predates max_links
+/// ignores it and sends kMaxHandoffChainLinks.
+constexpr std::size_t kChainPageLinks = nexus::security::constants::kMaxHttpChainLinks;
+/// 429 answers one walk waits out before it treats the source as unreachable.
+/// A server that predates the separate authority page limit allows a burst of
+/// 20 requests; the waits let a walk from Genesis finish there too.
+constexpr int kMaxRateLimitWaits = 30;
 /// Candidate servers one refresh probes.
 constexpr std::size_t kMaxProbes = 32;
 /// Chain walks a refresh starts again after a proof names a later epoch.
@@ -102,6 +110,7 @@ struct GenesisClaim {
 
 struct Tier1Directory::State {
     Tier1DiscoveryGet get;
+    std::chrono::milliseconds rate_limit_wait{1000};
 
     mutable std::mutex mutex;  // guards every field below except the walker
     std::optional<nexus::crypto::Ed25519PublicKey> genesis;
@@ -134,11 +143,21 @@ struct Tier1Directory::State {
     /// Walks pages from `server` until it has nothing newer. io: network.
     Walk walk_from(const ServerEndpoint& server, std::string& error) {
         bool advanced = false;
+        int waits = 0;
         for (int page_count = 0; page_count < kMaxChainPages; ++page_count) {
             const auto have = walker->epoch().underlying();
-            const auto reply =
-                get(server, "/api/tier1/authority?have_epoch=" + std::to_string(have));
+            const auto reply = get(server, "/api/tier1/authority?have_epoch=" +
+                                               std::to_string(have) +
+                                               "&max_links=" + std::to_string(kChainPageLinks));
             if (!reply) return advanced ? Walk::Advanced : Walk::Unreachable;
+            // A rate limit is no verdict on the chain: wait for the server's
+            // budget to refill and ask for the same page again.
+            if (reply->status == 429 && waits < kMaxRateLimitWaits) {
+                ++waits;
+                --page_count;
+                std::this_thread::sleep_for(rate_limit_wait);
+                continue;
+            }
             if (reply->status == 404) return advanced ? Walk::Advanced : Walk::Done;
             if (reply->status != 200) return advanced ? Walk::Advanced : Walk::Unreachable;
             const auto doc = json::parse(reply->body, nullptr, false);
@@ -148,8 +167,10 @@ struct Tier1Directory::State {
                 return Walk::Refused;
             }
             const auto bytes = decode_b64(doc["page"].get<std::string>());
-            const auto page = bytes ? sec::decode_authority_chain_page(*bytes)
-                                    : std::optional<sec::AuthorityChainPage>{};
+            const auto page =
+                bytes ? sec::decode_authority_chain_page(*bytes, kChainPageLinks,
+                                                         sec::constants::kMaxHttpChainPageBytes)
+                      : std::optional<sec::AuthorityChainPage>{};
             if (!page) {
                 error = "malformed authority chain page from " + server.host;
                 return Walk::Refused;
@@ -170,8 +191,10 @@ struct Tier1Directory::State {
     }
 };
 
-Tier1Directory::Tier1Directory(Tier1DiscoveryGet get) : state_(std::make_unique<State>()) {
+Tier1Directory::Tier1Directory(Tier1DiscoveryGet get, std::chrono::milliseconds rate_limit_wait)
+    : state_(std::make_unique<State>()) {
     state_->get = std::move(get);
+    state_->rate_limit_wait = rate_limit_wait;
     if (sodium_init() < 0) {
         spdlog::error("[Tier1Directory] libsodium failed to initialize");
     }

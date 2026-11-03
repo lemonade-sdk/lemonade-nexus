@@ -176,13 +176,14 @@ public:
     /// The network the pinned Genesis key derives.
     [[nodiscard]] NetworkId network_id() const;
 
-    /// One page of the stored authority chain after `have_epoch`
-    /// (SecurityDriver::authority_chain_page), read on the io thread. Waits at
-    /// most `timeout`; nullopt on timeout, after stop, or when nothing is
-    /// stored. Thread-safe. Do not call on the io thread: it would wait for
-    /// itself until the timeout.
+    /// One page of at most `max_links` links of the stored authority chain
+    /// after `have_epoch` (SecurityDriver::authority_chain_page), read on the
+    /// io thread. Waits at most `timeout`; nullopt on timeout, after stop, or
+    /// when nothing is stored. Thread-safe. Do not call on the io thread: it
+    /// would wait for itself until the timeout.
     [[nodiscard]] std::optional<AuthorityChainPage> authority_chain_page(
-        EpochId have_epoch, std::chrono::milliseconds timeout);
+        EpochId have_epoch, std::chrono::milliseconds timeout,
+        std::size_t max_links = constants::kMaxHandoffChainLinks);
 
     /// Registers a block payload handler with the driver
     /// (SecurityDriver::register_payload_handler). Not owning. Call before the

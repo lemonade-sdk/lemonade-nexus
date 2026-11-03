@@ -142,11 +142,13 @@ struct Chain {
         return chain;
     }
 
-    /// The page a server holding the first `known_epochs` epochs answers
-    /// after `have_epoch`, exactly as SecurityDriver::authority_chain_page
-    /// builds it. nullopt when it has nothing to add.
-    [[nodiscard]] std::optional<AuthorityChainPage> page_after(uint64_t have_epoch,
-                                                               std::size_t known_epochs) const {
+    /// The page of at most `max_links` links that a server holding the first
+    /// `known_epochs` epochs answers after `have_epoch`, exactly as
+    /// SecurityDriver::authority_chain_page builds it. nullopt when it has
+    /// nothing to add.
+    [[nodiscard]] std::optional<AuthorityChainPage> page_after(
+        uint64_t have_epoch, std::size_t known_epochs,
+        std::size_t max_links = constants::kMaxHandoffChainLinks) const {
         AuthorityChainPage page;
         uint64_t next_from = have_epoch;
         if (have_epoch == 0) {
@@ -156,7 +158,7 @@ struct Chain {
             next_from = 1;
         }
         for (const auto& link : links) {
-            if (page.links.size() >= constants::kMaxHandoffChainLinks) break;
+            if (page.links.size() >= max_links) break;
             if (link.handoff.to_epoch.underlying() > known_epochs) break;
             if (link.handoff.from_epoch.underlying() != next_from) continue;
             page.links.push_back(link);

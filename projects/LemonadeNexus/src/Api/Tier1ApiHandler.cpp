@@ -6,6 +6,7 @@
 #include <LemonadeNexus/Security/Epoch/Tier1Membership.hpp>
 #include <LemonadeNexus/Security/Transport/AuthorityChainCodec.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <optional>
 #include <string>
@@ -54,7 +55,21 @@ void Tier1ApiHandler::do_register_routes(httplib::Server& pub,
             }
             have_epoch = *parsed;
         }
-        const auto page = ctx_.authority_chain_page(have_epoch);
+        // A client that walks from Genesis asks for larger pages; a client
+        // that does not ask gets the security wire's page size, which every
+        // SDK decodes. Larger requests are clamped, not refused, so the client
+        // learns the server's size from the page itself.
+        std::size_t max_links = security::constants::kMaxHandoffChainLinks;
+        if (req.has_param("max_links")) {
+            const auto parsed = parse_epoch(req.get_param_value("max_links"));
+            if (!parsed || *parsed == 0) {
+                error_response(res, "max_links must be a positive decimal number");
+                return;
+            }
+            max_links = static_cast<std::size_t>(
+                std::min<uint64_t>(*parsed, security::constants::kMaxHttpChainLinks));
+        }
+        const auto page = ctx_.authority_chain_page(have_epoch, max_links);
         if (page.empty()) {
             // The chain a client verifies against is served from the local
             // store: a 404 is how an empty or stale replica announces
@@ -63,7 +78,8 @@ void Tier1ApiHandler::do_register_routes(httplib::Server& pub,
             error_response(res, "no authority chain after this epoch", 404);
             return;
         }
-        const auto decoded = security::decode_authority_chain_page(page);
+        const auto decoded = security::decode_authority_chain_page(
+            page, max_links, security::constants::kMaxHttpChainPageBytes);
         uint64_t top = have_epoch;
         if (decoded) {
             if (decoded->has_base && decoded->links.empty()) top = 1;

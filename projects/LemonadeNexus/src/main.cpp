@@ -999,11 +999,19 @@ int main(int argc, char* argv[]) {
                      "isolate authenticated endpoints to the mesh interface.");
     }
 
-    // Rate limiter
+    // Rate limiter. Authority chain pages have their own budget: a client
+    // walks the whole chain before its first tree request (Tier1ApiHandler.hpp).
     nexus::network::RateLimiter rate_limiter{{config.rate_limit_rpm, config.rate_limit_burst}};
-    auto rate_limit_handler = [&rate_limiter](const httplib::Request& req, httplib::Response& res) -> httplib::Server::HandlerResponse {
-        if (!rate_limiter.allow(req.remote_addr)) {
+    nexus::network::RateLimiter authority_rate_limiter{
+        {nexus::api::kAuthorityPagesPerMinute, nexus::api::kAuthorityPageBurst}};
+    auto rate_limit_handler = [&rate_limiter, &authority_rate_limiter](
+                                  const httplib::Request& req,
+                                  httplib::Response& res) -> httplib::Server::HandlerResponse {
+        auto& limiter = nexus::api::is_authority_chain_path(req.path) ? authority_rate_limiter
+                                                                      : rate_limiter;
+        if (!limiter.allow(req.remote_addr)) {
             res.status = 429;
+            res.set_header("Retry-After", "1");
             nlohmann::json rl_j = nexus::network::ErrorResponse{.error = "rate limited"};
             res.set_content(rl_j.dump(), "application/json");
             return httplib::Server::HandlerResponse::Handled;
@@ -1519,10 +1527,10 @@ int main(int argc, char* argv[]) {
         // Any server serves the chain: it is candidate data the client
         // verifies against its pinned Genesis key.
         .authority_chain_page =
-            [mesh](uint64_t have_epoch) -> std::vector<uint8_t> {
+            [mesh](uint64_t have_epoch, std::size_t max_links) -> std::vector<uint8_t> {
                 const auto page = mesh->authority_chain_page(nexus::security::EpochId{have_epoch},
-                                                             std::chrono::seconds(2));
-                return page ? nexus::security::encode_authority_chain_page(*page)
+                                                             std::chrono::seconds(2), max_links);
+                return page ? nexus::security::encode_authority_chain_page(*page, max_links)
                             : std::vector<uint8_t>{};
             },
         // A member proves its endpoint only while it holds and serves the tree.

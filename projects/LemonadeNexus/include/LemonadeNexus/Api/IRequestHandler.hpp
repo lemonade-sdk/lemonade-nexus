@@ -114,10 +114,12 @@ struct ApiContext {
     /// storage routes answer 404 without it. In the assembled server it is
     /// always set; nullptr is the state for handlers built without a vault.
     security::StorageVault*           storage_vault{nullptr};
-    /// GET /api/tier1/authority: one encoded authority chain page after the
-    /// given epoch (encode_authority_chain_page), or empty when this server
-    /// stores nothing to add. Thread-safe. Unset, the route answers 404.
-    std::function<std::vector<uint8_t>(uint64_t have_epoch)> authority_chain_page;
+    /// GET /api/tier1/authority: one encoded authority chain page of at most
+    /// `max_links` links (1 to kMaxHttpChainLinks) after the given epoch
+    /// (encode_authority_chain_page), or empty when this server stores nothing
+    /// to add. Thread-safe. Unset, the route answers 404.
+    std::function<std::vector<uint8_t>(uint64_t have_epoch, std::size_t max_links)>
+        authority_chain_page;
     /// GET /api/tier1/proof: the network and epoch, only while this server is
     /// a current Tier 1 member by finalized membership; nullopt otherwise.
     /// Thread-safe. Unset counts as not a member.

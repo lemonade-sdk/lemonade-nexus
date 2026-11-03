@@ -46,6 +46,8 @@ struct FakeServer {
     /// When set, it answers proofs with another host's proof (a relay).
     std::string relay_proof_for;
     bool down = false;
+    /// Serves up to max_links links per page, as servers since max_links do.
+    bool large_pages = true;
 };
 
 class FakeNetwork {
@@ -69,9 +71,15 @@ public:
         if (path.starts_with(authority)) {
             if (!s.chain) return lnsdk::HttpReply{404, R"({"error":"none"})"};
             const auto have = std::stoull(path.substr(authority.size()));
-            const auto page = s.chain->page_after(have, s.known_epochs);
+            // A server that predates max_links ignores it.
+            std::size_t links = sec::constants::kMaxHandoffChainLinks;
+            if (const auto at = path.find("&max_links="); at != std::string::npos && s.large_pages) {
+                links = std::min<std::size_t>(std::stoull(path.substr(at + 11)),
+                                              sec::constants::kMaxHttpChainLinks);
+            }
+            const auto page = s.chain->page_after(have, s.known_epochs, links);
             if (!page) return lnsdk::HttpReply{404, R"({"error":"none"})"};
-            const auto bytes = sec::encode_authority_chain_page(*page);
+            const auto bytes = sec::encode_authority_chain_page(*page, links);
             return lnsdk::HttpReply{
                 200, json{{"have_epoch", have}, {"page", nexus::crypto::to_base64(bytes)}}.dump()};
         }
@@ -439,6 +447,63 @@ TEST_F(SdkTier1Test, ARefusedOrUnreachableSourceNeverEndsTheSweep) {
     ASSERT_TRUE(refused.ok) << refused.error;
     EXPECT_EQ(asked, (std::vector<std::string>{"evil.example", "t1a.example"}));
     EXPECT_EQ(dir.membership().epoch, 2u);
+}
+
+// A walk asks for large pages, and a server that answers 429 is waited out:
+// a rate limit is no verdict on the chain.
+TEST_F(SdkTier1Test, AWalkAsksForLargePagesAndWaitsOutARateLimit) {
+    std::vector<std::string> paths;
+    int limited = 3;  // the first three chain page requests are rate limited
+    auto dir = lnsdk::Tier1Directory(
+        [&](const lnsdk::ServerEndpoint& ep, const std::string& path) {
+            std::lock_guard lock(mutex);
+            if (path.starts_with("/api/tier1/authority")) {
+                paths.push_back(path);
+                if (limited > 0) {
+                    --limited;
+                    return std::optional<lnsdk::HttpReply>{
+                        lnsdk::HttpReply{429, R"({"error":"rate limited"})"}};
+                }
+            }
+            return net.get(ep, path);
+        },
+        std::chrono::milliseconds(1));
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key), 2));
+    const auto refreshed = dir.refresh(seed("t1a.example"));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    EXPECT_EQ(refreshed.value.epoch, 2u);
+    ASSERT_GE(paths.size(), 4u);
+    EXPECT_EQ(paths.front(), "/api/tier1/authority?have_epoch=0&max_links=32");
+    EXPECT_EQ(paths[3], paths.front()) << "the same page is asked for again after a 429";
+}
+
+// A server that keeps answering 429 ends the walk after the bounded waits,
+// as an unreachable source; it is never taken for an empty chain.
+TEST_F(SdkTier1Test, AServerThatKeepsRateLimitingIsUnreachable) {
+    int asked = 0;
+    auto dir = lnsdk::Tier1Directory(
+        [&](const lnsdk::ServerEndpoint&, const std::string& path) {
+            if (path.starts_with("/api/tier1/authority")) ++asked;
+            return std::optional<lnsdk::HttpReply>{
+                lnsdk::HttpReply{429, R"({"error":"rate limited"})"}};
+        },
+        std::chrono::milliseconds(1));
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    const auto refreshed = dir.refresh(seed("t1a.example"));
+    EXPECT_FALSE(refreshed.ok);
+    EXPECT_NE(refreshed.error.find("unreachable"), std::string::npos) << refreshed.error;
+    EXPECT_EQ(asked, 31) << "one request and 30 waits";
+}
+
+// Against a server that predates max_links, the walk still finishes with the
+// small pages it is sent.
+TEST_F(SdkTier1Test, AServerWithoutLargePagesStillServesTheChain) {
+    net.servers["t1a.example"].large_pages = false;
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key), 2));
+    const auto refreshed = dir.refresh(seed("t1a.example"));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    EXPECT_EQ(refreshed.value.epoch, 2u);
 }
 
 TEST_F(SdkTier1Test, AFailedSweepNamesTheSourcesItTried) {

@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -83,7 +84,11 @@ inline constexpr std::size_t kGenesisDiscoveryMinHosts = 3;
 /// I/O.
 class Tier1Directory {
 public:
-    explicit Tier1Directory(Tier1DiscoveryGet get);
+    /// `get` performs the GET requests. `rate_limit_wait` is how long a chain
+    /// walk waits after a server answers 429 before it asks again for the
+    /// same page (kMaxRateLimitWaits times per walk at most).
+    explicit Tier1Directory(Tier1DiscoveryGet get,
+                            std::chrono::milliseconds rate_limit_wait = std::chrono::seconds(1));
     ~Tier1Directory();
 
     Tier1Directory(const Tier1Directory&) = delete;
