@@ -1,12 +1,12 @@
 {
-  "version": "0.9.8.18",
-  "base_url": "https://github.com/lemonade-sdk/lemonade-nexus/releases/download/mobile-sdk-v0.9.8.18",
+  "version": "0.9.8.19",
+  "base_url": "https://github.com/lemonade-sdk/lemonade-nexus/releases/download/mobile-sdk-v0.9.8.19",
   "ios": {
-    "file": "lemonade_nexus_sdk-ios-0.9.8.18.zip",
-    "sha256": "03ed831f79202fab087458df560dcf43a55c91aecfca87bc4967bffa9d7c19ad"
+    "file": "lemonade_nexus_sdk-ios-0.9.8.19.zip",
+    "sha256": "b03d9cd98c439a38791f9cbd2557a76e3de882d6c9b69302a1f92c43b8b80aa3"
   },
   "android": {
-    "file": "lemonade_nexus_sdk-android-0.9.8.18.zip",
-    "sha256": "e04e8bd8b87d2c869c1d20c57405cb3a589303e59d1412d89fe18b40306b68d1"
+    "file": "lemonade_nexus_sdk-android-0.9.8.19.zip",
+    "sha256": "5c1a33409009e669ce6ebb23e127ba6c5fb4aa85fa1ddc00511f535e9c969659"
   }
 }
