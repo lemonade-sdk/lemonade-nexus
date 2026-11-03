@@ -750,7 +750,7 @@ C: `ln_set_mesh_event_callback(client, fn, user)` with
 | Event | Read again |
 | --- | --- |
 | `peers` | `ln_get_mesh_peers`, `ln_mesh_status`: a peer was added or removed, or changed its online state, path or relay |
-| `devices` | `ln_list_network_devices`: the server reported a device list change, the event socket opened again, or the mesh resumed after a suspension |
+| `devices` | `ln_list_network_devices`: the server reported a device list change, the event socket opened again, or the mesh resumed after a suspension (its own detection or `ln_resume`) |
 | `port` | `ln_mesh_port_status`: the mesh port's devices changed |
 
 An event names no device and carries no data, and later versions may add
@@ -764,6 +764,25 @@ a C API client does not set them.
 The mesh port reads its device list when it starts, on every `devices`
 change, and again after a failed read (from 2 seconds, doubled up to 60). It
 applies a `peers` change without reading the list.
+
+### Suspension and resume
+
+The SDK detects a suspension by itself: a wall-clock gap of more than 10
+seconds between two passes of its loop runs the resume pass (fresh
+handshakes, a private transport reset, heartbeat, peer refresh, STUN, punch
+burst, relay fallback with its backoff forgotten, a `devices` event). That
+detection waits for the loop thread, and for any request already waiting on
+a connection the OS closed during the suspension. A host that knows when it
+came back calls `ln_resume(client)` (C++ `resume()`, Dart
+`LemonadeNexusSdk.resume()`) from its foreground notification, every time.
+It is safe at any time, never blocks on the network, and makes the mesh
+return as fast as after a fresh launch. Read `tunnel_up` from
+`ln_mesh_status` for the tunnel to the session server: false while the mesh
+is expected up means call `ln_resume`, and when it stays false, rebuild the
+mesh. On iOS the SDK also ignores SIGPIPE for the process at client creation
+and sets `SO_NOSIGPIPE` on its sockets, so a write to a socket iOS closed
+fails with an error instead of killing the app. See
+[Client-SDK.md](Client-SDK.md#suspension-and-resume).
 
 ### Mesh port
 

@@ -1100,6 +1100,17 @@ class LemonadeNexusFfi {
       _lib.lookupFunction<_LnMeshRefresh, _LnMeshRefreshDart>('ln_mesh_refresh');
   late final _lnMeshIsActive =
       _lib.lookupFunction<_LnMeshIsActive, _LnMeshIsActiveDart>('ln_mesh_is_active');
+  // Same shape as ln_mesh_refresh: (client) -> ln_error_t. Not in
+  // requiredSymbols: with a native library that predates it, resume() does
+  // nothing and the SDK's own wall-clock gap detection still runs the
+  // resume pass.
+  late final _LnMeshRefreshDart? _lnResume = () {
+    try {
+      return _lib.lookupFunction<_LnMeshRefresh, _LnMeshRefreshDart>('ln_resume');
+    } on ArgumentError {
+      return null;
+    }
+  }();
 
   // Stats & server listing
   late final _lnStats =
@@ -1191,6 +1202,10 @@ class LemonadeNexusFfi {
   ///
   /// [libraryPath] - Optional path to the C SDK dynamic library.
   /// If not provided, uses platform default naming.
+  /// Binds to an already opened [library] (tests use the test process itself
+  /// to exercise the paths for a native library that lacks a symbol).
+  LemonadeNexusFfi.fromLibrary(ffi.DynamicLibrary library) : _lib = library;
+
   LemonadeNexusFfi({String? libraryPath}) {
     if (libraryPath != null) {
       _lib = ffi.DynamicLibrary.open(libraryPath);
@@ -2254,6 +2269,17 @@ class LemonadeNexusFfi {
   LnError meshRefresh(LnClientHandle client) {
     return LnError.fromCode(_lnMeshRefresh(client));
   }
+
+  /// The host process returned from a suspension (ln_resume). Never blocks
+  /// on the network. [LnError.success] without a call when the native
+  /// library predates ln_resume.
+  LnError resume(LnClientHandle client) {
+    final call = _lnResume;
+    return call == null ? LnError.success : LnError.fromCode(call(client));
+  }
+
+  /// Whether the native library has ln_resume.
+  bool get hasResume => _lnResume != null;
 
   /// Whether the client's mesh dataplane is up right now (no network I/O).
   bool meshIsActive(LnClientHandle client) => _lnMeshIsActive(client) == 1;

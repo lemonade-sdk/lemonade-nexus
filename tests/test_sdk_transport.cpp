@@ -199,7 +199,7 @@ constexpr const char* kPeerId   = "node-peer";
 constexpr uint16_t    kPrivPort = 9101;
 
 /// The stand-in server's answer to one private request.
-enum class Reply { Ok, Reject, CutAfterHeaders };
+enum class Reply { Ok, Reject, CutAfterHeaders, HoldBody };
 
 /// Send the status line and headers, then close the connection before the
 /// body. The client gets no response, although the server ran the request.
@@ -656,6 +656,21 @@ protected:
             }
             ++peer_list_gets;
             if (peer_list_reply.load() == Reply::CutAfterHeaders) return cut_after_headers(res);
+            if (peer_list_reply.load() == Reply::HoldBody) {
+                // The headers go out and the body never does, until the
+                // test ends: the client waits on its read timeout.
+                res.set_chunked_content_provider(
+                    "application/json", [this](size_t, httplib::DataSink&) {
+                        const auto deadline =
+                            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                        while (std::chrono::steady_clock::now() < deadline &&
+                               !stopping_waits.load()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        }
+                        return false;
+                    });
+                return;
+            }
             nlohmann::json peer = {
                 {"node_id", kPeerId},
                 {"mesh_pubkey", peer_keys.second},
@@ -1741,6 +1756,217 @@ TEST_F(SdkMeshPrivateApiTest, ASuspensionGapRunsTheResumePath) {
     own.stop();
 }
 
+// The host says it resumed (resume()): the orchestrator runs the resume pass
+// at once, as it does for a wall-clock gap, although both intervals are an
+// hour and the wall clock shows no gap.
+TEST_F(SdkMeshPrivateApiTest, AResumeCallRunsTheResumePathWithoutAGap) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::BoringtunMesh own;
+    const auto own_keys = lnsdk::BoringtunMesh::generate_keypair();
+    ASSERT_TRUE(own.start(mesh_config(own_keys, "10.64.0.9/32")));
+    {
+        lnsdk::MeshOrchestrator orchestrator(*client, own, kNodeId);
+        lnsdk::MeshConfig cfg;
+        cfg.peer_refresh_interval_sec = 3600;
+        cfg.heartbeat_interval_sec    = 3600;
+        cfg.stun_refresh_interval_sec = 0;
+        orchestrator.start(cfg);
+        ASSERT_TRUE(wait_for([&] { return peer_list_gets.load() >= 1 && !heartbeats().empty(); },
+                             std::chrono::seconds(10)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const int gets = peer_list_gets.load();
+        const auto sent = heartbeats().size();
+
+        orchestrator.resume();
+        EXPECT_TRUE(wait_for([&] {
+            return peer_list_gets.load() > gets && heartbeats().size() > sent;
+        }, std::chrono::milliseconds(3000))) << "the resume path did not run";
+
+        // One call, one resume pass: no further refresh follows.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        const int after = peer_list_gets.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+        EXPECT_EQ(peer_list_gets.load(), after);
+        orchestrator.stop();
+    }
+    own.stop();
+}
+
+// resume() clears the private transport's failure state: the breaker that
+// would make the next request fail fast for 8 s, and the unanswered window
+// that would force a session move 30 s after the first failure. A request
+// after a resume goes out at once, and requests a suspension cut off never
+// add up to a move.
+TEST_F(SdkMeshPrivateApiTest, AResumeClearsTheBreakerAndTheUnansweredWindow) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+
+    // The private API goes away: the first request fails for real and
+    // starts the window; the breaker then fails the next ones fast.
+    ASSERT_NO_FATAL_FAILURE(stop_private_listener());
+    EXPECT_FALSE(client->mesh_heartbeat(kNodeId, "").ok);
+    ASSERT_NO_FATAL_FAILURE(start_private_listener());
+    auto started = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client->mesh_heartbeat(kNodeId, "").ok) << "the breaker did not arm";
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(2));
+
+    // The resume clears the breaker: the next request goes out at once.
+    started = std::chrono::steady_clock::now();
+    client->resume();
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(1))
+        << "resume() blocked";
+    EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok) << "the breaker survived the resume";
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+
+    // The window: failures 9 s apart (past the 8 s breaker) with a resume
+    // between them. Without the resume the move would come 30 s after the
+    // first failure; with it the window restarts at the first failure after
+    // the resume.
+    ASSERT_NO_FATAL_FAILURE(stop_private_listener());
+    EXPECT_FALSE(client->mesh_heartbeat(kNodeId, "").ok);  // window starts
+    std::this_thread::sleep_for(std::chrono::seconds(9));
+    EXPECT_FALSE(client->mesh_heartbeat(kNodeId, "").ok);
+    client->resume();                                        // window cleared
+    std::this_thread::sleep_for(std::chrono::seconds(9));
+    EXPECT_FALSE(client->mesh_heartbeat(kNodeId, "").ok);  // a new window starts
+    std::this_thread::sleep_for(std::chrono::seconds(9));
+    EXPECT_FALSE(client->mesh_heartbeat(kNodeId, "").ok);
+    std::this_thread::sleep_for(std::chrono::seconds(6));
+    EXPECT_FALSE(client->mesh_heartbeat(kNodeId, "").ok);  // 33 s after the first failure
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    EXPECT_TRUE(moves().empty()) << "the unanswered window survived the resume";
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+    EXPECT_EQ(client->session_token(), "session-token");
+
+    ASSERT_NO_FATAL_FAILURE(start_private_listener());
+    client->resume();
+    EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+}
+
+// resume() makes a private request waiting on a connection from before the
+// suspension fail at once, and the long-poll connection too, instead of
+// holding the private transport until the read timeout.
+TEST_F(SdkMeshPrivateApiTest, AResumeEndsARequestWaitingOnTheOldConnection) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    ASSERT_TRUE(client->fetch_mesh_peers(kNodeId).ok);
+
+    // The stand-in sends the headers and never the body: the client waits
+    // for the 15 s read timeout.
+    peer_list_reply = Reply::HoldBody;
+    auto waiting = std::async(std::launch::async, [&] {
+        const auto started = std::chrono::steady_clock::now();
+        const auto result = client->fetch_mesh_peers(kNodeId);
+        return std::make_pair(result.ok, std::chrono::steady_clock::now() - started);
+    });
+    ASSERT_TRUE(wait_for([&] { return peer_list_gets.load() >= 2; }, std::chrono::seconds(5)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    // The retry that follows the cut (a GET is sent once more) gets a cut
+    // answer at once, so the request ends with a failure either way.
+    peer_list_reply = Reply::CutAfterHeaders;
+    client->resume();
+    ASSERT_EQ(waiting.wait_for(std::chrono::seconds(8)), std::future_status::ready)
+        << "the waiting request did not end at the resume";
+    const auto [ok, took] = waiting.get();
+    EXPECT_FALSE(ok);
+    EXPECT_LT(took, std::chrono::seconds(8));
+    EXPECT_EQ(peer_list_gets.load(), 3);
+
+    // The cut-off request armed no breaker: the next one goes out at once.
+    peer_list_reply = Reply::Ok;
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_TRUE(client->fetch_mesh_peers(kNodeId).ok);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+
+    // A held long-poll ends at the resume too.
+    set_heartbeat_revision("rev-1");
+    auto poll = std::async(std::launch::async, [&] {
+        return client->wait_mesh_peers(kNodeId, "rev-1", 25);
+    });
+    ASSERT_TRUE(wait_for([&] { return peer_waits.load() >= 1; }, std::chrono::seconds(5)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    client->resume();
+    ASSERT_EQ(poll.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+        << "the long-poll did not end at the resume";
+    EXPECT_FALSE(poll.get().ok);
+}
+
+// resume() closes the event socket so the orchestrator opens it again, and
+// its resume pass runs at once: a peer refresh and a heartbeat although both
+// intervals are an hour. The tunnel reads alive throughout.
+TEST_F(SdkMeshPrivateApiTest, AResumeReopensTheEventSocketAndRefreshesAtOnce) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    serve_events = true;
+    set_heartbeat_revision("rev-1");
+    std::atomic<int> device_changes{0};
+    client->set_mesh_devices_callback([&] { ++device_changes; });
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 3600;
+    cfg.stun_refresh_interval_sec = 0;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] {
+        return event_sockets.load() >= 1 && peer_list_gets.load() >= 1 && !heartbeats().empty();
+    }, std::chrono::seconds(10)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const int sockets = event_sockets.load();
+    const int gets    = peer_list_gets.load();
+    const auto sent   = heartbeats().size();
+    const int changes = device_changes.load();
+    EXPECT_TRUE(client->mesh_status().tunnel_up);
+
+    client->resume();
+    EXPECT_TRUE(wait_for([&] {
+        return peer_list_gets.load() > gets && heartbeats().size() > sent;
+    }, std::chrono::seconds(5))) << "the resume pass did not run";
+    EXPECT_TRUE(wait_for([&] { return event_sockets.load() > sockets; }, std::chrono::seconds(10)))
+        << "the event socket did not open again";
+    EXPECT_TRUE(wait_for([&] { return device_changes.load() > changes; }, std::chrono::seconds(5)))
+        << "no devices notice followed the resume";
+    EXPECT_TRUE(client->mesh_status().tunnel_up);
+    EXPECT_TRUE(moves().empty());
+
+    const auto stop_started = std::chrono::steady_clock::now();
+    client->disable_mesh();
+    EXPECT_LT(std::chrono::steady_clock::now() - stop_started, std::chrono::seconds(5));
+    client->set_mesh_devices_callback({});
+}
+
+// tunnel_up follows the session server's own dataplane peer: false before
+// the mesh is enabled, true while the server's packets arrive (the heartbeat
+// answers cross the tunnel), false once the server stopped answering for the
+// window, which is well before the forced session move.
+TEST_F(SdkMeshPrivateApiTest, TunnelUpFollowsTheServerPeersTraffic) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    EXPECT_FALSE(client->mesh_status().tunnel_up) << "tunnel_up before enable_mesh";
+
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 1;
+    cfg.stun_refresh_interval_sec = 0;
+    client->enable_mesh(cfg);
+    EXPECT_TRUE(client->mesh_status().tunnel_up) << "a fresh mesh read as dead";
+    ASSERT_TRUE(wait_for([&] { return heartbeats().size() >= 3; }, std::chrono::seconds(10)));
+    EXPECT_TRUE(client->mesh_status().tunnel_up);
+
+    // The server forgets the client's peer: its answers stop reaching the
+    // dataplane, and after the window the tunnel reads dead.
+    ASSERT_NO_FATAL_FAILURE(server_forgets_client());
+    const auto forgot = std::chrono::steady_clock::now();
+    EXPECT_TRUE(wait_for([&] { return !client->mesh_status().tunnel_up; },
+                         lnsdk::kTunnelAliveWindow + std::chrono::seconds(10)))
+        << "tunnel_up stayed true without server traffic";
+    EXPECT_GT(std::chrono::steady_clock::now() - forgot, std::chrono::seconds(5))
+        << "tunnel_up fell on one missed heartbeat";
+    EXPECT_FALSE(client->mesh_status().needs_rejoin);
+    client->disable_mesh();
+    EXPECT_FALSE(client->mesh_status().tunnel_up) << "tunnel_up while the mesh is disabled";
+}
+
 // A device that already has a node and joins with an invite stays in its own
 // network; the join reports the membership the invite became, through the C++
 // result and the C ABI JSON.
@@ -2456,6 +2682,26 @@ TEST(SdkMeshConfig, AJsonConfigKeepsTheDefaultOfEachKeyItLeavesOut) {
 TEST(SdkMeshConfig, TheHeartbeatComesBeforeTheServerClosesAnIdleConnection) {
     EXPECT_LT(static_cast<time_t>(lnsdk::MeshConfig{}.heartbeat_interval_sec),
               nexus::network::HttpServer::kKeepAliveTimeoutSec);
+}
+
+// The tunnel liveness rule: a packet from the server peer within the window
+// is alive; before any packet a fresh mesh reads alive for one window, so a
+// mesh that has carried nothing yet is not torn down; an old packet with a
+// mesh enabled longer ago reads dead.
+TEST(SdkTunnelAlive, TheServerPeersPacketsWithinTheWindowKeepTheTunnelUp) {
+    using std::chrono::seconds;
+    const int64_t now = 1'000'000;
+    const auto window = lnsdk::kTunnelAliveWindow.count();
+    EXPECT_TRUE(lnsdk::tunnel_alive(now - 1, now, std::chrono::hours(1)));
+    EXPECT_TRUE(lnsdk::tunnel_alive(now - window + 1, now, std::chrono::hours(1)));
+    EXPECT_FALSE(lnsdk::tunnel_alive(now - window, now, std::chrono::hours(1)));
+    EXPECT_FALSE(lnsdk::tunnel_alive(0, now, std::chrono::hours(1)));
+    // Enabled less than a window ago: unknown reads as alive.
+    EXPECT_TRUE(lnsdk::tunnel_alive(0, now, seconds(5)));
+    EXPECT_TRUE(lnsdk::tunnel_alive(now - window - 100, now, seconds(5)));
+    EXPECT_FALSE(lnsdk::tunnel_alive(0, now, lnsdk::kTunnelAliveWindow));
+    // Several default heartbeats (3 s), not one.
+    EXPECT_GE(window, 3 * static_cast<int64_t>(lnsdk::MeshConfig{}.heartbeat_interval_sec));
 }
 
 // Relay choice ranks the Tier 1 servers this device verified as reachable;

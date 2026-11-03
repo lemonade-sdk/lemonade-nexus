@@ -209,11 +209,50 @@ direct path to every peer before it uses a relay:
 - When the SDK finds a wall-clock gap of more than 10 seconds between two
   passes of its background loop beyond the planned sleep (the app was
   suspended, or the computer slept), it resumes: it sends a fresh handshake
-  initiation to every peer and the server, sends a heartbeat, refreshes the
-  peer list, queries STUN, renews every peer, and runs the relay fallback.
+  initiation to every peer and the server, resets its private transport,
+  sends a heartbeat, refreshes the peer list, queries STUN, renews every
+  peer, forgets the relay backoff, and runs the relay fallback. See
+  "Suspension and resume" below for what the host should do.
 
 `ln_mesh_status` and `ln_mesh_peers` report a direct peer's address in
 `endpoint`.
+
+### Suspension and resume
+
+The SDK detects a suspension by itself from the wall-clock gap above, but
+only when its loop thread next runs, and a request already waiting on a
+connection the OS closed meanwhile holds the private transport until its
+read timeout (15 seconds, twice). A host that knows when it came back does
+better by saying so:
+
+- Call `ln_resume` (`LemonadeNexusClient::resume()`, Dart
+  `LemonadeNexusSdk.resume()`) every time the process returns to the
+  foreground (iOS `applicationDidBecomeActive`, Flutter
+  `AppLifecycleState.resumed`, a laptop's wake notification). It is safe at
+  any time and never blocks on the network. It re-keys the tunnel first,
+  then drops every private-API connection from before the suspension (a
+  request waiting on one fails at once and dials again), closes the event
+  socket so it opens again, clears the private transport's breaker and the
+  30-second unanswered window that would otherwise force a session move,
+  drops the pooled public connections, and runs the resume pass at once with
+  the relay backoff and relay cooldowns forgotten. One resume costs one Tier
+  1 verification: the relay fallback reuses the verification the first
+  private request made.
+- Read `tunnel_up` in `ln_mesh_status` (`MeshStatus.tunnelUp`) for the
+  tunnel to the session server instead of inferring it from the peers. It is
+  true while the server's dataplane peer sent a packet or a handshake within
+  the last 20 seconds (the SDK's own heartbeat crosses the tunnel every 3
+  seconds, so this is several missed heartbeats), or the mesh was enabled
+  less than 20 seconds ago and has carried nothing yet; false while the mesh
+  is not enabled. A host that expects the mesh up and reads false should
+  call `ln_resume` and, when it stays false for another window, rebuild the
+  mesh (`ln_mesh_disable`, `ln_join_network`, `ln_mesh_enable`).
+- SIGPIPE: iOS closes the sockets of a suspended app, and a TLS write to one
+  of them raises SIGPIPE, which kills the process before any error reaches
+  the caller. The SDK ignores SIGPIPE for the process when the first client
+  is created, and sets `SO_NOSIGPIPE` on every socket it opens on Apple
+  platforms. A host that installs its own SIGPIPE handler must keep it
+  ignored or tolerant.
 
 ### LAN-Direct Paths
 
