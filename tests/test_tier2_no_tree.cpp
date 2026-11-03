@@ -734,11 +734,12 @@ TEST_F(TreeRouteHttpTest, AnyServerServesTheAuthorityChainAsCandidateData) {
 // A client that asks gets pages of up to kMaxHttpChainLinks links; one that
 // does not ask gets kMaxHandoffChainLinks, the size every SDK decodes.
 TEST_F(TreeRouteHttpTest, TheAuthorityRouteServesLargerPagesOnlyWhenAsked) {
-    // Each epoch introduces fresh vote keys, as a real handoff must.
+    // Each handoff introduces a valid Tier 1 set (five members) with fresh keys.
     std::vector<std::vector<crypto::Ed25519Keypair>> rosters;
     for (int i = 0; i < 10; ++i) {
         rosters.push_back({tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
-                           tier1_chain_test::new_identity(), tier1_chain_test::new_identity()});
+                           tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
+                           tier1_chain_test::new_identity()});
     }
     auto chain = tier1_chain_test::Chain::make(rosters);
     std::size_t asked = 0;
@@ -783,11 +784,12 @@ TEST_F(TreeRouteHttpTest, TheAuthorityRouteServesLargerPagesOnlyWhenAsked) {
 // The security wire's bounds stay the default: a page with more links than
 // kMaxHandoffChainLinks neither encodes nor decodes without the HTTP bounds.
 TEST(AuthorityChainCodecBounds, LargerPagesNeedTheHttpBounds) {
-    // Each epoch introduces fresh vote keys, as a real handoff must.
+    // Each handoff introduces a valid Tier 1 set (five members) with fresh keys.
     std::vector<std::vector<crypto::Ed25519Keypair>> rosters;
     for (int i = 0; i < 8; ++i) {
         rosters.push_back({tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
-                           tier1_chain_test::new_identity(), tier1_chain_test::new_identity()});
+                           tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
+                           tier1_chain_test::new_identity()});
     }
     const auto chain = tier1_chain_test::Chain::make(rosters);
     const auto page = chain.page_after(0, chain.epochs.size(), 32);
