@@ -1,8 +1,9 @@
 # Lemonade Nexus — Flutter Desktop Client
 
-Desktop client (macOS + Windows) for the Lemonade Nexus userspace mesh, built
-with Flutter/Dart. It uses FFI bindings to communicate with the C SDK
-(`lemonade_nexus.h`).
+Desktop client (macOS, Windows, and Linux) for the Lemonade Nexus userspace
+mesh, built with Flutter/Dart. It uses the Flutter plugin
+[`packages/lemonade_nexus_sdk`](../../packages/lemonade_nexus_sdk), which wraps
+the C SDK (`lemonade_nexus.h`) through Dart FFI.
 
 ## Overview
 
@@ -56,32 +57,32 @@ lib/
 ├── main.dart              # App entry point
 ├── src/
 │   ├── api/               # REST/SSE client for the admin endpoint
-│   ├── platform/          # Paths, secure store, platform integration
-│   ├── sdk/               # FFI bindings to the C SDK
-│   │   ├── ffi_bindings.dart
-│   │   ├── lemonade_nexus_sdk.dart
-│   │   └── models.dart (+ generated models.g.dart)
-│   ├── services/          # dns_discovery.dart, passkey_manager.dart
-│   ├── state/             # Riverpod state (app_state, cluster keyring, providers)
+│   ├── platform/          # Paths, secure store, settings, platform integration
+│   ├── services/          # passkey_manager.dart
+│   ├── state/             # Riverpod state (app_state, cluster keyring, device identity, providers)
 │   ├── views/             # UI views (see below)
 │   └── windows/           # Windows integration: system tray, autostart, service
 └── theme/                 # app_theme.dart, components.dart
 ```
 
+The FFI bindings, the SDK wrapper, the models, and DNS discovery live in the
+plugin (`packages/lemonade_nexus_sdk/lib/`).
+
 Views: `login_view`, `main_navigation`, `dashboard_view`, `peers_view`,
 `network_monitor_view`, `tree_browser_view`, `node_detail_view`,
-`servers_view`, `certificates_view`, `settings_view`, `account_view`, and the
+`servers_view`, `certificates_view`, `settings_view`, `account_view`,
+`mesh_port_view`, the invite, member-access, and networks dialogs, and the
 `admin_console/` widget group (dashboard, backends, logs, models, system
 info).
 
 ## Prerequisites
 
 - Flutter SDK 3.x+ (Dart 3.x+)
-- CMake + Ninja, plus a C/C++ toolchain: Xcode (macOS) or Visual Studio
-  Build Tools (Windows)
+- CMake + Ninja, plus a C/C++ toolchain: Xcode (macOS), Visual Studio
+  Build Tools (Windows), or clang with GTK 3 development packages (Linux)
 - The native SDK shared library, built from the repo root
   (`liblemonade_nexus_sdk.dylib` on macOS, `lemonade_nexus_sdk.dll` on
-  Windows)
+  Windows, `liblemonade_nexus_sdk.so` on Linux)
 
 ## Setup
 
@@ -92,7 +93,7 @@ info).
 
 2. Enable desktop:
    ```bash
-   flutter config --enable-macos-desktop    # or --enable-windows-desktop
+   flutter config --enable-macos-desktop    # or --enable-windows-desktop / --enable-linux-desktop
    ```
 
 3. Install dependencies:
@@ -100,25 +101,37 @@ info).
    flutter pub get
    ```
 
-4. Build the native SDK shared library (from the repo root). CMake
-   downloads the pinned static OpenSSL archive and links it, so the dylib/DLL
-   loads no Homebrew or system OpenSSL:
+4. Build the native SDK shared library (from the repo root). On macOS and
+   Windows, CMake downloads the pinned static OpenSSL archive and links it, so
+   the dylib/DLL loads no Homebrew or system OpenSSL:
    ```bash
    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
    cmake --build build --target LemonadeNexusSDKShared --parallel
    ```
-
-5. **Windows only** — stage the SDK DLL next to the runner (macOS
-   auto-embeds the dylib via the Xcode "Embed Lemonade Nexus SDK" build
-   phase):
-   ```bat
-   copy build\projects\LemonadeNexusSDK\Release\lemonade_nexus_sdk.dll windows\
+   On Linux, build the SDK alone; it links the system OpenSSL 3:
+   ```bash
+   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+     -DBUILD_TESTING=OFF -DLEMONADE_NEXUS_SDK_ONLY=ON
+   cmake --build build --target LemonadeNexusSDKShared --parallel
    ```
+
+5. Bundle the library with the app:
+   - **macOS:** the Xcode "Embed Lemonade Nexus SDK" build phase copies and
+     signs the dylib.
+   - **Linux:** the runner's CMake bundles
+     `build/projects/LemonadeNexusSDK/liblemonade_nexus_sdk.so` into `lib/`.
+   - **Windows:** the runner's CMake bundles the DLL from
+     `build\projects\LemonadeNexusSDK\Release\`. A single-config Ninja build
+     writes it one directory up, so copy it there first:
+     ```bat
+     mkdir build\projects\LemonadeNexusSDK\Release
+     copy build\projects\LemonadeNexusSDK\lemonade_nexus_sdk.dll build\projects\LemonadeNexusSDK\Release\
+     ```
 
 ## Development
 
 ```bash
-flutter run -d macos      # or: flutter run -d windows
+flutter run -d macos      # or: flutter run -d windows / flutter run -d linux
 ```
 
 Hot reload during development: `r` (hot reload), `R` (hot restart), `q`
@@ -127,12 +140,13 @@ Hot reload during development: `r` (hot reload), `R` (hot restart), `q`
 ## Building for Release
 
 ```bash
-flutter build macos --release      # or: flutter build windows --release
+flutter build macos --release      # or: flutter build windows / linux --release
 ```
 
 Output:
 - macOS: `build/macos/Build/Products/Release/nexus-client.app`
 - Windows: `build/windows/x64/runner/Release/nexus-client.exe`
+- Linux: `build/linux/x64/release/bundle/`
 
 ## Packaging
 
@@ -153,11 +167,12 @@ flutter test
 
 ## CI Status
 
-The macOS client job in
 [`.github/workflows/flutter-clients.yml`](../../.github/workflows/flutter-clients.yml)
-runs on every push (analyze, test, release build, and SDK-embedding checks).
-The Windows job is currently disabled (`if: false`); validate Windows builds
-locally.
+has macOS, Windows, and Linux jobs. Each builds the SDK, runs `flutter
+analyze` and `flutter test`, builds the release app, and checks that the
+bundle carries the SDK. The workflow runs on pushes to `main` and pull
+requests that touch the client, the SDK, or the build files. The release
+workflow calls it and attaches the three client archives to the release.
 
 ## License
 

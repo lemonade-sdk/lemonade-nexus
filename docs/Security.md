@@ -481,15 +481,22 @@ claim.
 See [Attestation](Attestation) for the provider matrix and the evidence path.
 The boundary that matters here:
 
-- The implemented provider verifies the **AMD SEV-SNP/HCL/vTPM** evidence
-  chain plus IMA runtime measurements, bound to a fresh challenge, the node
-  identity, the epoch, and the network.
+- The Tier 1 profile is `snp-svsm-vtpm`: **AMD SEV-SNP with a COCONUT-SVSM
+  vTPM**. The provider verifies the SNP and SVSM evidence chain, the
+  enrolled attestation key, PCR 8 and 9, and IMA runtime measurements, bound
+  to a fresh challenge, the node identity, the epoch, and the network. The
+  release values come from the signed release approval, never from the host.
 - `nexus-attestd` runs under a separate service identity with scoped TPM/IMA
   access and filesystem restrictions. It collects evidence without holding
   the server's Nexus identity key, consensus vote key, or FROST share. It
   seals and unseals a PCR-bound key for the server's boot set but never
   receives the key material that key protects. The server itself has no TPM
   access.
+- The **threshold storage key** is a separate key role. Each server encrypts
+  its covered data files under its own data key and wraps that key to the
+  storage public key. Unlock needs partials from `t = ceil(0.65 × n)`
+  holders, and the first key needs 5 eligible, attested holders. See
+  [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key).
 - Confidential computing protects against a **hostile host or hypervisor**.
   It is not a claim that privileged root inside the guest cannot inspect
   guest processes.
@@ -505,18 +512,19 @@ What the protocol defends:
   faults).
 - A hostile hypervisor substituting the guest image or forging vTPM quotes
   outside the confidential boundary (SNP launch measurement plus the
-  paravisor-bound vTPM, IMA runtime measurements).
-- Substituting the running binary (signed release manifests verified against
-  the pinned release-signing key).
+  SVSM-bound vTPM, IMA runtime measurements).
+- Substituting the running binary (IMA measurements checked against the
+  binary hashes in the signed release approval, whose release key the pinned
+  Genesis key delegates).
 
 What it does not defend:
 
 - Privileged root **inside** the guest.
 - Rolling back or deleting the whole durable security store to an authentic
   older snapshot (see Current Limitations).
-- A network that never reaches Tier 1. With the shipped profile no node
-  qualifies, so a deployment without a qualifying platform has no authority
-  committee at all.
+- A network that never reaches Tier 1. Without a signed release approval
+  for the network and a qualifying platform, no node qualifies, and the
+  deployment has no authority committee at all.
 
 ## Transport and Message Security
 
@@ -525,12 +533,13 @@ What it does not defend:
 - **Private API:** HTTPS on virtual mesh addresses, forwarded through the
   userspace netstack to a loopback listener. Every private route is
   JWT-gated.
-- **Mesh:** BoringTun (WireGuard protocol) over UDP `51940`.
+- **Mesh:** the BoringTun dataplane over UDP `51940`.
 - **Security protocol:** signed gossip envelopes on UDP `9102`. The envelope
   is authenticated and size-bounded before parsing, never relayed, and
   carries attestation, consensus, DKG, and epoch-announcement messages.
   Sensitive pairwise DKG payloads are additionally sealed to the recipient
-  identity. Security messages are not all carried inside WireGuard.
+  identity. Security messages are not all carried inside the BoringTun
+  dataplane.
 
 Rate limiting is per-client (default 120 requests/minute, burst 20).
 `GET /api/tier1/authority` has its own budget per client address (600
@@ -963,14 +972,18 @@ No one of these paths can touch epochs, eligibility, or authority keys.
 
 These are implementation limits, not settings an operator can disable:
 
-1. **Tier 1 qualification is blocked in the shipped profile.** The compiled
-   attestation profile pins no launch measurement, TCB floor, IMA policy
-   digest, or approved component hashes. Every attestation fails with
-   `ProfileIncomplete` until a qualifying release pins those values. See
+1. **Tier 1 needs a signed release for its network.** Without a verified
+   release approval, the attestation profile has no approved binary digests
+   and no PCR 8/9 values. Every attestation then fails with
+   `ProfileIncomplete`. An approval binds to one network ID, and a locally
+   built package carries only an unsigned example. Only the VM shapes whose
+   launch measurements an approval lists can qualify. See
    [Attestation](Attestation).
-2. **Provider support is narrower than the design.** The SVSM-vTPM and
-   direct-boot providers currently refuse with `ProviderUnsupported`. SGX,
-   TDX, and Secure Enclave are not implemented Tier 1 providers here.
+2. **Provider support is narrow.** `snp-svsm-vtpm` is the only profile under
+   which the binary issues Tier 1 challenges. The `snp-hcl-vtpm` verifier
+   exists but is not the Tier 1 profile. The direct-boot provider refuses with
+   `ProviderUnsupported`. SGX, TDX, and Secure Enclave are not implemented
+   Tier 1 providers here.
 3. **Application authority is not fully integrated.** Admission and several
    replicated application stores still use root- or identity-gated paths.
    Receiving an author-signed record does not by itself authorize remote
@@ -981,9 +994,9 @@ These are implementation limits, not settings an operator can disable:
    whole store to a valid pre-Epoch-1 snapshot is not addressed, and a valid
    historical authority chain cannot in isolation prove it is the newest
    chain.
-5. **IMA checkpoint/resume acceptance is not implemented.** The bounded
-   evidence path must satisfy the current complete verification
-   requirements.
+5. **Lost storage state stops the server.** A server whose files are
+   encrypted refuses to start when the storage state that opens them is
+   missing, and the log names the files to restore.
 6. **No tree without Tier 1.** Only Tier 1 members hold the tree. Before Epoch
    1 activates, and while no server qualifies for Tier 1 (item 1), no server
    serves a tree route or a client session, and no client can join.

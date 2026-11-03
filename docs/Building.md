@@ -20,7 +20,8 @@ title: Building from Source
 - **CMake** 3.25.1 or newer
 - **Ninja** build system
 - **Rust/Cargo** toolchain (`rustc` and `cargo` on `PATH`) — Rust builds the
-  BoringTun FFI wrapper, the virtual netstack, and the FROST integration
+  BoringTun FFI wrapper, the virtual netstack, the FROST integration, and the
+  threshold storage key
 - **Git**
 
 On Debian/Ubuntu, the additional system packages are:
@@ -157,8 +158,37 @@ Set `LN_DEBUG=1` to surface verbose SDK and mesh diagnostics in the console.
 See the [Windows packaging guide](../apps/LemonadeNexusClient/windows/packaging/PACKAGING.md).
 The SDK DLL must be staged next to the runner before `flutter build windows`.
 
-CI builds and sanity-checks the macOS and Windows clients — see
+### Linux
+
+```bash
+# 1. Build the SDK alone. On Linux it links the system OpenSSL 3.
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF -DLEMONADE_NEXUS_SDK_ONLY=ON
+cmake --build build --target LemonadeNexusSDKShared --parallel
+
+# 2. Build the app. The runner's CMake bundles
+#    build/projects/LemonadeNexusSDK/liblemonade_nexus_sdk.so into lib/.
+cd apps/LemonadeNexusClient
+flutter pub get
+flutter build linux --release
+```
+
+The Flutter Linux toolchain needs clang and GTK 3; the plugins need libsecret,
+jsoncpp, and the Ayatana app indicator development packages. See the `linux`
+job in the workflow below for the exact package list.
+
+CI builds and sanity-checks the macOS, Windows, and Linux clients — see
 [`.github/workflows/flutter-clients.yml`](../.github/workflows/flutter-clients.yml).
+
+### iOS and Android SDK
+
+The Flutter plugin `packages/lemonade_nexus_sdk` carries the SDK for iOS and
+Android. `scripts/build-sdk-mobile.sh` builds it against pinned OpenSSL 3.5.9
+mobile archives (`.github/workflows/deps-openssl-mobile.yml`). The
+`Mobile SDK` workflow (`.github/workflows/mobile-sdk.yml`) builds both
+platforms, tests the plugin, and, with a `mobile-sdk-v<version>` release tag,
+uploads the archives. See the
+[plugin's native library notes](../packages/lemonade_nexus_sdk/native/README.md).
 
 ## Running Tests
 
@@ -213,5 +243,5 @@ source of truth for versions.
 | BoringTun | Rust crate via Corrosion (`crates/boringtun-ffi`) | Userspace WireGuard |
 | virtual netstack | Rust crate (`crates/virtual-netstack`) | Userspace TCP/IP (smoltcp) |
 | FROST | Rust crate (`crates/frost-ffi`, `frost-ed25519 = 2.2.0`) | Threshold authority signatures |
-| Storage threshold | Rust crate (`crates/storage-threshold`, `frost-ristretto255 = 2.2.0`, `elastic-elgamal = 0.3.1`) | Threshold storage key (library only; not yet used by the server) |
+| Storage threshold | Rust crate (`crates/storage-threshold`, `frost-ristretto255 = 2.2.0`, `elastic-elgamal = 0.3.1`) | Threshold storage key; the server links it for storage-key generation, refresh, and unlock |
 | json-c, libcurl, UUID | System packages (Linux) | TPM2-TSS build dependencies |

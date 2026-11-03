@@ -50,19 +50,21 @@ relay and proxy encrypted traffic and participate in the mesh. They do not
 qualify for Tier 1, so they hold no permission tree. A network needs Tier 1
 servers before clients can join.
 
-**Important:** with the currently shipped attestation profile, *no* node can
-qualify for Tier 1, because the profile's required measurements and release
-hashes are not yet pinned in a qualifying release. This is a fail-closed
-blocker, not a configuration problem. See [Attestation](Attestation) and
+**Important:** a node qualifies for Tier 1 only when it runs a signed
+release for its network. The signed release approval supplies the launch
+measurements, PCR 8 and 9, and the binary hashes. Without a verified approval,
+*no* node can qualify. This is a fail-closed rule, not a configuration
+problem. See [Attestation](Attestation) and
 [Security — Current
 Limitations](Security#current-limitations).
 
 ## Which attestation platforms are supported?
 
-The implemented provider verifies the **AMD SEV-SNP/HCL/vTPM** path (with
-IMA runtime measurements). The SVSM-vTPM and direct-boot providers are
-declared but refuse evidence (`ProviderUnsupported`), and there is no SGX,
-TDX, or Secure Enclave provider in this repository. See the
+The Tier 1 profile is **AMD SEV-SNP with a COCONUT-SVSM vTPM**
+(`snp-svsm-vtpm`, with IMA runtime measurements). An HCL/vTPM verifier
+(`snp-hcl-vtpm`) also exists but is not the Tier 1 profile. The direct-boot
+provider is declared but refuses evidence (`ProviderUnsupported`), and there
+is no SGX, TDX, or Secure Enclave provider in this repository. See the
 [provider matrix](Attestation#provider-matrix).
 
 ## How does NAT traversal work?
@@ -70,7 +72,7 @@ TDX, or Secure Enclave provider in this repository. See the
 1. STUN (UDP `3478`) discovers each peer's reflexive address.
 2. The routing API (`/api/routing/*`) coordinates candidate exchange and
    verifies candidates against the observed control-connection source.
-3. Both sides send WireGuard-protocol (BoringTun) handshakes to each other's
+3. Both sides send BoringTun dataplane handshakes to each other's
    discovered endpoints on the **shared mesh UDP port `51940`** — there is no
    separate hole-punch port.
 4. If a direct path cannot be formed, the coordinator issues a relay ticket
@@ -133,9 +135,11 @@ License](https://github.com/lemonade-sdk/lemonade-nexus/blob/main/LICENSE).
   evidence helper). macOS builds run in CI. Windows build definitions exist
   but the Windows CI jobs are disabled, so Windows is not a qualified
   platform yet.
-- **Client:** macOS desktop (CI-verified) and Windows desktop (build
-  definitions present; CI disabled).
-- **SDK:** C++ and C ABI, consumed by the Flutter client and by embedders.
+- **Client:** macOS, Windows, and Linux desktop builds run in CI. iOS and
+  Android use the Flutter plugin `packages/lemonade_nexus_sdk`, whose native
+  libraries are released as `mobile-sdk-v*` archives.
+- **SDK:** C++ and C ABI, consumed by the Flutter plugin, the Flutter client,
+  and embedders.
 
 Tier 1 attestation support and platform build support are separate questions;
 see [Building — Windows Status](Building#windows-status) and
@@ -146,9 +150,9 @@ see [Building — Windows Status](Building#windows-status) and
 | | Lemonade-Nexus | Tailscale | ZeroTier | Nebula |
 |---|---|---|---|---|
 | Coordination | Self-hosted servers you operate | SaaS coordination server | Controller (SaaS or self-hosted) | Self-hosted static config |
-| Transport | Userspace WireGuard (BoringTun) + userspace netstack | WireGuard (kernel) | Custom (ZT) | Custom (Nebula) |
+| Transport | Userspace BoringTun dataplane + userspace netstack | WireGuard (kernel) | Custom (ZT) | Custom (Nebula) |
 | Server authority | Epoch committee: attestation + consensus + threshold signing | Company-operated | Controller | Static root CA |
 | DNS | Built-in authoritative DNS | MagicDNS | None | None |
-| Hardware attestation | SEV-SNP/HCL/vTPM path implemented (qualification pending) | No | No | No |
+| Hardware attestation | SEV-SNP with a COCONUT-SVSM vTPM, release values from a signed approval | No | No | No |
 
 The comparison is structural, not a performance claim.

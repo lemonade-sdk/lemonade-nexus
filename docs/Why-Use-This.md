@@ -37,24 +37,26 @@ startup.
 
 ## Hardware-Rooted Evidence (with honest status)
 
-The implemented attestation path verifies an AMD SEV-SNP guest, a
-paravisor-bound vTPM, and IMA runtime measurements, bound to a fresh
-challenge and to the network. The evidence is collected by a
+The Tier 1 attestation path verifies an AMD SEV-SNP guest, a COCONUT-SVSM
+vTPM, and IMA runtime measurements, bound to a fresh challenge and to the
+network. The evidence is collected by a
 privilege-separated helper daemon that holds no Nexus keys.
 
-The status is explicit: the shipped profile is not yet pinned with approved
-measurements, so no node can qualify for Tier 1 with the current release.
-That is a fail-closed limit we document rather than a gap we hide. See
+The status is explicit: a node qualifies only under a signed release
+approval for its network, and only in a VM shape whose launch measurement
+that approval lists. Without one, no node reaches Tier 1. That is a
+fail-closed limit we document rather than a gap we hide. See
 [Attestation](Attestation).
 
 ## Encrypted End to End
 
-- Mesh traffic: WireGuard-protocol encryption (BoringTun), with NAT
-  traversal and relay fallback. Relays see only ciphertext.
+- Mesh traffic: the BoringTun dataplane, with NAT traversal and relay
+  fallback. Relays see only ciphertext.
 - Control planes: HTTPS only, with ACME-provisioned certificates. The
   private API additionally lives behind the mesh.
 - At rest: one versioned AEAD construction (XChaCha20-Poly1305-IETF) for
-  wrapped keys and credentials.
+  wrapped keys, credentials, and the data files under the threshold storage
+  key.
 
 ## Built-in Discovery and Addressing
 

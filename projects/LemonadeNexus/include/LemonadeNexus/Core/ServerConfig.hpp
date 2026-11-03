@@ -133,7 +133,12 @@ struct ServerConfig {
     // tee_attestation_validity_sec) were variously unreachable, inert, or dead.
 };
 
-/// Load config: CLI args > env vars > config file > defaults.
+/// Load config, highest priority first: env vars > CLI args > config file >
+/// defaults. Exceptions: an explicit --root-pubkey or --genesis-pubkey wins
+/// over its SP_* variable, and SP_SEED_PEERS appends to the seed list. With
+/// --tier1-authority-contract, inherited SP_* variables are ignored, only
+/// SP_LOG_LEVEL from the fixed environment file applies, and a trust-key CLI
+/// override sets tier1_contract_error.
 /// A boolean SP_* variable takes a value that parse_bool_flag accepts. Any
 /// other value is logged at error level and turns the setting off, except
 /// that SP_DDNS_ENABLED then stays off. Settings of removed features are

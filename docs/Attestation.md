@@ -6,12 +6,12 @@ title: Attestation
 # Attestation
 
 This page describes the implemented attestation behavior: which providers
-verify, what the evidence path proves, what the shipped profile requires, and
+verify, what the evidence path proves, what the profile requires, and
 how failures surface.
 
 - [Provider Matrix](#provider-matrix)
 - [Evidence Path](#evidence-path)
-- [The Shipped Profile](#the-shipped-profile)
+- [The Profile](#the-profile)
 - [The Evidence Helper: nexus-attestd](#the-evidence-helper-nexus-attestd)
 - [Runtime Requirements](#runtime-requirements)
 - [Fail-Closed Diagnostics](#fail-closed-diagnostics)
@@ -24,8 +24,8 @@ for one profile cannot answer a challenge for another.
 
 | Profile ID | Provider | State |
 |---|---|---|
-| `snp-hcl-vtpm` | `AzureSnpVtpmProvider` | **Implemented.** Verifies the AMD SEV-SNP chain (VCEK ← ASK ← compiled-in ARK), the SNP report signature, guest policy, launch measurement, TCB floor, the paravisor-bound vTPM (HCL report with `HCLAkPub`), the fresh TPM quote, and IMA runtime measurements. |
-| `snp-svsm-vtpm` | `SnpSvsmVtpmProvider` | **Declared, refuses.** Returns `ProviderUnsupported`. The SVSM service-manifest format is not invented; it waits on real evidence from an approved SVSM host. |
+| `snp-svsm-vtpm` | `SnpSvsmVtpmProvider` | **Implemented. The Tier 1 profile** (`kTier1AttestationProfileId`): the only profile under which this binary issues Tier 1 challenges. Verifies the AMD SEV-SNP chain (VCEK ← ASK ← compiled-in ARK), the COCONUT-SVSM service report that binds the vTPM endorsement key (EK) at VMPL0, the attestation key (AK) enrolled to that EK through TPM credential activation, a guest SNP report that proves Linux runs above VMPL0, the launch measurement, the TCB floor, a fresh quote under the AK, PCR 8 and 9, and IMA runtime measurements. |
+| `snp-hcl-vtpm` | `AzureSnpVtpmProvider` | **Implemented, not the Tier 1 profile.** Verifies the paravisor shape: the SNP chain, the HCL report with `HCLAkPub`, the fresh TPM quote, and IMA runtime measurements. No challenge uses this profile while `kTier1AttestationProfileId` names the SVSM profile. |
 | `snp-direct-boot` | `SnpDirectBootProvider` | **Declared, refuses, and not Tier 1 capable.** Returns `ProviderUnsupported`. A TPM-less measured boot has no protected runtime measurement accumulator, so implementing its evidence format will not make it Tier 1 capable. |
 | `tdx` | (none) | Named so the enum stays stable. No provider. |
 
@@ -36,63 +36,86 @@ Four separate things are often conflated; keep them apart:
 
 1. **Provider capability** — the design can produce the required claims.
 2. **Implemented verifier** — code exists and verifies the evidence.
-3. **Release-profile completeness** — the shipped profile is pinned (it is
-   not, today).
-4. **Successful deployment qualification** — a real host passed end to end
-   (none has, today).
+3. **Release-profile completeness** — a verified, signed release approval
+   supplies the release values (see [The Profile](#the-profile)). Without one,
+   the profile is incomplete.
+4. **Successful deployment qualification** — a real host passed end to end.
+   A release approval records its state in `qualification_state`; the
+   current fleet profile (`release/fleet-profile.json`) is
+   `LIVE_BOOT_APPROVED`, which requires exact PCR 8 and 9 values. This page
+   does not record a qualification of any other host shape.
 
 ## Evidence Path
 
 ```text
 challenge (fresh nonce, network, node, epoch, incarnation, profile)
-    -> platform evidence (SNP report + HCL/vTPM bundle + IMA log)
+    -> AK enrollment once per incarnation (credential activation via nexus-attestd)
+    -> platform evidence (guest SNP report + SVSM service report + AK quote + IMA log)
     -> PlatformEvidenceProvider verifies -> VerifiedPlatformClaims
     -> Tier1EligibilityPolicy (fifteen prerequisites, conjunction, fail closed)
     -> signed mesh observations
     -> finalized eligibility -> selection -> readiness -> handoff
 ```
 
-- The quote's `REPORT_DATA` equals `SHA-512(challenge)`, so the evidence binds
-  to a fresh challenge. The bound context includes the network ID, profile
+- The SNP `REPORT_DATA` is SHA-512 over a versioned domain and the canonical
+  challenge digest, so the evidence binds to a fresh challenge. The bound context includes the network ID, profile
   ID and ruleset, node identity, incarnation, epoch, and policy digest.
 - Platform claims travel inside **signed observations** from current Tier 1
   members. A node never supplies its own eligibility facts; a locally
   computed answer would be a self-report.
 - The verifier checks profile completeness first. An incomplete profile
   fails every candidate with `ProfileIncomplete` before any other check.
+- **IMA checkpoints.** After a passing SVSM attestation, the verifier stores
+  a checkpoint (event count, PCR 10, required paths) bound to the network,
+  node, incarnation, profile, policy digest, and enrolled AK. A later
+  challenge can ask for `Resume` from that checkpoint. A checkpoint that does
+  not match fails with `CheckpointRequired` or `CheckpointInvalid`.
 - AMD revocation: the VCEK and its issuing ASK are checked against a cached
   KDS CRL under the same compiled-in root. This gates **new** attestation
   only; a frozen epoch's membership is not shrunk by a KDS outage.
 
-## The Shipped Profile
+## The Profile
 
-`start_security_mesh()` installs the named compiled profile
-`linux_attestation_profile_v1()`. It fixes the rules:
+`start_security_mesh()` builds the profile from the packaged release
+approval (`/usr/lib/lemonade-nexus/release/release-approval.json`). The
+approval must verify against the pinned Genesis key: Genesis signs the release
+authority (network ID and release key), and the release key signs the
+approval. Without a verified approval, the server keeps the compiled template
+`linux_attestation_profile_v3_svsm_release()`. The template carries launch
+measurements, an IMA policy, and a kernel identity, but no approved binary
+digests and no PCR values, so it is incomplete. There is no local or
+environment fallback.
+
+The compiled template fixes the rules:
 
 | Field | Pinned value |
 |---|---|
 | Debug disabled | required |
 | Migration agent | denied |
-| VMPL policy | `RequireVmpl0` (the HCL/paravisor shape) |
-| IMA log | required, kernel-readback proof |
+| VMPL policy | `RequireAboveVmpl0` (Linux runs above the SVSM at VMPL0) |
+| IMA log | required, SHA-256 replay bank, measured-kernel policy binding |
 | `no_new_privs`, seccomp | required |
 | Approved paths | `/usr/bin/lemonade-nexus`, `/usr/bin/nexus-attestd` |
 | Evidence collector | `/usr/bin/nexus-attestd` (itself an approved path) |
+| TCB floor | `kReleaseMinTcb` (AMD-SB-3030, AMD-SB-3034). An approval can raise it, never lower it. |
 
-Deliberately **unset** (these are release observations, never host
-observations):
+The signed approval supplies the release values. They are release
+observations, never host observations:
 
-| Field | Gap name | Consequence while unset |
+| Field | Source in the approval | Gap name while unset |
 |---|---|---|
-| `snp.expected_measurements_hex` | `NoPinnedLaunchMeasurement` | Any SNP guest image would pass |
-| `snp.min_tcb` | `NoTcbFloor` | Firmware with known issues would pass |
-| `ima_policy_digest` | `NoImaPolicyDigest` | The measuring policy is unproven |
-| Approved path digests | `NoApprovedBinary` | No measured component can be looked up |
+| `snp.expected_measurements_hex` | `svsm_launch_measurements`, one per approved VM shape | `NoPinnedLaunchMeasurement` |
+| `ima_policy_digest`, `ima_policy_id` | `ima_policy` (`id`, `sha256`) | `NoImaPolicyDigest` |
+| Kernel identity | `kernel` (release, bzImage, vmlinux, module tree) | — |
+| Approved path digests | `approved_paths`, plus `previous_release_paths` during a rollout | `NoApprovedBinary` |
+| `expected_pcrs` | PCR 8 and 9 (`expected_pcrs`) | `NoExpectedPcrs` |
 
-While those stay unset, `profile_is_complete()` is false, every attestation
+While any value is unset, `profile_is_complete()` is false, every attestation
 fails with `ProfileIncomplete`, and **no node can reach Tier 1**. The server
-logs each gap at startup. This is the intended behavior: pinning values
-observed on an unqualified host would make the profile decide nothing.
+logs each gap at startup. A package built locally without
+`-DLEMONADE_RELEASE_APPROVAL_FILE` installs the unsigned example from
+`packaging/release/`, so it stays in this state. An approval binds to one
+network ID; it does not verify for another Genesis key.
 
 ## The Evidence Helper: nexus-attestd
 
@@ -133,18 +156,22 @@ key, or the FROST share. The Nexus server has no TPM or IMA access at all.
 
 ## Runtime Requirements
 
-For a server to produce evidence the implemented provider can verify:
+For a server to produce evidence the Tier 1 provider can verify:
 
-- An AMD SEV-SNP guest with the vTPM **inside** the confidential boundary —
-  the paravisor/SVSM shape that publishes `HCLAkPub` in the SNP report's
-  runtime data. A host-side `swtpm` attached by QEMU sits outside the
-  boundary and its quotes carry no attestation weight.
+- An AMD SEV-SNP guest that runs Linux above VMPL0, with a COCONUT-SVSM vTPM
+  at VMPL0 **inside** the confidential boundary, and a launch measurement
+  that the release approval lists. A host-side `swtpm` attached by QEMU sits
+  outside the boundary and its quotes carry no attestation weight.
+- The kernel TSM report interface (`/sys/kernel/config/tsm/report`).
+  `nexus-attestd-tsm-setup.service` creates the two report objects that
+  `nexus-attestd` uses.
+- The boot chain whose PCR 8 and 9 the release approval pins.
 - The IMA measurement policy loaded **before** the Nexus binary first
   executes (the `nexus-ima-policy.service` unit ships with the IMA
   measurement component, which is not part of this repository yet).
 - The Nexus binaries installed at the approved paths (`/usr/bin/lemonade-nexus`,
-  `/usr/bin/nexus-attestd`) with their release digests pinned in a complete
-  profile.
+  `/usr/bin/nexus-attestd`) with their release digests listed in the
+  verified release approval.
 - The `nexus-attestd` service running; the server unit requests it with
   `Wants=`/`After=`. A missing helper costs Tier 1, it does not stop the mesh
   node, except on a host whose gossip identity is fully sealed: that server
@@ -162,10 +189,12 @@ Expected log lines and what they mean:
 
 | Log line | Meaning |
 |---|---|
-| `Attestation profile v1 is incomplete: <gap>` (repeated per gap) | The shipped profile is missing pinned values. Every candidate will fail `ProfileIncomplete`. Normal at this revision. |
+| `Attestation profile v3 is incomplete: <gap>` (repeated per gap) | The profile is missing release values, usually because no verified release approval is installed. Every candidate will fail `ProfileIncomplete`. |
+| `Tier-1 release approval unavailable: <reason>` | The packaged approval is missing, unsigned, for another network, or does not verify against the Genesis key. |
 | `No node can reach Tier 1 until the profile pins these values.` | Same, as a summary. |
 | Verdict failures recording `ProfileIncomplete` | The completeness gate, working as designed. |
-| `ProviderUnsupported` from the SVSM or direct-boot provider | A candidate presented (or was configured for) an unimplemented provider shape. It stays ineligible. |
+| `ProviderUnsupported` from the direct-boot provider | A candidate presented (or was configured for) an unimplemented provider shape. It stays ineligible. |
+| `ActivationRequired`, `CheckpointRequired`, `CheckpointInvalid` | The SVSM AK is not enrolled for this incarnation, or the IMA checkpoint does not match. The AK rotates on reboot, so a reboot re-runs enrollment. |
 | `Onboard: no platform evidence on this host` | The onboarding candidate could not produce evidence; it requests a Tier 2 certificate. Not a failure of the join. |
 | Missing helper / socket refused | The server runs without evidence capability. Mesh services work; Tier 1 is unreachable. |
 
@@ -175,12 +204,15 @@ report, not a setting to work around.
 
 ## Qualifying a Host
 
-Two host shapes can satisfy the compiled profile:
+Two host shapes appear in the profile set:
 
-1. **SVSM-vTPM (the HCL/paravisor shape).** Run an SVSM at VMPL0 with the
+1. **SVSM-vTPM (the Tier 1 profile).** Run a COCONUT-SVSM at VMPL0 with the
    guest at VMPL1 or above, so the vTPM lives inside the confidential
-   boundary and the SNP report binds it. This is the shape the implemented
-   `snp-hcl-vtpm` provider verifies.
+   boundary and the SVSM service report binds it. This is the shape the
+   `snp-svsm-vtpm` provider verifies. The host also needs a launch
+   measurement and a boot chain that the release approval lists; a new VM
+   shape needs a reviewed change to `release/fleet-profile.json` (see
+   [Releasing](Releasing#reviewed-release-inputs)).
 2. **SNP measured direct boot** with the kernel, initrd, and command line in
    the launch measurement and a dm-verity root hash pinned on that command
    line. The corresponding provider is declared but not implemented, so this

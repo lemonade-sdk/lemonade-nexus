@@ -559,7 +559,7 @@ bit fires the mesh state callback (the `peers` mesh event).
 (`lnsdk::peer_signal_fresh` and `lnsdk::next_peer_liveness` in
 `MeshOrchestrator.hpp`). An authenticated packet from the peer, keepalives
 included, within three keepalive intervals plus 5 s keeps it online. Before
-the first packet, a live WireGuard session (handshake under 200 s; BoringTun
+the first packet, a live BoringTun session (handshake under 200 s; BoringTun
 rejects a session after 180 s) or a recent server contact (`last_seen`
 within 15 s plus one peer refresh interval) counts. A relayed peer also
 stays online while the server's `last_seen` is that recent. The server's

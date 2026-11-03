@@ -501,7 +501,10 @@ attestation at the next boot. Two rules keep the measured image:
 
 - **Upgrade turns have no hardware qualification yet.** The turn gate answers
   from finalized UpgradeProgress records (Phase 5). The tests inject the
-  `UpgradeHealth` attestation verdicts; no rollout has run on the fleet.
+  `UpgradeHealth` attestation verdicts. Rollouts do run on the fleet: the
+  rollout guard of a release run reports the previous rollout's proven state
+  (for example, `the rollout of release 2026103101 is complete`). That is
+  operating evidence, not a qualification.
 - **A fix after a halt.** A second halt in a row adds the first fix's hashes
   to the next fix, so the overlap grows by one release for each consecutive
   halt until a rollout completes. The approval holds one PCR 8/9 pair, so a
