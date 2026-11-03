@@ -41,6 +41,22 @@ uint16_t code(Enum value) {
     return static_cast<uint16_t>(value);
 }
 
+/// The upgrade record exchange repeats byte-identical messages on a cadence:
+/// a nonce-less record request, the record proofs that answer it, and the
+/// approval bundle re-offered to every peer. Each is verified and applied
+/// idempotently by the upgrade service, so a repeat only costs the answer.
+/// Remembering them made a quiet mesh drop every repeat: the dedupe ring
+/// only forgets a digest when newer traffic pushes it out.
+bool upgrade_exchange(const SecurityMessage& message) {
+    if (message.kind != SecurityMessageKind::Upgrade) {
+        return false;
+    }
+    const auto* upgrade = std::get_if<UpgradeMsg>(&message.body);
+    return upgrade != nullptr && (upgrade->topic == UpgradeTopic::RecordRequest ||
+                                  upgrade->topic == UpgradeTopic::RecordProof ||
+                                  upgrade->topic == UpgradeTopic::ApprovalOffer);
+}
+
 bool storage_kind(SecurityMessageKind kind) {
     return kind == SecurityMessageKind::StoragePlanProof ||
            kind == SecurityMessageKind::StorageKeyPackage ||
@@ -427,7 +443,8 @@ RouteResult SecurityRouter::receive(const NodeId& authenticated_sender,
                             message.kind == SecurityMessageKind::StoragePlanProof ||
                             message.kind == SecurityMessageKind::StorageKeyPackage ||
                             message.kind == SecurityMessageKind::StoragePlanRequest ||
-                            message.kind == SecurityMessageKind::StorageWrapClaim;
+                            message.kind == SecurityMessageKind::StorageWrapClaim ||
+                            upgrade_exchange(message);
     if (!idempotent && !remember(envelope)) {
         return drop(DropReason::Duplicate);
     }
