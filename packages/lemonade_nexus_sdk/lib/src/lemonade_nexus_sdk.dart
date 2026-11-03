@@ -1368,6 +1368,22 @@ class LemonadeNexusSdk {
     }
   }
 
+  /// The host process is about to be suspended (ln_suspend): an iOS app
+  /// left the foreground and its grace period ended. Closes the dataplane's
+  /// UDP socket now, keeping the peers, and drops the private connections,
+  /// because the OS defuncts the sockets of a suspended app and a defunct
+  /// socket receives nothing. Call it after [stopMeshPort] and
+  /// [disableMesh] when the app uses them; [resume] opens a new socket.
+  /// Never blocks on the network. A native library older than ln_suspend
+  /// makes this a no-op.
+  Future<void> suspend() async {
+    if (_isDisposed || _client == null) return;
+    final error = await _offThread((f, c) => f.suspend(c));
+    if (error != LnError.success) {
+      throw SdkException(error, message: 'Failed to suspend');
+    }
+  }
+
   // =========================================================================
   // Mesh port (loopback listener that serves group devices by name)
   // =========================================================================

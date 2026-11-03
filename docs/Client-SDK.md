@@ -225,12 +225,23 @@ connection the OS closed meanwhile holds the private transport until its
 read timeout (15 seconds, twice). A host that knows when it came back does
 better by saying so:
 
+- Call `ln_suspend` (`LemonadeNexusClient::suspend()`, Dart
+  `LemonadeNexusSdk.suspend()`) when the process is about to be suspended
+  (an iOS app left the foreground and the host's grace period ended,
+  Android stopped the app), after `ln_stop_mesh_port` and `ln_mesh_disable`
+  when the host uses them. iOS and Android defunct the sockets of a
+  suspended app, and a defunct UDP socket receives nothing afterwards, so
+  the SDK gives the dataplane socket up now, keeping the netstack and every
+  peer and session, and drops the private-API connections so the server
+  sees clean closes. It never blocks on the network.
 - Call `ln_resume` (`LemonadeNexusClient::resume()`, Dart
   `LemonadeNexusSdk.resume()`) every time the process returns to the
   foreground (iOS `applicationDidBecomeActive`, Flutter
   `AppLifecycleState.resumed`, a laptop's wake notification). It is safe at
-  any time and never blocks on the network. It re-keys the tunnel first,
-  then drops every private-API connection from before the suspension (a
+  any time and never blocks on the network. It opens a new dataplane UDP
+  socket (also when the host never called `ln_suspend`: the old socket may
+  be defunct) and re-keys the tunnel from it first, so every peer learns the
+  new path, then drops every private-API connection from before the suspension (a
   request waiting on one fails at once and dials again), closes the event
   socket so it opens again, clears the private transport's breaker and the
   30-second unanswered window that would otherwise force a session move,

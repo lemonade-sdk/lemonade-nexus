@@ -176,6 +176,58 @@ TEST_F(UserspaceDataplaneTest, TwoNodesHandshakeAndExchangePackets) {
     server.dataplane.stop();
 }
 
+// A suspended app's socket is defunct when the app returns (iOS, Android).
+// suspend() gives the socket up before that, rebind() opens a new one, and
+// the peers, routes, and sessions survive: the server learns the client's
+// new source port from the next packet, as it learned the first one.
+TEST_F(UserspaceDataplaneTest, SuspendThenRebindKeepsPeersAndCarriesTraffic) {
+    Node server, client;
+    ASSERT_TRUE(server.start());
+    ASSERT_TRUE(client.start());
+    server.dataplane.add_local_ip(ip(10, 64, 0, 1));
+    client.dataplane.add_local_ip(ip(10, 64, 0, 2));
+    ASSERT_TRUE(server.dataplane.add_peer(client.keys.pub_b64, "10.64.0.2/32", ""));
+    ASSERT_TRUE(client.dataplane.add_peer(server.keys.pub_b64, "10.64.0.0/10",
+                                          server.loopback_endpoint()));
+    auto first = make_ipv4(ip(10, 64, 0, 2), ip(10, 64, 0, 1), "before-suspend");
+    ASSERT_TRUE(send_until_received(client.dataplane, server.inbox, first, "before-suspend"));
+
+    client.dataplane.suspend();
+    EXPECT_FALSE(client.dataplane.is_running());
+    EXPECT_TRUE(client.dataplane.is_suspended());
+    EXPECT_EQ(client.dataplane.snapshot_peers().size(), 1u) << "peers stay through a suspension";
+
+    ASSERT_TRUE(client.dataplane.rebind());
+    EXPECT_TRUE(client.dataplane.is_running());
+    EXPECT_FALSE(client.dataplane.is_suspended());
+    EXPECT_NE(client.dataplane.bound_port(), 0);
+    ASSERT_EQ(client.dataplane.snapshot_peers().size(), 1u);
+    EXPECT_EQ(client.dataplane.snapshot_peers()[0].endpoint, server.loopback_endpoint())
+        << "the server's endpoint survives the rebind";
+
+    // Traffic flows again in both directions from the new socket.
+    ASSERT_TRUE(client.dataplane.probe_endpoint(server.keys.pub_b64, server.loopback_endpoint()));
+    auto after = make_ipv4(ip(10, 64, 0, 2), ip(10, 64, 0, 1), "after-rebind");
+    ASSERT_TRUE(send_until_received(client.dataplane, server.inbox, after, "after-rebind"))
+        << "client->server never delivered from the new socket";
+    auto back = make_ipv4(ip(10, 64, 0, 1), ip(10, 64, 0, 2), "back-after-rebind");
+    ASSERT_TRUE(send_until_received(server.dataplane, client.inbox, back, "back-after-rebind"))
+        << "server->client never delivered: the server did not learn the new port";
+
+    // A rebind without a suspension (the socket died under a running plane)
+    // works the same way.
+    ASSERT_TRUE(client.dataplane.rebind());
+    auto again = make_ipv4(ip(10, 64, 0, 2), ip(10, 64, 0, 1), "after-second-rebind");
+    ASSERT_TRUE(send_until_received(client.dataplane, server.inbox, again, "after-second-rebind"));
+
+    // A plane that never started has nothing to rebind.
+    UserspaceDataplane fresh;
+    EXPECT_FALSE(fresh.rebind());
+
+    client.dataplane.stop();
+    server.dataplane.stop();
+}
+
 TEST_F(UserspaceDataplaneTest, HairpinRoutesClientToClientWithoutLocalDelivery) {
     Node server, alice, bob;
     ASSERT_TRUE(server.start());
