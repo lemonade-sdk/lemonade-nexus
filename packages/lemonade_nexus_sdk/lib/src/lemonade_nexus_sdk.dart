@@ -48,6 +48,14 @@ class JsonParseException implements Exception {
 /// High-level Dart SDK for Lemonade Nexus.
 ///
 /// Provides async, type-safe access to all C SDK functions.
+///
+/// Suspension and resume: the native SDK detects a suspension by itself
+/// from the wall-clock gap in its loop, but only when that loop next runs
+/// and after any request waiting on a dead connection times out. An app
+/// that observes its lifecycle calls [resume] when it returns to the
+/// foreground, and reads [MeshStatus.tunnelUp] instead of inferring the
+/// tunnel's health from the peer list: false while the mesh is expected up
+/// means call [resume] and, when it stays false, rebuild the mesh.
 /// Call [dispose()] when done to release resources.
 class LemonadeNexusSdk {
   late final LemonadeNexusFfi _ffi;
@@ -1331,13 +1339,32 @@ class LemonadeNexusSdk {
     return _ffi.meshIsActive(_client!);
   }
 
-  /// Forces an immediate mesh peer refresh.
+  /// Forces an immediate mesh peer refresh. For a return from a suspension
+  /// call [resume] instead.
   Future<void> refreshMesh() async {
     _checkDisposed();
     _checkConnected();
     final error = await _offThread((f, c) => f.meshRefresh(c));
     if (error != LnError.success) {
       throw SdkException(error, message: 'Failed to refresh mesh');
+    }
+  }
+
+  /// The app returned to the foreground after a suspension (ln_resume):
+  /// call it from `AppLifecycleState.resumed`, every time. Safe at any
+  /// time; it does nothing before [connect] or after [dispose], and never
+  /// blocks on the network. The native SDK re-keys the tunnel, drops the
+  /// private connections from before the suspension, opens the event
+  /// socket again, and runs its mesh resume pass at once, so the mesh is
+  /// back as fast as after a fresh launch instead of after the read
+  /// timeouts of dead connections. A native library older than ln_resume
+  /// makes this a no-op; the SDK then still resumes by itself when its
+  /// loop finds the wall-clock gap, only later.
+  Future<void> resume() async {
+    if (_isDisposed || _client == null) return;
+    final error = await _offThread((f, c) => f.resume(c));
+    if (error != LnError.success) {
+      throw SdkException(error, message: 'Failed to resume');
     }
   }
 

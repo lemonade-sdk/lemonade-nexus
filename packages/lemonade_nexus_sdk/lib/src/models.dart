@@ -768,6 +768,15 @@ class MeshStatus {
   /// until a join succeeds again, which clears it.
   final bool needsRejoin;
 
+  /// True while the tunnel to the session server is alive: the server's
+  /// dataplane peer sent a packet or a handshake within the last 20 seconds
+  /// (the SDK's own heartbeat crosses the tunnel every 3 seconds), or the
+  /// mesh was enabled less than 20 seconds ago. False while the mesh is not
+  /// enabled, and with a native library that predates the field. A host
+  /// that expects the mesh up and reads false should call
+  /// [LemonadeNexusSdk.resume] and, when it stays false, rebuild the mesh.
+  final bool tunnelUp;
+
   MeshStatus({
     required this.isUp,
     this.tunnelIp,
@@ -777,6 +786,7 @@ class MeshStatus {
     required this.totalTxBytes,
     required this.peers,
     this.needsRejoin = false,
+    this.tunnelUp = false,
   });
 
   /// Parses the SDK's mesh status output (macOS `SDKMeshStatus`).
@@ -796,6 +806,7 @@ class MeshStatus {
                 .toList() ??
             const [],
         needsRejoin: (json['needs_rejoin'] as bool?) ?? false,
+        tunnelUp: (json['tunnel_up'] as bool?) ?? false,
       );
 
   Map<String, dynamic> toJson() => _$MeshStatusToJson(this);
