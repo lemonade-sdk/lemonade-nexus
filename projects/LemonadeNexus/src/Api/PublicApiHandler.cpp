@@ -4,9 +4,40 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Network/HttpServer.hpp>
 #include <LemonadeNexus/Network/SeipNaming.hpp>
+#include <LemonadeNexus/Gossip/DevicePresence.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Relay/RelayService.hpp>
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+
+#include <algorithm>
 
 namespace nexus::api {
+
+NetworkCounts count_network(const tree::rules::NodeMap& nodes,
+                            const gossip::DevicePresence& presence, uint64_t now) {
+    NetworkCounts counts;
+    for (const auto& [id, node] : nodes) {
+        switch (node.type) {
+            case tree::NodeType::Endpoint:
+                ++counts.devices;
+                if (presence.status(id, now).online) ++counts.devices_online;
+                break;
+            case tree::NodeType::Customer: ++counts.groups; break;
+            case tree::NodeType::Relay:    ++counts.relays; break;
+            case tree::NodeType::Root:     break;
+        }
+    }
+    return counts;
+}
+
+NetworkCounts PublicApiHandler::network_counts(uint64_t now) {
+    std::lock_guard lock(counts_mutex_);
+    if (counts_at_ == 0 || now >= counts_at_ + kNetworkCountsCacheSec || now < counts_at_) {
+        counts_ = count_network(ctx_.tree.nodes_snapshot(), ctx_.gossip.device_presence(), now);
+        counts_at_ = now;
+    }
+    return counts_;
+}
 
 void PublicApiHandler::do_register_routes(httplib::Server& pub,
                                           [[maybe_unused]] httplib::Server& priv) {
@@ -46,14 +77,33 @@ void PublicApiHandler::do_register_routes(httplib::Server& pub,
         json_response(res, resp);
     });
 
-    // GET /api/stats — service statistics
+    // GET /api/stats — service statistics. Aggregate counts only: nothing
+    // that names a device, account, group, or address.
     pub.Get("/api/stats", [this](const httplib::Request&, httplib::Response& res) {
         auto peers = ctx_.gossip.get_peers();
+        const auto relay_sessions = ctx_.relay.session_count();
+        const auto relay_paired = ctx_.relay.paired_session_count();
         nlohmann::json resp = {
             {"service",             "lemonade-nexus"},
             {"peer_count",          peers.size()},
             {"private_api_enabled", !ctx_.tunnel_bind_ip.empty()},
+            // This server's relay only.
+            {"relay_sessions", {{"paired", relay_paired},
+                                {"waiting", relay_sessions - std::min(relay_paired, relay_sessions)}}},
         };
+        // Network counts come from the tree and the presence that Tier 1
+        // members share, so only a current Tier 1 member reports them.
+        if (ctx_.tier1_identity && ctx_.tier1_identity()) {
+            const auto now = epoch_seconds();
+            const auto counts = network_counts(now);
+            resp["network"] = {
+                {"devices_registered", counts.devices},
+                {"devices_online",     counts.devices_online},
+                {"devices_offline",    counts.devices - counts.devices_online},
+                {"groups",             counts.groups},
+                {"relays",             counts.relays},
+            };
+        }
         json_response(res, resp);
     });
 
