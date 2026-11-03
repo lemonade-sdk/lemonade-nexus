@@ -8,6 +8,7 @@
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/ACL/ACLService.hpp>
 #include <LemonadeNexus/Network/HttpServer.hpp>
+#include <LemonadeNexus/Api/RequestBudget.hpp>
 #include <LemonadeNexus/Network/RateLimiter.hpp>
 
 // Lemonade-Nexus services
@@ -999,17 +1000,15 @@ int main(int argc, char* argv[]) {
                      "isolate authenticated endpoints to the mesh interface.");
     }
 
-    // Rate limiter. Authority chain pages have their own budget: a client
-    // walks the whole chain before its first tree request (Tier1ApiHandler.hpp).
-    nexus::network::RateLimiter rate_limiter{{config.rate_limit_rpm, config.rate_limit_burst}};
-    nexus::network::RateLimiter authority_rate_limiter{
-        {nexus::api::kAuthorityPagesPerMinute, nexus::api::kAuthorityPageBurst}};
-    auto rate_limit_handler = [&rate_limiter, &authority_rate_limiter](
+    // Request budget (Api/RequestBudget.hpp): a valid session spends its
+    // node's bucket, anything else the address bucket, and the authority
+    // chain walk its own.
+    nexus::api::RequestBudget request_budget{{config.rate_limit_rpm, config.rate_limit_burst},
+                                             auth_service};
+    auto rate_limit_handler = [&request_budget](
                                   const httplib::Request& req,
                                   httplib::Response& res) -> httplib::Server::HandlerResponse {
-        auto& limiter = nexus::api::is_authority_chain_path(req.path) ? authority_rate_limiter
-                                                                      : rate_limiter;
-        if (!limiter.allow(req.remote_addr)) {
+        if (!request_budget.allow(req)) {
             res.status = 429;
             res.set_header("Retry-After", "1");
             nlohmann::json rl_j = nexus::network::ErrorResponse{.error = "rate limited"};

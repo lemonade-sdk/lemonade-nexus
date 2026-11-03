@@ -212,7 +212,7 @@ See the [Configuration reference](docs/Configuration.md) and `lemonade-nexus --h
 | Release rollout | `/api/upgrade/rollout-proof` |
 | Authenticated application services | Tree, IPAM, mesh, routing, relay, certificates, account data, storage status, and onboarding administration |
 
-`GET /api/stats` reports aggregate counts only. A current Tier 1 member adds network-wide device, group, and relay counts. `GET /api/tier1/authority` serves the epoch authority chain in pages of up to 32 handoffs (`max_links`), under its own per-address rate limit. Clients verify that chain against the pinned Genesis key.
+`GET /api/stats` reports aggregate counts only. A current Tier 1 member adds network-wide device, group, and relay counts. `GET /api/tier1/authority` serves the epoch authority chain in pages of up to 32 handoffs (`max_links`), under its own per-address rate limit. Clients verify that chain against the pinned Genesis key. Every other public request spends a budget: a request with a valid session spends its node's budget (600 per minute, 60 in a burst, enough for a join or a resume), an unauthenticated request the per-address budget (`rate_limit_rpm`, `rate_limit_burst`; 120 per minute, 20 in a burst by default). Many devices share one address behind a carrier NAT, so the address budget guards only what has no session yet.
 
 The [route handlers](projects/LemonadeNexus/src/Api) define the current methods and authorization checks. The old `/api/trust/*`, `/api/enrollment/status`, and `/api/governance/*` endpoints have been retired. Review the [private-listener fallback](#public-and-private-apis) when configuring exposure.
 

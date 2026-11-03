@@ -41,13 +41,27 @@ using AuthenticatedHandler = std::function<void(
 ///   server.Get("/api/protected", require_auth(auth_service, [&](auto& req, auto& res, auto& claims) {
 ///       // `claims` is guaranteed valid here
 ///   }));
+/// The bearer token of `req`: the part after "Bearer " in its Authorization
+/// header. Empty when the header is missing or is not "Bearer <token>".
+/// Extraction only; the token is not validated here.
+[[nodiscard]] inline std::string bearer_token(const httplib::Request& req) {
+    const auto it = req.headers.find("Authorization");
+    if (it == req.headers.end()) return {};
+    constexpr std::string_view bearer_prefix = "Bearer ";
+    const auto& auth_header = it->second;
+    if (auth_header.size() <= bearer_prefix.size() ||
+        auth_header.compare(0, bearer_prefix.size(), bearer_prefix) != 0) {
+        return {};
+    }
+    return auth_header.substr(bearer_prefix.size());
+}
+
 inline httplib::Server::Handler require_auth(AuthService& auth,
                                               AuthenticatedHandler handler) {
     return [&auth, handler = std::move(handler)](
                const httplib::Request& req, httplib::Response& res) {
         // --- Extract the Authorization header ---
-        auto it = req.headers.find("Authorization");
-        if (it == req.headers.end()) {
+        if (req.headers.find("Authorization") == req.headers.end()) {
             spdlog::debug("[AuthMiddleware] Missing Authorization header for {}",
                           req.path);
             res.status = 401;
@@ -57,12 +71,9 @@ inline httplib::Server::Handler require_auth(AuthService& auth,
             return;
         }
 
-        const auto& auth_header = it->second;
-
         // Must be "Bearer <token>"
-        constexpr std::string_view bearer_prefix = "Bearer ";
-        if (auth_header.size() <= bearer_prefix.size() ||
-            auth_header.compare(0, bearer_prefix.size(), bearer_prefix) != 0) {
+        const std::string token = bearer_token(req);
+        if (token.empty()) {
             spdlog::debug("[AuthMiddleware] Malformed Authorization header for {}",
                           req.path);
             res.status = 401;
@@ -71,8 +82,6 @@ inline httplib::Server::Handler require_auth(AuthService& auth,
                 "application/json");
             return;
         }
-
-        std::string token = auth_header.substr(bearer_prefix.size());
 
         // --- Validate and extract claims ---
         auto claims = auth.validate_session_claims(token);
