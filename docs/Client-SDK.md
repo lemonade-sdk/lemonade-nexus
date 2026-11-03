@@ -112,6 +112,10 @@ The SDK then:
 It verifies again every five minutes and after a server refuses a tree route.
 `refresh_tier1()` / `ln_tier1_refresh()` verifies now, and
 `tier1_membership()` / `ln_tier1_membership()` returns the last result.
+`tier1_walk_progress()` / `ln_tier1_progress()` reports the chain walk that
+runs now (`active`, `epoch`, `target`, `pages_done`, `pages_total`) without
+waiting for it, so an application can show progress while a join or sign-in
+waits. The Flutter plugin exposes it as `tier1Progress`.
 
 Without a pinned key, a chain that does not verify, a stale epoch, or no
 reachable verified server, the SDK sends no tree request: the call fails with
@@ -357,15 +361,21 @@ target_link_libraries(myapp PRIVATE ${LEMONADE_NEXUS_SDK})
 ```
 
 libsodium, BoringTun, and the netstack are embedded in the shared library.
-On Linux it links the system OpenSSL 3 (`libssl.so.3`); on macOS, Windows,
-iOS, and Android it embeds the pinned static OpenSSL.
+A Linux SDK-only build (`-DLEMONADE_NEXUS_SDK_ONLY=ON`, as the release and the
+Linux client build it) links the system OpenSSL 3 (`libssl.so.3`); a full
+Linux build with the default `LEMONADE_NEXUS_STATIC_DEPS=ON` links the pinned
+static OpenSSL. On macOS, Windows, iOS, and Android it embeds the pinned static
+OpenSSL.
 
 ## Platform Notes
 
+- **Linux:** the release and the Linux Flutter client CI job build the SDK
+  alone on Ubuntu 24.04 x86-64.
 - **macOS:** builds are CI-verified. On arm64 the build links the pinned
   static OpenSSL archive, so the dylib loads no Homebrew or system OpenSSL.
-- **Windows:** build definitions exist; CI is currently disabled, so validate
-  locally.
+- **Windows:** the Flutter client workflow builds the SDK DLL and checks its
+  exports. The native test matrix has its Windows entries disabled, so the
+  SDK tests do not run on Windows in CI.
 - **iOS and Android:** `scripts/build-sdk-mobile.sh` builds the SDK alone
   (`LEMONADE_NEXUS_SDK_ONLY`) as an XCFramework (device arm64, simulator
   arm64/x86_64, iOS 15+) and as `liblemonade_nexus_sdk.so` for arm64-v8a,

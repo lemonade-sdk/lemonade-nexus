@@ -16,16 +16,27 @@ title: Configuration Reference
 - [DDNS](#ddns)
 - [Onboarding](#onboarding)
 - [Tree Operations](#tree-operations)
-- [Experimental: Threshold Storage Key](#experimental-threshold-storage-key)
+- [Threshold Storage Key](#threshold-storage-key)
 - [JSON Config Example](#json-config-example)
+- [Command-Mode Flags](#command-mode-flags)
 - [Retired and Inert Settings](#retired-and-inert-settings)
 
 ## Configuration Sources and Precedence
 
-A normal start reads settings from four sources. **Highest priority first:**
+**The packaged service** starts the server with `--config
+/var/lib/lemonade-nexus/lemonade-nexus.json --tier1-authority-contract`. Under
+that contract:
 
-1. **Environment variables** — `SP_*` (for the packaged service:
-   `/etc/lemonade-nexus/lemonade-nexus.env`)
+- The JSON file must be the fixed path above, and it must exist.
+- Inherited `SP_*` variables are ignored.
+- `/etc/lemonade-nexus/lemonade-nexus.env` must exist and may contain only
+  `SP_LOG_LEVEL`. Any other entry refuses startup.
+- `--root-pubkey` and `--genesis-pubkey` on the command line refuse startup.
+
+**Outside the contract**, a normal start reads settings from four sources.
+**Highest priority first:**
+
+1. **Environment variables** — `SP_*`
 2. **CLI arguments** — for example `--http-port 8443`
 3. **JSON config file** — `lemonade-nexus.json` (packaged default location:
    `/var/lib/lemonade-nexus/lemonade-nexus.json`)
@@ -43,8 +54,7 @@ Two deliberate exceptions to "environment wins":
   replace it.
 
 Note: an environment variable overrides a CLI value for *every other* setting
-(for example `SP_HTTP_PORT` overrides `--http-port`). Keep the packaged
-environment file for deliberate operator overrides only.
+(for example `SP_HTTP_PORT` overrides `--http-port`).
 
 **Boolean environment variables** (`SP_DDNS_ENABLED`) take `1`, `true`,
 `yes`, or `on` for true and `0`, `false`, `no`, or `off` for false, in any
@@ -70,25 +80,30 @@ longer exists and ignores its value.
 
 ## Trust Anchors (Required for a Normal Start)
 
-A normal daemon start refuses to run without all three values:
+A normal daemon start refuses to run without both values:
 
 | Setting | Purpose | Accepted encoding |
 |---|---|---|
 | `root_pubkey` | Mesh root management key. Verifies server admission certificates; without it no certificate can be verified. | Hex Ed25519 public key (64 hex characters) |
 | `genesis_pubkey` | Pins the Genesis bootstrap anchor. The network identity derives from it, and the epoch authority chain verifies from it. Its unilateral authority ends at Epoch 1 activation. | Base64 Ed25519 public key (32 bytes) |
-| `release_signing_pubkey` | Verifies signed release manifests. Without it no binary can be approved and the server can never reach Tier 1. | Ed25519 public key; base64 in the daemon config, hex or base64 via `nexus-bootstrap` |
 
 ```
 --root-pubkey <hex>          SP_ROOT_PUBKEY
 --genesis-pubkey <b64>       SP_GENESIS_PUBKEY
---release-signing-pubkey <key>  SP_RELEASE_SIGNING_PUBKEY
 ```
 
-On the Genesis server, `nexus-bootstrap` writes all three (see
+On the Genesis server, `nexus-bootstrap` writes both (see
 [Getting Started](Getting-Started)). On a joining server, the operator sets
 `root_pubkey` and `genesis_pubkey` in the config before start; onboarding
-verifies the bundle against them and never writes the config
-(`release_signing_pubkey` is always configured by the operator).
+verifies the bundle against them and never writes the config.
+
+**Release authority is not a setting.** Genesis signs a release authority
+(network ID and release key), and that key signs each release approval. The
+server reads the approval from
+`/usr/lib/lemonade-nexus/release/release-approval.json` and accepts it only
+when both signatures verify against the pinned Genesis key. The JSON key
+`release_signing_pubkey` is deprecated and parse-only: the server never uses
+it as a trust input, and it has no CLI flag or environment variable.
 
 These are the only trust inputs. There is no supported configuration switch to
 force Tier 1, skip evidence, or change quorums or thresholds: those are
@@ -389,9 +404,9 @@ the vault mode and phase; it does not report the holder count.
 commissioned.** The flag was removed with that gate waived, not satisfied. The
 design cites an audit of `frost` v0.6.0, while the lockfile ships
 `frost-core` and `frost-ristretto255` 2.2.0, which that audit does not cover.
-CI runs no `cargo test` step.
+The native CI job runs `cargo test --locked` for the crate.
 
-With the setting on:
+How it works:
 
 - **Holder plans in consensus.** Tier 1 finalizes storage records as block
   payloads (`StorageHolderPlan`, `StorageKeyRotation`). At each epoch boundary
@@ -490,7 +505,6 @@ Limits:
   "log_level": "info",
   "root_pubkey": "<hex ed25519 root management key>",
   "genesis_pubkey": "<base64 ed25519 genesis anchor>",
-  "release_signing_pubkey": "<release signing key>",
   "seed_peers": ["<server-ip>:9102"]
 }
 ```

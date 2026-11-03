@@ -67,27 +67,31 @@ The package installs:
 
 - `/usr/bin/lemonade-nexus` — the server
 - `/usr/bin/nexus-attestd` — the platform evidence helper
+- `/usr/bin/nexus-updater` — the in-place release installer (see
+  [Releasing](Releasing#the-updater-on-a-server))
 - `/usr/bin/nexus-bootstrap` — the Genesis setup command
-- The `lemonade-nexus.service` and `nexus-attestd.service` units
+- `/usr/bin/nexus-tree-migrate` — the one-time tree merge command
+- `/usr/lib/lemonade-nexus/release/release-approval.json` — the release
+  approval
+- The `lemonade-nexus.service`, `nexus-attestd.service`,
+  `nexus-updater.timer`, and `nexus-updater.path` units
 
-The install **enables** the services without starting them. Start them only
-after the configuration below is in place.
+The install **enables** the server, the evidence helper, and the updater units
+without starting them. Start them only after the configuration below is in
+place.
+
+A package that you build yourself installs the unsigned example approval from
+`packaging/release/`, unless you configure with
+`-DLEMONADE_RELEASE_APPROVAL_FILE=<signed approval>`. With the example, the
+server runs but cannot reach Tier 1. The packages of a published release carry
+the signed approval.
 
 ## Start a new network (Genesis)
 
 Genesis starts a **new network**. Use the packaged bootstrap command:
 
 ```bash
-sudo nexus-bootstrap \
-  --release-signing-pubkey 'YOUR_RELEASE_SIGNING_PUBLIC_KEY'
-```
-
-`--release-signing-pubkey` is the Ed25519 public key that verifies your release
-manifests, encoded as 64 hex characters or base64 for 32 bytes. Generate one
-with:
-
-```bash
-python3 scripts/generate_release_signing_key.py
+sudo nexus-bootstrap --install-dns-nat
 ```
 
 Bootstrap creates the node identities, pins the root and Genesis public keys,
@@ -104,17 +108,21 @@ The on-disk values:
 |---|---|
 | `root_pubkey` | The node identity public key (hex Ed25519). This is the mesh root; every other server must use the same value. |
 | `genesis_pubkey` | The node gossip public key (base64 Ed25519). It pins the Genesis bootstrap anchor, whose unilateral security authority ends at Epoch 1 activation. |
-| `release_signing_pubkey` | The release-signing key you supplied (or, for `--test-release-key`, the node identity). |
+| `release_signing_pubkey` | Deprecated and parse-only. Empty, or the value of `--release-signing-pubkey` / `--test-release-key`. The server never uses it as release authority. |
 
-If this host serves public authoritative DNS, add `--install-dns-nat` to map
-UDP/TCP `53` to `5335` with nftables. That option requires `nft` and `ip`;
+`--install-dns-nat` maps public UDP/TCP `53` to `5335` with nftables. Use it
+if this host serves public authoritative DNS. That option requires `nft` and `ip`;
 `--wan-interface` selects the external interface when auto-detection is
 ambiguous. You can also configure the mapping on your router. See
 [Ports and Firewall](Ports-and-Firewall).
 
-For a disposable development network, `sudo nexus-bootstrap --test-release-key`
-uses the node identity as the test release key. It does not bypass attestation
-requirements or enable Tier 1 qualification.
+Release authority does not come from bootstrap. Genesis delegates it to a
+release key in the signed release approval; the approval binds to one network
+ID. A new network needs its own Genesis-signed release authority and its own
+signed approvals before any server can reach Tier 1. See
+[Releasing](Releasing) and [Attestation](Attestation#the-profile).
+`--release-signing-pubkey` and `--test-release-key` only fill the legacy
+configuration field.
 
 Then start the server:
 
@@ -128,9 +136,10 @@ The server unit also requests `nexus-attestd`, so starting the server pulls the
 helper in.
 
 **A successful bootstrap or daemon start does not mean that Epoch 1 has
-formed.** The shipped attestation profile is incomplete by design, so no node
-can currently reach Tier 1 with it. See [current blockers](#current-blockers)
-and [Security — current limitations](Security#current-limitations).
+formed.** Epoch 1 needs five qualifying founders, and a founder qualifies only
+under a verified release approval for this network. See
+[current blockers](#current-blockers) and
+[Security — current limitations](Security#current-limitations).
 
 ## Join an existing network (server onboarding)
 
@@ -144,7 +153,6 @@ the returned network-bound certificate.
 |---|---|---|
 | `root_pubkey` (hex Ed25519) | **Out of band**, before onboarding. On the Genesis server it is the `Identity pubkey` printed by `--first-run`; it is also in the Genesis server's protected configuration. | Passed as `--root-pubkey`; the client verifies the bundle against it. Onboarding *confirms* it but never writes the config. |
 | `genesis_pubkey` (base64 Ed25519) | **The onboarding bundle authenticates it**: the certificate's network ID must derive from the bundle's Genesis key. No separate out-of-band exchange is needed. | The operator sets it in the candidate's config before start: copy it from the Genesis server at bootstrap time, or from the onboarding client's report (the bundle's Genesis binding is verified by the client, so the printed value is authenticated). Onboarding warns if the config's value differs from the admitted mesh's. |
-| `release_signing_pubkey` | **Not part of the bundle.** Configure it separately with the key that verifies the releases you will run. | Candidate's config. Required for a normal daemon start. |
 
 Do not copy security state (certificates, keypairs, epoch stores) from another
 server to make a candidate join. Onboarding produces the candidate's own
@@ -208,10 +216,9 @@ the server.
 
 ### After onboarding
 
-1. Edit the protected configuration with `sudoedit`: verify
-   `release_signing_pubkey` is set (it is not delivered by onboarding), and
-   apply the recommended `seed_peers` from the onboarding report (if any).
-   Onboarding itself never writes this file.
+1. Edit the protected configuration with `sudoedit`: set `genesis_pubkey`
+   and apply the recommended `seed_peers` from the onboarding report (if
+   any). Onboarding itself never writes this file.
 2. Start the packaged service:
 
    ```bash
@@ -259,7 +266,8 @@ sudo journalctl -u nexus-attestd.service -f
 #   "All services started. HTTPS:9100, PrivateHTTPS:..., UDP:51940, ..."
 #   "Public API withheld: no TLS certificate yet ..."  (expected on first boot;
 #    the background ACME thread brings the listener up once a cert is issued)
-#   "Attestation profile v1 is incomplete: ..." (expected; see current blockers)
+#   "Attestation profile v3 is incomplete: ..." (no verified release approval;
+#    see current blockers)
 
 # Listener check
 ss -ltnup | grep -E '9100|9101|51940|9102|3478|9103|5335'
@@ -275,17 +283,19 @@ server's mesh configuration before exposing it.
 
 These are implementation limits, not settings an operator can disable:
 
-- **Tier 1 qualification is blocked in the shipped profile.** The compiled
-  attestation profile pins no launch measurement, TCB floor, IMA policy
-  digest, or approved component hashes. Until a qualifying release pins those
-  values, every attestation fails with `ProfileIncomplete` and no node can
-  reach Tier 1. See [Attestation](Attestation).
-- **Application-root initialization is incomplete.** Public authentication
-  does not initialize an application-root owner, and several admission and
-  application paths are root- or identity-gated rather than derived from
-  finalized security state. Fresh-network administrative approval flows are
+- **Tier 1 needs a signed release for its network.** Without a verified
+  release approval, the attestation profile has no approved binary digests
+  and no PCR 8/9 values. Every attestation then fails with
+  `ProfileIncomplete` and no node can reach Tier 1. Only an AMD SEV-SNP host
+  with a COCONUT-SVSM vTPM, in a VM shape whose launch measurement the
+  approval lists, can qualify. See [Attestation](Attestation).
+- **Application authority is not fully integrated.** Tier 1 commits the
+  application root for the configured `root_pubkey` as tree log height 1.
+  Public authentication does not initialize an application-root owner, and
+  several admission and application paths are root- or identity-gated rather
+  than derived from finalized security state. Fresh-network administrative approval flows are
   affected. See [Security — current limitations](Security#current-limitations).
 
-Everything in this guide that does not depend on those two items works as
-documented: mesh transport, client join, discovery, certificates, and Tier 2
-server operation.
+Mesh transport, discovery, certificates, and Tier 2 server operation do not
+depend on those two items. Client join and the permission tree need Tier 1:
+before Epoch 1 activates, no server serves them.

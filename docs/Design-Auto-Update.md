@@ -5,8 +5,9 @@ title: "Design: In-Place Auto-Update"
 # Design: In-Place Auto-Update
 
 Status: **draft plan; Phases 0.1, 0.3, 1 to 5 implemented, not
-hardware-qualified, release workflow not run.** See
-[Implementation status](#implementation-status).
+hardware-qualified.** The release workflow publishes the date-tagged releases
+(`v2026.10.25` was the bootstrap release, see `release/bootstrap-complete`).
+See [Implementation status](#implementation-status).
 
 ## Goal
 
@@ -228,8 +229,8 @@ The operator steps are in [Releasing](Releasing), Bootstrap procedure.
 | 0.1 Approval supersession | Implemented | `ReleaseChain`, `SecurityDriver::start` (`release_commitment`), `ReleaseApproval` format 3 |
 | 0.2 Holder margin | Open; see the restart defect below | |
 | 0.3 Fleet profile | Implemented; seeded from r21 | `release/fleet-profile.json`, `ReleaseApproval.cpp` (boot line verified against the approval only) |
-| 1 Release workflow | Implemented, not run | `.github/workflows/release.yml`, `scripts/nexus-release-tool`, `scripts/nexus-release-sign`, [Releasing](Releasing) |
-| Release guards | Implemented, not run | Previous approval required; rollout proof (`Security/Upgrade/RolloutProof.hpp`, `nexus-rollout-check`, `GET /api/upgrade/rollout-proof`); fix after a halt (`release_follows_rollout`, `nexus-release-bundle --previous-halted`); mixed-version job; bootstrap detection (`nexus-release-tool previous`) |
+| 1 Release workflow | Implemented; publishes the date-tagged releases | `.github/workflows/release.yml`, `scripts/nexus-release-tool`, `scripts/nexus-release-sign`, [Releasing](Releasing) |
+| Release guards | Implemented; run in every release run (the release after the bootstrap release or a hand-installed release uses the reviewed file instead of a rollout proof) | Previous approval required; rollout proof (`Security/Upgrade/RolloutProof.hpp`, `nexus-rollout-check`, `GET /api/upgrade/rollout-proof`); fix after a halt (`release_follows_rollout`, `nexus-release-bundle --previous-halted`); mixed-version job; bootstrap detection (`nexus-release-tool previous`) |
 | Release floor | Implemented, memory-mesh tested | `ReleaseChain::raise_floor`, `UpgradeService` (finalized Start records) |
 | 2 Approval chain and adoption | Implemented | `ReleaseChain`, `UpgradeService` (ApprovalOffer, status-driven exchange), `AttestationService::replace_profile` |
 | 3 Mixed-version gate | Memory-mesh test in CI; multi-process job (wire checks only without SEV-SNP) | `tests/security/lifecycle/upgrade_path.cpp`, `scripts/mixed-version-mesh.sh`, `.github/workflows/mixed-version.yml`, [Wire Compatibility](Wire-Compatibility) |
