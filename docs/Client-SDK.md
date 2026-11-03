@@ -230,10 +230,12 @@ better by saying so:
   (an iOS app left the foreground and the host's grace period ended,
   Android stopped the app), after `ln_stop_mesh_port` and `ln_mesh_disable`
   when the host uses them. iOS and Android defunct the sockets of a
-  suspended app, and a defunct UDP socket receives nothing afterwards, so
-  the SDK gives the dataplane socket up now, keeping the netstack and every
-  peer and session, and drops the private-API connections so the server
-  sees clean closes. It never blocks on the network.
+  suspended app: a defunct UDP socket receives nothing afterwards, and a
+  defunct loopback listener refuses every connect. So the SDK gives up the
+  dataplane socket and the loopback egress listeners the private API dials
+  through now, keeping the netstack and every peer and session, and drops
+  the private-API connections so the server sees clean closes. It never
+  blocks on the network.
 - Call `ln_resume` (`LemonadeNexusClient::resume()`, Dart
   `LemonadeNexusSdk.resume()`) every time the process returns to the
   foreground (iOS `applicationDidBecomeActive`, Flutter

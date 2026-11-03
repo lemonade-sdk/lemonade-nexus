@@ -90,6 +90,35 @@ TEST(MeshIngress, ExposedServiceReachableFromPeer) {
     EXPECT_EQ(res->status, 200);
     EXPECT_EQ(res->body, "sidecar-pong");
 
+    // --- B is suspended and comes back (an app after a lock) ---
+    // The OS defuncts a suspended app's sockets: the dataplane UDP socket
+    // and the loopback egress listener alike. suspend() gives both up,
+    // rebind() opens a new socket, and the next tcp_egress() binds a new
+    // listener; the old loopback port is gone.
+    b.suspend();
+    ASSERT_TRUE(b.rebind().has_value());
+    {
+        httplib::Client stale("127.0.0.1", egress_port);
+        stale.set_connection_timeout(2, 0);
+        auto stale_res = stale.Get("/ping");
+        EXPECT_FALSE(stale_res && stale_res->status == 200)
+            << "the listener from before the suspension must be gone";
+    }
+    const uint16_t egress_after = b.tcp_egress("10.64.0.2", 8080);
+    ASSERT_NE(egress_after, 0);
+    httplib::Client again("127.0.0.1", egress_after);
+    again.set_connection_timeout(10, 0);
+    again.set_read_timeout(10, 0);
+    deadline = std::chrono::steady_clock::now() + 15s;
+    do {
+        res = again.Get("/ping");
+        if (res && res->status == 200) break;
+        std::this_thread::sleep_for(200ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(res) << "no HTTP response through the mesh after the rebind";
+    EXPECT_EQ(res->status, 200);
+    EXPECT_EQ(res->body, "sidecar-pong");
+
     b.stop();
     a.stop();
     api.stop();
