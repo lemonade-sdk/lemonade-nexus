@@ -1111,6 +1111,13 @@ class LemonadeNexusFfi {
       return null;
     }
   }();
+  late final _LnMeshRefreshDart? _lnSuspend = () {
+    try {
+      return _lib.lookupFunction<_LnMeshRefresh, _LnMeshRefreshDart>('ln_suspend');
+    } on ArgumentError {
+      return null;
+    }
+  }();
 
   // Stats & server listing
   late final _lnStats =
@@ -2280,6 +2287,18 @@ class LemonadeNexusFfi {
 
   /// Whether the native library has ln_resume.
   bool get hasResume => _lnResume != null;
+
+  /// The host process is about to be suspended (ln_suspend): the dataplane
+  /// socket is closed now, keeping the peers, and the private connections
+  /// are dropped. Never blocks on the network. [LnError.success] without a
+  /// call when the native library predates ln_suspend.
+  LnError suspend(LnClientHandle client) {
+    final call = _lnSuspend;
+    return call == null ? LnError.success : LnError.fromCode(call(client));
+  }
+
+  /// Whether the native library has ln_suspend.
+  bool get hasSuspend => _lnSuspend != null;
 
   /// Whether the client's mesh dataplane is up right now (no network I/O).
   bool meshIsActive(LnClientHandle client) => _lnMeshIsActive(client) == 1;
