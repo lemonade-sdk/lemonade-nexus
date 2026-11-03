@@ -541,7 +541,16 @@ What it does not defend:
   identity. Security messages are not all carried inside the BoringTun
   dataplane.
 
-Rate limiting is per-client (default 120 requests/minute, burst 20).
+Rate limiting is a request budget (`Api/RequestBudget.hpp`). A request that
+carries a valid session token spends the budget of the node the session
+names (600 requests/minute, burst 60: a join or a resume is a burst of
+twenty-odd requests, and many devices share one address behind a carrier
+NAT). A request without a valid session spends the per-address budget
+(default 120 requests/minute, burst 20): probes, discovery, and the
+challenge round-trip before a session exists. A token that does not verify
+falls back to the address budget, so a forged token buys nothing, and a
+valid one moves the request to another bucket and nothing more: every route
+still authenticates and authorizes on its own.
 `GET /api/tier1/authority` has its own budget per client address (600
 requests/minute, burst 120): a client walks the whole authority chain from
 Genesis before its first tree request, and under the general burst a chain
