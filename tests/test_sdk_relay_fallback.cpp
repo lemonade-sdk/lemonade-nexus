@@ -698,3 +698,118 @@ TEST_F(SdkRelayFallbackTest, RequestsOnBothSidesOfAWindowBoundaryPair) {
     EXPECT_TRUE(eventually(paired, pass, 3s)) << "the request from the old window was kept";
     EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong-through-relay");
 }
+
+// A resume forgets the failures counted before the suspension: a peer's
+// retry delay and failure count, and every relay cooldown. A fresh process
+// starts at zero, and a resumed one must not do worse.
+TEST_F(SdkRelayFallbackTest, ResetBackoffForgetsFailuresAndCooldowns) {
+    // A ticket refusal arms a 10 s retry delay; reset_backoff() ends it.
+    std::atomic<int> requests{0};
+    lnsdk::RelayFallback::Timing timing = fast_timing();
+    timing.backoff_base = 10s;
+    lnsdk::RelayFallback fallback(
+        bob,
+        [&](const std::string&) {
+            ++requests;
+            return lnsdk::Result<lnsdk::RelayTicket>{false, {}, 421, "not a Tier 1 member"};
+        },
+        [&] { return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}}; },
+        timing);
+    const std::vector<lnsdk::MeshPeer> peers = {peer(alice_keys.second, "10.64.0.2/32")};
+    for (int i = 0; i < 5; ++i) fallback.maintain(peers, true);
+    EXPECT_EQ(requests.load(), 1);
+    fallback.reset_backoff();
+    fallback.maintain(peers, true);
+    EXPECT_EQ(requests.load(), 2) << "the retry delay survived reset_backoff";
+
+    // A relay that refused is skipped for its cooldown (300 s by default);
+    // reset_backoff() lets the next pass ask it again.
+    std::atomic<int> tickets{0};
+    const auto candidates = [this] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-wrong", "127.0.0.1", r->local_port()}};
+    };
+    lnsdk::RelayFallback alice_fallback(
+        alice, [&](const std::string& relay_id) {
+            ++tickets;
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("alice", relay_id), 200, ""};
+        },
+        candidates, fast_timing());
+    const std::vector<lnsdk::MeshPeer> alice_peers = {peer(bob_keys.second, "10.64.0.3/32")};
+    for (int i = 0; i < 15; ++i) {
+        alice_fallback.maintain(alice_peers, true);
+        std::this_thread::sleep_for(100ms);
+    }
+    ASSERT_GE(tickets.load(), 1);
+    EXPECT_TRUE(alice_fallback.relayed_peers().empty());
+    const int before = tickets.load();
+    for (int i = 0; i < 12; ++i) {
+        alice_fallback.maintain(alice_peers, true);
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_EQ(tickets.load(), before) << "the refused relay was asked again within its cooldown";
+    alice_fallback.reset_backoff();
+    alice_fallback.maintain(alice_peers, true);
+    EXPECT_EQ(tickets.load(), before + 1) << "the cooldown survived reset_backoff";
+}
+
+// A paired relay that carries nothing after this device renewed the peer
+// (a resume) is released, not abandoned: the silence is the suspension's
+// doing, not the relay's, so no failure is counted and the next pass asks
+// for a relay at once instead of after the backoff.
+TEST_F(SdkRelayFallbackTest, ARenewedChannelThatGoesSilentIsReleasedWithoutAFailure) {
+    const auto candidates = [this] {
+        return std::vector<lnsdk::RelayCandidate>{{"relay-1", "127.0.0.1", r->local_port()}};
+    };
+    auto timing = fast_timing();
+    timing.handshake_fresh_sec = 1;  // the relay reads stale within 2 s of silence
+    timing.handshake_grace = 500ms;
+    timing.backoff_base = 60s;  // a counted failure would hold the next request
+    timing.backoff_max = 60s;
+    std::atomic<int> alice_tickets{0};
+    lnsdk::RelayFallback alice_fallback(
+        alice, [&](const std::string& relay_id) {
+            ++alice_tickets;
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("alice", relay_id), 200, ""};
+        },
+        candidates, timing);
+    lnsdk::RelayFallback bob_fallback(
+        bob, [&](const std::string& relay_id) {
+            return lnsdk::Result<lnsdk::RelayTicket>{true, sdk_ticket("bob", relay_id), 200, ""};
+        },
+        candidates, timing);
+    const std::vector<lnsdk::MeshPeer> alice_peers = {peer(bob_keys.second, "10.64.0.3/32")};
+    const std::vector<lnsdk::MeshPeer> bob_peers = {peer(alice_keys.second, "10.64.0.2/32")};
+    ASSERT_TRUE(eventually(
+        [&] {
+            return alice_fallback.relayed_peers().contains(bob_keys.second) &&
+                   bob_fallback.relayed_peers().contains(alice_keys.second);
+        },
+        [&] {
+            alice_fallback.maintain(alice_peers, true);
+            bob_fallback.maintain(bob_peers, true);
+        },
+        10s));
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong-through-relay");
+    // A few passes record the traffic the relay carried.
+    for (int i = 0; i < 3; ++i) {
+        alice_fallback.maintain(alice_peers, true);
+        bob_fallback.maintain(bob_peers, true);
+        std::this_thread::sleep_for(100ms);
+    }
+    ASSERT_TRUE(alice_fallback.relayed_peers().contains(bob_keys.second));
+    const int tickets_before = alice_tickets.load();
+
+    // Bob goes quiet (his side suspended), and Alice resumes: her renewal
+    // comes before her relay reads silent.
+    bob.stop();
+    alice_fallback.renew({bob_keys.second}, false);
+    ASSERT_TRUE(eventually([&] { return alice_fallback.relayed_peers().empty(); },
+                           [&] { alice_fallback.maintain(alice_peers, true); }, 10s))
+        << "the silent relay was kept";
+    EXPECT_EQ(alice_tickets.load(), tickets_before) << "a ticket was requested before the release";
+
+    // No failure was counted: the next pass asks for a relay at once.
+    alice_fallback.maintain(alice_peers, true);
+    EXPECT_EQ(alice_tickets.load(), tickets_before + 1)
+        << "the released channel armed the backoff";
+}
