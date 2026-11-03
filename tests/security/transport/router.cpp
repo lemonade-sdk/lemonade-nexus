@@ -1065,6 +1065,37 @@ TEST_F(RouterMesh, NodeWithoutEpochStateReceivesUpgradeTraffic) {
     EXPECT_EQ(holder->events.upgrade_messages.size(), 1u);
 }
 
+TEST_F(RouterMesh, UpgradeRecordExchangeRepeatsPastTheDedupeWindow) {
+    // The record sync asks the same nonce-less question on a cadence, and a
+    // holder answers with the same record proof. On a quiet mesh nothing
+    // pushes those digests out of the dedupe ring, so remembering them
+    // silenced every repeat: a Tier 2 server behind on records asked once
+    // and was never heard again.
+    bootstrap_epoch_one();
+    Node* holder = founders[0];
+    Node* asker = founders[1];
+    const auto upgrade = [&](UpgradeTopic topic) {
+        return encode_security_message(asker->router->compose(
+            SecurityMessageKind::Upgrade,
+            UpgradeMsg{topic, std::vector<uint8_t>(8, 0), std::nullopt}, 1));
+    };
+    // A record proof follows the same rule; it needs a commit proof to pass
+    // the codec, which the lifecycle tests supply.
+    for (const UpgradeTopic topic : {UpgradeTopic::RecordRequest, UpgradeTopic::ApprovalOffer}) {
+        const auto bytes = upgrade(topic);
+        EXPECT_TRUE(holder->deliver(asker->id, bytes, mesh.now_ms).delivered);
+        EXPECT_TRUE(holder->deliver(asker->id, bytes, mesh.now_ms).delivered)
+            << "a repeated upgrade exchange message is not a replay";
+    }
+    EXPECT_EQ(holder->events.upgrade_messages.size(), 4u);
+
+    // A status report is a signed statement about a moment; the same bytes
+    // twice stay a replay.
+    const auto status = upgrade(UpgradeTopic::Status);
+    EXPECT_TRUE(holder->deliver(asker->id, status, mesh.now_ms).delivered);
+    EXPECT_EQ(holder->deliver(asker->id, status, mesh.now_ms).dropped, DropReason::Duplicate);
+}
+
 TEST_F(RouterMesh, OwnChallengesRollTheProductionWindowOnTheCallersClock) {
     // Production incident (release 2026102601): the local path dispatched at
     // time zero, so this node's own production window never rolled. After

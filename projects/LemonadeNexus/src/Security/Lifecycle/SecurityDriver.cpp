@@ -405,6 +405,9 @@ void SecurityDriver::start(uint64_t now_ms) {
 }
 
 bool SecurityDriver::enter_eligibility_epoch(EpochId epoch, const Tier1Set& members) {
+    // Observations expire by epoch, so the first statement about every
+    // subject in the new epoch goes out at once.
+    participation_published_ms_.clear();
     return eligibility_.enter_epoch(epoch, members.members()) != EligibilityRestore::Corrupt;
 }
 
@@ -415,6 +418,44 @@ bool SecurityDriver::epoch_aged(uint64_t now_ms) const {
 void SecurityDriver::publish(const EligibilityObservation& observation, EpochId epoch) {
     (void)router_.broadcast(
         router_.compose(SecurityMessageKind::EligibilityObservation, observation, epoch));
+}
+
+void SecurityDriver::publish_participation(const ParticipationProof& proof, EpochId epoch) {
+    // The ledger keeps one participation statement per observer and subject,
+    // so repeating it every view only costs every peer a signed packet.
+    const auto published = participation_published_ms_.find(proof.subject);
+    if (published != participation_published_ms_.end() &&
+        now_ms_ - published->second < kParticipationRepublishMs) {
+        return;
+    }
+    if (auto observation = eligibility_.observe_participation(proof, last_committed_height_,
+                                                              last_committed_root_)) {
+        publish(*observation, epoch);
+        participation_published_ms_[proof.subject] = now_ms_;
+    }
+}
+
+bool SecurityDriver::uncommitted_content() const {
+    const HotStuffService* consensus = runtime_.consensus();
+    if (consensus == nullptr) {
+        return false;
+    }
+    const Height committed = consensus->last_committed_height();
+    Digest digest = consensus->state().high_qc.proposal_digest;
+    // COMMIT_ON_THREE_CHAIN leaves at most three blocks above the committed
+    // height; a walk past that is a broken chain and carries nothing to wait
+    // for.
+    for (int depth = 0; depth < 3; ++depth) {
+        const Proposal* block = consensus->block(digest);
+        if (block == nullptr || block->height <= committed) {
+            return false;
+        }
+        if (block->transitions_digest != Digest{} || consensus->block_payload(digest) != nullptr) {
+            return true;
+        }
+        digest = block->parent_digest;
+    }
+    return false;
 }
 
 void SecurityDriver::on_peer(const NodeId& peer, uint64_t now_ms) {
@@ -1550,10 +1591,7 @@ void SecurityDriver::on_vote_accepted(const Vote& vote) {
     proof.subject = vote.voter;
     proof.incarnation = 1;
     proof.subject_height = vote.height;
-    if (auto observation = eligibility_.observe_participation(proof, last_committed_height_,
-                                                              last_committed_root_)) {
-        publish(*observation, epochs->current().id);
-    }
+    publish_participation(proof, epochs->current().id);
 }
 
 void SecurityDriver::on_justify_quorum(const QuorumCertificate& certificate) {
@@ -1577,10 +1615,7 @@ void SecurityDriver::on_justify_quorum(const QuorumCertificate& certificate) {
         proof.subject = signer.node_id;
         proof.incarnation = 1;
         proof.subject_height = certificate.height;
-        if (auto observation = eligibility_.observe_participation(proof, last_committed_height_,
-                                                                  last_committed_root_)) {
-            publish(*observation, epochs->current().id);
-        }
+        publish_participation(proof, epochs->current().id);
     }
 }
 
@@ -1890,6 +1925,14 @@ void SecurityDriver::maybe_propose(View view) {
             payload = handler->propose(*consensus);
             if (payload.has_value()) break;
         }
+    }
+    // An empty block only extends the chain. While nothing waits to commit,
+    // the chain idles at kIdleProposalIntervalMs instead of one view per
+    // tick; every view costs each peer a proposal, a vote and the
+    // observations they trigger.
+    if (transitions == Digest{} && !payload.has_value() && !uncommitted_content() &&
+        now_ms_ - last_progress_ms_ < kIdleProposalIntervalMs) {
+        return;
     }
     const auto make = [&](const std::optional<ProposedPayload>& carried)
         -> std::optional<ProposalMessage> {

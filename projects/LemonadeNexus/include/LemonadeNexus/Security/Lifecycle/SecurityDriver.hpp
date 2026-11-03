@@ -35,6 +35,21 @@ namespace nexus::security {
 /// (EligibilityService::flush). Liveness tuning, not a protocol rule.
 inline constexpr uint64_t kEligibilityFlushIntervalMs = 1000;
 
+/// Shortest time between two published participation observations about the
+/// same subject. The ledger keeps one participation statement per observer
+/// and subject (EligibilityLedger::record replaces), so a statement per vote
+/// or per certificate only repeats the last one to every peer. One per
+/// interval keeps a restarted or late observer current. Liveness tuning, not
+/// a protocol rule: what an observation asserts is unchanged.
+inline constexpr uint64_t kParticipationRepublishMs = 60'000;
+
+/// Shortest time after the chain's last progress before a leader proposes a
+/// block that carries nothing. A block with a stage transition or a payload,
+/// and the blocks that commit one, are proposed on the leader's next tick.
+/// Below kViewTimeoutBaseMs, so an idle chain never times a view out.
+/// Liveness tuning, not a protocol rule.
+inline constexpr uint64_t kIdleProposalIntervalMs = 500;
+
 enum class DriverPhase : uint16_t {
     Failed,
     Idle,
@@ -417,6 +432,13 @@ private:
     /// write per observation.
     void maybe_flush_eligibility(uint64_t now_ms);
     void publish(const EligibilityObservation& observation, EpochId epoch);
+    /// Witnesses `proof` and broadcasts the observation, at most once per
+    /// kParticipationRepublishMs for each subject. The first statement about
+    /// a subject in an epoch goes out at once.
+    void publish_participation(const ParticipationProof& proof, EpochId epoch);
+    /// True while a block above the committed height carries a stage
+    /// transition or a payload, so the blocks that commit it must not wait.
+    [[nodiscard]] bool uncommitted_content() const;
     void begin_founding_observations();
     /// Paced retries (re-challenge, re-broadcast) that keep the bootstrap live.
     void run_bootstrap_liveness(uint64_t now_ms);
@@ -485,6 +507,9 @@ private:
     /// first tick that finds the store dirty writes it.
     uint64_t last_eligibility_flush_ms_ = 0;
     View last_proposed_view_ = 0;
+    /// When this node last published a participation observation about each
+    /// subject, for the current eligibility epoch.
+    std::map<NodeId, uint64_t> participation_published_ms_;
     Digest last_committed_root_{};
     Height last_committed_height_ = 0;
 
