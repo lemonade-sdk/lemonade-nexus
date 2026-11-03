@@ -734,11 +734,12 @@ TEST_F(TreeRouteHttpTest, AnyServerServesTheAuthorityChainAsCandidateData) {
 // A client that asks gets pages of up to kMaxHttpChainLinks links; one that
 // does not ask gets kMaxHandoffChainLinks, the size every SDK decodes.
 TEST_F(TreeRouteHttpTest, TheAuthorityRouteServesLargerPagesOnlyWhenAsked) {
+    // Each epoch introduces fresh vote keys, as a real handoff must.
     std::vector<std::vector<crypto::Ed25519Keypair>> rosters;
-    const std::vector<crypto::Ed25519Keypair> roster = {
-        tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
-        tier1_chain_test::new_identity(), tier1_chain_test::new_identity()};
-    for (int i = 0; i < 10; ++i) rosters.push_back(roster);
+    for (int i = 0; i < 10; ++i) {
+        rosters.push_back({tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
+                           tier1_chain_test::new_identity(), tier1_chain_test::new_identity()});
+    }
     auto chain = tier1_chain_test::Chain::make(rosters);
     std::size_t asked = 0;
     chain_pages = [&chain, &asked](uint64_t have, std::size_t max_links) {
@@ -782,11 +783,12 @@ TEST_F(TreeRouteHttpTest, TheAuthorityRouteServesLargerPagesOnlyWhenAsked) {
 // The security wire's bounds stay the default: a page with more links than
 // kMaxHandoffChainLinks neither encodes nor decodes without the HTTP bounds.
 TEST(AuthorityChainCodecBounds, LargerPagesNeedTheHttpBounds) {
+    // Each epoch introduces fresh vote keys, as a real handoff must.
     std::vector<std::vector<crypto::Ed25519Keypair>> rosters;
-    const std::vector<crypto::Ed25519Keypair> roster = {
-        tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
-        tier1_chain_test::new_identity(), tier1_chain_test::new_identity()};
-    for (int i = 0; i < 8; ++i) rosters.push_back(roster);
+    for (int i = 0; i < 8; ++i) {
+        rosters.push_back({tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
+                           tier1_chain_test::new_identity(), tier1_chain_test::new_identity()});
+    }
     const auto chain = tier1_chain_test::Chain::make(rosters);
     const auto page = chain.page_after(0, chain.epochs.size(), 32);
     ASSERT_TRUE(page.has_value());
