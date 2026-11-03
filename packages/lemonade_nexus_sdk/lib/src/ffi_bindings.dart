@@ -972,6 +972,15 @@ class LemonadeNexusFfi {
       _lib.lookupFunction<_LnTier1Json, _LnTier1JsonDart>('ln_tier1_refresh');
   late final _lnTier1Membership =
       _lib.lookupFunction<_LnTier1Json, _LnTier1JsonDart>('ln_tier1_membership');
+  // Not in requiredSymbols: a native library that predates it only loses the
+  // progress display (tier1Progress returns null).
+  late final _LnTier1JsonDart? _lnTier1Progress = () {
+    try {
+      return _lib.lookupFunction<_LnTier1Json, _LnTier1JsonDart>('ln_tier1_progress');
+    } on ArgumentError {
+      return null;
+    }
+  }();
   late final _lnDiscoverGenesisKey =
       _lib.lookupFunction<_LnDiscoverGenesisKey, _LnDiscoverGenesisKeyDart>(
           'ln_discover_genesis_key');
@@ -1412,6 +1421,13 @@ class LemonadeNexusFfi {
   /// The last verified Tier 1 membership, without network I/O.
   (LnError, String?) tier1Membership(LnClientHandle client) =>
       _tier1Json(client, _lnTier1Membership);
+
+  /// Progress of the Tier 1 chain walk running now, as JSON; never blocks.
+  /// Null when the native library predates ln_tier1_progress.
+  (LnError, String?)? tier1Progress(LnClientHandle client) {
+    final call = _lnTier1Progress;
+    return call == null ? null : _tier1Json(client, call);
+  }
 
   /// First-connect discovery of the network key, only when none is pinned.
   /// [hostsJson] is null or a JSON array of `{"host", "port"}` candidates.

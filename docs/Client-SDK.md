@@ -90,7 +90,10 @@ The SDK then:
 
 1. Walks the authority chain from the key (`GET /api/tier1/authority` on any
    server) and verifies the Genesis certificate and every finalized handoff
-   with its commit proof.
+   with its commit proof. It asks for pages of 32 handoffs (`max_links=32`);
+   a server that predates that parameter sends 4. When a server answers
+   `429`, the SDK waits a second and asks for the same page again, at most 30
+   times per server, before it treats the server as unreachable.
 2. Asks each candidate server (the configured servers, and the servers they
    list in `/api/servers` that are members) for an endpoint proof over a fresh
    nonce (`GET /api/tier1/proof`). It keeps a server only when a member of the

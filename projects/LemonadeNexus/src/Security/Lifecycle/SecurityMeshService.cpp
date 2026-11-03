@@ -362,11 +362,12 @@ std::optional<EpochId> tier1_departure_epoch(
 NetworkId SecurityMeshService::network_id() const { return mesh_network_id(config_); }
 
 std::optional<AuthorityChainPage> SecurityMeshService::authority_chain_page(
-    EpochId have_epoch, std::chrono::milliseconds timeout) {
+    EpochId have_epoch, std::chrono::milliseconds timeout, std::size_t max_links) {
     auto promise = std::make_shared<std::promise<std::optional<AuthorityChainPage>>>();
     auto answer = promise->get_future();
-    asio::post(timer_.get_executor(), [this, have_epoch, promise] {
-        promise->set_value(running_ ? driver_.authority_chain_page(have_epoch) : std::nullopt);
+    asio::post(timer_.get_executor(), [this, have_epoch, max_links, promise] {
+        promise->set_value(running_ ? driver_.authority_chain_page(have_epoch, max_links)
+                                    : std::nullopt);
     });
     if (answer.wait_for(timeout) != std::future_status::ready) {
         return std::nullopt;

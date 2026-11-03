@@ -2558,8 +2558,9 @@ std::optional<AuthorityChainPage> SecurityDriver::chain_page(EpochId have_epoch,
     return page;
 }
 
-std::optional<AuthorityChainPage> SecurityDriver::authority_chain_page(EpochId have_epoch) const {
-    return chain_page(have_epoch, constants::kMaxHandoffChainLinks);
+std::optional<AuthorityChainPage> SecurityDriver::authority_chain_page(
+    EpochId have_epoch, std::size_t max_links) const {
+    return chain_page(have_epoch, std::min(max_links, constants::kMaxHttpChainLinks));
 }
 
 std::optional<AuthorityChainPage> SecurityDriver::authority_chain() const {

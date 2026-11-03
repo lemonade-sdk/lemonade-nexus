@@ -445,7 +445,7 @@ protected:
     int port = 0;
     std::atomic<bool> holds_tree{false};
     crypto::Ed25519Keypair identity_kp{};
-    std::function<std::vector<uint8_t>(uint64_t)> chain_pages;
+    std::function<std::vector<uint8_t>(uint64_t, std::size_t)> chain_pages;
     std::function<std::optional<api::Tier1Identity>()> identity;
 
     void SetUp() override {
@@ -500,8 +500,8 @@ protected:
             .admission = *admission,
             .server_fqdn = "srv.test.local",
             .server_seip_fqdn = "t1.test.local",
-            .authority_chain_page = [this](uint64_t have) {
-                return chain_pages ? chain_pages(have) : std::vector<uint8_t>{};
+            .authority_chain_page = [this](uint64_t have, std::size_t max_links) {
+                return chain_pages ? chain_pages(have, max_links) : std::vector<uint8_t>{};
             },
             .tier1_identity = [this] {
                 return identity ? identity() : std::optional<api::Tier1Identity>{};
@@ -708,7 +708,7 @@ TEST_F(TreeRouteHttpTest, AnyServerServesTheAuthorityChainAsCandidateData) {
     auto chain = tier1_chain_test::Chain::make(
         {{tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
           tier1_chain_test::new_identity(), tier1_chain_test::new_identity()}});
-    chain_pages = [&chain](uint64_t have) {
+    chain_pages = [&chain](uint64_t have, std::size_t) {
         const auto page = chain.page_after(have);
         return page ? security::encode_authority_chain_page(*page) : std::vector<uint8_t>{};
     };
@@ -729,4 +729,84 @@ TEST_F(TreeRouteHttpTest, AnyServerServesTheAuthorityChainAsCandidateData) {
     auto bad = send("GET", "/api/tier1/authority?have_epoch=-1");
     ASSERT_TRUE(bad);
     EXPECT_EQ(bad->status, 400);
+}
+
+// A client that asks gets pages of up to kMaxHttpChainLinks links; one that
+// does not ask gets kMaxHandoffChainLinks, the size every SDK decodes.
+TEST_F(TreeRouteHttpTest, TheAuthorityRouteServesLargerPagesOnlyWhenAsked) {
+    // Each handoff introduces a valid Tier 1 set (five members) with fresh keys.
+    std::vector<std::vector<crypto::Ed25519Keypair>> rosters;
+    for (int i = 0; i < 10; ++i) {
+        rosters.push_back({tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
+                           tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
+                           tier1_chain_test::new_identity()});
+    }
+    auto chain = tier1_chain_test::Chain::make(rosters);
+    std::size_t asked = 0;
+    chain_pages = [&chain, &asked](uint64_t have, std::size_t max_links) {
+        asked = max_links;
+        const auto page = chain.page_after(have, chain.epochs.size(), max_links);
+        return page ? security::encode_authority_chain_page(*page, max_links)
+                    : std::vector<uint8_t>{};
+    };
+    const auto links_in = [](const httplib::Result& res) -> std::size_t {
+        const auto bytes = crypto::from_base64(json::parse(res->body)["page"].get<std::string>());
+        const auto page = security::decode_authority_chain_page(
+            bytes, security::constants::kMaxHttpChainLinks,
+            security::constants::kMaxHttpChainPageBytes);
+        return page ? page->links.size() : 0;
+    };
+
+    auto plain = send("GET", "/api/tier1/authority?have_epoch=0");
+    ASSERT_TRUE(plain);
+    ASSERT_EQ(plain->status, 200);
+    EXPECT_EQ(asked, security::constants::kMaxHandoffChainLinks);
+    EXPECT_EQ(links_in(plain), security::constants::kMaxHandoffChainLinks);
+
+    auto large = send("GET", "/api/tier1/authority?have_epoch=0&max_links=32");
+    ASSERT_TRUE(large);
+    ASSERT_EQ(large->status, 200);
+    EXPECT_EQ(asked, 32u);
+    EXPECT_EQ(links_in(large), 9u) << "all nine handoffs of the ten epochs in one page";
+
+    auto clamped = send("GET", "/api/tier1/authority?have_epoch=0&max_links=100000");
+    ASSERT_TRUE(clamped);
+    EXPECT_EQ(clamped->status, 200);
+    EXPECT_EQ(asked, security::constants::kMaxHttpChainLinks);
+
+    for (const auto* bad : {"0", "-3", "x"}) {
+        auto res = send("GET", std::string("/api/tier1/authority?have_epoch=0&max_links=") + bad);
+        ASSERT_TRUE(res);
+        EXPECT_EQ(res->status, 400) << bad;
+    }
+}
+
+// The security wire's bounds stay the default: a page with more links than
+// kMaxHandoffChainLinks neither encodes nor decodes without the HTTP bounds.
+TEST(AuthorityChainCodecBounds, LargerPagesNeedTheHttpBounds) {
+    // Each handoff introduces a valid Tier 1 set (five members) with fresh keys.
+    std::vector<std::vector<crypto::Ed25519Keypair>> rosters;
+    for (int i = 0; i < 8; ++i) {
+        rosters.push_back({tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
+                           tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
+                           tier1_chain_test::new_identity()});
+    }
+    const auto chain = tier1_chain_test::Chain::make(rosters);
+    const auto page = chain.page_after(0, chain.epochs.size(), 32);
+    ASSERT_TRUE(page.has_value());
+    ASSERT_EQ(page->links.size(), 7u);
+
+    EXPECT_TRUE(security::encode_authority_chain_page(*page).empty());
+    const auto bytes = security::encode_authority_chain_page(
+        *page, security::constants::kMaxHttpChainLinks);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_FALSE(security::decode_authority_chain_page(bytes).has_value());
+    const auto decoded = security::decode_authority_chain_page(
+        bytes, security::constants::kMaxHttpChainLinks,
+        security::constants::kMaxHttpChainPageBytes);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->links.size(), 7u);
+    EXPECT_FALSE(security::decode_authority_chain_page(
+                     bytes, 6, security::constants::kMaxHttpChainPageBytes)
+                     .has_value());
 }

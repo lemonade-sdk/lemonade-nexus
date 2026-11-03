@@ -144,11 +144,13 @@ public:
 
     /// One page of the stored authority chain after `have_epoch`: the Genesis
     /// certificate and founder listing when `have_epoch` is 0, then at most
-    /// kMaxHandoffChainLinks consecutive finalized handoffs with their commit
-    /// proofs. nullopt when this node stores nothing to add. A bounded read of
-    /// local records; the page asserts nothing its own proofs do not carry.
-    /// io thread.
-    [[nodiscard]] std::optional<AuthorityChainPage> authority_chain_page(EpochId have_epoch) const;
+    /// `max_links` consecutive finalized handoffs with their commit proofs
+    /// (kMaxHandoffChainLinks on the security wire, up to kMaxHttpChainLinks
+    /// for GET /api/tier1/authority). nullopt when this node stores nothing to
+    /// add. A bounded read of local records; the page asserts nothing its own
+    /// proofs do not carry. io thread.
+    [[nodiscard]] std::optional<AuthorityChainPage> authority_chain_page(
+        EpochId have_epoch, std::size_t max_links = constants::kMaxHandoffChainLinks) const;
 
     /// The finalized next-epoch plan this member holds for the open boundary,
     /// or nullptr when none is committed. A current member the plan does not

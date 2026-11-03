@@ -54,6 +54,19 @@ void main() {
     expect(order, [0, 1, 2, 3, 4]);
   });
 
+  test('peek answers while a queued task is still running', () async {
+    if (!lib.existsSync()) {
+      markTestSkipped('SDK library not built at ${lib.path}');
+      return;
+    }
+    var slowDone = false;
+    final slow = worker.run(_sleepAWhile).then((_) => slowDone = true);
+    final progress = await worker.peek(_progress);
+    expect(slowDone, isFalse, reason: 'peek waited for the queued task');
+    expect(progress, isNull, reason: 'no client is connected');
+    await slow;
+  });
+
   test('passes SDK errors back to the caller', () async {
     if (!lib.existsSync()) {
       markTestSkipped('SDK library not built at ${lib.path}');
@@ -87,3 +100,10 @@ Future<int> Function(LemonadeNexusSdk) _sleepThenReturn(int i) => (sdk) async {
       await Future<void>.delayed(Duration(milliseconds: 20 - i * 4));
       return i;
     };
+
+Tier1Progress? _progress(LemonadeNexusSdk sdk) => sdk.tier1Progress();
+
+Future<int> _sleepAWhile(LemonadeNexusSdk sdk) async {
+  await Future<void>.delayed(const Duration(milliseconds: 300));
+  return 0;
+}

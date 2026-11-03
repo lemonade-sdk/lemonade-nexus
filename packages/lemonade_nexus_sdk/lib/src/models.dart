@@ -466,6 +466,47 @@ class MeshEvent {
   String toString() => 'MeshEvent($name)';
 }
 
+/// Progress of the Tier 1 authority chain walk ([LemonadeNexusSdk.tier1Progress]).
+/// Before its first tree request a client verifies the network's key history
+/// page by page from the pinned Genesis key; on a long history that takes a
+/// few requests, which an app can show as "2 of 4".
+class Tier1Progress {
+  /// A walk is running now.
+  final bool active;
+
+  /// The epoch verified so far.
+  final int epoch;
+
+  /// The epoch the walk aims for; 0 when unknown.
+  final int target;
+
+  /// Pages applied in this walk.
+  final int pagesDone;
+
+  /// Pages expected in all, an estimate; 0 when unknown.
+  final int pagesTotal;
+
+  const Tier1Progress({
+    required this.active,
+    required this.epoch,
+    required this.target,
+    required this.pagesDone,
+    required this.pagesTotal,
+  });
+
+  factory Tier1Progress.fromJson(Map<String, dynamic> json) => Tier1Progress(
+        active: json['active'] == true,
+        epoch: (json['epoch'] as num?)?.toInt() ?? 0,
+        target: (json['target'] as num?)?.toInt() ?? 0,
+        pagesDone: (json['pages_done'] as num?)?.toInt() ?? 0,
+        pagesTotal: (json['pages_total'] as num?)?.toInt() ?? 0,
+      );
+
+  @override
+  String toString() =>
+      'Tier1Progress(active: $active, epoch: $epoch/$target, pages: $pagesDone/$pagesTotal)';
+}
+
 /// One device of a network, as [LemonadeNexusSdk.getGroupDevices] and
 /// [LemonadeNexusSdk.listNetworkDevices] return it.
 class NetworkDevice {

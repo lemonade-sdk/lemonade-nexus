@@ -527,9 +527,15 @@ What it does not defend:
   Sensitive pairwise DKG payloads are additionally sealed to the recipient
   identity. Security messages are not all carried inside WireGuard.
 
-Rate limiting is per-client (default 120 requests/minute, burst 20). Security
-messages have per-peer budgets and deduplication windows compiled into the
-router.
+Rate limiting is per-client (default 120 requests/minute, burst 20).
+`GET /api/tier1/authority` has its own budget per client address (600
+requests/minute, burst 120): a client walks the whole authority chain from
+Genesis before its first tree request, and under the general burst a chain
+longer than about 80 epochs could not be walked at 4 links per page. The
+pages carry only proofs the client verifies, and a page holds at most
+`kMaxHttpChainLinks` (32) links. A `429` answer carries `Retry-After: 1`.
+Security messages have per-peer budgets and deduplication windows compiled
+into the router.
 
 ## Permission Tree Administration
 
