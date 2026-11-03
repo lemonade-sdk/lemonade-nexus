@@ -610,6 +610,23 @@ class LemonadeNexusSdk {
     return _tier1Result(error, json, 'Tier 1 verification failed');
   }
 
+  /// Progress of the Tier 1 chain walk that a join or sign-in is waiting on.
+  /// Reads only and never blocks, so it can run while [joinNetwork] runs
+  /// (see [NexusWorker.peek]). Null when no client is connected or the native
+  /// library predates it.
+  Tier1Progress? tier1Progress() {
+    if (_isDisposed || _client == null) return null;
+    final result = _ffi.tier1Progress(_client!);
+    if (result == null) return null;
+    final (error, json) = result;
+    if (error != LnError.success || json == null) return null;
+    try {
+      return Tier1Progress.fromJson(jsonDecode(json) as Map<String, dynamic>);
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// The last verified Tier 1 membership, without network I/O.
   Future<Map<String, dynamic>> tier1Membership() async {
     _checkDisposed();

@@ -30,7 +30,8 @@ inline constexpr uint32_t kAuthorityPageBurst = 120;
 ///     {"have_epoch":N,"page":"<base64 encode_authority_chain_page>"}.
 ///     At most M links (clamped to kMaxHttpChainLinks); without max_links,
 ///     kMaxHandoffChainLinks, the size every SDK decodes. 400 for an M that
-///     is not a positive decimal number.
+///     is not a positive decimal number. "latest_epoch" (when known) is the
+///     server's current epoch, a progress hint the client does not trust.
 ///     Any server answers; the page is candidate data that the client
 ///     verifies against its pinned Genesis key (Security/Epoch/
 ///     Tier1Membership.hpp). 404 when the server stores nothing after N.

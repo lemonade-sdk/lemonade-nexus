@@ -96,6 +96,31 @@ class NexusWorker {
     return await completer.future as R;
   }
 
+  /// Runs [read] with the worker's SDK at once, ahead of the queued tasks,
+  /// and returns its result. For reads that never block, such as
+  /// [LemonadeNexusSdk.tier1Progress] while a [run] task waits on
+  /// [LemonadeNexusSdk.joinNetwork]: the native calls of a task run on their
+  /// own isolate, so the worker answers in between. [read] must not wait for
+  /// the network or change the SDK's state, and it must be sendable (see
+  /// [run]).
+  Future<R> peek<R>(R Function(LemonadeNexusSdk sdk) read) async {
+    if (_closed) throw StateError('NexusWorker is closed');
+    final id = _nextId++;
+    final completer = Completer<Object?>();
+    _pending[id] = completer;
+    try {
+      _commands.send(_Peek(id, _wrapRead(read)));
+    } catch (_) {
+      _pending.remove(id);
+      rethrow;
+    }
+    return await completer.future as R;
+  }
+
+  // A separate function, so the read closure captures only [read].
+  static Object? Function(LemonadeNexusSdk) _wrapRead<R>(R Function(LemonadeNexusSdk sdk) read) =>
+      (sdk) => read(sdk);
+
   // A separate function, so the job closure captures only [task].
   static Future<Object?> Function(LemonadeNexusSdk) _wrap<R>(
           FutureOr<R> Function(LemonadeNexusSdk sdk) task) =>
@@ -151,6 +176,12 @@ class _Job {
   final Future<Object?> Function(LemonadeNexusSdk sdk) task;
 }
 
+class _Peek {
+  const _Peek(this.id, this.read);
+  final int id;
+  final Object? Function(LemonadeNexusSdk sdk) read;
+}
+
 void _workerMain((SendPort, String?) args) {
   final (out, libraryPath) = args;
   final commands = ReceivePort();
@@ -184,6 +215,15 @@ void _workerMain((SendPort, String?) args) {
         commands.close();
         Isolate.exit();
       });
+      return;
+    }
+    if (message is _Peek) {
+      try {
+        if (sdk == null) throw loadError!;
+        reply(message.id, true, message.read(sdk), null);
+      } catch (e, st) {
+        reply(message.id, false, e, st);
+      }
       return;
     }
     final job = message as _Job;

@@ -1533,6 +1533,11 @@ int main(int argc, char* argv[]) {
                 return page ? nexus::security::encode_authority_chain_page(*page, max_links)
                             : std::vector<uint8_t>{};
             },
+        .authority_latest_epoch =
+            [mesh]() -> uint64_t {
+                const auto snapshot = mesh->membership();
+                return snapshot.known ? snapshot.epoch.underlying() : 0;
+            },
         // A member proves its endpoint only while it holds and serves the tree.
         .tier1_identity =
             [mesh, self_node, &tree_role]() -> std::optional<nexus::api::Tier1Identity> {

@@ -90,8 +90,13 @@ void Tier1ApiHandler::do_register_routes(httplib::Server& pub,
         spdlog::debug("[Tier1Api] authority: have_epoch={} served to epoch {} ({} links{})",
                      have_epoch, top, decoded ? decoded->links.size() : 0u,
                      decoded && decoded->has_base ? ", with base" : "");
-        json_response(res, nlohmann::json{{"have_epoch", have_epoch},
-                                          {"page", crypto::to_base64(page)}});
+        nlohmann::json body{{"have_epoch", have_epoch}, {"page", crypto::to_base64(page)}};
+        if (ctx_.authority_latest_epoch) {
+            if (const auto latest = ctx_.authority_latest_epoch(); latest > 0) {
+                body["latest_epoch"] = latest;
+            }
+        }
+        json_response(res, body);
     });
 
     pub.Get("/api/tier1/proof", [this](const httplib::Request& req, httplib::Response& res) {

@@ -120,6 +120,11 @@ struct ApiContext {
     /// to add. Thread-safe. Unset, the route answers 404.
     std::function<std::vector<uint8_t>(uint64_t have_epoch, std::size_t max_links)>
         authority_chain_page;
+    /// GET /api/tier1/authority: the latest epoch this server knows, sent as
+    /// "latest_epoch" so a client can show how far its walk has to go. A hint
+    /// only: the client verifies every page and trusts no epoch it names. 0
+    /// when not known. Thread-safe. Unset, the field is left out.
+    std::function<uint64_t()> authority_latest_epoch;
     /// GET /api/tier1/proof: the network and epoch, only while this server is
     /// a current Tier 1 member by finalized membership; nullopt otherwise.
     /// Thread-safe. Unset counts as not a member.

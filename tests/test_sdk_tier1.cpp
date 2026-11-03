@@ -495,6 +495,43 @@ TEST_F(SdkTier1Test, AServerThatKeepsRateLimitingIsUnreachable) {
     EXPECT_EQ(asked, 31) << "one request and 30 waits";
 }
 
+// While a refresh walks the chain, walk_progress reports it without waiting
+// for the walk: the epoch verified so far and the epoch it aims for. A
+// server's latest_epoch hint raises the target; the walk still verifies.
+TEST_F(SdkTier1Test, TheWalkReportsItsProgressWhileItRuns) {
+    std::vector<lnsdk::Tier1WalkProgress> seen;
+    lnsdk::Tier1Directory* self = nullptr;
+    auto dir = lnsdk::Tier1Directory(
+        [&](const lnsdk::ServerEndpoint& ep, const std::string& path) {
+            if (self && path.starts_with("/api/tier1/authority")) {
+                seen.push_back(self->walk_progress());
+            }
+            std::lock_guard lock(mutex);
+            auto reply = net.get(ep, path);
+            if (reply && reply->status == 200 && path.starts_with("/api/tier1/authority")) {
+                auto doc = json::parse(reply->body);
+                doc["latest_epoch"] = 2;
+                reply->body = doc.dump();
+            }
+            return reply;
+        });
+    self = &dir;
+    EXPECT_FALSE(dir.walk_progress().active);
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    const auto refreshed = dir.refresh(seed("t1a.example"));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+
+    ASSERT_FALSE(seen.empty());
+    EXPECT_TRUE(seen.front().active);
+    EXPECT_EQ(seen.front().pages_done, 0u);
+    const auto done = dir.walk_progress();
+    EXPECT_FALSE(done.active);
+    EXPECT_EQ(done.epoch, 2u);
+    EXPECT_EQ(done.target, 2u);
+    EXPECT_GE(done.pages_done, 1u);
+    EXPECT_EQ(done.pages_total, done.pages_done);
+}
+
 // Against a server that predates max_links, the walk still finishes with the
 // small pages it is sent.
 TEST_F(SdkTier1Test, AServerWithoutLargePagesStillServesTheChain) {
