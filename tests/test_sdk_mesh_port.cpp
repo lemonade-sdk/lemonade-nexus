@@ -179,6 +179,12 @@ protected:
     TestServer guarded;
     TestServer second;  // serves PeerModel too: the auto router's fallback when peer dies
     TestServer starting;  // lists PeerModel as loaded but its service answers 503 (not ready)
+    TestServer stalled;   // lists PeerModel as loaded; its chat never answers until released
+    std::mutex stalled_mutex;
+    std::condition_variable stalled_changed;
+    bool stalled_entered = false;
+    bool stalled_released = false;
+    std::atomic<int> peer_chats{0};
     std::mutex seen_mutex;
     std::string peer_authorization;
     std::string peer_model;
@@ -247,6 +253,7 @@ protected:
         guarded.server.Get("/api/v1/models", keyed(R"({"object":"list","data":[{"id":"Guarded"}]})"));
         guarded.server.Post("/api/v1/chat/completions", keyed(R"({"served_by":"guarded"})"));
         peer.server.Post("/api/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
+            ++peer_chats;
             const auto body = json::parse(req.body, nullptr, false);
             {
                 std::lock_guard lock(seen_mutex);
@@ -278,6 +285,20 @@ protected:
         second.server.Post("/api/v1/chat/completions", [](const httplib::Request& req, httplib::Response& res) {
             const auto body = json::parse(req.body, nullptr, false);
             res.set_content(json{{"served_by", "second"}, {"model", body.value("model", "")}}.dump(), "application/json");
+        });
+        stalled.server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(R"({"status":"ok","all_models_loaded":[{"model_name":"PeerModel","is_busy":false}]})",
+                            "application/json");
+        });
+        stalled.server.Get("/api/v1/models", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(R"({"object":"list","data":[{"id":"PeerModel"}]})", "application/json");
+        });
+        stalled.server.Post("/api/v1/chat/completions", [this](const httplib::Request&, httplib::Response& res) {
+            std::unique_lock lock(stalled_mutex);
+            stalled_entered = true;
+            stalled_changed.notify_all();
+            stalled_changed.wait_for(lock, std::chrono::seconds(20), [this] { return stalled_released; });
+            res.status = 500;
         });
         starting.server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"status":"ok","all_models_loaded":[{"model_name":"PeerModel","is_busy":false}]})",
@@ -341,6 +362,7 @@ protected:
         const auto guarded_port = static_cast<uint16_t>(guarded.port);
         const auto second_port = static_cast<uint16_t>(second.port);
         const auto starting_port = static_cast<uint16_t>(starting.port);
+        const auto stalled_port = static_cast<uint16_t>(stalled.port);
         b.open_egress = [=](const std::string& ip, uint16_t vport) -> uint16_t {
             if (vport != lnsdk::kMeshPortPeerServicePort) return 0;
             if (ip == "10.64.0.3") return peer_port;
@@ -348,6 +370,7 @@ protected:
             if (ip == "10.64.0.9") return guarded_port;
             if (ip == "10.64.0.10") return second_port;
             if (ip == "10.64.0.11") return starting_port;
+            if (ip == "10.64.0.12") return stalled_port;
             return 0;
         };
         b.close_egress = [this](const std::string&, uint16_t) { ++closed_egress; };
@@ -715,6 +738,41 @@ TEST_F(MeshPortTest, AutoRouterFailsOverOnceWhenTheChosenDeviceAnswers503) {
     ASSERT_TRUE(named);
     EXPECT_EQ(named->status, 503);
     EXPECT_EQ(port->status()["auto_failovers"], 1);
+}
+
+// stop() cancels a request still waiting on its device. That cancellation is not
+// "the device gave no answer": the auto router must not re-send it to the next
+// device, and nothing may start a new upstream request once stop() has begun.
+TEST_F(MeshPortTest, StopDoesNotReSendACancelledAutoRequest) {
+    stalled.start();
+    add_member("stalled", "Stalled box", "10.64.0.12");
+    start();
+    ASSERT_EQ(port->set_selection("auto", ""), 0);
+    std::thread caller([this] {
+        httplib::Client client("127.0.0.1", number);
+        client.set_read_timeout(30, 0);
+        auto res = chat(client, "PeerModel");
+        if (res) EXPECT_NE(res->status, 200) << "a cancelled request must not be served by another device";
+    });
+    {
+        std::unique_lock lock(stalled_mutex);
+        ASSERT_TRUE(stalled_changed.wait_for(lock, std::chrono::seconds(10), [this] { return stalled_entered; }))
+            << "the stalled device (5 ms) should be chosen over the gpu (20 ms)";
+    }
+    const int before = peer_chats.load();
+    const auto started = std::chrono::steady_clock::now();
+    port->stop();
+    const auto took = std::chrono::steady_clock::now() - started;
+    caller.join();
+    EXPECT_LT(took, std::chrono::seconds(5)) << "stop() waited on a fallback request";
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(peer_chats.load(), before) << "the cancelled request was re-sent to the next device";
+    EXPECT_EQ(port->status()["auto_failovers"], 0);
+    {
+        std::lock_guard lock(stalled_mutex);
+        stalled_released = true;
+    }
+    stalled_changed.notify_all();
 }
 
 TEST_F(MeshPortTest, AutoRouterSkipsDevicesThatRefuseTheKey) {
