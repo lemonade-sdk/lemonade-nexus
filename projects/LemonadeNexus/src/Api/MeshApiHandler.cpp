@@ -918,6 +918,9 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         const auto caller_pubkey = normalize_pubkey(claims.pubkey);
         if (ctx_.tree.check_permission(caller_pubkey, hb_node_id, acl::Permission::Read)) {
             j["peers_revision"] = caller_peers_revision(caller_pubkey, *current, now);
+            // An SDK without the event socket learns of device list changes
+            // from the heartbeat answer.
+            j["devices_revision"] = devices_revision(ctx_.tree, claims);
         }
         // A member that the finalized next-epoch plan leaves out says so, so
         // the client moves its session before this server's authority ends.
