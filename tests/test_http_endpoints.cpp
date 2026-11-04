@@ -2371,7 +2371,8 @@ TEST_F(MeshPeersConnectTest, PeerPermissionsNameWhatThePeerHoldsTowardTheCaller)
 // A node the caller may not connect to changes nothing, and a caller without
 // Read on its node gets no revision.
 TEST_F(MeshPeersConnectTest, HeartbeatPeersRevisionFollowsThePeerList) {
-    const auto revision = [this](const std::string& node, const std::string& pubkey) {
+    const auto revision = [this](const std::string& node, const std::string& pubkey,
+                                 const char* field = "peers_revision") {
         const auto now = std::chrono::system_clock::now();
         const auto token = jwt::create()
                                .set_issuer("lemonade-nexus")
@@ -2388,9 +2389,9 @@ TEST_F(MeshPeersConnectTest, HeartbeatPeersRevisionFollowsThePeerList) {
         if (!res) return std::string{"<no answer>"};
         EXPECT_EQ(res->status, 200) << res->body;
         const auto answer = json::parse(res->body);
-        if (!answer.contains("peers_revision")) return std::string{};
-        EXPECT_TRUE(answer["peers_revision"].is_string()) << res->body;
-        return answer["peers_revision"].get<std::string>();
+        if (!answer.contains(field)) return std::string{};
+        EXPECT_TRUE(answer[field].is_string()) << res->body;
+        return answer[field].get<std::string>();
     };
     const auto mine = [&] { return revision("mc_self", caller); };
     const auto update = [this](const std::string& id, const auto& change) {
@@ -2428,6 +2429,22 @@ TEST_F(MeshPeersConnectTest, HeartbeatPeersRevisionFollowsThePeerList) {
     const auto stranger = principal();
     add("mc_no_read", "mc_group", tree::NodeType::Endpoint, {{stranger, {"connect_private"}}});
     EXPECT_EQ(revision("mc_no_read", stranger), "");
+
+    // The same answer carries devices_revision, which follows the device
+    // list of the caller's groups rather than the peer list: a device added
+    // to a group the caller belongs to changes it. A caller without Read
+    // gets neither. (mc_self's node belongs to root; a permission on the
+    // group makes the caller its member.)
+    update("mc_group", [&](tree::TreeNode& n) {
+        n.assignments.push_back({.management_pubkey = caller, .permissions = {"read"}});
+    });
+    const auto devices = [&] { return revision("mc_self", caller, "devices_revision"); };
+    const auto listed = devices();
+    ASSERT_FALSE(listed.empty());
+    EXPECT_EQ(devices(), listed);
+    add("mc_third", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    EXPECT_NE(devices(), listed) << "a device added to the caller's group left devices_revision as it was";
+    EXPECT_EQ(revision("mc_no_read", stranger, "devices_revision"), "");
 }
 
 // GET /api/mesh/peers with wait_revision holds the request until the
@@ -2571,17 +2588,34 @@ TEST_F(MeshPeersConnectTest, EventSocketSendsTheRevisionsAndEachChange) {
     ws.close();
 }
 
+// WebSocketClient::connect() reports the server's HTTP status from cpp-httplib
+// 0.58.0; before, it answers a bool. A test of the refusal statuses needs the
+// former.
+template <typename WsClient>
+int refused_connect_status(WsClient& ws) {
+    const auto result = ws.connect();
+    EXPECT_FALSE(result);
+    if constexpr (requires { result.status(); }) {
+        return result.status();
+    } else {
+        return -1;
+    }
+}
+template <typename WsClient>
+constexpr bool kConnectReportsStatus = requires(WsClient& ws) { ws.connect().status(); };
+
 // The upgrade request gets the checks of GET /api/mesh/peers before the
 // protocol switches: no session 401, an unknown node 404, a node without Read
 // 403. A server without the route answers 404 with no JSON body.
 TEST_F(MeshPeersConnectTest, EventSocketRefusesBeforeTheUpgrade) {
+    if (!kConnectReportsStatus<httplib::ws::WebSocketClient>) {
+        GTEST_SKIP() << "cpp-httplib " CPPHTTPLIB_VERSION " reports no status from connect()";
+    }
     add("mc_closed", "mc_group", tree::NodeType::Endpoint, {{principal(), {"read"}}});
     const auto status = [this](const std::string& query, const httplib::Headers& headers) {
         httplib::ws::WebSocketClient ws(
             "ws://127.0.0.1:" + std::to_string(mesh_port) + "/api/events" + query, headers);
-        const auto result = ws.connect();
-        EXPECT_FALSE(result);
-        return result.status();
+        return refused_connect_status(ws);
     };
     const httplib::Headers session{{"Authorization", "Bearer " + make_jwt(caller)}};
     EXPECT_EQ(status("?node_id=mc_self", {}), 401);

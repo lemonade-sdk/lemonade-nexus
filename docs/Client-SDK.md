@@ -155,7 +155,11 @@ direct path to every peer before it uses a relay:
   listed peer's mesh key, tunnel address, private subnet, endpoint,
   hostname, or online state (`is_online`) changes. When the value differs
   from the previous answer, the SDK fetches the peer list at once instead of
-  at the next `peer_refresh_interval_sec` (default 30). A peer that joined
+  at the next `peer_refresh_interval_sec` (default 30). The answer also
+  carries `devices_revision`, which changes with the device list of the
+  device's groups; a new value reports a possible device list change
+  (`set_mesh_devices_callback`) within one heartbeat, which is how a build
+  without the event socket sees it. A peer that joined
   or moved is therefore seen within one heartbeat. The value carries no peer
   data; peers still come only from `GET /api/mesh/peers`. Servers without
   the field leave the 30-second refresh as the only schedule.
@@ -175,7 +179,14 @@ direct path to every peer before it uses a relay:
   0.26.0, Debian 13 backports 0.41.0) has no event socket, because that
   WebSocket client cannot dial the private FQDN through the loopback egress
   with the certificate verified; `LemonadeNexusClient::event_socket_supported()`
-  is false and the SDK keeps the long-poll.
+  is then false, the SDK keeps the long-poll, and the heartbeat's
+  `devices_revision` reports device list changes. With cpp-httplib 0.47.0
+  to 0.50.0 (Fedora ships 0.48.0) the SDK always closes an open socket
+  before it releases the client, which keeps that library's teardown from
+  writing through a freed TLS session; with 0.47.0 to 0.53.0 a cancel or a
+  resume shuts the socket down instead of closing it from the other thread,
+  because that library's `close()` reads the peer's reply beside the thread
+  that is reading, and the reading thread then closes the socket.
 - Without the event socket, the SDK holds a long-poll on the peer list:
   `GET /api/mesh/peers/<node_id>?wait_revision=<revision>&timeout=25` on its
   own connection to the session server. The server answers as soon as the

@@ -403,15 +403,36 @@ protected:
     std::atomic<bool> serve_events{false};
     std::atomic<int>  event_sockets{0};
     std::string       devices_revision{"dev-1"};  // guarded by revision_mtx
+#if LEMONADE_NEXUS_HTTPLIB_VERSION >= 33000
+    // The open event sockets; a revision change is pushed to each. Guarded
+    // by revision_mtx (cpp-httplib serializes send() against the reading
+    // thread itself).
+    std::set<httplib::ws::WebSocket*> event_socket_peers;
+#endif
+
+    nlohmann::json revisions_event_locked() const {
+        return {{"event", "revisions"},
+                {"peers_revision", heartbeat_revision},
+                {"devices_revision", devices_revision}};
+    }
+
+    void push_revisions_locked() {
+#if LEMONADE_NEXUS_HTTPLIB_VERSION >= 33000
+        const auto event = revisions_event_locked().dump();
+        for (auto* ws : event_socket_peers) (void)ws->send(event);
+#endif
+    }
 
     void set_devices_revision(std::string revision) {
         std::lock_guard lock(revision_mtx);
         devices_revision = std::move(revision);
+        push_revisions_locked();
     }
 
     void set_heartbeat_revision(std::string revision) {
         std::lock_guard lock(revision_mtx);
         heartbeat_revision = std::move(revision);
+        push_revisions_locked();
     }
 
     // The stand-in server is the one reachable Tier 1 member of a five-member
@@ -604,33 +625,22 @@ protected:
         // cpp-httplib serves WebSockets from v0.33.0; an SDK built against an
         // older library has no event socket and never asks for one.
 #if LEMONADE_NEXUS_HTTPLIB_VERSION >= 33000
-        srv.WebSocket("/api/events", [this](const httplib::Request&, auto& ws) {
+        srv.WebSocket("/api/events", [this](const httplib::Request&, httplib::ws::WebSocket& ws) {
             ++event_sockets;
-            std::string sent;
-            std::string message;
-            // The stand-in polls its revisions between reads, which needs the
-            // read timeout of cpp-httplib 0.58.0. Built against an older
-            // library, it holds no socket and the event socket tests skip.
-            // (ws is a template parameter so that branch is not compiled.)
-            if constexpr (!requires { ws.set_read_timeout(0, 20000); }) {
-                ws.close();
-                return;
-            } else {
-                ws.set_read_timeout(0, 20000);
+            // The revisions go out when the socket opens and whenever a test
+            // changes them (set_*_revision pushes to every open socket); the
+            // handler only keeps the socket open until the client closes it.
+            {
+                std::lock_guard lock(revision_mtx);
+                event_socket_peers.insert(&ws);
+                (void)ws.send(revisions_event_locked().dump());
             }
-            while (!stopping_waits.load()) {
-                std::string now;
-                nlohmann::json event;
-                {
-                    std::lock_guard lock(revision_mtx);
-                    event = {{"event", "revisions"},
-                             {"peers_revision", heartbeat_revision},
-                             {"devices_revision", devices_revision}};
-                }
-                now = event.dump();
-                if (now != sent && !ws.send(now)) break;
-                sent = now;
-                if (ws.read(message) == httplib::ws::Fail) break;
+            std::string message;
+            while (!stopping_waits.load() && ws.read(message) != httplib::ws::Fail) {
+            }
+            {
+                std::lock_guard lock(revision_mtx);
+                event_socket_peers.erase(&ws);
             }
             ws.close();
         });
@@ -807,7 +817,10 @@ protected:
             }
             {
                 std::lock_guard lock(revision_mtx);
-                if (!heartbeat_revision.empty()) answer["peers_revision"] = heartbeat_revision;
+                if (!heartbeat_revision.empty()) {
+                    answer["peers_revision"] = heartbeat_revision;
+                    answer["devices_revision"] = devices_revision;
+                }
             }
             res.set_content(answer.dump(), "application/json");
         });
@@ -1910,6 +1923,36 @@ TEST_F(SdkMeshPrivateApiTest, AResumeEndsARequestWaitingOnTheOldConnection) {
     ASSERT_EQ(poll.wait_for(std::chrono::seconds(5)), std::future_status::ready)
         << "the long-poll did not end at the resume";
     EXPECT_FALSE(poll.get().ok);
+}
+
+// Without the event socket, the heartbeat answer's devices_revision reports
+// a device list change: the devices callback runs within one heartbeat of
+// the change, and not for an unchanged value.
+TEST_F(SdkMeshPrivateApiTest, AHeartbeatDevicesRevisionChangeCallsTheDevicesCallback) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    set_heartbeat_revision("rev-1");
+    std::atomic<int> device_changes{0};
+    client->set_mesh_devices_callback([&] { ++device_changes; });
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 1;
+    cfg.stun_refresh_interval_sec = 0;
+    client->enable_mesh(cfg);
+    const auto heartbeats = [&] {
+        std::lock_guard lock(heartbeat_mtx);
+        return heartbeat_endpoints.size();
+    };
+    ASSERT_TRUE(wait_for([&] { return heartbeats() >= 2; }, std::chrono::seconds(10)))
+        << "no heartbeats reached the stand-in";
+    const int changes = device_changes.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    EXPECT_EQ(device_changes.load(), changes) << "an unchanged devices_revision ran the callback";
+
+    set_devices_revision("dev-2");
+    EXPECT_TRUE(wait_for([&] { return device_changes.load() > changes; }, std::chrono::seconds(5)))
+        << "the heartbeat's new devices_revision did not run the devices callback";
+    client->disable_mesh();
 }
 
 // resume() closes the event socket so the orchestrator opens it again, and

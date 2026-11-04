@@ -247,7 +247,8 @@ to the probed address.
 The heartbeat answer's `peers_revision` changes when a device's peer list
 changes, so the other side fetches a new or moved peer's endpoint within one
 heartbeat (3 seconds) and punches back at once, instead of at its next
-30-second peer refresh. The SDK also holds an event socket open to its
+30-second peer refresh; its `devices_revision` reports a device list change
+the same way. The SDK also holds an event socket open to its
 session server (`GET /api/events`, a WebSocket on the private API). The
 server sends the device's `peers_revision` and `devices_revision` when the
 socket opens and as soon as either changes: when a tree change commits, a
