@@ -1430,7 +1430,14 @@ void MeshPort::serve_auto(const httplib::Request& req, httplib::Response& res, c
         forwarded = body.dump();
     }
     if (route.target != "local") {
-        if (forward_to_node(route.target, path, req, res, peer_authorization, forwarded) || !may_fail_over) return;
+        const bool answered = forward_to_node(route.target, path, req, res, peer_authorization, forwarded);
+        // A device whose own ingress answers 502/503 has a service behind it
+        // that is down or not ready: no model byte was produced, so the request
+        // is as safe to re-send as one that got no answer at all.
+        const bool unavailable = !answered || res.status == 502 || res.status == 503;
+        spdlog::debug("[MeshPort] auto: {} -> {} answered={} status={} probed={} named_device={} peers={}", model,
+                      route.target, answered, res.status, probed, named_device, peers.size());
+        if (!unavailable || !may_fail_over) return;
         // The chosen device never answered. Drop it from this request's view
         // and ask the ranking for the next device, once.
         const std::string dead = route.target;
