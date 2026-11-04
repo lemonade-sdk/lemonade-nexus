@@ -1888,7 +1888,10 @@ TEST_F(SdkMeshPrivateApiTest, AResumeEndsARequestWaitingOnTheOldConnection) {
     const auto [ok, took] = waiting.get();
     EXPECT_FALSE(ok);
     EXPECT_LT(took, std::chrono::seconds(8));
-    EXPECT_EQ(peer_list_gets.load(), 3);
+    // cpp-httplib 0.61 sends the GET once more on the cut connection; older
+    // releases (0.41) report the failure without a retry.
+    EXPECT_GE(peer_list_gets.load(), 2);
+    EXPECT_LE(peer_list_gets.load(), 3);
 
     // The cut-off request armed no breaker: the next one goes out at once.
     peer_list_reply = Reply::Ok;
