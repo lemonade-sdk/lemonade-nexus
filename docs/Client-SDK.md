@@ -170,7 +170,12 @@ direct path to every peer before it uses a relay:
   list again. The socket pings every 15 seconds and ends after two missed
   answers. After a failure it waits 1 second, doubled up to 30 seconds. A
   server without the socket answers `404`; the SDK then uses the long-poll
-  below for 5 minutes and tries the socket again.
+  below for 5 minutes and tries the socket again. An SDK built against a
+  cpp-httplib older than 0.47.0 (a distribution's library: Ubuntu ships
+  0.26.0, Debian 13 backports 0.41.0) has no event socket, because that
+  WebSocket client cannot dial the private FQDN through the loopback egress
+  with the certificate verified; `LemonadeNexusClient::event_socket_supported()`
+  is false and the SDK keeps the long-poll.
 - Without the event socket, the SDK holds a long-poll on the peer list:
   `GET /api/mesh/peers/<node_id>?wait_revision=<revision>&timeout=25` on its
   own connection to the session server. The server answers as soon as the
