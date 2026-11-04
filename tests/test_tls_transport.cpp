@@ -16,6 +16,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>

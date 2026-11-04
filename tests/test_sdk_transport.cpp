@@ -601,11 +601,23 @@ protected:
             }
             return httplib::Server::HandlerResponse::Unhandled;
         });
-        srv.WebSocket("/api/events", [this](const httplib::Request&, httplib::ws::WebSocket& ws) {
+        // cpp-httplib serves WebSockets from v0.33.0; an SDK built against an
+        // older library has no event socket and never asks for one.
+#if LEMONADE_NEXUS_HTTPLIB_VERSION >= 33000
+        srv.WebSocket("/api/events", [this](const httplib::Request&, auto& ws) {
             ++event_sockets;
             std::string sent;
             std::string message;
-            ws.set_read_timeout(0, 20000);
+            // The stand-in polls its revisions between reads, which needs the
+            // read timeout of cpp-httplib 0.58.0. Built against an older
+            // library, it holds no socket and the event socket tests skip.
+            // (ws is a template parameter so that branch is not compiled.)
+            if constexpr (!requires { ws.set_read_timeout(0, 20000); }) {
+                ws.close();
+                return;
+            } else {
+                ws.set_read_timeout(0, 20000);
+            }
             while (!stopping_waits.load()) {
                 std::string now;
                 nlohmann::json event;
@@ -622,6 +634,7 @@ protected:
             }
             ws.close();
         });
+#endif
         srv.Get(std::string("/api/mesh/peers/") + kNodeId,
                 [this](const httplib::Request& req, httplib::Response& res) {
             // A long-poll (wait_revision) holds until the stand-in's
@@ -1680,6 +1693,9 @@ TEST_F(SdkMeshPrivateApiTest, APeerListLongPollRefreshesWithoutWaitingForAHeartb
 // changes.
 TEST_F(SdkMeshPrivateApiTest, AnEventSocketReplacesTheLongPoll) {
     LN_REQUIRE_TEST_TRUST();
+    if (!lnsdk::LemonadeNexusClient::event_socket_supported()) {
+        GTEST_SKIP() << "this build has no event socket (cpp-httplib " CPPHTTPLIB_VERSION ")";
+    }
     auto client = joined_client();
     serve_events = true;
     set_heartbeat_revision("rev-1");
@@ -1872,7 +1888,10 @@ TEST_F(SdkMeshPrivateApiTest, AResumeEndsARequestWaitingOnTheOldConnection) {
     const auto [ok, took] = waiting.get();
     EXPECT_FALSE(ok);
     EXPECT_LT(took, std::chrono::seconds(8));
-    EXPECT_EQ(peer_list_gets.load(), 3);
+    // cpp-httplib 0.61 sends the GET once more on the cut connection; older
+    // releases (0.41) report the failure without a retry.
+    EXPECT_GE(peer_list_gets.load(), 2);
+    EXPECT_LE(peer_list_gets.load(), 3);
 
     // The cut-off request armed no breaker: the next one goes out at once.
     peer_list_reply = Reply::Ok;
@@ -1898,6 +1917,9 @@ TEST_F(SdkMeshPrivateApiTest, AResumeEndsARequestWaitingOnTheOldConnection) {
 // intervals are an hour. The tunnel reads alive throughout.
 TEST_F(SdkMeshPrivateApiTest, AResumeReopensTheEventSocketAndRefreshesAtOnce) {
     LN_REQUIRE_TEST_TRUST();
+    if (!lnsdk::LemonadeNexusClient::event_socket_supported()) {
+        GTEST_SKIP() << "this build has no event socket (cpp-httplib " CPPHTTPLIB_VERSION ")";
+    }
     auto client = joined_client();
     serve_events = true;
     set_heartbeat_revision("rev-1");

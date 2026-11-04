@@ -232,7 +232,7 @@ source of truth for versions.
 | OpenSSL | Linux: Ubuntu 24.04 `libssl-dev` 3.0.13, linked statically (client SDK build: system OpenSSL 3); macOS arm64 / Windows x64: pinned static archive (3.5.9), checked by SHA-256; `LEMONADE_NEXUS_STATIC_DEPS=OFF`: system package | TLS, ACME client |
 | TPM2-TSS (FAPI) | Source build (4.1.3), Linux | TPM access for the evidence helper |
 | asio | FetchContent (1.34.2) | Async I/O (UDP, timers) |
-| cpp-httplib | FetchContent (0.18.3) | HTTP/HTTPS server and client |
+| cpp-httplib | FetchContent (0.61.0); the client SDK also builds against a system library from 0.26.0 (the event socket needs 0.47.0) | HTTP/HTTPS server and client, WebSocket event socket |
 | c-ares | FetchContent (1.34.6) | Async DNS resolution |
 | nlohmann/json | FetchContent (3.12.0) | JSON parsing |
 | spdlog | FetchContent (1.16.0) | Structured logging |

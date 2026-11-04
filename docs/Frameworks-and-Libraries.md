@@ -57,7 +57,7 @@ across all supported machines.
 | Component | Purpose |
 |-----------|---------|
 | **asio** (1.34.2) | Async I/O: UDP sockets, timers, signals |
-| **cpp-httplib** (0.18.3) | HTTP/HTTPS server and client |
+| **cpp-httplib** (0.61.0; the client SDK accepts a system library from 0.26.0) | HTTP/HTTPS server and client, WebSocket event socket |
 | **BoringTun** (Rust crate via Corrosion) | Userspace WireGuard implementation |
 | **virtual-netstack / smoltcp** (Rust crate) | Userspace TCP/IP: delivers virtual addresses to in-process listeners |
 

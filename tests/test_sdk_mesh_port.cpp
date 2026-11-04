@@ -757,12 +757,23 @@ TEST_F(MeshPortTest, TlsReloadsTheCertificateInPlace) {
         long serial = 0;
         auto client = secure("my-laptop.team.lo.example");
         client->enable_server_certificate_verification(true);
+#if LEMONADE_NEXUS_HTTPLIB_VERSION >= 33000
         client->set_server_certificate_verifier([&](const httplib::tls::VerifyContext& ctx) {
             if (ctx.depth == 0 && ctx.cert) {
                 serial = ASN1_INTEGER_get(X509_get0_serialNumber(static_cast<const X509*>(ctx.cert)));
             }
             return true;
         });
+#else
+        // cpp-httplib before v0.33.0 hands the verifier the SSL object.
+        client->set_server_certificate_verifier([&](SSL* ssl) {
+            if (X509* leaf = SSL_get1_peer_certificate(ssl)) {
+                serial = ASN1_INTEGER_get(X509_get0_serialNumber(leaf));
+                X509_free(leaf);
+            }
+            return httplib::SSLVerifierResponse::CertificateAccepted;
+        });
+#endif
         client->Get("/api/v1/models");
         return serial;
     };
