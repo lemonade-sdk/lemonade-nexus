@@ -193,10 +193,12 @@ Platform rules, kept behind the existing boundaries:
 
 - **Tier 1 mesh (SEV-SNP + SVSM vTPM + nexus-attestd):** the share is sealed
   in the boot set under the `storage-share` domain, with the same PCR 8/9
-  binding, two-boot migration, and upgrade staging as the gossip identity
-  (B6). Unseal failure stops the share, not the node: the node runs without
-  its share and cannot act as a holder. That is the existing `Missing` /
-  `PolicyMismatch` / `Corrupt` status handling.
+  binding and upgrade staging as the gossip identity (B6), and kept in the
+  machine-bound file store as well. A sealed copy that reports `Missing`,
+  `PolicyMismatch`, or `Corrupt` is replaced from the file copy and sealed
+  again; the SVSM vTPM keeps no state across a reboot, so without the file
+  copy every reboot of the fleet lost every share. Only when neither copy
+  opens does the node run without its share and stop acting as a holder.
 - **Certificate-only hosts (Tier 2, no TPM):** the file store stands. This is
   the documented B6 limit and it already exists for the gossip identity
   (`keypair.json` at mode 600). Nothing about a macOS or Linux change may

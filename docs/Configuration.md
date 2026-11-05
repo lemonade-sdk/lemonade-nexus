@@ -444,16 +444,20 @@ How it works:
   storage key still unlocks through the epoch after the rotation's effective
   epoch, then never. Covered files are encrypted whenever a data key exists
 (below).
-- **Share storage.** When the host can seal (nexus-attestd with Seal and
-  Unseal), the holder's shares are sealed beside the gossip identity under the
-  domain `storage-share`: `data/sealed/storage-share.sealed`, with the same
-  upgrade staging (`storage-share.next.sealed`). A host that cannot seal keeps
+- **Share storage.** Every holder keeps its shares in
   `data/security/storage/sealed/storage-share.share` (mode 600, under the
-  machine-bound wrapping that the epoch vote keys use on such a host). A share
-  found in that file
-  on a host that can now seal moves into the sealed store after the sealed
-  copy unseals to the same bytes. A sealed share that reports Missing,
-  PolicyMismatch, or Corrupt is never replaced by the file copy.
+  machine-bound wrapping that the epoch vote keys use on a host without
+  sealing). When the host can seal (nexus-attestd with Seal and Unseal), the
+  same shares are also sealed beside the gossip identity under the domain
+  `storage-share`: `data/sealed/storage-share.sealed`, with the same upgrade
+  staging (`storage-share.next.sealed`). At start the holder reads the sealed
+  copy first. When it reports Missing, PolicyMismatch, Corrupt, or no sealing,
+  the holder reads the file copy and seals it again under the running
+  platform state. When the sealed copy opens and the file copy is missing or
+  does not open, the file copy is rewritten from it. A TPM that loses its
+  state, as a virtual TPM without persistence does at every reboot, therefore
+  costs the holder nothing. Only when neither copy opens does the holder run
+  without its share.
 - **Files.** `data/security/storage/records.json` (the live records and their
   proofs; a live record without a proof is under `unproven`) and
   `data/security/storage/data-key.json` (the wrapped data key). A share whose
@@ -465,8 +469,12 @@ How it works:
 
 Limits:
 
-- **Hosts without sealing.** Shares stay in the machine-bound file wrapping
-  (design B6 limit).
+- **The file copy is on the disk.** The machine-bound wrapping keys off
+  `identity/wrap_local.key` and `/etc/machine-id` on the same disk, so a
+  reader of a holder's whole disk learns that holder's share (design B6
+  limit, on every host). One share is useless alone: the storage secret
+  needs `t` holders' shares. The sealed copy adds protection only while
+  nobody has the disk.
 - **Holder loss is found by sessions.** A holder that goes away is replaced
   when a session runs: at the next epoch boundary, at the daily rotation, or
   after a session timeout. A holder that sends round 1 and then withholds its

@@ -157,24 +157,141 @@ TEST_F(ShareStoreTest, SealedAdapterFailsClosedOnMissingAndPolicyMismatch) {
     EXPECT_EQ(store.unseal(kStorageShareDomain).status, ShareStoreStatus::Unreachable);
 }
 
-TEST_F(ShareStoreTest, SealedAdapterMovesALegacyFileShareOnlyAfterItUnseals) {
-    FileStorageShareStore legacy(root / "sealed", &crypto, wrapping.get(), identity.public_key);
-    const auto value = secret();
-    ASSERT_EQ(legacy.seal(kStorageShareDomain, value), ShareStoreStatus::Ok);
+// --- Sealed adapter with the durable copy ----------------------------------------
+
+namespace {
+
+std::vector<uint8_t> bytes_of(const nexus::crypto::SecureBuffer& buffer) {
+    return {buffer.data(), buffer.data() + buffer.size()};
+}
+
+}  // namespace
+
+TEST_F(ShareStoreTest, SealedAdapterWritesBothCopiesAndRemovesBoth) {
+    FileStorageShareStore durable(root / "sealed", &crypto, wrapping.get(), identity.public_key);
     seal_test::FakeSealer sealer;
     SealedBlobStore blobs(root / "boot-sealed", sealer.backend());
-    SealedStorageShareStore store(blobs, &legacy);
+    SealedStorageShareStore store(blobs, &durable);
+    const auto value = secret();
+    ASSERT_EQ(store.seal(kStorageShareDomain, value), ShareStoreStatus::Ok);
+    EXPECT_TRUE(fs::exists(blobs.current_path(kStorageShareDomain)));
+    EXPECT_TRUE(fs::exists(durable.path_of(kStorageShareDomain)));
+    // The durable copy is the machine-bound wrapping, not plaintext.
+    std::ifstream in(durable.path_of(kStorageShareDomain), std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), {});
+    EXPECT_EQ(text.find(nexus::crypto::to_base64(value)), std::string::npos);
+    const auto back = store.unseal(kStorageShareDomain);
+    ASSERT_EQ(back.status, ShareStoreStatus::Ok);
+    EXPECT_EQ(bytes_of(back.plaintext), value);
+    EXPECT_TRUE(store.remove(kStorageShareDomain));
+    EXPECT_FALSE(fs::exists(blobs.current_path(kStorageShareDomain)));
+    EXPECT_FALSE(fs::exists(durable.path_of(kStorageShareDomain)));
+    EXPECT_EQ(store.unseal(kStorageShareDomain).status, ShareStoreStatus::Missing);
+}
+
+// The failure of 2026-11-05: every holder rebooted and every virtual TPM came
+// back without its state, so every sealed share reported Corrupt. The durable
+// copy opens, the share is sealed again under the new TPM, and the next start
+// unseals the sealed copy.
+TEST_F(ShareStoreTest, SealedAdapterRecoversTheShareWhenTheTpmLosesItsState) {
+    FileStorageShareStore durable(root / "sealed", &crypto, wrapping.get(), identity.public_key);
+    seal_test::FakeSealer sealer;
+    SealedBlobStore blobs(root / "boot-sealed", sealer.backend());
+    SealedStorageShareStore store(blobs, &durable);
+    const auto value = secret();
+    ASSERT_EQ(store.seal(kStorageShareDomain, value), ShareStoreStatus::Ok);
+
+    sealer.owner_seed = "owner-seed-B";  // a new TPM: the old blob does not load
+    {
+        SealedStorageShareStore sealed_only(blobs);
+        EXPECT_EQ(sealed_only.unseal(kStorageShareDomain).status, ShareStoreStatus::Corrupt);
+    }
+    const auto recovered = store.unseal(kStorageShareDomain);
+    ASSERT_EQ(recovered.status, ShareStoreStatus::Ok);
+    EXPECT_EQ(bytes_of(recovered.plaintext), value);
+    // Sealed again under the new TPM: the sealed copy alone opens now.
+    SealedStorageShareStore sealed_only(blobs);
+    const auto resealed = sealed_only.unseal(kStorageShareDomain);
+    ASSERT_EQ(resealed.status, ShareStoreStatus::Ok);
+    EXPECT_EQ(bytes_of(resealed.plaintext), value);
+    EXPECT_TRUE(fs::exists(durable.path_of(kStorageShareDomain)));
+}
+
+TEST_F(ShareStoreTest, SealedAdapterRecoversTheShareOnAPolicyMismatch) {
+    FileStorageShareStore durable(root / "sealed", &crypto, wrapping.get(), identity.public_key);
+    seal_test::FakeSealer sealer;
+    SealedBlobStore blobs(root / "boot-sealed", sealer.backend());
+    SealedStorageShareStore store(blobs, &durable);
+    const auto value = secret();
+    ASSERT_EQ(store.seal(kStorageShareDomain, value), ShareStoreStatus::Ok);
+    sealer.pcrs = seal_test::pcrs_of(0x55, 0x66);  // a boot chain nothing was staged for
+    const auto recovered = store.unseal(kStorageShareDomain);
+    ASSERT_EQ(recovered.status, ShareStoreStatus::Ok);
+    EXPECT_EQ(bytes_of(recovered.plaintext), value);
+    SealedStorageShareStore sealed_only(blobs);
+    EXPECT_EQ(sealed_only.unseal(kStorageShareDomain).status, ShareStoreStatus::Ok);
+}
+
+// A holder updated from a release that kept the sealed copy alone: the first
+// unseal writes the durable copy. A durable copy that does not open is
+// rewritten the same way and never read.
+TEST_F(ShareStoreTest, SealedAdapterWritesTheDurableCopyWhenOnlyTheSealedCopyExists) {
+    FileStorageShareStore durable(root / "sealed", &crypto, wrapping.get(), identity.public_key);
+    seal_test::FakeSealer sealer;
+    SealedBlobStore blobs(root / "boot-sealed", sealer.backend());
+    const auto value = secret();
+    {
+        SealedStorageShareStore sealed_only(blobs);
+        ASSERT_EQ(sealed_only.seal(kStorageShareDomain, value), ShareStoreStatus::Ok);
+    }
+    EXPECT_FALSE(fs::exists(durable.path_of(kStorageShareDomain)));
+    SealedStorageShareStore store(blobs, &durable);
     const auto first = store.unseal(kStorageShareDomain);
     ASSERT_EQ(first.status, ShareStoreStatus::Ok);
-    EXPECT_FALSE(fs::exists(legacy.path_of(kStorageShareDomain)));
+    EXPECT_EQ(bytes_of(first.plaintext), value);
+    ASSERT_TRUE(fs::exists(durable.path_of(kStorageShareDomain)));
+    const auto copy = durable.unseal(kStorageShareDomain);
+    ASSERT_EQ(copy.status, ShareStoreStatus::Ok);
+    EXPECT_EQ(bytes_of(copy.plaintext), value);
+
+    // A planted plaintext file in place of the durable copy is replaced, and
+    // the sealed copy's bytes are what the store returns.
+    FileStorageShareStore plain(root / "sealed");
+    ASSERT_EQ(plain.seal(kStorageShareDomain, secret()), ShareStoreStatus::Ok);
+    EXPECT_EQ(durable.unseal(kStorageShareDomain).status, ShareStoreStatus::Corrupt);
     const auto second = store.unseal(kStorageShareDomain);
     ASSERT_EQ(second.status, ShareStoreStatus::Ok);
-    EXPECT_EQ(std::vector<uint8_t>(second.plaintext.data(),
-                                   second.plaintext.data() + second.plaintext.size()),
-              value);
-    // A policy mismatch on the sealed copy never falls back to a file copy.
+    EXPECT_EQ(bytes_of(second.plaintext), value);
+    EXPECT_EQ(bytes_of(durable.unseal(kStorageShareDomain).plaintext), value);
+}
+
+// With no copy that opens, nothing is invented: the sealed status stands when
+// the durable copy is missing, and a damaged durable copy is reported when the
+// sealed copy is gone too.
+TEST_F(ShareStoreTest, SealedAdapterFailsClosedWhenNeitherCopyOpens) {
+    FileStorageShareStore durable(root / "sealed", &crypto, wrapping.get(), identity.public_key);
+    seal_test::FakeSealer sealer;
+    SealedBlobStore blobs(root / "boot-sealed", sealer.backend());
+    SealedStorageShareStore store(blobs, &durable);
+    EXPECT_EQ(store.unseal(kStorageShareDomain).status, ShareStoreStatus::Missing);
+    ASSERT_EQ(store.seal(kStorageShareDomain, secret()), ShareStoreStatus::Ok);
+    ASSERT_TRUE(durable.remove(kStorageShareDomain));
     sealer.pcrs = seal_test::pcrs_of(0x55, 0x66);
     EXPECT_EQ(store.unseal(kStorageShareDomain).status, ShareStoreStatus::PolicyMismatch);
+    sealer.owner_seed = "owner-seed-C";
+    EXPECT_EQ(store.unseal(kStorageShareDomain).status, ShareStoreStatus::Corrupt);
+    // Unreachable daemon with a durable copy: the copy is used and no seal is
+    // attempted until the daemon answers.
+    sealer.owner_seed = "owner-seed-A";
+    sealer.pcrs = seal_test::pcrs_of(0x11, 0x22);
+    const auto value = secret();
+    ASSERT_EQ(store.seal(kStorageShareDomain, value), ShareStoreStatus::Ok);
+    sealer.reachable = false;
+    const int seals_before = sealer.seal_calls;
+    const auto offline = store.unseal(kStorageShareDomain);
+    ASSERT_EQ(offline.status, ShareStoreStatus::Ok);
+    EXPECT_EQ(bytes_of(offline.plaintext), value);
+    EXPECT_EQ(sealer.seal_calls, seals_before);
 }
 
 }  // namespace

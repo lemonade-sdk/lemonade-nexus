@@ -768,11 +768,16 @@ Always on, no setting (`Security/Storage/`):
   missing
   `records.json` or `data-key.json`, a chain without a final plan, or a
   foreign chain stops startup with an error that names the files to restore.
-- **Share storage.** On a host that can seal, shares are kept by
-  `SealedStorageShareStore` in the boot set's `SealedBlobStore` under the
-  domain `storage-share`, with the same backend and upgrade staging as the
-  gossip identity. A host that cannot seal keeps `FileStorageShareStore` under
-  today's machine-bound wrapping (the B6 limit).
+- **Share storage.** Every holder keeps its shares in `FileStorageShareStore`
+  under today's machine-bound wrapping (the B6 limit). On a host that can
+  seal, `SealedStorageShareStore` also seals them in the boot set's
+  `SealedBlobStore` under the domain `storage-share`, with the same backend
+  and upgrade staging as the gossip identity, reads the sealed copy first,
+  falls back to the file copy when the sealed copy does not open, and seals
+  the share again. The file copy is the recovery path for a fleet whose TPMs
+  lose their state at the same time (the SVSM vTPM keeps none across a
+  reboot); without it, every holder's share is lost at once and no data key
+  unwraps again.
 
 ### B12. Phase 7 implementation
 

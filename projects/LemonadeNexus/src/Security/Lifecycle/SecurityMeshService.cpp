@@ -169,9 +169,9 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
                      vote_key_protection_name(vote_key_protection_));
     }
     if (config.seal_backend.available() && sealed_blobs_ != nullptr) {
-        // The share joins the gossip identity in the sealed boot set. A share
-        // kept in the file store before this host could seal moves across on
-        // first use.
+        // The share joins the gossip identity in the sealed boot set and keeps
+        // its machine-bound copy in the file store: a TPM that loses its state
+        // must not take the holder's share with it (StorageShareStore.hpp).
         share_store_ = std::make_unique<SealedStorageShareStore>(*sealed_blobs_,
                                                                  file_share_store_.get());
     } else {

@@ -5,13 +5,25 @@
 // IStorageShareStore has the SealedBlobStore seal/unseal calls and statuses.
 // Two implementations:
 //
-// - SealedStorageShareStore: the sealed boot set. It calls SealedBlobStore
-//   (Security/Sealing/SealedBlobStore.hpp) under the domain kStorageShareDomain
-//   ("storage-share"), with the same seal backend and directory as the gossip
-//   identity (Core/BootSet.hpp). The server uses it when the host can seal.
+// - SealedStorageShareStore: the sealed boot set plus a durable copy. It calls
+//   SealedBlobStore (Security/Sealing/SealedBlobStore.hpp) under the domain
+//   kStorageShareDomain ("storage-share"), with the same seal backend and
+//   directory as the gossip identity (Core/BootSet.hpp), and keeps the same
+//   share in a FileStorageShareStore so that a TPM that loses its state (a
+//   virtual TPM without persistence, a cleared TPM, a replaced board) does not
+//   destroy the holder's share. The server uses it when the host can seal.
 // - FileStorageShareStore: hosts and builds that cannot seal, and tests. It
 //   keeps today's machine-bound wrapping, which B6 records as a documented
 //   limit.
+//
+// Why the durable copy. The storage secret is split across the Tier 1 holders
+// with a threshold, so one holder's share is useless alone, and a holder that
+// cannot read its share is a holder lost. When every holder reboots at once
+// and every TPM comes back empty, the whole network loses its data key, and
+// no copy of the shares exists anywhere else. The durable copy is the
+// recovery path for that case. It is on the same disk as the local wrapping
+// secret, so a reader of the whole disk learns this one share; that is the
+// B6 limit of hosts without sealing, now the floor on every host.
 //
 // The stored value is one bundle: every share this holder keeps, each under
 // the digest of the final plan it belongs to (the current plan, the retiring
@@ -115,19 +127,30 @@ private:
 /// The share store status for a sealed-store status (same names and meanings).
 [[nodiscard]] ShareStoreStatus share_store_status(SealStatus status);
 
-/// The share store on the sealed boot set. Not owning: `sealed` and `legacy`
-/// must outlive the adapter.
+/// The share store on the sealed boot set with a durable copy. Not owning:
+/// `sealed` and `durable` must outlive the adapter.
 ///
-/// `legacy` (nullable) is the file store this host used before it could seal.
-/// When the sealed store has nothing under a domain and the legacy store has
-/// it, the secret is sealed, unsealed again and compared, and only then
-/// removed from the legacy store. Every other status fails closed: Missing,
-/// PolicyMismatch, Corrupt, and the rest are returned as they are, and the
-/// legacy store is not consulted for them.
+/// `durable` (nullable) is the machine-bound file store. With it:
+///
+/// - seal() writes the durable copy first and then the sealed copy. Ok means
+///   the durable copy is on disk; a seal backend failure is logged and the
+///   sealed copy is written again at the next unseal().
+/// - unseal() reads the sealed copy first. When it opens, a missing or
+///   unreadable durable copy is rewritten from it (the first start after the
+///   release that added the copy, or a damaged file). When the sealed copy
+///   reports Missing, PolicyMismatch, Corrupt, Unavailable, Unreachable, or
+///   Failed, the durable copy is read instead, and if it opens the secret is
+///   sealed again under the running platform state, so the sealed copy is
+///   current for the next start. Only when neither copy opens does the sealed
+///   store's status stand, and nothing is invented.
+/// - remove() removes both copies.
+///
+/// Without `durable` (tests) the adapter is the sealed store alone and every
+/// status fails closed.
 class SealedStorageShareStore final : public IStorageShareStore {
 public:
     explicit SealedStorageShareStore(SealedBlobStore& sealed,
-                                     FileStorageShareStore* legacy = nullptr);
+                                     FileStorageShareStore* durable = nullptr);
 
     [[nodiscard]] ShareStoreStatus seal(std::string_view domain,
                                         std::span<const uint8_t> plaintext) override;
@@ -135,8 +158,12 @@ public:
     bool remove(std::string_view domain) override;
 
 private:
+    /// Seals `plaintext` and reads it back; true when the sealed copy opens to
+    /// the same bytes.
+    bool reseal_checked(std::string_view domain, std::span<const uint8_t> plaintext);
+
     SealedBlobStore& sealed_;
-    FileStorageShareStore* legacy_;
+    FileStorageShareStore* durable_;
 };
 
 /// Every share a holder keeps, keyed by the digest of the final plan it

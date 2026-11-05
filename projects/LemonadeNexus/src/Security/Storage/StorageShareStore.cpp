@@ -296,43 +296,100 @@ ShareStoreStatus share_store_status(SealStatus status) {
 }
 
 SealedStorageShareStore::SealedStorageShareStore(SealedBlobStore& sealed,
-                                                 FileStorageShareStore* legacy)
-    : sealed_(sealed), legacy_(legacy) {}
+                                                 FileStorageShareStore* durable)
+    : sealed_(sealed), durable_(durable) {}
+
+bool SealedStorageShareStore::reseal_checked(std::string_view domain,
+                                             std::span<const uint8_t> plaintext) {
+    if (sealed_.seal(domain, plaintext).status != SealStatus::Ok) {
+        return false;
+    }
+    auto check = sealed_.unseal(domain);
+    return check.status == SealStatus::Ok && check.plaintext.size() == plaintext.size() &&
+           sodium_memcmp(check.plaintext.data(), plaintext.data(), plaintext.size()) == 0;
+}
 
 ShareStoreStatus SealedStorageShareStore::seal(std::string_view domain,
                                                std::span<const uint8_t> plaintext) {
-    return share_store_status(sealed_.seal(domain, plaintext).status);
+    if (durable_ == nullptr) {
+        return share_store_status(sealed_.seal(domain, plaintext).status);
+    }
+    // The durable copy first: it is the copy that survives a TPM that loses
+    // its state, so Ok must mean that copy is on disk.
+    const auto durable = durable_->seal(domain, plaintext);
+    if (durable != ShareStoreStatus::Ok) {
+        return durable;
+    }
+    const auto sealed = sealed_.seal(domain, plaintext);
+    if (sealed.status != SealStatus::Ok) {
+        spdlog::warn("[storage] the storage share is on disk under the machine-bound wrapping, "
+                     "but sealing it failed ({}); it is sealed again at the next start",
+                     seal_status_name(sealed.status));
+    }
+    return ShareStoreStatus::Ok;
 }
 
 ShareUnsealResult SealedStorageShareStore::unseal(std::string_view domain) {
     auto reply = sealed_.unseal(domain);
-    if (reply.status == SealStatus::Missing && legacy_ != nullptr) {
-        auto legacy = legacy_->unseal(domain);
-        if (legacy.status != ShareStoreStatus::Ok) {
-            return {legacy.status, {}};
-        }
-        // Move the share into the sealed store. The legacy copy goes only
-        // after the sealed copy unseals to the same bytes.
-        if (sealed_.seal(domain, legacy.plaintext.span()).status != SealStatus::Ok) {
-            spdlog::warn("[storage] the legacy share could not be sealed; using the file copy");
-            return legacy;
-        }
-        auto check = sealed_.unseal(domain);
-        if (check.status == SealStatus::Ok && check.plaintext.size() == legacy.plaintext.size() &&
-            sodium_memcmp(check.plaintext.data(), legacy.plaintext.data(),
-                          legacy.plaintext.size()) == 0) {
-            (void)legacy_->remove(domain);
-            spdlog::info("[storage] the storage share moved into the sealed store");
-        }
-        return legacy;
+    if (durable_ == nullptr) {
+        return {share_store_status(reply.status), std::move(reply.plaintext)};
     }
-    return {share_store_status(reply.status), std::move(reply.plaintext)};
+    if (reply.status == SealStatus::Ok) {
+        // The sealed copy is current. A durable copy that is missing (the
+        // first start after the release that added it) or does not open (a
+        // damaged file) is rewritten from it; a planted plaintext file is
+        // overwritten the same way, never read.
+        auto durable = durable_->unseal(domain);
+        const bool same = durable.status == ShareStoreStatus::Ok &&
+                          durable.plaintext.size() == reply.plaintext.size() &&
+                          sodium_memcmp(durable.plaintext.data(), reply.plaintext.data(),
+                                        reply.plaintext.size()) == 0;
+        if (!same) {
+            if (durable_->seal(domain, reply.plaintext.span()) == ShareStoreStatus::Ok) {
+                spdlog::info("[storage] wrote the machine-bound copy of the storage share "
+                             "(the durable copy was {})",
+                             durable.status == ShareStoreStatus::Missing ? "missing"
+                                                                          : "not readable");
+            } else {
+                spdlog::warn("[storage] the machine-bound copy of the storage share could "
+                             "not be written; only the sealed copy exists");
+            }
+        }
+        return {ShareStoreStatus::Ok, std::move(reply.plaintext)};
+    }
+    // The sealed copy does not open: nothing sealed yet, a TPM that lost its
+    // state (Corrupt), a boot chain the blob is not bound to (PolicyMismatch),
+    // or no sealing on this start. The durable copy is the recovery path.
+    auto durable = durable_->unseal(domain);
+    if (durable.status != ShareStoreStatus::Ok) {
+        if (durable.status == ShareStoreStatus::Missing) {
+            return {share_store_status(reply.status), {}};
+        }
+        return {durable.status, {}};
+    }
+    if (reply.status != SealStatus::Missing) {
+        spdlog::warn("[storage] the sealed storage share does not open ({}); using the "
+                     "machine-bound copy and sealing it again",
+                     seal_status_name(reply.status));
+    }
+    if (reply.status == SealStatus::Unreachable) {
+        // The daemon may still be starting; the next start seals it.
+        return durable;
+    }
+    if (reseal_checked(domain, durable.plaintext.span())) {
+        spdlog::info("[storage] the storage share is sealed again under the running "
+                     "platform state");
+    } else {
+        spdlog::warn("[storage] the storage share could not be sealed; the machine-bound "
+                     "copy stands until the next start");
+    }
+    return durable;
 }
 
 bool SealedStorageShareStore::remove(std::string_view domain) {
     const bool sealed_gone = sealed_.remove(domain);
-    const bool legacy_gone = legacy_ == nullptr || legacy_->remove(domain);
-    return sealed_gone && legacy_gone;
+    const bool durable_gone = durable_ == nullptr || durable_->remove(domain);
+    return sealed_gone && durable_gone;
 }
 
 }  // namespace nexus::security
