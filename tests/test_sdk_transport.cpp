@@ -1231,6 +1231,39 @@ TEST_F(SdkMeshPrivateApiTest, ATreeRefusalFromTheSessionServerStartsTheMove) {
     EXPECT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
 }
 
+// lemond reaches the private API through call_private_api(). Once the session's
+// server left Tier 1, that path verifies the membership again and reads the
+// identity under the client mutex; the call must not hold that mutex itself, or
+// it waits on itself for ever and every other client call queues behind it.
+TEST_F(SdkMeshPrivateApiTest, ACApiPrivateCallReturnsWhenTheSessionServerLeftTier1) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    ASSERT_TRUE(client->mesh_heartbeat(kNodeId, "").ok);
+    ASSERT_NO_FATAL_FAILURE(server_leaves_tier1(*client));
+
+    auto call = std::async(std::launch::async, [&] {
+        return client->call_private_api("GET", std::string("/api/mesh/peers/") + kNodeId, "");
+    });
+    if (call.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
+        // The call holds the client mutex against itself. Its thread never ends,
+        // so the fixture cannot be torn down either: end the process.
+        ADD_FAILURE() << "call_private_api did not return after the session's server left Tier 1";
+        std::_Exit(EXIT_FAILURE);
+    }
+    const auto refused = call.get();
+    EXPECT_FALSE(refused.ok);
+
+    // The refusal started the move, and the moved session serves the next call.
+    ASSERT_TRUE(wait_for([&] { return moves().size() == 1; }, std::chrono::seconds(20)));
+    EXPECT_TRUE(moves().front().silent) << moves().front().error;
+    EXPECT_EQ(client->session_token(), "session-token-2");
+    const auto served = client->call_private_api("GET", std::string("/api/mesh/peers/") + kNodeId, "");
+    EXPECT_TRUE(served.ok) << served.error;
+}
+
 // Without an identity the SDK cannot authenticate by itself, so it keeps the
 // earlier behavior: the session is dropped, needs_rejoin is set, the move is
 // reported as not silent, and join_network() authenticates afresh instead of
