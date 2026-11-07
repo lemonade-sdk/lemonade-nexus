@@ -170,8 +170,9 @@ data/
 ├── attestation/           # Evidence cache
 ├── security/              # Durable security stores
 │   ├── epoch store (bootstrap cert, current epoch, authority history)
-│   ├── hotstuff-safety-<epoch>.json / hotstuff-commit-<epoch>.json
-│   ├── hotstuff-chain-<epoch>.json  # block headers the high certificate names
+│   ├── hotstuff-safety-<epoch>.json / .b.json  # vote record slots: safety
+│   │                          # state plus the block headers its certificate names
+│   ├── hotstuff-commit-<epoch>.json / .b.json  # latest commit, two slots
 │   ├── eligibility store
 │   └── revocation/        # AMD KDS CRL cache
 ├── acl.db                 # SQLite ACL store (application state)

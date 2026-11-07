@@ -18,8 +18,11 @@
 
 #include "support/tier1_chain.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <optional>
 #include <string>
 #include <vector>
@@ -240,6 +243,40 @@ TEST_F(SdkTier1Test, TheVerifiedListHoldsOnlyCurrentMembersThatProvedTheirEndpoi
     EXPECT_EQ(hosts, (std::vector<std::string>{"t1a.example", "t1b.example"}));
     EXPECT_TRUE(dir.is_verified_member(b64(epoch2[0].public_key)));
     EXPECT_FALSE(dir.is_verified_member(b64(epoch1[4].public_key)));
+}
+
+// The endpoint proofs go out to every candidate at once: a refresh costs one
+// proof round trip, not one per member.
+TEST_F(SdkTier1Test, EndpointProofsAreAskedOfEveryCandidateAtOnce) {
+    std::atomic<int> in_flight{0};
+    std::atomic<int> peak{0};
+    lnsdk::Tier1Directory dir(
+        [this, &in_flight, &peak](const lnsdk::ServerEndpoint& ep, const std::string& path) {
+            const bool proof = path.rfind("/api/tier1/proof", 0) == 0;
+            if (proof) {
+                const int now = ++in_flight;
+                int seen = peak.load();
+                while (seen < now && !peak.compare_exchange_weak(seen, now)) {
+                }
+                // Long enough that one-by-one proofs could never overlap.
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            std::optional<lnsdk::HttpReply> reply;
+            {
+                std::lock_guard lock(mutex);
+                reply = net.get(ep, path);
+            }
+            if (proof) --in_flight;
+            return reply;
+        });
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    const auto refreshed = dir.refresh(seed("t2.example"));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    std::vector<std::string> hosts;
+    for (const auto& s : refreshed.value.servers) hosts.push_back(s.host);
+    EXPECT_EQ(hosts, (std::vector<std::string>{"t1a.example", "t1b.example"}))
+        << "the verified list keeps the candidate order";
+    EXPECT_GE(peak.load(), 2) << "the proofs were asked one after another";
 }
 
 TEST_F(SdkTier1Test, TreeRequestsGoOnlyToVerifiedTier1ServersAndFailOver) {

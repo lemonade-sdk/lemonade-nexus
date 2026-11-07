@@ -18,7 +18,10 @@
 #include <LemonadeNexus/Security/Consensus/HotStuffState.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 
+#include <array>
+#include <cstdint>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <variant>
 
@@ -46,12 +49,13 @@ public:
 
     [[nodiscard]] virtual std::optional<ConsensusCommit> latest_commit(EpochId epoch) const = 0;
 
-    /// Stores the certified blocks below the high certificate: the
-    /// uncommitted chain, oldest first, with `chain.certifying` over its last
-    /// block. Replaces the previous chain record of `epoch`. False when the
-    /// chain is empty, longer than kMaxSyncChainBlocks, or not on disk; the
-    /// caller then MUST NOT store a safety state that names the new high
-    /// certificate.
+    /// Takes the certified blocks below the high certificate: the uncommitted
+    /// chain, oldest first, with `chain.certifying` over its last block. The
+    /// chain reaches disk inside the next store_before_vote record of
+    /// `epoch`, so the blocks and the safety state that names their
+    /// certificate land together. False when the chain is empty or longer
+    /// than kMaxSyncChainBlocks; the caller then MUST NOT store a safety
+    /// state that names the new high certificate.
     [[nodiscard]] virtual bool store_chain(EpochId epoch, const CertifiedChain& chain) = 0;
 
     /// The stored chain of `epoch`. Absent: nothing stored, for example state
@@ -62,13 +66,23 @@ public:
         EpochId epoch) const = 0;
 };
 
-// One directory, one file per epoch and kind:
-//   hotstuff-safety-<epoch>.json
-//   hotstuff-commit-<epoch>.json
-//   hotstuff-chain-<epoch>.json
-// The chain file holds block headers and certificates only, never a block
-// payload: the store must be readable before the data key unlocks, and a
-// payload can carry application data the storage vault keeps encrypted.
+// One directory, two slot files per epoch and kind:
+//   hotstuff-safety-<epoch>.json and hotstuff-safety-<epoch>.b.json
+//   hotstuff-commit-<epoch>.json and hotstuff-commit-<epoch>.b.json
+// A record carries a `seq` counter; each write goes over the older slot in
+// place with one device sync (write_slot_durable), and a load takes the newest
+// slot that validates. A slot that does not validate is a write a crash tore
+// before it completed, so no vote relied on it; when no slot validates the
+// store is Corrupt. The vote record also carries the certified chain, so the
+// blocks and the safety state that names their certificate reach disk in one
+// write. hotstuff-chain-<epoch>.json is the chain record of earlier releases,
+// read only while no vote record of the new layout exists.
+// A record never holds a block payload: the store must be readable before the
+// data key unlocks, and a payload can carry application data the storage vault
+// keeps encrypted.
+// The first slot keeps the file name and keys of the earlier release; the
+// added `seq` and `chain` keys make that release read it as Corrupt, so a
+// rollback stops voting instead of voting twice.
 class FileConsensusStore final : public IConsensusStore {
 public:
     // Creates the directory when it does not exist.
@@ -92,11 +106,19 @@ public:
         EpochId epoch) const override;
 
 private:
-    [[nodiscard]] std::filesystem::path safety_path(EpochId epoch) const;
-    [[nodiscard]] std::filesystem::path commit_path(EpochId epoch) const;
+    struct VoteRecord;
+    struct CommitRecord;
+    [[nodiscard]] std::array<std::filesystem::path, 2> safety_slots(EpochId epoch) const;
+    [[nodiscard]] std::array<std::filesystem::path, 2> commit_slots(EpochId epoch) const;
     [[nodiscard]] std::filesystem::path chain_path(EpochId epoch) const;
+    /// The newest vote record of `epoch` that validates, Absent when no slot
+    /// exists, Corrupt when slots exist and none validates.
+    [[nodiscard]] std::variant<VoteRecord, LoadResult> newest_vote_record(EpochId epoch) const;
 
     std::filesystem::path directory_;
+    /// The chain store_chain took for each epoch, written with every vote
+    /// record of that epoch from then on.
+    std::map<uint64_t, CertifiedChain> chain_;
 };
 
 }  // namespace nexus::security

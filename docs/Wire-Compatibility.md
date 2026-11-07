@@ -88,6 +88,20 @@ the old binary as an invalid baseline.
   - A member that restarts on N+1 without the file takes the blocks from its
     running peers through restart sync and writes the file with its next
     vote.
+- **Vote record slots.** A Tier 1 server writes one record per vote:
+  `security/consensus/hotstuff-safety-<epoch>.json` and
+  `hotstuff-safety-<epoch>.b.json`, alternating, each written in place with
+  one device sync. The record is the safety state of before with a `seq`
+  counter and the certified chain inside (`chain`), so a vote costs one sync
+  instead of the four of two temp-file replacements. `hotstuff-commit-<epoch>`
+  has the same two slots. The reader takes the newest slot that validates; a
+  slot a crash tore is a write no vote relied on.
+  - N+1 loads the safety, commit and chain files of N in place; its first
+    vote writes the second slot and leaves the files of N as they are.
+  - N reads a slot record as Corrupt (unknown keys) and stops voting. A
+    rollback to N therefore needs the operator to remove the `seq` and
+    `chain` keys from the newest `hotstuff-safety-<epoch>` slot and store it
+    under the first slot's name; it never votes twice.
   - Install order: update the Tier 1 members one at a time, and let each one
     rejoin and vote before the next one stops (the normal rollout order). Do
     not restart the whole committee together until every member ran N+1 and
