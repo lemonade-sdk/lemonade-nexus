@@ -129,8 +129,13 @@ class Settings {
   final String genesisKey;
 
   /// The highest Tier 1 epoch this app verified. The SDK refuses an older
-  /// membership after a restart.
+  /// membership of the same chain after a restart.
   final int tier1MinEpoch;
+
+  /// The chain instance [tier1MinEpoch] belongs to (the membership's
+  /// `chain`). Empty until a membership is verified; a network founded again
+  /// has another chain and is reported, not followed.
+  final String tier1Chain;
 
   const Settings({
     this.serverHost = 'localhost',
@@ -141,6 +146,7 @@ class Settings {
     this.darkModeEnabled = true,
     this.genesisKey = '',
     this.tier1MinEpoch = 0,
+    this.tier1Chain = '',
   });
 
   Settings copyWith({
@@ -152,6 +158,7 @@ class Settings {
     bool? darkModeEnabled,
     String? genesisKey,
     int? tier1MinEpoch,
+    String? tier1Chain,
   }) {
     return Settings(
       serverHost: serverHost ?? this.serverHost,
@@ -162,6 +169,7 @@ class Settings {
       darkModeEnabled: darkModeEnabled ?? this.darkModeEnabled,
       genesisKey: genesisKey ?? this.genesisKey,
       tier1MinEpoch: tier1MinEpoch ?? this.tier1MinEpoch,
+      tier1Chain: tier1Chain ?? this.tier1Chain,
     );
   }
 
@@ -592,7 +600,12 @@ class AppNotifier extends StateNotifier<AppState> {
       return;
     }
     try {
-      _sdk.setGenesisKey(key, minEpoch: state.settings.tier1MinEpoch);
+      // The floor names its chain; a floor stored before the chain was
+      // recorded is dropped rather than applied to any chain.
+      _sdk.setGenesisKey(key);
+      if (state.settings.tier1Chain.isNotEmpty) {
+        _sdk.setEpochFloor(state.settings.tier1Chain, state.settings.tier1MinEpoch);
+      }
     } catch (e) {
       _log('connectToServer: network key refused -> $e');
       addActivity(ActivityLevel.error, 'The network key is not valid: $e');
@@ -643,6 +656,7 @@ class AppNotifier extends StateNotifier<AppState> {
       settings: state.settings.copyWith(
         genesisKey: trimmed,
         tier1MinEpoch: changed ? 0 : state.settings.tier1MinEpoch,
+        tier1Chain: changed ? '' : state.settings.tier1Chain,
       ),
     );
     await _persistSettings();
@@ -651,19 +665,31 @@ class AppNotifier extends StateNotifier<AppState> {
     }
   }
 
-  /// Remember the verified Tier 1 epoch, so a later run refuses an older one.
-  /// Reads the SDK's last verified membership (no network I/O) and saves the
-  /// epoch next to the network key when it grows; it never shrinks.
+  /// Remember the verified Tier 1 epoch and its chain, so a later run refuses
+  /// an older membership of that chain. Reads the SDK's last verified
+  /// membership (no network I/O) and saves the epoch next to the network key
+  /// when it grows; it never shrinks. A membership of another chain under the
+  /// same key means the network was founded again: the SDK does not follow it,
+  /// and the user is told to leave the network and join it again.
   Future<void> _recordTier1Epoch() async {
     try {
       final membership = await _sdk.tier1Membership();
+      if (membership['refounded'] == true) {
+        addActivity(ActivityLevel.error,
+            'The network was founded again. Leave the network and join it '
+            'with a new invitation.');
+        return;
+      }
       final stored = state.settings.tier1MinEpoch;
       final epoch = nextTier1MinEpoch(stored, membership['epoch']);
-      if (epoch != stored) {
+      final chain = membership['chain'];
+      if (epoch != stored && chain is String && chain.isNotEmpty) {
         state = state.copyWith(
-            settings: state.settings.copyWith(tier1MinEpoch: epoch));
+            settings: state.settings
+                .copyWith(tier1MinEpoch: epoch, tier1Chain: chain));
         await _persistSettings();
-        _log('_recordTier1Epoch: Tier 1 epoch floor is now $epoch');
+        _log('_recordTier1Epoch: Tier 1 epoch floor is now $epoch on chain '
+            '${chain.substring(0, 12)}');
       }
     } catch (e) {
       _log('_recordTier1Epoch: $e');

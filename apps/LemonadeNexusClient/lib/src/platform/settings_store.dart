@@ -16,6 +16,7 @@ class SettingsStore {
   static const _kThemeMode = 'themeMode';
   static const _kGenesisKey = 'genesisKey';
   static const _kTier1MinEpoch = 'tier1MinEpoch';
+  static const _kTier1Chain = 'tier1Chain';
 
   Future<Settings> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -29,6 +30,7 @@ class SettingsStore {
       darkModeEnabled: prefs.getBool(_kDarkMode) ?? defaults.darkModeEnabled,
       genesisKey: prefs.getString(_kGenesisKey) ?? defaults.genesisKey,
       tier1MinEpoch: prefs.getInt(_kTier1MinEpoch) ?? defaults.tier1MinEpoch,
+      tier1Chain: prefs.getString(_kTier1Chain) ?? defaults.tier1Chain,
     );
   }
 
@@ -42,6 +44,7 @@ class SettingsStore {
     await prefs.setBool(_kDarkMode, s.darkModeEnabled);
     await prefs.setString(_kGenesisKey, s.genesisKey);
     await prefs.setInt(_kTier1MinEpoch, s.tier1MinEpoch);
+    await prefs.setString(_kTier1Chain, s.tier1Chain);
   }
 
   Future<ThemeMode> loadThemeMode() async {

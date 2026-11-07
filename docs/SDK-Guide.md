@@ -144,6 +144,7 @@ deprecated stub that always fails; use an Ed25519 identity.
 | C++ | C | Purpose |
 |---|---|---|
 | `set_genesis_key(b64, min_epoch)` | `ln_set_genesis_key(client, b64, min_epoch)` | Pin the Genesis key and the lowest epoch to accept |
+| `set_epoch_floor(chain, min_epoch)` | `ln_set_epoch_floor(client, chain, min_epoch)` | The lowest epoch to accept for the stored chain; another chain under the key is reported as re-founded (`refounded`) |
 | `discover_genesis_key(hosts)` | `ln_discover_genesis_key(client, hosts_json, &json)` | First connect only: pin the key that at least 3 servers in the network domain agree on (trust on first use) |
 | `discover_servers(domain, region, port)` | `ln_discover_servers(domain, region, port, &json)` | Bootstrap without a configured host: resolve `<region>.seip.<domain>` and read each server's certificate name; the names are candidates for `ln_create_tls`, not trusted servers |
 | `refresh_tier1()` | `ln_tier1_refresh(client, &json)` | Verify the membership now |
