@@ -21,6 +21,7 @@
 #include <sodium.h>
 
 #include <chrono>
+#include <cstdio>
 #include <string>
 #include <thread>
 
@@ -120,6 +121,102 @@ TEST(VirtualE2E, HttpOverUserspaceMeshTunnel) {
     EXPECT_EQ(res->body, "pong");
 
     // Teardown.
+    client_dp.stop();
+    server_dp.stop();
+    client_vnet.stop();
+    server_vnet.stop();
+    api.stop();
+    if (api_thread.joinable()) api_thread.join();
+}
+
+// A bulk transfer in each direction through the same tunnel, with the TCP
+// buffer the SDK uses. Loopback has no round-trip delay, so this measures the
+// packet path (encrypt, UDP, decrypt, smoltcp, bridge), not the window; the
+// rate is printed for that reason and only completion is asserted.
+TEST(VirtualE2E, BulkTransferOverUserspaceMeshTunnel) {
+    ASSERT_GE(sodium_init(), 0);
+    constexpr size_t kBlob = 64u << 20;
+    const std::string blob(kBlob, 'b');
+
+    httplib::Server api;
+    api.Get("/blob", [&blob](const httplib::Request&, httplib::Response& res) {
+        res.set_content(blob, "application/octet-stream");
+    });
+    api.Post("/sink", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_content(std::to_string(req.body.size()), "text/plain");
+    });
+    api.set_payload_max_length(kBlob + 1024);
+    int api_port = api.bind_to_any_port("127.0.0.1");
+    ASSERT_GT(api_port, 0);
+    std::thread api_thread([&api] { api.listen_after_bind(); });
+
+    Keypair server_keys = make_keypair();
+    Keypair client_keys = make_keypair();
+    nexus::network::VirtualNetConfig vnet_cfg;
+    vnet_cfg.tcp_buffer = 1u << 20;
+
+    UserspaceDataplane server_dp;
+    VirtualNetService  server_vnet(vnet_cfg);
+    server_vnet.start();
+    server_dp.set_inbound_handler(
+        [&](std::span<const uint8_t> p) { server_vnet.deliver_inbound_ip_packet(p); });
+    server_vnet.set_outbound_sink(
+        [&](std::span<const uint8_t> p) { server_dp.send_outbound_ip_packet(p); });
+    ASSERT_TRUE(server_dp.start({server_keys.priv_b64, server_keys.pub_b64, 0, 2}));
+    server_dp.add_local_ip(0x0A400001u);
+    server_vnet.add_local_ip("10.64.0.1/10");
+    ASSERT_TRUE(server_dp.add_peer(client_keys.pub_b64, "10.64.0.2/32", ""));
+    ASSERT_TRUE(server_vnet.add_tcp_forward(
+        "10.64.0.1", 80, "tcp:127.0.0.1:" + std::to_string(api_port)));
+
+    UserspaceDataplane client_dp;
+    VirtualNetService  client_vnet(vnet_cfg);
+    client_vnet.start();
+    client_dp.set_inbound_handler(
+        [&](std::span<const uint8_t> p) { client_vnet.deliver_inbound_ip_packet(p); });
+    client_vnet.set_outbound_sink(
+        [&](std::span<const uint8_t> p) { client_dp.send_outbound_ip_packet(p); });
+    ASSERT_TRUE(client_dp.start({client_keys.priv_b64, client_keys.pub_b64, 0, 2}));
+    client_dp.add_local_ip(0x0A400002u);
+    client_vnet.add_local_ip("10.64.0.2/10");
+    ASSERT_TRUE(client_dp.add_peer(server_keys.pub_b64, "10.64.0.0/10",
+                                   "127.0.0.1:" + std::to_string(server_dp.bound_port())));
+    uint16_t egress_port = client_vnet.add_tcp_egress("10.64.0.1", 80, "10.64.0.2");
+    ASSERT_NE(egress_port, 0);
+    std::this_thread::sleep_for(200ms);
+
+    httplib::Client client("127.0.0.1", egress_port);
+    client.set_connection_timeout(10, 0);
+    client.set_read_timeout(120, 0);
+    client.set_write_timeout(120, 0);
+
+    const auto rate = [](size_t bytes, std::chrono::steady_clock::duration took) {
+        const double seconds = std::chrono::duration<double>(took).count();
+        return seconds > 0 ? static_cast<double>(bytes) / seconds / 1e6 : 0.0;
+    };
+
+    size_t received = 0;
+    auto start = std::chrono::steady_clock::now();
+    auto down = client.Get("/blob", [&received](const char*, size_t n) {
+        received += n;
+        return true;
+    });
+    auto took = std::chrono::steady_clock::now() - start;
+    ASSERT_TRUE(down) << "no download over the userspace tunnel";
+    EXPECT_EQ(down->status, 200);
+    EXPECT_EQ(received, kBlob);
+    std::printf("download: 64 MiB in %.2f s = %.1f MB/s\n",
+                std::chrono::duration<double>(took).count(), rate(received, took));
+
+    start = std::chrono::steady_clock::now();
+    auto up = client.Post("/sink", blob, "application/octet-stream");
+    took = std::chrono::steady_clock::now() - start;
+    ASSERT_TRUE(up) << "no upload over the userspace tunnel";
+    EXPECT_EQ(up->status, 200);
+    EXPECT_EQ(up->body, std::to_string(kBlob));
+    std::printf("upload: 64 MiB in %.2f s = %.1f MB/s\n",
+                std::chrono::duration<double>(took).count(), rate(kBlob, took));
+
     client_dp.stop();
     server_dp.stop();
     client_vnet.stop();
