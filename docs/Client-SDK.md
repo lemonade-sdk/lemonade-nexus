@@ -120,10 +120,20 @@ waits. The Flutter plugin exposes it as `tier1Progress`.
 Without a pinned key, a chain that does not verify, a stale epoch, or no
 reachable verified server, the SDK sends no tree request: the call fails with
 `http_status` 0 (`LN_ERR_CONNECT`) and an error that says why. Store the
-returned `epoch` and pass it as `min_epoch` on the next start: the SDK then
-refuses an older membership. A client with no stored epoch can be held at an
+returned `epoch` and `chain` and pass both to `set_epoch_floor` /
+`ln_set_epoch_floor` on the next start: the SDK then refuses an older
+membership of that chain. A client with no stored epoch can be held at an
 old epoch only if every server it reaches withholds the newer handoffs and
-every member it reaches signs the older epoch.
+every member it reaches signs the older epoch. Catching up has no limit: a
+client that was away for any number of epochs pages the chain forward.
+
+`chain` names the chain instance (the Epoch 1 anchor). Genesis signs one
+Epoch 1; a network founded again after losing its data is another chain under
+the same key. When the servers serve another chain, the refresh fails with
+`http_status` 409 and `refounded: true` in `ln_tier1_refresh` and
+`ln_tier1_membership`; the SDK neither applies the stored floor to that chain
+nor adopts it. The application tells the user to leave the network and join it
+again, which clears the stored floor with the account.
 
 ## Direct Paths (Hole Punching)
 

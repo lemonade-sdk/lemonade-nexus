@@ -75,7 +75,16 @@ void Tier1ApiHandler::do_register_routes(httplib::Server& pub,
             // store: a 404 is how an empty or stale replica announces
             // itself, so the requested epoch goes to the log.
             spdlog::debug("[Tier1Api] authority: no chain after have_epoch={}", have_epoch);
-            error_response(res, "no authority chain after this epoch", 404);
+            // The latest epoch lets a client that is ahead of this chain
+            // tell a short store from another chain under the same Genesis
+            // key (a network founded again), without a second request.
+            nlohmann::json body{{"error", "no authority chain after this epoch"}};
+            if (ctx_.authority_latest_epoch) {
+                if (const auto latest = ctx_.authority_latest_epoch(); latest > 0) {
+                    body["latest_epoch"] = latest;
+                }
+            }
+            json_response(res, body, 404);
             return;
         }
         const auto decoded = security::decode_authority_chain_page(

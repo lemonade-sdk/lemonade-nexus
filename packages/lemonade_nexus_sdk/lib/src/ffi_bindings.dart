@@ -190,6 +190,16 @@ typedef _LnSetGenesisKeyDart = int Function(
   ffi.Pointer<ffi.Char> genesisPubkeyB64,
   int minEpoch,
 );
+typedef _LnSetEpochFloor = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> chain,
+  ffi.Uint64 minEpoch,
+);
+typedef _LnSetEpochFloorDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> chain,
+  int minEpoch,
+);
 typedef _LnTier1Json = ffi.Int32 Function(
   LnClientHandle client,
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
@@ -981,6 +991,15 @@ class LemonadeNexusFfi {
       return null;
     }
   }();
+  // Not in requiredSymbols: a native library that predates it keeps the
+  // chain-less floor behaviour (setEpochFloor returns null).
+  late final _LnSetEpochFloorDart? _lnSetEpochFloor = () {
+    try {
+      return _lib.lookupFunction<_LnSetEpochFloor, _LnSetEpochFloorDart>('ln_set_epoch_floor');
+    } on ArgumentError {
+      return null;
+    }
+  }();
   late final _lnDiscoverGenesisKey =
       _lib.lookupFunction<_LnDiscoverGenesisKey, _LnDiscoverGenesisKeyDart>(
           'ln_discover_genesis_key');
@@ -1432,6 +1451,18 @@ class LemonadeNexusFfi {
     final key = genesisPubkeyB64.toNativeUtf8().cast<ffi.Char>();
     final result = _lnSetGenesisKey(client, key, minEpoch);
     malloc.free(key);
+    return LnError.fromCode(result);
+  }
+
+  /// The lowest epoch to accept for the chain instance [chain] (64 hex digits,
+  /// a membership's `chain`). Null when the native library predates
+  /// ln_set_epoch_floor.
+  LnError? setEpochFloor(LnClientHandle client, String chain, int minEpoch) {
+    final call = _lnSetEpochFloor;
+    if (call == null) return null;
+    final text = chain.toNativeUtf8().cast<ffi.Char>();
+    final result = call(client, text, minEpoch);
+    malloc.free(text);
     return LnError.fromCode(result);
   }
 

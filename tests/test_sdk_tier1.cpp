@@ -51,6 +51,9 @@ struct FakeServer {
     bool down = false;
     /// Serves up to max_links links per page, as servers since max_links do.
     bool large_pages = true;
+    /// Names its latest epoch when it has nothing after have_epoch, as
+    /// servers do now; false for a server from before that.
+    bool hints_latest = true;
 };
 
 class FakeNetwork {
@@ -81,7 +84,11 @@ public:
                                               sec::constants::kMaxHttpChainLinks);
             }
             const auto page = s.chain->page_after(have, s.known_epochs, links);
-            if (!page) return lnsdk::HttpReply{404, R"({"error":"none"})"};
+            if (!page) {
+                json none{{"error", "none"}};
+                if (s.hints_latest) none["latest_epoch"] = s.known_epochs;
+                return lnsdk::HttpReply{404, none.dump()};
+            }
             const auto bytes = sec::encode_authority_chain_page(*page, links);
             return lnsdk::HttpReply{
                 200, json{{"have_epoch", have}, {"page", nexus::crypto::to_base64(bytes)}}.dump()};
@@ -637,8 +644,161 @@ TEST_F(SdkTier1Test, TheClientSendsNoTreeCallWithoutAVerifiedTier1Server) {
     EXPECT_EQ(ln_tier1_refresh(c, &out), LN_ERR_CONNECT);
     ASSERT_NE(out, nullptr);
     EXPECT_TRUE(json::parse(out).contains("error"));
+    EXPECT_FALSE(json::parse(out)["refounded"].get<bool>());
     ln_free(out);
+    EXPECT_EQ(ln_set_epoch_floor(c, "not hex", 1), LN_ERR_REJECTED);
+    EXPECT_EQ(ln_set_epoch_floor(c, std::string(64, 'a').c_str(), 1), LN_OK);
+    EXPECT_EQ(ln_set_epoch_floor(nullptr, "", 1), LN_ERR_NULL_ARG);
     ln_destroy(c);
+}
+
+namespace {
+
+/// The chain instance id a membership reports: the Epoch 1 anchor.
+std::string anchor_hex(const Chain& chain) {
+    return nexus::crypto::to_hex(sec::bootstrap_certificate_signing_digest(chain.certificate));
+}
+
+}  // namespace
+
+// Genesis signs one Epoch 1. A network founded again under the same key is
+// another chain: a device that stored a floor for the first chain is told
+// so, the floor is not applied to the new chain, and the new chain is not
+// adopted.
+TEST_F(SdkTier1Test, AReFoundedNetworkIsReportedNotAdopted) {
+    const Chain refounded = Chain::make({epoch1}, chain.genesis);
+    for (auto& [host, server] : net.servers) {
+        server.chain = &refounded;
+        server.known_epochs = 1;
+        server.proof_epoch = 1;
+    }
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    ASSERT_TRUE(dir.set_epoch_floor(anchor_hex(chain), 131));
+    const auto refreshed = dir.refresh(seed("t2.example"));
+    EXPECT_FALSE(refreshed.ok);
+    EXPECT_EQ(refreshed.http_status, 409);
+    EXPECT_NE(refreshed.error.find("re-founded"), std::string::npos) << refreshed.error;
+    EXPECT_NE(refreshed.error.find("epoch 131"), std::string::npos) << refreshed.error;
+    EXPECT_TRUE(dir.network_refounded());
+    EXPECT_TRUE(dir.membership().servers.empty());
+
+    // Without a stored chain the floor cannot tell the chains apart: the
+    // older release's stale error stays.
+    auto legacy = directory();
+    ASSERT_TRUE(legacy.set_genesis_key(b64(chain.genesis.public_key), 131));
+    const auto stale = legacy.refresh(seed("t2.example"));
+    EXPECT_FALSE(stale.ok);
+    EXPECT_EQ(stale.http_status, 403);
+    EXPECT_FALSE(legacy.network_refounded());
+}
+
+// A floor for the chain the servers serve still refuses an older list, and a
+// floor the chain meets passes; the membership names the chain.
+TEST_F(SdkTier1Test, AFloorForTheServedChainStillRefusesAnOlderList) {
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    ASSERT_TRUE(dir.set_epoch_floor(anchor_hex(chain), 3));
+    const auto refused = dir.refresh(seed("t2.example"));
+    EXPECT_FALSE(refused.ok);
+    EXPECT_EQ(refused.http_status, 403);
+    EXPECT_NE(refused.error.find("stale"), std::string::npos) << refused.error;
+    EXPECT_FALSE(dir.network_refounded());
+
+    auto met = directory();
+    ASSERT_TRUE(met.set_genesis_key(b64(chain.genesis.public_key)));
+    EXPECT_FALSE(met.set_epoch_floor("not hex", 2));
+    EXPECT_FALSE(met.set_epoch_floor(anchor_hex(chain).substr(2), 2));
+    ASSERT_TRUE(met.set_epoch_floor(anchor_hex(chain), 2));
+    const auto refreshed = met.refresh(seed("t2.example"));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    EXPECT_EQ(refreshed.value.epoch, 2u);
+    EXPECT_EQ(refreshed.value.chain, anchor_hex(chain));
+    EXPECT_EQ(met.membership().chain, anchor_hex(chain));
+}
+
+// A client that verified the old chain in this process hears "nothing new"
+// from servers of the new chain: one base page tells the chains apart, and
+// the restart is reported. When the known chain is served again, the next
+// refresh verifies it and the flag clears.
+TEST_F(SdkTier1Test, AClientThatHoldsTheOldChainNoticesTheRestart) {
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    auto refreshed = dir.refresh(seed("t2.example"));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    EXPECT_EQ(refreshed.value.chain, anchor_hex(chain));
+
+    const Chain refounded = Chain::make({epoch1}, chain.genesis);
+    for (auto& [host, server] : net.servers) {
+        server.chain = &refounded;
+        server.known_epochs = 1;
+        server.proof_epoch = 1;
+    }
+    refreshed = dir.refresh(seed("t2.example"));
+    EXPECT_FALSE(refreshed.ok);
+    EXPECT_EQ(refreshed.http_status, 409);
+    EXPECT_NE(refreshed.error.find("epoch 2 of chain"), std::string::npos) << refreshed.error;
+    EXPECT_NE(refreshed.error.find("at epoch 1"), std::string::npos) << refreshed.error;
+    EXPECT_TRUE(dir.network_refounded());
+    EXPECT_TRUE(dir.membership().servers.empty());
+
+    for (auto& [host, server] : net.servers) {
+        server.chain = &chain;
+        server.known_epochs = 2;
+        server.proof_epoch = 2;
+    }
+    refreshed = dir.refresh(seed("t2.example"));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    EXPECT_EQ(refreshed.value.epoch, 2u);
+    EXPECT_FALSE(dir.network_refounded());
+}
+
+// A server from before the latest-epoch hint answers a bare 404 when it has
+// nothing newer; the client asks it for one base page and still notices the
+// restart. A server that reports a latest epoch at or above the client's is
+// not asked again.
+TEST_F(SdkTier1Test, AServerWithoutTheLatestEpochHintIsAskedForItsBase) {
+    std::vector<std::string> asked;
+    auto dir = lnsdk::Tier1Directory(
+        [&](const lnsdk::ServerEndpoint& ep, const std::string& path) {
+            if (path.starts_with("/api/tier1/authority")) asked.push_back(path);
+            std::lock_guard lock(mutex);
+            return net.get(ep, path);
+        });
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    ASSERT_TRUE(dir.refresh(seed("t2.example")).ok);
+    asked.clear();
+    ASSERT_TRUE(dir.refresh(seed("t2.example")).ok);
+    EXPECT_EQ(asked.size(), 1u) << "an up-to-date server costs one request";
+
+    const Chain refounded = Chain::make({epoch1}, chain.genesis);
+    for (auto& [host, server] : net.servers) {
+        server.chain = &refounded;
+        server.known_epochs = 1;
+        server.proof_epoch = 1;
+        server.hints_latest = false;
+    }
+    asked.clear();
+    const auto refreshed = dir.refresh(seed("t2.example"));
+    EXPECT_FALSE(refreshed.ok);
+    EXPECT_EQ(refreshed.http_status, 409);
+    EXPECT_TRUE(dir.network_refounded());
+    ASSERT_GE(asked.size(), 2u);
+    EXPECT_EQ(asked[1], "/api/tier1/authority?have_epoch=0&max_links=1");
+}
+
+// Changing the pinned key drops the floor and the known chain: epochs of one
+// Genesis say nothing about another.
+TEST_F(SdkTier1Test, ANewGenesisKeyDropsTheFloorAndTheKnownChain) {
+    const Chain other = Chain::make({epoch1});
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(other.genesis.public_key)));
+    ASSERT_TRUE(dir.set_epoch_floor(anchor_hex(other), 131));
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    const auto refreshed = dir.refresh(seed("t2.example"));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    EXPECT_EQ(refreshed.value.epoch, 2u);
+    EXPECT_FALSE(dir.network_refounded());
 }
 
 // ---------------------------------------------------------------------------

@@ -446,6 +446,7 @@ protected:
     std::atomic<bool> holds_tree{false};
     crypto::Ed25519Keypair identity_kp{};
     std::function<std::vector<uint8_t>(uint64_t, std::size_t)> chain_pages;
+    uint64_t latest_epoch = 0;  // the authority route's latest_epoch hint
     std::function<std::optional<api::Tier1Identity>()> identity;
 
     void SetUp() override {
@@ -503,6 +504,7 @@ protected:
             .authority_chain_page = [this](uint64_t have, std::size_t max_links) {
                 return chain_pages ? chain_pages(have, max_links) : std::vector<uint8_t>{};
             },
+            .authority_latest_epoch = [this] { return latest_epoch; },
             .tier1_identity = [this] {
                 return identity ? identity() : std::optional<api::Tier1Identity>{};
             },
@@ -723,9 +725,19 @@ TEST_F(TreeRouteHttpTest, AnyServerServesTheAuthorityChainAsCandidateData) {
     security::AuthorityChainWalker walker(chain.genesis.public_key);
     EXPECT_EQ(walker.apply(*page), security::ChainPageResult::Advanced);
 
+    // Nothing after the latest epoch: the 404 names that epoch, so a client
+    // that holds a longer chain of another Epoch 1 under the same key can
+    // tell a short store from a network founded again.
+    latest_epoch = 1;
     auto none = send("GET", "/api/tier1/authority?have_epoch=1");
     ASSERT_TRUE(none);
     EXPECT_EQ(none->status, 404);
+    EXPECT_EQ(json::parse(none->body)["latest_epoch"].get<uint64_t>(), 1u);
+    latest_epoch = 0;
+    auto unhinted = send("GET", "/api/tier1/authority?have_epoch=1");
+    ASSERT_TRUE(unhinted);
+    EXPECT_EQ(unhinted->status, 404);
+    EXPECT_FALSE(json::parse(unhinted->body).contains("latest_epoch"));
     auto bad = send("GET", "/api/tier1/authority?have_epoch=-1");
     ASSERT_TRUE(bad);
     EXPECT_EQ(bad->status, 400);

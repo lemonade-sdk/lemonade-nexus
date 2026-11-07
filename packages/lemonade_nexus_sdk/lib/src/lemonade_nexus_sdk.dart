@@ -591,6 +591,24 @@ class LemonadeNexusSdk {
     }
   }
 
+  /// The lowest Tier 1 epoch to accept for one chain instance: [chain] and
+  /// [minEpoch] are the `chain` and `epoch` of a membership this app stored
+  /// (see [tier1Membership]). Genesis signs one Epoch 1; a network founded
+  /// again after losing its data is another chain. When the servers serve
+  /// another chain, [tier1Membership] reports `refounded: true` and the
+  /// refresh fails; the app tells the user to leave the network and join it
+  /// again. Throws when [chain] is not 64 hex digits. No-op on a native
+  /// library from before this call.
+  void setEpochFloor(String chain, int minEpoch) {
+    _checkDisposed();
+    _checkConnected();
+    final error = _ffi.setEpochFloor(_client!, chain, minEpoch);
+    if (error != null && error != LnError.success) {
+      throw SdkException(error,
+          message: 'The chain must be the 64 hex digits of a verified membership');
+    }
+  }
+
   /// First-connect discovery of the network key, for a client with no pinned
   /// key. The SDK asks [hosts] (certificate FQDN and HTTP port, for example
   /// from DNS discovery), the connected server, and the servers it lists. It
