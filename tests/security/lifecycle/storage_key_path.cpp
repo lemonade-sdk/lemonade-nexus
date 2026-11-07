@@ -1520,6 +1520,52 @@ TEST_F(StorageKeyPath, FilesMigrateAfterAHolderRoundTripAndColdStartNeedsTHolder
     EXPECT_FALSE(locked.write(server->dir / "files/identity/jwt_secret.hex", "replaced"));
 }
 
+// A member the next epoch leaves out continues as Tier 2 and keeps its share.
+// When it restarts afterwards, its stored epoch is superseded by the verified
+// chain, and its data key must still come back through the holders: the
+// unlock binds to the epoch the chain names, not to the epoch the node last
+// served. Release 2026.11.07 on sn01: the holders refused every request and
+// the node never opened its ports.
+TEST_F(StorageKeyPath, AMemberLeftOutOfTheNextEpochRestartsAndUnlocks) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    Node* out = members.back();
+    build_vault(*out, /*seed=*/true);
+    ASSERT_TRUE(run_storage_until([&] { return vault_done(*out); }));
+    const auto out_key = data_key_bytes(out);
+    ASSERT_EQ(out_key.size(), 32u);
+
+    // The next epoch is selected from a pool that does not observe `out`.
+    std::vector<Node*> pool;
+    for (Node* node : founders) {
+        if (node != out) pool.push_back(node);
+    }
+    for (Node* node : reserves) pool.push_back(node);
+    const auto next = rotate(members, pool, 2);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_EQ(std::find(next.begin(), next.end(), out), next.end())
+        << "the left-out member was selected again";
+    members = next;
+    ASSERT_TRUE(run_storage_until([&] {
+        const auto& chain = storage(members.front()).chain();
+        return !chain.pending.has_value() && all_current(storage_nodes(), chain.current_digest);
+    }));
+    EXPECT_FALSE(out->driver->is_tier1_member());
+    EXPECT_TRUE(storage(out).data_keys().state() == DataKeyState::Unlocked);
+
+    // A full restart: driver, runtime, storage side and vault come back from
+    // disk; the data key leaves memory.
+    restart_node(*out);
+    out->driver->start(mesh.now_ms);
+    EXPECT_EQ(out->runtime->epochs(), nullptr) << "a superseded epoch must not be resumed";
+    build_storage(*out);
+    auto& vault = build_vault(*out, /*seed=*/false);
+    EXPECT_FALSE(vault.files_ready());
+    ASSERT_TRUE(run_storage_until([&] { return vault.files_ready(); }))
+        << "a member the next epoch left out never unlocked after its restart";
+    EXPECT_EQ(data_key_bytes(out), out_key);
+}
+
 TEST_F(StorageKeyPath, DataKeyRotationRewrapsThroughTheHoldersAndSurvivesARestart) {
     create_key(founders);
     ASSERT_FALSE(::testing::Test::HasFatalFailure());

@@ -390,6 +390,13 @@ private:
     uint64_t partials_sent_ = 0;
 
     std::map<StorageDrop, uint64_t> drops_;
+    /// Rate limit of the per-reason drop log line (one per kDropLogWindowMs).
+    struct DropLogWindow {
+        uint64_t window_start_ms = 0;
+        uint64_t suppressed = 0;
+    };
+    static constexpr uint64_t kDropLogWindowMs = 60'000;
+    std::map<StorageDrop, DropLogWindow> drop_log_;
 };
 
 }  // namespace nexus::security
