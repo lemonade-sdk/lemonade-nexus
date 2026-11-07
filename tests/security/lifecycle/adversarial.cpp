@@ -787,9 +787,10 @@ TEST_F(AdversarialMesh, CorruptConsensusSafetyStateIsPermanentlyUnusable) {
     Node* control = founders[1];
     restart_node(*victim);
     restart_node(*control);
-    {
-        // The safety file is the only record of what this node already voted.
-        std::ofstream out(victim->dir / "consensus" / "hotstuff-safety-1.json");
+    // The vote record slots are the only record of what this node already
+    // voted. Both are damaged: one torn slot is a write no vote relied on.
+    for (const char* slot : {"hotstuff-safety-1.json", "hotstuff-safety-1.b.json"}) {
+        std::ofstream out(victim->dir / "consensus" / slot);
         out << "{not-json";
     }
 

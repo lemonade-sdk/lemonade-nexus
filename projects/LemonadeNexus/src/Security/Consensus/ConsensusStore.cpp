@@ -199,83 +199,198 @@ template <typename Tag>
 
 }  // namespace
 
+// A slot record is the kind's JSON document plus `seq`; a vote record may
+// also carry `chain`. Both keys sit outside the record digest, which covers
+// the kind's own fields as before.
+struct FileConsensusStore::VoteRecord {
+    HotStuffState state;
+    uint64_t seq = 0;
+    std::size_t slot = 0;  // index into safety_slots
+    std::optional<CertifiedChain> chain;
+    bool chain_corrupt = false;  // a chain key is there but does not validate
+};
+
+struct FileConsensusStore::CommitRecord {
+    ConsensusCommit commit;
+    uint64_t seq = 0;
+    std::size_t slot = 0;
+};
+
+namespace {
+
+/// Splits `seq` off a slot document. A document without the key is a record
+/// of the earlier release, which wrote each record once: seq 0.
+[[nodiscard]] bool take_seq(json& document, uint64_t& seq) {
+    seq = 0;
+    const auto it = document.find("seq");
+    if (it == document.end()) return true;
+    if (!it->is_number_unsigned()) return false;
+    seq = it->get<uint64_t>();
+    document.erase(it);
+    return true;
+}
+
+[[nodiscard]] std::array<fs::path, 2> slot_paths(const fs::path& directory, const char* kind,
+                                                 EpochId epoch) {
+    const auto stem = std::string(kind) + "-" + std::to_string(epoch.underlying());
+    return {directory / (stem + ".json"), directory / (stem + ".b.json")};
+}
+
+}  // namespace
+
 FileConsensusStore::FileConsensusStore(fs::path directory) : directory_(std::move(directory)) {
     fs::create_directories(directory_);
 }
 
-fs::path FileConsensusStore::safety_path(EpochId epoch) const {
-    return directory_ / ("hotstuff-safety-" + std::to_string(epoch.underlying()) + ".json");
+std::array<fs::path, 2> FileConsensusStore::safety_slots(EpochId epoch) const {
+    return slot_paths(directory_, "hotstuff-safety", epoch);
 }
 
-fs::path FileConsensusStore::commit_path(EpochId epoch) const {
-    return directory_ / ("hotstuff-commit-" + std::to_string(epoch.underlying()) + ".json");
+std::array<fs::path, 2> FileConsensusStore::commit_slots(EpochId epoch) const {
+    return slot_paths(directory_, "hotstuff-commit", epoch);
 }
 
 fs::path FileConsensusStore::chain_path(EpochId epoch) const {
     return directory_ / ("hotstuff-chain-" + std::to_string(epoch.underlying()) + ".json");
 }
 
+std::variant<FileConsensusStore::VoteRecord, IConsensusStore::LoadResult>
+FileConsensusStore::newest_vote_record(EpochId epoch) const {
+    std::optional<VoteRecord> newest;
+    bool present = false;
+    const auto slots = safety_slots(epoch);
+    for (std::size_t slot = 0; slot < slots.size(); ++slot) {
+        std::error_code ec;
+        const bool exists = fs::exists(slots[slot], ec);
+        // A stat failure is not proof of absence.
+        if (ec) return LoadResult::Corrupt;
+        if (!exists) continue;
+        present = true;
+        auto document = parse_file(slots[slot]);
+        if (!document || !document->is_object()) continue;
+        VoteRecord record;
+        record.slot = slot;
+        if (!take_seq(*document, record.seq)) continue;
+        std::optional<json> chain_document;
+        if (const auto chain = document->find("chain"); chain != document->end()) {
+            chain_document = *chain;
+            document->erase(chain);
+        }
+        auto state = hotstuff_state_from_json(*document);
+        // A record that names another epoch is a misplaced or rolled disk.
+        if (!state || state->epoch != epoch) continue;
+        record.state = std::move(*state);
+        if (chain_document) {
+            if (auto chain = chain_from_json(*chain_document, epoch)) {
+                record.chain = std::move(*chain);
+            } else {
+                record.chain_corrupt = true;
+            }
+        }
+        if (!newest || record.seq > newest->seq) newest = std::move(record);
+    }
+    if (newest) return std::move(*newest);
+    return present ? LoadResult::Corrupt : LoadResult::Absent;
+}
+
 bool FileConsensusStore::store_before_vote(const HotStuffState& state) {
-    // Monotonicity guard. The stored values may only stay or grow.
-    const auto existing = load(state.epoch);
+    const auto existing = newest_vote_record(state.epoch);
+    uint64_t seq = 1;
+    std::size_t slot = 0;
     if (const auto* result = std::get_if<LoadResult>(&existing)) {
         // Corrupt state is never overwritten as if it were fresh: it may hide
         // a vote this node already cast.
         if (*result == LoadResult::Corrupt) return false;
     } else {
-        const auto& prior = std::get<HotStuffState>(existing);
-        if (state.epoch != prior.epoch) return false;
-        if (state.last_voted_view < prior.last_voted_view) return false;
-        if (state.high_qc.view < prior.high_qc.view) return false;
-        if (state.locked_qc.view < prior.locked_qc.view) return false;
+        // Monotonicity guard. The stored values may only stay or grow.
+        const auto& prior = std::get<VoteRecord>(existing);
+        if (state.epoch != prior.state.epoch) return false;
+        if (state.last_voted_view < prior.state.last_voted_view) return false;
+        if (state.high_qc.view < prior.state.high_qc.view) return false;
+        if (state.locked_qc.view < prior.state.locked_qc.view) return false;
+        seq = prior.seq + 1;
+        slot = prior.slot == 0 ? 1 : 0;
+        // The chain stays with the epoch's records until store_chain
+        // replaces it, as the chain file of the earlier layout did.
+        if (prior.chain && !chain_.contains(state.epoch.underlying())) {
+            chain_.emplace(state.epoch.underlying(), *prior.chain);
+        }
     }
-    return write_durable(safety_path(state.epoch), hotstuff_state_to_json(state).dump());
+    json record = hotstuff_state_to_json(state);
+    record["seq"] = seq;
+    if (const auto chain = chain_.find(state.epoch.underlying()); chain != chain_.end()) {
+        record["chain"] = chain_to_json(state.epoch, chain->second);
+    }
+    return write_slot_durable(safety_slots(state.epoch)[slot], record.dump());
 }
 
 std::variant<HotStuffState, IConsensusStore::LoadResult> FileConsensusStore::load(
     EpochId epoch) const {
-    const auto path = safety_path(epoch);
-
-    std::error_code ec;
-    const bool present = fs::exists(path, ec);
-    // A stat failure is not proof of absence.
-    if (ec) return LoadResult::Corrupt;
-    if (!present) return LoadResult::Absent;
-
-    // Only the final name is ever opened. A leftover "<final>.tmp" from an
-    // interrupted write is simply ignored — the rename discipline means it
-    // never held state this node relied on.
-    const auto document = parse_file(path);
-    if (!document) return LoadResult::Corrupt;
-    auto state = hotstuff_state_from_json(*document);
-    if (!state) return LoadResult::Corrupt;
-    // A safety file that names another epoch is a misplaced or rolled disk.
-    if (state->epoch != epoch) return LoadResult::Corrupt;
-    return std::move(*state);
+    auto newest = newest_vote_record(epoch);
+    if (const auto* result = std::get_if<LoadResult>(&newest)) return *result;
+    return std::move(std::get<VoteRecord>(newest).state);
 }
 
 bool FileConsensusStore::store_commit(const ConsensusCommit& commit) {
-    return write_durable(commit_path(commit.epoch), commit_to_json(commit).dump());
+    uint64_t seq = 1;
+    std::size_t slot = 0;
+    const auto slots = commit_slots(commit.epoch);
+    std::optional<CommitRecord> newest;
+    for (std::size_t index = 0; index < slots.size(); ++index) {
+        auto document = parse_file(slots[index]);
+        if (!document || !document->is_object()) continue;
+        CommitRecord record;
+        record.slot = index;
+        if (!take_seq(*document, record.seq)) continue;
+        auto parsed = commit_from_json(*document);
+        if (!parsed || parsed->epoch != commit.epoch) continue;
+        record.commit = *parsed;
+        if (!newest || record.seq > newest->seq) newest = record;
+    }
+    if (newest) {
+        seq = newest->seq + 1;
+        slot = newest->slot == 0 ? 1 : 0;
+    }
+    json record = commit_to_json(commit);
+    record["seq"] = seq;
+    return write_slot_durable(slots[slot], record.dump());
 }
 
 std::optional<ConsensusCommit> FileConsensusStore::latest_commit(EpochId epoch) const {
-    const auto path = commit_path(epoch);
-    std::error_code ec;
-    if (!fs::exists(path, ec) || ec) return std::nullopt;
-    const auto document = parse_file(path);
-    if (!document) return std::nullopt;
-    auto commit = commit_from_json(*document);
-    if (!commit || commit->epoch != epoch) return std::nullopt;
-    return commit;
+    std::optional<CommitRecord> newest;
+    for (const auto& path : commit_slots(epoch)) {
+        std::error_code ec;
+        if (!fs::exists(path, ec) || ec) continue;
+        auto document = parse_file(path);
+        if (!document || !document->is_object()) continue;
+        CommitRecord record;
+        if (!take_seq(*document, record.seq)) continue;
+        auto commit = commit_from_json(*document);
+        if (!commit || commit->epoch != epoch) continue;
+        record.commit = *commit;
+        if (!newest || record.seq > newest->seq) newest = record;
+    }
+    if (!newest) return std::nullopt;
+    return newest->commit;
 }
 
 bool FileConsensusStore::store_chain(EpochId epoch, const CertifiedChain& chain) {
     if (chain.chain.empty() || chain.chain.size() > constants::kMaxSyncChainBlocks) return false;
-    return write_durable(chain_path(epoch), chain_to_json(epoch, chain).dump());
+    chain_[epoch.underlying()] = chain;
+    return true;
 }
 
 std::variant<CertifiedChain, IConsensusStore::LoadResult> FileConsensusStore::load_chain(
     EpochId epoch) const {
+    const auto newest = newest_vote_record(epoch);
+    if (const auto* record = std::get_if<VoteRecord>(&newest)) {
+        if (record->chain) return *record->chain;
+        if (record->chain_corrupt) return LoadResult::Corrupt;
+        // A vote record without a chain: the earlier release's chain file,
+        // when it is there, is the last chain this node stored.
+    } else if (std::get<LoadResult>(newest) == LoadResult::Corrupt) {
+        return LoadResult::Corrupt;
+    }
     const auto path = chain_path(epoch);
     std::error_code ec;
     const bool present = fs::exists(path, ec);

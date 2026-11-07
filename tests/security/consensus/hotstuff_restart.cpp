@@ -1,11 +1,13 @@
 #include "hotstuff_harness.hpp"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -35,8 +37,23 @@ protected:
         return directory_ / ("hotstuff-safety-" + std::to_string(kEpoch.underlying()) + ".json");
     }
 
-    [[nodiscard]] fs::path chain_file() const {
-        return directory_ / ("hotstuff-chain-" + std::to_string(kEpoch.underlying()) + ".json");
+    [[nodiscard]] fs::path safety_slot_b() const {
+        return directory_ / ("hotstuff-safety-" + std::to_string(kEpoch.underlying()) + ".b.json");
+    }
+    // Rewrites every vote record on disk with `edit` applied to its document.
+    void edit_vote_records(const std::function<void(nlohmann::json&)>& edit) const {
+        for (const auto& path : {safety_file(), safety_slot_b()}) {
+            std::ifstream in(path, std::ios::binary);
+            if (!in) continue;
+            auto document = nlohmann::json::parse(in);
+            edit(document);
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            out << document.dump();
+        }
+    }
+    [[nodiscard]] bool stored_chain_loads() const {
+        FileConsensusStore store(directory_);
+        return std::holds_alternative<CertifiedChain>(store.load_chain(kEpoch));
     }
 
     // Votes at views 1 and 2, then goes away.
@@ -110,7 +127,7 @@ TEST_F(HotStuffRestart, RestartRequiresCertifiedSyncBeforeAnyVote) {
 // the leader can propose on it again.
 TEST_F(HotStuffRestart, RestartRestoresTheBlockTheHighCertificateNames) {
     run_first_incarnation();
-    ASSERT_TRUE(fs::exists(chain_file()));
+    ASSERT_TRUE(stored_chain_loads());
     const auto chain = harness.build_chain(2);
 
     FileConsensusStore store(directory_);
@@ -140,7 +157,8 @@ TEST_F(HotStuffRestart, RestartRestoresTheBlockTheHighCertificateNames) {
 // it, no leader can propose on the certificate, and the replica stays safe.
 TEST_F(HotStuffRestart, StateWithoutAChainRecordRecoversTheBlockFromAPeer) {
     run_first_incarnation();
-    ASSERT_TRUE(fs::remove(chain_file()));
+    edit_vote_records([](nlohmann::json& document) { document.erase("chain"); });
+    ASSERT_FALSE(stored_chain_loads());
     const auto chain = harness.build_chain(2);
 
     FileConsensusStore store(directory_);
@@ -170,10 +188,7 @@ TEST_F(HotStuffRestart, StateWithoutAChainRecordRecoversTheBlockFromAPeer) {
 TEST_F(HotStuffRestart, ARecordThatDoesNotVerifyRestoresNothing) {
     run_first_incarnation();
     const auto chain = harness.build_chain(2);
-    {
-        std::ofstream out(chain_file(), std::ios::trunc);
-        out << "{damaged";
-    }
+    edit_vote_records([](nlohmann::json& document) { document["chain"] = "{damaged"; });
     {
         FileConsensusStore store(directory_);
         HotStuffService second(harness.config_for(0), clone_key(harness.keys[0]), store);
@@ -189,6 +204,8 @@ TEST_F(HotStuffRestart, ARecordThatDoesNotVerifyRestoresNothing) {
     forged.certifying = chain[1].justify;
     forged.certifying.signers.resize(1);
     ASSERT_TRUE(store.store_chain(kEpoch, forged));
+    // The chain reaches disk with a vote record; the same state is no regression.
+    ASSERT_TRUE(store.store_before_vote(std::get<HotStuffState>(store.load(kEpoch))));
     HotStuffService third(harness.config_for(0), clone_key(harness.keys[0]), store);
     EXPECT_TRUE(third.usable());
     EXPECT_EQ(third.block(chain[0].digest), nullptr);
@@ -322,8 +339,10 @@ TEST_F(HotStuffRestart, HeldProposalEarnsNoSecondVoteAndForgeriesAreNotHeld) {
 
 TEST_F(HotStuffRestart, CorruptSafetyStateIsPermanentlyUnusable) {
     run_first_incarnation();
-    {
-        std::ofstream stream(safety_file(), std::ios::binary | std::ios::trunc);
+    // Both slots: a single torn slot is a write no vote relied on, and the
+    // other slot still binds.
+    for (const auto& path : {safety_file(), safety_slot_b()}) {
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
         stream << "\xff\xfe garbage that is not json";
     }
 

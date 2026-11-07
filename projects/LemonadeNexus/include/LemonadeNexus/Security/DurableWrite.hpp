@@ -37,6 +37,19 @@ namespace nexus::security {
 [[nodiscard]] bool rename_durable(const std::filesystem::path& source_path,
                                   const std::filesystem::path& final_path);
 
+/// Overwrite `path` in place and flush the data to the device with one sync
+/// (two syncs the first time the file is created, for its directory entry).
+/// This is NOT crash-atomic on its own: a crash during the write can leave a
+/// torn file. A record that must survive a crash alternates between two slot
+/// files and writes over the older one, so the slot the last completed write
+/// landed in is never the one being written; the reader takes the newest slot
+/// that validates. The payload is padded with newlines to a 4 KiB multiple,
+/// so a rewrite of the same record size changes no file metadata. False on
+/// any failure, including a failure to flush; the caller then treats the
+/// record as not written.
+[[nodiscard]] bool write_slot_durable(const std::filesystem::path& path,
+                                      std::string_view payload);
+
 /// Overwrite the content of `path` with zeros and flush it to the device. Best
 /// effort: a journaling or copy-on-write file system, LVM snapshots, or SSD
 /// remapping can keep older blocks. A missing file is not an error.
