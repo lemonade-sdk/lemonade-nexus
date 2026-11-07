@@ -29,6 +29,10 @@ namespace nexus::network {
 struct VirtualNetConfig {
     /// MTU for the virtual stack (clients use ~1420).
     uint32_t mtu{1420};
+    /// Receive and send buffer of every virtual TCP connection, in bytes.
+    /// The server answers small API requests for many clients at once, so
+    /// it keeps one unscaled window per connection.
+    uint32_t tcp_buffer{64 * 1024};
 };
 
 class VirtualNetService : public core::IService<VirtualNetService> {

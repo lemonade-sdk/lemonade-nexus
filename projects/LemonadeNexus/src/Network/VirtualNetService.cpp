@@ -41,7 +41,7 @@ VirtualNetService::~VirtualNetService() {
 
 void VirtualNetService::on_start() {
     if (stack_) return;
-    stack_ = ns_create(config_.mtu, &output_trampoline, this);
+    stack_ = ns_create(config_.mtu, config_.tcp_buffer, &output_trampoline, this);
     if (!stack_) {
         spdlog::error("[{}] failed to create virtual netstack", name());
         return;

@@ -85,8 +85,8 @@ impl Pair {
     fn new() -> Pair {
         let wiring_a = Box::into_raw(Box::new(Wiring { peer: Mutex::new(None) }));
         let wiring_b = Box::into_raw(Box::new(Wiring { peer: Mutex::new(None) }));
-        let a = unsafe { ns_create(1420, forward_to_peer, wiring_a as *mut c_void) };
-        let b = unsafe { ns_create(1420, forward_to_peer, wiring_b as *mut c_void) };
+        let a = unsafe { ns_create(1420, 65536, forward_to_peer, wiring_a as *mut c_void) };
+        let b = unsafe { ns_create(1420, 65536, forward_to_peer, wiring_b as *mut c_void) };
         assert!(!a.is_null() && !b.is_null());
         unsafe {
             *(*wiring_a).peer.lock().unwrap() = Some(b);
