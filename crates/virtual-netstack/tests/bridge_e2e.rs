@@ -65,8 +65,8 @@ fn tcp_request_response_through_two_stacks() {
     let wiring_a = Box::into_raw(Box::new(Wiring { peer: Mutex::new(None) }));
     let wiring_b = Box::into_raw(Box::new(Wiring { peer: Mutex::new(None) }));
 
-    let stack_a = unsafe { ns_create(1420, forward_to_peer, wiring_a as *mut c_void) };
-    let stack_b = unsafe { ns_create(1420, forward_to_peer, wiring_b as *mut c_void) };
+    let stack_a = unsafe { ns_create(1420, 65536, forward_to_peer, wiring_a as *mut c_void) };
+    let stack_b = unsafe { ns_create(1420, 65536, forward_to_peer, wiring_b as *mut c_void) };
     assert!(!stack_a.is_null());
     assert!(!stack_b.is_null());
 
@@ -156,8 +156,8 @@ fn repeated_connections_and_larger_payload() {
 
     let wiring_a = Box::into_raw(Box::new(Wiring { peer: Mutex::new(None) }));
     let wiring_b = Box::into_raw(Box::new(Wiring { peer: Mutex::new(None) }));
-    let stack_a = unsafe { ns_create(1420, forward_to_peer, wiring_a as *mut c_void) };
-    let stack_b = unsafe { ns_create(1420, forward_to_peer, wiring_b as *mut c_void) };
+    let stack_a = unsafe { ns_create(1420, 65536, forward_to_peer, wiring_a as *mut c_void) };
+    let stack_b = unsafe { ns_create(1420, 65536, forward_to_peer, wiring_b as *mut c_void) };
     unsafe {
         *(*wiring_a).peer.lock().unwrap() = Some(stack_b);
         *(*wiring_b).peer.lock().unwrap() = Some(stack_a);
@@ -253,8 +253,8 @@ fn observed_forward_reports_the_virtual_source_of_each_connection() {
     let events = Box::into_raw(Box::new(IngressEvents::new(Vec::new())));
     let wiring_a = Box::into_raw(Box::new(Wiring { peer: Mutex::new(None) }));
     let wiring_b = Box::into_raw(Box::new(Wiring { peer: Mutex::new(None) }));
-    let stack_a = unsafe { ns_create(1420, forward_to_peer, wiring_a as *mut c_void) };
-    let stack_b = unsafe { ns_create(1420, forward_to_peer, wiring_b as *mut c_void) };
+    let stack_a = unsafe { ns_create(1420, 65536, forward_to_peer, wiring_a as *mut c_void) };
+    let stack_b = unsafe { ns_create(1420, 65536, forward_to_peer, wiring_b as *mut c_void) };
     assert!(!stack_a.is_null() && !stack_b.is_null());
     unsafe {
         *(*wiring_a).peer.lock().unwrap() = Some(stack_b);
@@ -326,7 +326,7 @@ fn observed_forward_reports_the_virtual_source_of_each_connection() {
 // stale port.
 #[test]
 fn removing_egress_closes_only_its_loopback_listener() {
-    let stack = unsafe { ns_create(1420, discard_packets, std::ptr::null_mut()) };
+    let stack = unsafe { ns_create(1420, 65536, discard_packets, std::ptr::null_mut()) };
     assert!(!stack.is_null());
     let src = cs("10.0.0.1");
     let first = cs("10.0.0.2");
@@ -355,10 +355,203 @@ fn removing_egress_closes_only_its_loopback_listener() {
 fn create_returns_null_when_the_stack_cannot_start() {
     // 67 is one byte below the IPv4 minimum MTU (RFC 791).
     for mtu in [0u32, 20, 67] {
-        let stack = unsafe { ns_create(mtu, discard_packets, std::ptr::null_mut()) };
+        let stack = unsafe { ns_create(mtu, 65536, discard_packets, std::ptr::null_mut()) };
         assert!(stack.is_null(), "ns_create({mtu}) returned a handle");
     }
-    let stack = unsafe { ns_create(68, discard_packets, std::ptr::null_mut()) };
+    let stack = unsafe { ns_create(68, 65536, discard_packets, std::ptr::null_mut()) };
+    assert!(!stack.is_null());
+    unsafe { ns_destroy(stack) };
+}
+
+/// Wiring with a one-way delay: each packet reaches the peer after `delay`,
+/// in order, so the stacks see a real round-trip time.
+struct DelayedWiring {
+    queue: std::sync::mpsc::Sender<(std::time::Instant, Vec<u8>)>,
+}
+
+impl DelayedWiring {
+    /// The peer handle arrives through the returned sender, as an address,
+    /// once both stacks exist.
+    fn new() -> (*mut DelayedWiring, std::sync::mpsc::Sender<usize>) {
+        let (queue, packets) = std::sync::mpsc::channel::<(std::time::Instant, Vec<u8>)>();
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel::<usize>();
+        std::thread::spawn(move || {
+            let peer = match peer_rx.recv() {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            for (due, pkt) in packets {
+                let now = std::time::Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                }
+                unsafe { ns_feed_inbound(peer as *mut NsHandle, pkt.as_ptr(), pkt.len()) };
+            }
+        });
+        (Box::into_raw(Box::new(DelayedWiring { queue })), peer_tx)
+    }
+}
+
+static ONE_WAY_DELAY: Mutex<Duration> = Mutex::new(Duration::from_millis(0));
+
+unsafe extern "C" fn forward_delayed(ctx: *mut c_void, pkt: *const u8, len: usize) {
+    let wiring = &*(ctx as *const DelayedWiring);
+    let delay = *ONE_WAY_DELAY.lock().unwrap();
+    let data = std::slice::from_raw_parts(pkt, len).to_vec();
+    let _ = wiring.queue.send((std::time::Instant::now() + delay, data));
+}
+
+/// A server that counts the bytes it receives on each connection and
+/// reports the total through `counted`.
+fn byte_sink(counted: &'static std::sync::atomic::AtomicUsize, hold: Duration) -> std::net::SocketAddr {
+    let sink = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = sink.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in sink.incoming() {
+            let mut stream = match stream { Ok(s) => s, Err(_) => break };
+            std::thread::spawn(move || {
+                std::thread::sleep(hold);
+                let mut buf = vec![0u8; 1 << 16];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => { counted.fetch_add(n, std::sync::atomic::Ordering::Relaxed); }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+struct Pair {
+    a: *mut NsHandle,
+    b: *mut NsHandle,
+    port: u16,
+    wiring: [*mut DelayedWiring; 2],
+}
+
+/// Two stacks with `tcp_buffer` bytes per socket, delayed wiring, an
+/// ingress on B to `sink` and an egress on A toward it.
+fn delayed_pair(tcp_buffer: u32, one_way: Duration, sink: std::net::SocketAddr) -> Pair {
+    *ONE_WAY_DELAY.lock().unwrap() = one_way;
+    let (wiring_a, peer_of_a) = DelayedWiring::new();
+    let (wiring_b, peer_of_b) = DelayedWiring::new();
+    let a = unsafe { ns_create(1420, tcp_buffer, forward_delayed, wiring_a as *mut c_void) };
+    let b = unsafe { ns_create(1420, tcp_buffer, forward_delayed, wiring_b as *mut c_void) };
+    assert!(!a.is_null() && !b.is_null());
+    peer_of_a.send(b as usize).unwrap();
+    peer_of_b.send(a as usize).unwrap();
+    let a_ip = cs("10.0.0.1/8");
+    let b_ip = cs("10.0.0.2/8");
+    let target = cs(&format!("tcp:{sink}"));
+    let b_vip = cs("10.0.0.2");
+    let dst_ip = cs("10.0.0.2");
+    let src_ip = cs("10.0.0.1");
+    let port = unsafe {
+        assert_eq!(ns_add_local_ip(a, a_ip.as_ptr()), 0);
+        assert_eq!(ns_add_local_ip(b, b_ip.as_ptr()), 0);
+        assert_eq!(ns_add_tcp_forward(b, b_vip.as_ptr(), 80, target.as_ptr()), 0);
+        ns_add_tcp_egress(a, dst_ip.as_ptr(), 80, src_ip.as_ptr())
+    };
+    assert_ne!(port, 0);
+    std::thread::sleep(Duration::from_millis(100));
+    Pair { a, b, port, wiring: [wiring_a, wiring_b] }
+}
+
+fn destroy_pair(pair: Pair) {
+    unsafe {
+        ns_destroy(pair.a);
+        ns_destroy(pair.b);
+        for w in pair.wiring {
+            drop(Box::from_raw(w));
+        }
+    }
+}
+
+/// Write `payload` through the egress and wait until the sink counted it
+/// all. Returns the time the transfer took.
+fn transfer(port: u16, payload: &[u8], counted: &std::sync::atomic::AtomicUsize, deadline: Duration) -> Duration {
+    let start = std::time::Instant::now();
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let before = counted.load(std::sync::atomic::Ordering::Relaxed);
+    client.write_all(payload).unwrap();
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    while counted.load(std::sync::atomic::Ordering::Relaxed) - before < payload.len() {
+        assert!(start.elapsed() < deadline,
+                "sink has {} of {} bytes after {:?}",
+                counted.load(std::sync::atomic::Ordering::Relaxed) - before, payload.len(), deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    start.elapsed()
+}
+
+// The TCP buffer sets the bytes one connection keeps in flight per round
+// trip. Over a link with a 50 ms round trip, an 8 MiB transfer needs at
+// least 128 round trips (6.4 s) with the one unscaled 64 KiB window the
+// earlier release had; a 1 MiB buffer scales the window and finishes in a
+// fraction of that.
+#[test]
+fn a_larger_tcp_buffer_carries_a_transfer_over_a_delayed_link() {
+    static COUNTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let sink = byte_sink(&COUNTED, Duration::ZERO);
+    let pair = delayed_pair(1 << 20, Duration::from_millis(25), sink);
+    let payload = vec![0x5au8; 8 << 20];
+    let took = transfer(pair.port, &payload, &COUNTED, Duration::from_secs(20));
+    eprintln!("8 MiB over a 50 ms round trip: {took:?}");
+    assert!(took < Duration::from_secs(3),
+            "8 MiB over a 50 ms round trip took {took:?}; the window is not scaled");
+    destroy_pair(pair);
+}
+
+// Bytes a slow bridge target does not read stay in the sender's socket
+// instead of in the stack's staging buffers: the writer is held back and
+// nothing is lost once the target reads.
+#[test]
+fn a_slow_bridge_reader_holds_the_writer_back() {
+    static COUNTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let sink = byte_sink(&COUNTED, Duration::from_secs(4));
+    let pair = delayed_pair(1 << 20, Duration::ZERO, sink);
+    let payload: &'static [u8] = Box::leak(vec![0xa5u8; 128 << 20].into_boxed_slice());
+    static WRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    let mut client = TcpStream::connect(("127.0.0.1", pair.port)).unwrap();
+    let writer = {
+        let mut c = client.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut off = 0;
+            while off < payload.len() {
+                let n = c.write(&payload[off..]).unwrap();
+                off += n;
+                WRITTEN.store(off, std::sync::atomic::Ordering::Relaxed);
+            }
+            c.shutdown(std::net::Shutdown::Write).unwrap();
+        })
+    };
+    std::thread::sleep(Duration::from_secs(3));
+    let accepted = WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(accepted < 64 << 20,
+            "the stacks absorbed {accepted} bytes while the target read nothing");
+
+    let start = std::time::Instant::now();
+    while COUNTED.load(std::sync::atomic::Ordering::Relaxed) < payload.len() {
+        assert!(start.elapsed() < Duration::from_secs(60), "transfer stalled");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    writer.join().unwrap();
+    let mut end = [0u8; 1];
+    assert_eq!(client.read(&mut end).unwrap_or(0), 0);
+    destroy_pair(pair);
+}
+
+// A TCP buffer below one unscaled window is refused like a bad MTU.
+#[test]
+fn create_returns_null_for_a_tcp_buffer_below_the_minimum() {
+    for buffer in [0u32, 4096, 65535] {
+        let stack = unsafe { ns_create(1420, buffer, discard_packets, std::ptr::null_mut()) };
+        assert!(stack.is_null(), "ns_create with tcp_buffer {buffer} returned a handle");
+    }
+    let stack = unsafe { ns_create(1420, 65536, discard_packets, std::ptr::null_mut()) };
     assert!(!stack.is_null());
     unsafe { ns_destroy(stack) };
 }
