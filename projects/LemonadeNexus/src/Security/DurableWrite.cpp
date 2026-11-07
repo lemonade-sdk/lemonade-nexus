@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Security/DurableWrite.hpp>
 
 #include <cstddef>
+#include <string>
 #include <fstream>
 #include <vector>
 #include <system_error>
@@ -153,6 +154,77 @@ bool rename_durable(const fs::path& source_path, const fs::path& final_path) {
     return true;
 #else
     const int dir_fd = ::open(final_path.parent_path().c_str(), O_RDONLY);
+    if (dir_fd < 0) return false;
+    const bool directory_synced = ::fsync(dir_fd) == 0;
+    ::close(dir_fd);
+    return directory_synced;
+#endif
+}
+
+bool write_slot_durable(const fs::path& path, std::string_view payload) {
+    // One trailing newline always ends the text, then padding to a 4 KiB
+    // multiple: a rewrite of a record of about the same size keeps the file
+    // size, so the sync below carries data and no inode change.
+    constexpr std::size_t kSlotGranule = 4096;
+    const std::size_t padded = ((payload.size() + 1 + kSlotGranule - 1) / kSlotGranule) * kSlotGranule;
+    std::string content(payload);
+    content.append(padded - payload.size(), '\n');
+#ifdef _WIN32
+    const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                      OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    std::size_t written = 0;
+    while (written < content.size()) {
+        const std::size_t remaining = content.size() - written;
+        const DWORD chunk = remaining > (1u << 20) ? DWORD{1u << 20}
+                                                   : static_cast<DWORD>(remaining);
+        DWORD produced = 0;
+        if (::WriteFile(file, content.data() + written, chunk, &produced, nullptr) == 0 ||
+            produced == 0) {
+            ::CloseHandle(file);
+            return false;
+        }
+        written += produced;
+    }
+    // The file pointer sits at the end of the new content: cut off what a
+    // longer previous record left behind.
+    const bool sized = ::SetEndOfFile(file) != 0;
+    // FlushFileBuffers commits the data and, for a new file, its entry.
+    const bool flushed = sized && ::FlushFileBuffers(file) != 0;
+    ::CloseHandle(file);
+    return flushed;
+#else
+    std::error_code ec;
+    const bool existed = fs::exists(path, ec);
+    if (ec) return false;
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    std::size_t written = 0;
+    while (written < content.size()) {
+        const ssize_t count = ::pwrite(fd, content.data() + written, content.size() - written,
+                                       static_cast<off_t>(written));
+        if (count <= 0) {
+            ::close(fd);
+            return false;
+        }
+        written += static_cast<std::size_t>(count);
+    }
+    struct stat current{};
+    if (::fstat(fd, &current) != 0 ||
+        (static_cast<std::size_t>(current.st_size) > content.size() &&
+         ::ftruncate(fd, static_cast<off_t>(content.size())) != 0)) {
+        ::close(fd);
+        return false;
+    }
+#ifdef __APPLE__
+    const bool synced = ::fsync(fd) == 0;  // no fdatasync in the macOS headers
+#else
+    const bool synced = ::fdatasync(fd) == 0;
+#endif
+    if (::close(fd) != 0 || !synced) return false;
+    if (existed) return true;
+    // A new file's directory entry is durable only with its directory.
+    const int dir_fd = ::open(path.parent_path().c_str(), O_RDONLY);
     if (dir_fd < 0) return false;
     const bool directory_synced = ::fsync(dir_fd) == 0;
     ::close(dir_fd);

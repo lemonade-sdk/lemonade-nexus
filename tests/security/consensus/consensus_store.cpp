@@ -120,6 +120,12 @@ protected:
     [[nodiscard]] fs::path safety_file(EpochId epoch) const {
         return directory_ / ("hotstuff-safety-" + std::to_string(epoch.underlying()) + ".json");
     }
+    [[nodiscard]] fs::path safety_slot_b(EpochId epoch) const {
+        return directory_ / ("hotstuff-safety-" + std::to_string(epoch.underlying()) + ".b.json");
+    }
+    [[nodiscard]] fs::path commit_slot_b(EpochId epoch) const {
+        return directory_ / ("hotstuff-commit-" + std::to_string(epoch.underlying()) + ".b.json");
+    }
 
     void write_raw(const fs::path& path, const std::string& content) const {
         std::ofstream stream(path, std::ios::binary | std::ios::trunc);
@@ -490,7 +496,7 @@ TEST_F(ConsensusStoreTest, CommitRoundTripCoversTransitionsDigest) {
     EXPECT_EQ(store.latest_commit(7), std::nullopt);
 }
 
-// --- Stored blocks (hotstuff-chain-<epoch>.json) ----------------------------
+// --- Stored blocks (the chain inside the vote record) -----------------------
 
 [[nodiscard]] CertifiedChain make_chain(EpochId epoch, std::size_t length) {
     CertifiedChain chain;
@@ -523,6 +529,9 @@ TEST_F(ConsensusStoreTest, ChainRoundTripsEveryBlockAndCertificate) {
     FileConsensusStore store(directory_);
     const auto chain = make_chain(7, 3);
     ASSERT_TRUE(store.store_chain(7, chain));
+    // Nothing is on disk until the vote record that names its certificate.
+    EXPECT_EQ(std::get<LoadResult>(store.load_chain(7)), LoadResult::Absent);
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 5, 4, 3)));
 
     const auto result = store.load_chain(7);
     ASSERT_TRUE(std::holds_alternative<CertifiedChain>(result));
@@ -535,8 +544,9 @@ TEST_F(ConsensusStoreTest, ChainRoundTripsEveryBlockAndCertificate) {
     }
     expect_qc_eq(stored.certifying, chain.certifying);
 
-    // A later chain replaces the record.
+    // A later chain replaces the record with the next vote.
     ASSERT_TRUE(store.store_chain(7, make_chain(7, 1)));
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 6, 5, 4)));
     const auto replaced = store.load_chain(7);
     ASSERT_TRUE(std::holds_alternative<CertifiedChain>(replaced));
     EXPECT_EQ(std::get<CertifiedChain>(replaced).chain.size(), 1u);
@@ -571,11 +581,13 @@ TEST_F(ConsensusStoreTest, ChainOutsideTheBoundsIsRefused) {
     EXPECT_FALSE(store.store_chain(7, make_chain(7, constants::kMaxSyncChainBlocks + 1)));
     EXPECT_FALSE(fs::exists(chain_file(directory_, 7)));
     EXPECT_TRUE(store.store_chain(7, make_chain(7, constants::kMaxSyncChainBlocks)));
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 5, 4, 3)));
+    EXPECT_FALSE(fs::exists(chain_file(directory_, 7))) << "the chain lives in the vote record";
 
-    // A record that grew past the bound on disk is not read.
-    auto document = json::parse(read_raw(chain_file(directory_, 7)));
-    document["blocks"].push_back(document["blocks"][0]);
-    write_raw(chain_file(directory_, 7), document.dump());
+    // A chain that grew past the bound on disk is not read.
+    auto document = json::parse(read_raw(safety_file(7)));
+    document["chain"]["blocks"].push_back(document["chain"]["blocks"][0]);
+    write_raw(safety_file(7), document.dump());
     const auto result = store.load_chain(7);
     ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
     EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
@@ -583,7 +595,7 @@ TEST_F(ConsensusStoreTest, ChainOutsideTheBoundsIsRefused) {
 
 TEST_F(ConsensusStoreTest, DamagedChainRecordIsCorrupt) {
     FileConsensusStore store(directory_);
-    const auto path = chain_file(directory_, 7);
+    const auto path = safety_file(7);
     const auto expect_corrupt = [&](const std::string& content) {
         write_raw(path, content);
         const auto result = store.load_chain(7);
@@ -591,6 +603,7 @@ TEST_F(ConsensusStoreTest, DamagedChainRecordIsCorrupt) {
         EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
     };
     ASSERT_TRUE(store.store_chain(7, make_chain(7, 2)));
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 5, 4, 3)));
     const std::string good = read_raw(path);
 
     std::string flipped = good;
@@ -598,23 +611,149 @@ TEST_F(ConsensusStoreTest, DamagedChainRecordIsCorrupt) {
     expect_corrupt(flipped);
     expect_corrupt("{not json");
 
+    // A damaged chain inside a sound vote record: the safety state still
+    // loads, the chain does not.
     auto document = json::parse(good);
-    document["blocks"][0]["proposal"]["view"] = 99;
+    document["chain"]["blocks"][0]["proposal"]["view"] = 99;
+    expect_corrupt(document.dump());
+    EXPECT_TRUE(std::holds_alternative<HotStuffState>(store.load(7)));
+
+    document = json::parse(good);
+    document["chain"]["extra"] = 1;
     expect_corrupt(document.dump());
 
     document = json::parse(good);
-    document["extra"] = 1;
-    expect_corrupt(document.dump());
-
-    document = json::parse(good);
-    document["version"] = constants::kConsensusStoreFormatVersion + 1;
+    document["chain"]["version"] = constants::kConsensusStoreFormatVersion + 1;
     expect_corrupt(document.dump());
 
     // A record in another epoch's slot is misplaced.
-    write_raw(chain_file(directory_, 8), good);
+    write_raw(safety_file(8), good);
     const auto misplaced = store.load_chain(8);
     ASSERT_TRUE(std::holds_alternative<LoadResult>(misplaced));
     EXPECT_EQ(std::get<LoadResult>(misplaced), LoadResult::Corrupt);
+}
+
+// The chain file of the earlier release is read while no vote record of the
+// new layout exists, and ignored once one does.
+TEST_F(ConsensusStoreTest, TheEarlierChainFileIsReadUntilAVoteRecordReplacesIt) {
+    FileConsensusStore store(directory_);
+    const auto legacy = make_chain(7, 2);
+    write_raw(chain_file(directory_, 7),
+              json{{"version", constants::kConsensusStoreFormatVersion},
+                   {"epoch", 7},
+                   {"blocks", json::array()},
+                   {"certifying", json::object()},
+                   {"record_digest", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}}
+                  .dump());
+    // A damaged legacy file is Corrupt, not Absent.
+    EXPECT_EQ(std::get<LoadResult>(store.load_chain(7)), LoadResult::Corrupt);
+
+    // A vote record without a chain still defers to the legacy file.
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 5, 4, 3)));
+    EXPECT_EQ(std::get<LoadResult>(store.load_chain(7)), LoadResult::Corrupt);
+
+    // The first vote record with a chain is the record from then on.
+    ASSERT_TRUE(store.store_chain(7, legacy));
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 6, 5, 4)));
+    ASSERT_TRUE(std::holds_alternative<CertifiedChain>(store.load_chain(7)));
+    EXPECT_EQ(std::get<CertifiedChain>(store.load_chain(7)).chain.size(), 2u);
+}
+
+// --- Slots: one in-place write per vote --------------------------------------
+
+// Each vote lands in the slot the previous vote did not use, so the record
+// the previous vote relied on is never the one being written.
+TEST_F(ConsensusStoreTest, VotesAlternateBetweenTwoSlotsAndLoadTheNewest) {
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 1, 0, 0)));
+    EXPECT_TRUE(fs::exists(safety_file(7)));
+    EXPECT_FALSE(fs::exists(safety_slot_b(7)));
+    EXPECT_FALSE(fs::exists(safety_file(7).string() + ".tmp"));
+
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 2, 1, 0)));
+    EXPECT_TRUE(fs::exists(safety_slot_b(7)));
+    EXPECT_EQ(loaded(store.load(7)).last_voted_view, 2u);
+    EXPECT_EQ(json::parse(read_raw(safety_file(7)))["seq"].get<uint64_t>(), 1u);
+    EXPECT_EQ(json::parse(read_raw(safety_slot_b(7)))["seq"].get<uint64_t>(), 2u);
+
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 3, 2, 1)));
+    EXPECT_EQ(json::parse(read_raw(safety_file(7)))["seq"].get<uint64_t>(), 3u);
+    EXPECT_EQ(loaded(store.load(7)).last_voted_view, 3u);
+
+    // The padded record is one 4 KiB granule, rewritten in place.
+    EXPECT_EQ(fs::file_size(safety_file(7)) % 4096, 0u);
+    EXPECT_EQ(std::get<LoadResult>(store.load_chain(7)), LoadResult::Absent)
+        << "no chain was given to the store";
+}
+
+// A crash during a write tears only the slot being written, which held the
+// older record; the newer slot is the state the last vote relied on.
+TEST_F(ConsensusStoreTest, ATornWriteOverTheOlderSlotLeavesTheNewestRecord) {
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(store.store_chain(7, make_chain(7, 2)));
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 1, 0, 0)));
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 2, 1, 0)));
+
+    // The third write would go over slot A; it is torn.
+    const auto full = read_raw(safety_file(7));
+    write_raw(safety_file(7), full.substr(0, full.size() / 3));
+    EXPECT_EQ(loaded(store.load(7)).last_voted_view, 2u);
+    EXPECT_TRUE(std::holds_alternative<CertifiedChain>(store.load_chain(7)));
+
+    // The next vote repairs that slot and moves on.
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 3, 2, 1)));
+    EXPECT_EQ(loaded(store.load(7)).last_voted_view, 3u);
+    EXPECT_EQ(json::parse(read_raw(safety_file(7)))["seq"].get<uint64_t>(), 3u);
+
+    // When neither slot validates, the state is Corrupt and voting stops.
+    write_raw(safety_file(7), "{torn");
+    write_raw(safety_slot_b(7), "\xff garbage");
+    EXPECT_EQ(std::get<LoadResult>(store.load(7)), LoadResult::Corrupt);
+    EXPECT_FALSE(store.store_before_vote(make_state(7, 9, 8, 7)));
+}
+
+// A safety file of the earlier release (no seq, no chain) is the first slot:
+// it loads, bounds the next vote, and the next vote goes to the second slot.
+TEST_F(ConsensusStoreTest, TheEarlierSafetyFileLoadsAndTheNextVoteTakesTheOtherSlot) {
+    FileConsensusStore store(directory_);
+    const auto legacy = make_state(7, 5, 4, 3);
+    write_raw(safety_file(7), nexus::security::hotstuff_state_to_json(legacy).dump());
+    expect_state_eq(loaded(store.load(7)), legacy);
+
+    EXPECT_FALSE(store.store_before_vote(make_state(7, 4, 4, 3))) << "the floor still holds";
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 6, 5, 4)));
+    EXPECT_TRUE(fs::exists(safety_slot_b(7)));
+    EXPECT_FALSE(json::parse(read_raw(safety_file(7))).contains("seq")) << "the legacy file is untouched";
+    EXPECT_EQ(json::parse(read_raw(safety_slot_b(7)))["seq"].get<uint64_t>(), 1u);
+    EXPECT_EQ(loaded(store.load(7)).last_voted_view, 6u);
+}
+
+// The earlier release reads a slot record as Corrupt (unknown keys), so a
+// rollback stops voting instead of voting twice.
+TEST_F(ConsensusStoreTest, ASlotRecordIsCorruptToTheEarlierReader) {
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 5, 4, 3)));
+    const auto document = json::parse(read_raw(safety_file(7)));
+    EXPECT_TRUE(document.contains("seq"));
+    EXPECT_EQ(nexus::security::hotstuff_state_from_json(document), std::nullopt);
+}
+
+TEST_F(ConsensusStoreTest, CommitRecordsAlternateBetweenTwoSlots) {
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(store.store_commit(make_commit(7, 3, 5)));
+    ASSERT_TRUE(store.store_commit(make_commit(7, 4, 6)));
+    EXPECT_TRUE(fs::exists(commit_slot_b(7)));
+    EXPECT_EQ(store.latest_commit(7)->height, 4u);
+
+    ASSERT_TRUE(store.store_commit(make_commit(7, 5, 7)));
+    EXPECT_EQ(json::parse(read_raw(commit_file(7)))["seq"].get<uint64_t>(), 3u);
+    EXPECT_EQ(store.latest_commit(7)->height, 5u);
+
+    // A torn slot yields to the other; two torn slots yield nothing.
+    write_raw(commit_file(7), "{torn");
+    EXPECT_EQ(store.latest_commit(7)->height, 4u);
+    write_raw(commit_slot_b(7), "{torn");
+    EXPECT_EQ(store.latest_commit(7), std::nullopt);
 }
 
 }  // namespace
