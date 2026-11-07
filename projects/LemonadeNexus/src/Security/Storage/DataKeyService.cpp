@@ -439,6 +439,13 @@ void DataKeyService::tick(uint64_t now_ms) {
     }
 
     if (attempt_.has_value() && now_ms - attempt_->started_ms >= kAttemptTimeoutMs) {
+        // One line per attempt: the backoff spaces them seconds apart, and a
+        // server that never unlocks is otherwise silent about why.
+        spdlog::info("[storage] unlock attempt {} timed out: {} of {} partials (threshold {}), "
+                     "{} holder(s) asked, epoch {}, plan {}",
+                     attempts_, attempt_->partials.size(), attempt_->plan.holders.size(),
+                     attempt_->plan.threshold, attempt_->asked.size(),
+                     attempt_->request.epoch.underlying(), short_hex(attempt_->plan_digest));
         fail_attempt();
     }
 

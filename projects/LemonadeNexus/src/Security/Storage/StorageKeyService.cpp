@@ -375,9 +375,54 @@ uint64_t StorageKeyService::drops(StorageDrop reason) const {
     return it == drops_.end() ? 0 : it->second;
 }
 
+namespace {
+
+std::string_view storage_drop_name(StorageDrop reason) {
+    switch (reason) {
+        case StorageDrop::Malformed: return "Malformed";
+        case StorageDrop::UnknownSession: return "UnknownSession";
+        case StorageDrop::NotAHolder: return "NotAHolder";
+        case StorageDrop::WrongRound: return "WrongRound";
+        case StorageDrop::Equivocation: return "Equivocation";
+        case StorageDrop::BadSignature: return "BadSignature";
+        case StorageDrop::ProofInvalid: return "ProofInvalid";
+        case StorageDrop::UnknownPlan: return "UnknownPlan";
+        case StorageDrop::EpochMismatch: return "EpochMismatch";
+        case StorageDrop::Replay: return "Replay";
+        case StorageDrop::PendingBusy: return "PendingBusy";
+        case StorageDrop::BudgetExceeded: return "BudgetExceeded";
+        case StorageDrop::AttestationFailed: return "AttestationFailed";
+        case StorageDrop::InvalidPartial: return "InvalidPartial";
+        case StorageDrop::NoShare: return "NoShare";
+        case StorageDrop::UnclaimedWrap: return "UnclaimedWrap";
+        case StorageDrop::ClaimInvalid: return "ClaimInvalid";
+    }
+    return "Unknown";
+}
+
+}  // namespace
+
 void StorageKeyService::drop(StorageDrop reason) {
     ++drops_[reason];
-    spdlog::debug("[storage] dropped a message: reason {}", static_cast<uint16_t>(reason));
+    // One info line per reason and minute, as the security router logs its
+    // drops: a requester that every holder refuses is visible from the
+    // holders' logs without becoming a flood.
+    const auto name = storage_drop_name(reason);
+    const auto it = drop_log_.find(reason);
+    if (it == drop_log_.end()) {
+        spdlog::info("[storage] dropped a message: {}", name);
+        drop_log_.emplace(reason, DropLogWindow{now_ms_, 0});
+    } else if (now_ms_ - it->second.window_start_ms >= kDropLogWindowMs) {
+        if (it->second.suppressed > 0) {
+            spdlog::info("[storage] dropped a message: {} ({} suppressed)", name,
+                         it->second.suppressed);
+        } else {
+            spdlog::info("[storage] dropped a message: {}", name);
+        }
+        it->second = DropLogWindow{now_ms_, 0};
+    } else {
+        ++it->second.suppressed;
+    }
 }
 
 bool StorageKeyService::expects_unlock_challenge(const NodeId& holder,
