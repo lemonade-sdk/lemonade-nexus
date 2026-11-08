@@ -553,3 +553,26 @@ TEST_F(DnsTcpTest, TheZoneApexIsAnsweredWithoutANameserverSlot) {
     const std::vector<uint8_t> rdata(reply.end() - 4, reply.end());
     EXPECT_EQ(rdata, (std::vector<uint8_t>{192, 0, 2, 7}));
 }
+
+// A server outside Tier 1 holds no tree. It cannot tell a missing tree name
+// from one it does not hold, so it answers SERVFAIL and the resolver asks
+// another name server. Its own dynamic records still answer.
+TEST_F(DnsTcpTest, AServerWithoutATreeAnswersServfailForTreeNames) {
+    const auto held = udp_query(make_query("nobody.ep.test.local", 0x7B01));
+    ASSERT_GE(held.size(), 12u);
+    EXPECT_EQ(held[3] & 0x0F, 3);  // NXDOMAIN: the tree is held and has no such name
+
+    tree_->close();
+
+    const auto endpoint = udp_query(make_query("nobody.ep.test.local", 0x7B02));
+    ASSERT_GE(endpoint.size(), 12u);
+    EXPECT_EQ(endpoint[3] & 0x0F, 2);  // SERVFAIL: no tree to answer from
+
+    const auto loopback = udp_query(make_query("gpu.g0123456789abcdef0123.lo.test.local", 0x7B03));
+    ASSERT_GE(loopback.size(), 12u);
+    EXPECT_EQ(loopback[3] & 0x0F, 2);
+
+    const auto dynamic = udp_query(make_query(kName, 0x7B04));
+    ASSERT_GE(dynamic.size(), 12u);
+    EXPECT_EQ(dynamic[3] & 0x0F, 0);  // NOERROR: dynamic records need no tree
+}

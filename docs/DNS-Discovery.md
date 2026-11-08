@@ -74,6 +74,9 @@ the device that the name belongs to.
   tree; `lemond` does the routing.
 - The answer comes from the replicated tree, so every Tier 1 server gives
   the same answer. The names stop resolving when the group is deleted.
+- A server outside Tier 1 holds no tree. It answers SERVFAIL for these
+  names, as for every other tree name, so the resolver asks another name
+  server of the zone instead of caching a denial.
 - The server answers only A queries. Other query types for these names get
   NXDOMAIN, like every other tree name.
 
