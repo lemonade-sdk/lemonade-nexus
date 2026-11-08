@@ -76,8 +76,8 @@ int main() {
     }
 
     // Join: create endpoint node, allocate tunnel IP, start the dataplane.
-    // With a valid identity the username/password arguments are unused
-    // (they remain only for the deprecated password fallback).
+    // With a valid identity the username/password arguments are unused;
+    // left empty, a refused key is reported as the server states it.
     const auto join = client.join_network("", "");
     if (!join.ok) {
         std::cerr << "join failed: " << join.error << '\n';
@@ -486,6 +486,10 @@ ln_free(json);
   application root is never removed.
 - On `"deleted"` the client stops the mesh and clears its session. A
   `"pending"` answer means Tier 1 has not committed the deletion yet.
+- An answer lost after the deletion committed is recognized: the server
+  revoked the key with the account, so the client authenticates once more and
+  answers `"deleted"` with `confirmed: "revoked"` when the key is refused as
+  revoked.
 - Local files stay. See [Client SDK](Client-SDK#account-deletion) for the list
   to delete, and [Security](Security#account-deletion) for the rules.
 

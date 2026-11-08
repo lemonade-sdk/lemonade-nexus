@@ -408,6 +408,14 @@ node id, and (C ABI) stops the account image service. The answer can be
 status `"pending"` with an `op_id`. The SDK then keeps
 its session, and the deletion takes effect when Tier 1 commits it.
 
+A committed deletion revokes the identity key before its answer travels back,
+and the tunnel the answer takes can end with the account. When the request
+gets no answer, or no session is left to ask for the challenge, the SDK
+authenticates once more. A key the server refuses as revoked confirms the
+deletion: the answer is status `"deleted"` with `confirmed: "revoked"` and an
+empty `account_id`. A key the server still accepts leaves the failure as it
+is, so the caller can retry.
+
 The SDK does not delete local files. After a deletion, the application
 deletes:
 

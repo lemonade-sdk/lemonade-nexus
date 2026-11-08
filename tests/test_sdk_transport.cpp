@@ -8,6 +8,7 @@
 
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
+#include <LemonadeNexus/Auth/AccountDeletionProof.hpp>
 #include <LemonadeNexusSDK/LanPaths.hpp>
 #include <LemonadeNexusSDK/MeshOrchestrator.hpp>
 #include <LemonadeNexusSDK/RelayFallback.hpp>
@@ -278,6 +279,11 @@ protected:
     std::atomic<int>   delete_posts{0};
     std::atomic<Reply> peer_list_reply{Reply::Ok};
     std::atomic<Reply> delete_reply{Reply::Ok};
+    // POST /api/account/delete: Ok answers "deleted"; CutAfterHeaders is a
+    // deletion whose answer is lost on the way.
+    std::atomic<Reply> account_delete_reply{Reply::Ok};
+    // The server revoked the client's key: POST /api/auth refuses it.
+    std::atomic<bool>  identity_revoked{false};
 
     // Joins answered 202 pending before one answers 200, and whether each
     // join request carried a link token.
@@ -789,7 +795,11 @@ protected:
                                 .dump(),
                             "application/json");
         });
-        srv.Post("/api/account/delete", [](const httplib::Request&, httplib::Response& res) {
+        srv.Post("/api/account/delete", [this](const httplib::Request&, httplib::Response& res) {
+            if (account_delete_reply.load() == Reply::CutAfterHeaders) {
+                cut_after_headers(res);
+                return;
+            }
             res.set_content(R"({"success":true,"status":"deleted","account_id":"node-self"})",
                             "application/json");
         });
@@ -914,8 +924,17 @@ protected:
                             R"("suggestion":"work-pc-2"})",
                             "application/json");
         });
-        srv.Post("/api/auth", [&auths](const httplib::Request&, httplib::Response& res) {
+        srv.Post("/api/auth", [this, &auths](const httplib::Request&, httplib::Response& res) {
             ++auths;
+            if (identity_revoked.load()) {
+                res.status = 403;
+                res.set_content(
+                    nlohmann::json{{"authenticated", false},
+                                   {"error", std::string(nexus::auth::kIdentityRevokedError)}}
+                        .dump(),
+                    "application/json");
+                return;
+            }
             res.set_content(
                 R"({"authenticated":true,"user_id":"user","session_token":"auth-token"})",
                 "application/json");
@@ -1561,6 +1580,82 @@ TEST_F(SdkMeshPrivateApiTest, DeletingTheAccountEndsTheSessionSoNoMoveJoinsAgain
     EXPECT_FALSE(wait_for([&] { return !moves().empty(); }, std::chrono::seconds(2)));
     EXPECT_EQ(auth_posts.load(), 0);
     EXPECT_EQ(join_bearers().size(), 1u);
+}
+
+// A deletion commits and revokes the key before its answer travels back, and
+// the tunnel the answer takes ends with the account. When no answer arrives,
+// the client authenticates once more: the revoked key confirms the deletion.
+TEST_F(SdkMeshPrivateApiTest, ADeletionWhoseAnswerIsLostIsConfirmedByTheRevokedKey) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    account_delete_reply = Reply::CutAfterHeaders;
+    identity_revoked     = true;
+    const int auths_before = auth_posts.load();
+    auto deleted = client->delete_account();
+    ASSERT_TRUE(deleted.ok) << deleted.error;
+    EXPECT_EQ(deleted.value.value("status", std::string{}), "deleted");
+    EXPECT_EQ(deleted.value.value("confirmed", std::string{}), "revoked");
+    EXPECT_EQ(auth_posts.load(), auths_before + 1);
+    EXPECT_FALSE(client->is_mesh_active());
+    EXPECT_TRUE(client->session_token().empty());
+    EXPECT_TRUE(client->node_id().empty());
+}
+
+// The same lost answer with a key the server still accepts is a failure: the
+// deletion did not commit, the node stays joined, and the caller may retry.
+TEST_F(SdkMeshPrivateApiTest, ALostDeletionAnswerWithAValidKeyStaysAFailure) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    account_delete_reply = Reply::CutAfterHeaders;
+    auto deleted = client->delete_account();
+    EXPECT_FALSE(deleted.ok);
+    EXPECT_EQ(deleted.error, "account deletion failed (server unreachable)");
+    EXPECT_TRUE(client->is_mesh_active());
+    EXPECT_FALSE(client->node_id().empty());
+}
+
+// A device whose session ended with its deleted account gets no deletion
+// challenge any more. The revoked key still settles the request.
+TEST_F(SdkMeshPrivateApiTest, ADeletionWithoutASessionIsConfirmedByTheRevokedKey) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::Identity identity;
+    identity.generate();
+    client->set_identity(identity);
+    client->set_session_token({});
+    identity_revoked = true;
+    auto deleted = client->delete_account();
+    ASSERT_TRUE(deleted.ok) << deleted.error;
+    EXPECT_EQ(deleted.value.value("confirmed", std::string{}), "revoked");
+    EXPECT_FALSE(client->is_mesh_active());
+    EXPECT_TRUE(client->session_token().empty());
+}
+
+// A join without credentials reports the server's refusal of the device key
+// as it is: there is no password to fall back to, so the answer names the
+// revoked key, not a missing username.
+TEST_F(SdkMeshPrivateApiTest, AJoinWithARevokedKeyAndNoCredentialsReportsTheRevocation) {
+    LN_REQUIRE_TEST_TRUST();
+    lnsdk::ServerConfig cfg;
+    cfg.servers       = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    lnsdk::Identity identity;
+    identity.generate();
+    client.set_identity(identity);
+    identity_revoked = true;
+    const auto joined = client.join_network("", "");
+    EXPECT_FALSE(joined.ok);
+    EXPECT_EQ(joined.error, "authentication failed: This identity has been revoked");
+    EXPECT_EQ(auth_posts.load(), 1);
+    EXPECT_FALSE(client.is_mesh_active());
 }
 
 // A rejected delete leaves the node joined: the mesh stays up so the caller can
