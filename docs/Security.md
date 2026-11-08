@@ -936,6 +936,16 @@ refused after a restart.
 **Idempotence.** A deletion with nothing left changes nothing and succeeds.
 After a deletion the revoked key cannot request another one.
 
+**The answer leaves first.** The request arrives over the device's own
+tunnel, and the removal cascade closes that tunnel by removing the device's
+dataplane peer. The server that handles the request keeps the peers of the
+account's own devices until the response has been written or the connection
+failed (`PeerRemovalHold`), then removes them. Other Tier 1 servers remove
+their copies of the peers at once; they do not carry this tunnel. The same
+hold applies to a device that deletes its own node (a leave). A client whose
+answer is lost anyway confirms the deletion through the revoked key (see
+[Client SDK](Client-SDK#account-deletion)).
+
 Limits:
 
 - An envelope is dropped from the replicated stream without a tombstone. A

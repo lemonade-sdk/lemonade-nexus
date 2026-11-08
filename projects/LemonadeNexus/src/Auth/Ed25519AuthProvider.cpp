@@ -139,7 +139,7 @@ AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
                      pubkey_b64.substr(0, 16));
         return AuthResult{
             .authenticated = false,
-            .error_message = "This identity has been revoked"
+            .error_message = std::string(kIdentityRevokedError)
         };
     }
 
@@ -249,7 +249,7 @@ bool Ed25519AuthProvider::verify_account_delete_proof(const std::string& raw_pub
     std::copy(pubkey_bytes.begin(), pubkey_bytes.end(), pubkey.begin());
     const auto pubkey_b64 = crypto::to_base64(std::span<const uint8_t>(pubkey));
     if (is_pubkey_revoked(pubkey_b64)) {
-        error = "This identity has been revoked";
+        error = std::string(kIdentityRevokedError);
         return false;
     }
     if (auto refusal = consume_challenge(challenge_b64, pubkey_b64); !refusal.empty()) {

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <set>
 #include <unordered_set>
+#include <utility>
 
 #include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Acme/AcmeService.hpp>
@@ -126,6 +127,37 @@ tree::TreeOpSubmitter* tree_op_submitter(ApiContext& ctx, httplib::Response& res
 /// Answer a submission that did not finish: 202 with the op id when the op is
 /// queued but not yet committed, 503 when this server cannot order tree
 /// operations now. Returns true when it answered.
+/// Holds the caller's peer removals for a request that removes the caller's
+/// own node, and ends the hold when the answer has left the server. A hold
+/// that was not handed to a response (an early return) ends with this object.
+class HeldPeerRemoval {
+public:
+    HeldPeerRemoval(PeerRemovalHold* holds, std::string principal)
+        : holds_(holds), principal_(std::move(principal)) {
+        if (holds_) holds_->hold(principal_);
+    }
+    ~HeldPeerRemoval() {
+        if (holds_) holds_->release(principal_);
+    }
+    HeldPeerRemoval(const HeldPeerRemoval&)            = delete;
+    HeldPeerRemoval& operator=(const HeldPeerRemoval&) = delete;
+
+    /// Answer with `j`; the hold ends once the response has been written.
+    void answer(httplib::Response& res, const nlohmann::json& j, int status = 200) {
+        auto* holds = std::exchange(holds_, nullptr);
+        if (!holds) {
+            json_response(res, j, status);
+            return;
+        }
+        json_response_then(res, j, status,
+                           [holds, principal = principal_](bool) { holds->release(principal); });
+    }
+
+private:
+    PeerRemovalHold* holds_;
+    std::string principal_;
+};
+
 bool answer_unfinished(httplib::Response& res, const tree::TreeOpSubmission& s) {
     if (s.pending) {
         json_response(res, {{"success", true}, {"status", "pending"}, {"op_id", s.op_id}}, 202);
@@ -696,7 +728,13 @@ nlohmann::json tree_memberships(const tree::PermissionTreeService& tree,
 // Applied tree operations call the hook on every server that applies them, so
 // per-server cleanup of a removed node runs everywhere, once.
 TreeApiHandler::TreeApiHandler(ApiContext& ctx)
-    : ctx_(ctx), pending_joins_(std::make_shared<PendingJoins>()) {
+    : ctx_(ctx), pending_joins_(std::make_shared<PendingJoins>()),
+      peer_holds_([this](const std::string& peer_key) {
+          if (ctx_.boringtun && ctx_.boringtun->remove_peer(peer_key)) {
+              spdlog::info("[TreeApi] removed mesh peer {}… of a deleted node",
+                           peer_key.substr(0, 8));
+          }
+      }) {
     ctx_.tree.set_removed_nodes_hook(
         [this](const std::vector<tree::RemovedNode>& removed) { cleanup_removed_nodes(removed); });
 }
@@ -734,14 +772,14 @@ void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
     (void)ctx_.ipam.release(node_id, ipam::BlockType::Tunnel);
     (void)ctx_.ipam.release(node_id, ipam::BlockType::Private);
     (void)ctx_.ipam.release(node_id, ipam::BlockType::Shared);
-    // 3. Remove the mesh peer using the join-time key conversion.
+    // 3. Remove the mesh peer using the join-time key conversion. A device
+    //    that removes its own node asked over this very tunnel: its peer
+    //    waits until the answer has left (peer_holds_).
     if (ctx_.boringtun && !doomed->mesh_pubkey.empty()) {
         // Same Ed25519->Curve25519 conversion the join route performs; the
         // stored key must match the dataplane peer key byte-for-byte.
-        const auto peer_mesh_key = api::normalize_mesh_pubkey(doomed->mesh_pubkey);
-        if (ctx_.boringtun->remove_peer(peer_mesh_key)) {
-            spdlog::info("[TreeApi] removed mesh peer for deleted node '{}'", node_id);
-        }
+        peer_holds_.remove_or_defer(tree::canonical_principal(doomed->mgmt_pubkey),
+                                    api::normalize_mesh_pubkey(doomed->mesh_pubkey));
     }
     // 4. Remove the private EP A record registered at join; otherwise the
     //    stale record keeps serving a tunnel IP IPAM has already recycled
@@ -1644,9 +1682,13 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         }
 
         // The committed-removal hook runs the post-delete cascade on every
-        // server that applies the delete (cleanup_removed_nodes).
+        // server that applies the delete (cleanup_removed_nodes). A device
+        // that removes its own node asks over the tunnel the cascade closes:
+        // its peer stays until the answer has left.
         auto* submitter = tree_op_submitter(ctx_, res);
         if (!submitter) return;
+        HeldPeerRemoval held(ctx_.tree.removes_own_device(caller, node_id) ? &peer_holds_ : nullptr,
+                             tree::canonical_principal(caller));
         tree::TreeOp op;
         op.kind = tree::TreeOpKind::DeleteNode;
         op.target = node_id;
@@ -1665,7 +1707,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
 
         nlohmann::json resp = {{"success", true}};
         spdlog::info("[TreeApi] deleted node '{}'", node_id);
-        json_response(res, resp);
+        held.answer(res, resp);
     }));
 
     // ========================================================================
@@ -1726,6 +1768,9 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         nlohmann::json removed = nlohmann::json::array();
         auto* submitter = tree_op_submitter(ctx_, res);
         if (!submitter) return;
+        // The deletion closes the tunnel this request came over: the peers
+        // of the account's own devices stay until the answer has left.
+        HeldPeerRemoval held(&peer_holds_, tree::canonical_principal(principal));
         for (const auto& id : tree::rules::account_scope(ctx_.tree.nodes_snapshot(),
                                                          principal).removed) {
             removed.push_back(id);
@@ -1742,10 +1787,10 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
         spdlog::info("[TreeApi] deleted account '{}' ({} nodes)", account_id, removed.size());
-        json_response(res, {{"success", true},
-                            {"status", "deleted"},
-                            {"account_id", account_id},
-                            {"removed_nodes", std::move(removed)}});
+        held.answer(res, {{"success", true},
+                          {"status", "deleted"},
+                          {"account_id", account_id},
+                          {"removed_nodes", std::move(removed)}});
     }));
 
     // ========================================================================

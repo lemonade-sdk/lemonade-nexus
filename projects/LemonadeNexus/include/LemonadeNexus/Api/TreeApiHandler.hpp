@@ -1,6 +1,7 @@
 #pragma once
 
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
+#include <LemonadeNexus/Api/PeerRemovalHold.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -100,6 +101,9 @@ private:
     ApiContext& ctx_;
     /// Join operations this server submitted that have not committed yet.
     std::shared_ptr<PendingJoins> pending_joins_;
+    /// Peer removals held for a device that removes its own node over its
+    /// tunnel, until its answer has left (see PeerRemovalHold).
+    PeerRemovalHold peer_holds_;
 };
 
 } // namespace nexus::api
