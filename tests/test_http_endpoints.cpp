@@ -701,6 +701,65 @@ protected:
 
 // --- Health endpoint ---
 
+// A device that removes its own node asks over the tunnel the removal
+// closes. Its peer removal waits for the hold to end; other principals'
+// peers go at once, and nested holds by one key end together.
+TEST(PeerRemovalHoldTest, AHeldPrincipalsPeersGoWhenTheLastHoldEnds) {
+    std::vector<std::string> removed;
+    api::PeerRemovalHold holds([&](const std::string& key) { removed.push_back(key); });
+    holds.remove_or_defer("ed25519:a", "peer-a0");
+    EXPECT_EQ(removed, (std::vector<std::string>{"peer-a0"}));
+
+    holds.hold("ed25519:a");
+    holds.remove_or_defer("ed25519:a", "peer-a1");
+    holds.remove_or_defer("ed25519:b", "peer-b");
+    EXPECT_EQ(removed, (std::vector<std::string>{"peer-a0", "peer-b"}));
+    EXPECT_EQ(holds.deferred("ed25519:a"), 1u);
+
+    holds.hold("ed25519:a");
+    holds.release("ed25519:a");
+    EXPECT_EQ(removed.size(), 2u) << "the first of two holds keeps the peer";
+    holds.release("ed25519:a");
+    EXPECT_EQ(removed, (std::vector<std::string>{"peer-a0", "peer-b", "peer-a1"}));
+    EXPECT_EQ(holds.deferred("ed25519:a"), 0u);
+
+    holds.release("ed25519:a");
+    EXPECT_EQ(removed.size(), 3u) << "a principal that is not held is left alone";
+}
+
+// json_response_then delivers the body like json_response and runs its
+// completion once the response has been written.
+TEST(JsonResponseThenTest, TheCompletionRunsAfterTheBodyWasSent) {
+    httplib::Server server;
+    std::atomic<int> completions{0};
+    std::atomic<bool> sent{false};
+    server.Get("/answer", [&](const httplib::Request&, httplib::Response& res) {
+        api::json_response_then(res, {{"ok", true}}, 202, [&](bool was_sent) {
+            sent = was_sent;
+            ++completions;
+        });
+    });
+    const int port = server.bind_to_any_port("127.0.0.1");
+    ASSERT_GT(port, 0);
+    std::thread thread([&] { server.listen_after_bind(); });
+    server.wait_until_ready();
+
+    httplib::Client client("127.0.0.1", port);
+    auto res = client.Get("/answer");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 202);
+    EXPECT_EQ(res->get_header_value("Content-Type"), "application/json");
+    EXPECT_EQ(nlohmann::json::parse(res->body), nlohmann::json({{"ok", true}}));
+    for (int i = 0; i < 200 && completions.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(completions.load(), 1);
+    EXPECT_TRUE(sent.load());
+
+    server.stop();
+    thread.join();
+}
+
 TEST_F(HttpEndpointTest, HealthEndpoint) {
     auto cli = make_client();
     auto res = cli.Get("/api/health");

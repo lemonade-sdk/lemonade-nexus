@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <concepts>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -167,6 +168,25 @@ inline void json_response(httplib::Response& res, const nlohmann::json& j,
                            int status = 200) {
     res.status = status;
     res.set_content(j.dump(), "application/json");
+}
+
+/// Send a JSON response and run `after` once the response has left this
+/// server: the body was written (sent = true) or the connection failed.
+/// For work that must wait until the client has its answer, such as closing
+/// the tunnel the answer travels over. `after` runs on the server thread that
+/// served the request, after the handler returned.
+inline void json_response_then(httplib::Response& res, const nlohmann::json& j, int status,
+                               std::function<void(bool sent)> after) {
+    res.status = status;
+    auto body = std::make_shared<const std::string>(j.dump());
+    res.set_content_provider(
+        body->size(), "application/json",
+        [body](size_t offset, size_t length, httplib::DataSink& sink) {
+            return sink.write(body->data() + offset, length);
+        },
+        [after = std::move(after)](bool sent) {
+            if (after) after(sent);
+        });
 }
 
 /// Send an error response.
