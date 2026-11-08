@@ -454,6 +454,8 @@ void DnsService::handle_query(const uint8_t* data, std::size_t bytes,
     //                    → NXDOMAIN
     //   4. A   (IN)   — zone apex → tier+region wildcard multi-A → region
     //                    wildcard multi-A → dynamic A → tree resolve → NXDOMAIN
+    //                    (SERVFAIL instead of the tree step when this server
+    //                    holds no tree)
     //   5. anything else → NXDOMAIN
     if (q.qtype == ARES_REC_TYPE_SOA && q.qclass == ARES_CLASS_IN) {
         answer_soa_query(q, send_response);
@@ -632,7 +634,15 @@ void DnsService::answer_a_query(const ParsedQuery& q, const ResponseSink& send) 
         return;
     }
 
-    // 3. Tree-based resolution
+    // 3. Tree-based resolution. Only a Tier 1 member holds the tree. A server
+    // outside Tier 1 cannot tell a missing name from one it does not hold, so
+    // it answers SERVFAIL, never NXDOMAIN: the resolver then asks another
+    // name server of the zone instead of caching a denial.
+    if (!tree_.is_open()) {
+        spdlog::debug("[{}] {} -> SERVFAIL (this server holds no tree)", name(), q.qname);
+        send(build_servfail(q));
+        return;
+    }
     auto record = do_resolve(q.qname);
     if (record) {
         spdlog::debug("[{}] {} -> {}", name(), q.qname, record->ipv4_address);
@@ -1165,12 +1175,19 @@ std::vector<uint8_t> DnsService::build_txt_response(
 }
 
 std::vector<uint8_t> DnsService::build_nxdomain(const ParsedQuery& q) {
+    return build_error(q, ARES_RCODE_NXDOMAIN);
+}
 
-    // Create NXDOMAIN response
+std::vector<uint8_t> DnsService::build_servfail(const ParsedQuery& q) {
+    return build_error(q, ARES_RCODE_SERVFAIL);
+}
+
+std::vector<uint8_t> DnsService::build_error(const ParsedQuery& q, ares_dns_rcode_t rcode) {
+    // The question echoed back under `rcode`, with no records.
     ares_dns_record_t* response = nullptr;
     unsigned short flags = ARES_FLAG_QR | ARES_FLAG_AA;
     ares_status_t status = ares_dns_record_create(
-        &response, q.id, flags, ARES_OPCODE_QUERY, ARES_RCODE_NXDOMAIN);
+        &response, q.id, flags, ARES_OPCODE_QUERY, rcode);
     if (status != ARES_SUCCESS || !response) return {};
     DnsRecordGuard response_guard(response);
 

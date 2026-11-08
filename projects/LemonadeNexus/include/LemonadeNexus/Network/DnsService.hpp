@@ -64,6 +64,11 @@ using DnsRecordCallback = std::function<void(const std::string& delta_id,
 ///   _config.<hostname>.<base_domain>             -> TXT record with port config
 ///   _acme-challenge.<domain>                     -> ACME DNS-01 TXT challenge
 ///   <device>.<group-label>.lo.<base_domain>      -> 127.0.0.1 (group loopback name)
+///
+/// Tree names (endpoint, group and relay hostnames, group loopback names) are
+/// answered from the replicated tree, which only a Tier 1 member holds. A
+/// server outside Tier 1 answers SERVFAIL for them, never NXDOMAIN, so a
+/// resolver asks another name server of the zone instead of caching a denial.
 inline constexpr std::size_t kDnsTcpMaxMessageBytes = 65535;
 inline constexpr std::size_t kDnsMinMessageBytes = 12;
 inline constexpr int kDnsTcpMaxSessions = 64;
@@ -335,6 +340,14 @@ private:
     [[nodiscard]] std::vector<uint8_t> build_soa_response(const ParsedQuery& q);
 
     [[nodiscard]] std::vector<uint8_t> build_nxdomain(const ParsedQuery& q);
+
+    /// SERVFAIL: this server cannot answer, the resolver should ask another
+    /// name server of the zone. Sent for tree names when this server holds no
+    /// tree (it is not a Tier 1 member).
+    [[nodiscard]] std::vector<uint8_t> build_servfail(const ParsedQuery& q);
+
+    /// The question echoed back with no records under `rcode`.
+    [[nodiscard]] std::vector<uint8_t> build_error(const ParsedQuery& q, ares_dns_rcode_t rcode);
 
     /// Build a DNS response with multiple A records (for region-wildcard SEIP queries).
     /// Caps at 5 IPs to stay within the 512-byte UDP limit.
