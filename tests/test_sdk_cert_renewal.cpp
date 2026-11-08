@@ -288,3 +288,14 @@ TEST_F(CertRenewalTest, CApiValidatesArgumentsAndReportsNotDue) {
     EXPECT_EQ(ln_set_cert_renewed_callback(client, nullptr, nullptr), LN_OK);
     ln_destroy(client);
 }
+
+// A valid stored certificate is installed again after a restart. The result
+// names it, as a renewal does, so the mesh port can match it to its group.
+TEST_F(CertRenewalTest, ANotDueResultNamesTheStoredCertificate) {
+    store(make_cert("*.gabc.lo.example.test", -kDay, 89 * kDay));
+    const auto r = renewer.renew_if_needed(std::string(lnsdk::kGroupLoopbackCertTarget), dir,
+                                           now_s(), fetch());
+    EXPECT_EQ(r.status, CertRenewalStatus::NotDue);
+    EXPECT_EQ(r.domain, "*.gabc.lo.example.test");
+    EXPECT_EQ(fetches, 0);
+}
