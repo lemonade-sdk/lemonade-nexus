@@ -309,6 +309,16 @@ public endpoints. They connect over the LAN instead:
   `rmnet`, `pdp_ip`, and others; on Windows, adapters that are not Ethernet or
   Wi-Fi, or that name themselves virtual or VPN). A carrier NAT address
   (100.64/10) counts only when STUN saw that very address.
+- The kept addresses are ordered fastest link first, by the interface's
+  reported link speed (`/sys/class/net/<name>/speed` on Linux,
+  `SIOCGIFMEDIA` on macOS, `TransmitLinkSpeed` on Windows; Wi-Fi and
+  unreadable links report 0, which sorts last), so a peer tries this
+  device's fastest address before a slower one. The endpoint list carries no
+  speed on the wire, so this order is local only; a peer orders by its own
+  links. When two interfaces share one subnet (a host multihomed on the same
+  LAN), only the faster one is advertised: a socket bound to `0.0.0.0`
+  answers a probe from its default-route interface whatever address the probe
+  went to, so the second same-subnet address is never a distinct direct path.
 - The heartbeat carries them as `local_endpoints`. A changed list goes out at
   once. The server lists them only to the peers that already list the
   device (see [Security](Security#direct-paths)), and `peers_revision`
