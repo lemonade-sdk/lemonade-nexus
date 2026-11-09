@@ -995,12 +995,16 @@ public:
 
     /// Record that device `node_id` reached this server at `now` (Unix
     /// seconds): an authenticated heartbeat or event socket of the session
-    /// that owns the node. The caller must have checked that ownership. When
-    /// this server had not heard the device within kDevicePresenceOnlineSec
-    /// and is Tier 1, it sends the entry to every Tier 1 peer at once instead
-    /// of at the next kPresenceSyncIntervalSec. Returns true when the device
-    /// became online. Thread-safe: the send runs on the io thread.
-    bool record_device_presence(const std::string& node_id, uint64_t now);
+    /// that owns the node, with the LAN endpoints the heartbeat reported
+    /// (`lan`, see DevicePresence::record_local: nullopt leaves them, an
+    /// empty list removes them). The caller must have checked that ownership
+    /// and validated the list. When this server is Tier 1 and had not heard
+    /// the device within kDevicePresenceOnlineSec, or the listed LAN
+    /// endpoints changed, it sends the entry to every Tier 1 peer at once
+    /// instead of at the next kPresenceSyncIntervalSec. Returns true when the
+    /// device became online. Thread-safe: the send runs on the io thread.
+    bool record_device_presence(const std::string& node_id, uint64_t now,
+                                std::optional<std::vector<std::string>> lan = std::nullopt);
 
     /// Drop the replicated envelopes of a deleted account: every envelope of a
     /// group in `group_ids`, and every envelope addressed to a canonical key

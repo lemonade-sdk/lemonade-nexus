@@ -258,8 +258,8 @@ seen without waiting for a heartbeat. A server without the socket gets the
 peer list long-poll instead (`GET /api/mesh/peers/<node_id>?wait_revision=`,
 up to 25 seconds), which the server answers as soon as the revision changes.
 Each server wakes only the requests that it holds; a change that arrives
-through consensus wakes them on every Tier 1 server. LAN endpoints stay on
-the server that received the heartbeat.
+through consensus or through shared presence wakes them on every Tier 1
+server.
 
 Device presence is shared. A device is present at a server while it sends
 authenticated heartbeats or holds its own event socket open there. Each
@@ -272,8 +272,11 @@ and a home server on another therefore see each other online. Presence is a
 hint for display and path choice; it grants nothing.
 
 The heartbeat also carries the device's private LAN addresses with its
-dataplane port (`local_endpoints`). The server keeps them in memory and
-lists them only to the peers that already list the device. A device probes
+dataplane port (`local_endpoints`). The server keeps them in memory with the
+device's presence, and `PresenceSync` carries them to the other Tier 1
+servers, so a peer whose session is on another server gets them too. Each
+server validates a received list as it validates a heartbeat, and lists it
+only to the peers that already list the device. A device probes
 the LAN endpoints of a peer on its own network (the same public address, or
 a shared subnet) together with the peer's public endpoint, so two devices
 behind a router that does not hairpin UDP still connect directly over the

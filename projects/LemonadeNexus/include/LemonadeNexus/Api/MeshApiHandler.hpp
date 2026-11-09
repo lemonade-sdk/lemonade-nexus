@@ -2,6 +2,7 @@
 
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
 #include <LemonadeNexus/Api/MeshPeerWaiters.hpp>
+#include <LemonadeNexus/Gossip/DevicePresence.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 
@@ -12,7 +13,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace nexus::api {
@@ -40,8 +40,9 @@ namespace nexus::api {
                                     std::string_view caller_pubkey,
                                     const tree::TreeNode& peer);
 
-/// Most LAN endpoints one heartbeat may report.
-inline constexpr std::size_t kMaxMeshLocalEndpoints = 4;
+/// Most LAN endpoints one heartbeat may report: what a device's presence
+/// carries (gossip::kDevicePresenceMaxLanEndpoints).
+inline constexpr std::size_t kMaxMeshLocalEndpoints = gossip::kDevicePresenceMaxLanEndpoints;
 
 /// Route of the private event socket (see MeshApiHandler).
 inline constexpr const char* kMeshEventsRoute = "/api/events";
@@ -53,19 +54,21 @@ inline constexpr const char* kMeshEventsRoute = "/api/events";
 [[nodiscard]] std::string devices_revision(const tree::PermissionTreeService& tree,
                                            const auth::SessionClaims& claims);
 
-/// How long the server lists the LAN endpoints of a heartbeat, in seconds.
-/// Every heartbeat of a current client reports them again, so they disappear
-/// from the peer lists this long after the device stops sending heartbeats.
-inline constexpr uint64_t kMeshLocalEndpointTtlSec = 120;
+/// How long the servers list the LAN endpoints of a heartbeat, in seconds
+/// (gossip::kDevicePresenceLanTtlSec). Every heartbeat of a current client
+/// reports them again, so they disappear from the peer lists this long after
+/// the device stops sending heartbeats.
+inline constexpr uint64_t kMeshLocalEndpointTtlSec = gossip::kDevicePresenceLanTtlSec;
 
 /// Parse the `local_endpoints` of a mesh heartbeat: a JSON array of at most
-/// kMaxMeshLocalEndpoints strings, each "a.b.c.d:port" with decimal octets
-/// without leading zeros and a port from 1 to 65535. Each address must be
-/// private: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, or 100.64.0.0/10
-/// (shared address space). A loopback address (127.0.0.0/8) is accepted only
-/// with `allow_loopback` (a single-host deployment whose server address is
-/// loopback). A repeated entry is dropped. Returns nullopt when the value is
-/// not such an array or any entry fails. Pure.
+/// kMaxMeshLocalEndpoints strings that pass
+/// gossip::presence_lan_endpoint_valid: each "a.b.c.d:port" with decimal
+/// octets without leading zeros and a port from 1 to 65535, and a private
+/// address (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, or 100.64.0.0/10,
+/// the shared address space). A loopback address (127.0.0.0/8) is accepted
+/// only with `allow_loopback` (a single-host deployment whose server address
+/// is loopback). A repeated entry is dropped. Returns nullopt when the value
+/// is not such an array or any entry fails. Pure.
 [[nodiscard]] std::optional<std::vector<std::string>> parse_mesh_local_endpoints(
     const nlohmann::json& value, bool allow_loopback);
 
@@ -73,10 +76,11 @@ inline constexpr uint64_t kMeshLocalEndpointTtlSec = 120;
 ///
 /// A device is present at this server while it sends authenticated
 /// heartbeats or holds an open event socket; the gossip service's
-/// DevicePresence table holds that time and the times other Tier 1 servers
-/// share. The peer list reports a listed device's `is_online` and
-/// `last_seen` from that table, so a device on another Tier 1 server reads
-/// online too.
+/// DevicePresence table holds that time, the LAN endpoints the heartbeat
+/// reported, and what other Tier 1 servers share of both. The peer list
+/// reports a listed device's `is_online`, `last_seen`, and `local_endpoints`
+/// from that table, so a device on another Tier 1 server reads online with
+/// its LAN endpoints too.
 class MeshApiHandler : public IRequestHandler<MeshApiHandler> {
     friend class IRequestHandler<MeshApiHandler>;
 
@@ -109,29 +113,7 @@ private:
     /// Build the server peer JSON entry (always included in peer lists).
     [[nodiscard]] nlohmann::json build_server_peer() const;
 
-    /// Store the LAN endpoints that `node_id`'s owner reported at `now`
-    /// (Unix seconds). An empty list removes the entry. Wakes the peer list
-    /// long-polls when the stored list changed. Thread-safe.
-    void store_local_endpoints(const std::string& node_id, std::vector<std::string> endpoints,
-                               uint64_t now);
-
-    /// The LAN endpoints `node_id` reported within kMeshLocalEndpointTtlSec
-    /// of `now`; empty when none. Thread-safe.
-    [[nodiscard]] std::vector<std::string> local_endpoints_of(const std::string& node_id,
-                                                              uint64_t now) const;
-
     ApiContext& ctx_;
-
-    /// LAN endpoints by node id. Runtime state of this server only: it is
-    /// not part of the tree and is not replicated, so a peer list shows the
-    /// LAN endpoints of the devices whose heartbeats reach this server.
-    struct LocalEndpoints {
-        std::vector<std::string> endpoints;
-        uint64_t                 reported_at{0};  ///< Unix seconds
-    };
-    mutable std::mutex                              local_mtx_;
-    std::unordered_map<std::string, LocalEndpoints> local_endpoints_;
-    uint64_t                                        local_pruned_at_{0};
 
     MeshPeerWaiters waiters_;
 

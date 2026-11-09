@@ -227,3 +227,215 @@ TEST(PresenceSyncCodecTest, MalformedAndOversizedPayloadsAreRefused) {
     EXPECT_TRUE(decode_presence_sync(
         msgpack_of({{"entries", {entry("dev1", kNow)}}, {"pad", std::string(100, 'x')}})));
 }
+
+// LAN endpoints recorded with a local presence are listed for the TTL from
+// the heartbeat that reported them, a heartbeat without the field keeps
+// them, an empty list removes them, and the hook runs on a change only.
+TEST(DevicePresenceTest, LocalLanEndpointsFollowTheHeartbeatAndExpire) {
+    const std::vector<std::string> lan{"192.168.1.20:41234", "10.0.0.5:41234"};
+    DevicePresence p;
+    int calls = 0;
+    p.set_changed_hook([&calls] { ++calls; });
+
+    auto r = p.record_local("dev1", kNow, lan);
+    EXPECT_TRUE(r.accepted);
+    EXPECT_TRUE(r.became_online);
+    EXPECT_TRUE(r.lan_changed);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(p.lan_endpoints("dev1", kNow), lan);
+    EXPECT_EQ(p.lan_endpoints("dev1", kNow + kDevicePresenceLanTtlSec - 1), lan);
+    EXPECT_TRUE(p.lan_endpoints("dev1", kNow + kDevicePresenceLanTtlSec).empty());
+    EXPECT_TRUE(p.lan_endpoints("other", kNow).empty());
+
+    // The same list again restarts the TTL and is not a change.
+    r = p.record_local("dev1", kNow + 3, lan);
+    EXPECT_FALSE(r.lan_changed);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(p.lan_endpoints("dev1", kNow + 3 + kDevicePresenceLanTtlSec - 1), lan);
+
+    // Without the field (an older client or an event socket) the list stays,
+    // and its TTL still counts from the last report.
+    r = p.record_local("dev1", kNow + 6);
+    EXPECT_FALSE(r.lan_changed);
+    EXPECT_EQ(p.lan_endpoints("dev1", kNow + 6), lan);
+    EXPECT_TRUE(p.lan_endpoints("dev1", kNow + 3 + kDevicePresenceLanTtlSec).empty());
+
+    // Local presence carries the list to the other Tier 1 servers.
+    auto local = p.local_online(kNow + 6);
+    ASSERT_EQ(local.size(), 1u);
+    EXPECT_EQ(local[0], (PresenceEntry{"dev1", kNow + 6, lan}));
+
+    // A new list is a change; an empty list removes it; removing nothing is
+    // not a change.
+    const std::vector<std::string> moved{"172.16.4.9:41234"};
+    r = p.record_local("dev1", kNow + 9, moved);
+    EXPECT_TRUE(r.lan_changed);
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(p.lan_endpoints("dev1", kNow + 9), moved);
+    r = p.record_local("dev1", kNow + 12, std::vector<std::string>{});
+    EXPECT_TRUE(r.lan_changed);
+    EXPECT_EQ(calls, 3);
+    EXPECT_TRUE(p.lan_endpoints("dev1", kNow + 12).empty());
+    r = p.record_local("dev1", kNow + 15, std::vector<std::string>{});
+    EXPECT_FALSE(r.lan_changed);
+    EXPECT_EQ(calls, 3);
+    local = p.local_online(kNow + 15);
+    ASSERT_EQ(local.size(), 1u);
+    EXPECT_TRUE(local[0].lan.empty());
+
+    // An expired list reads as a change when it is reported again, and the
+    // sweep drops it.
+    (void)p.record_local("dev1", kNow + 20, lan);
+    const auto later = kNow + 20 + kDevicePresenceLanTtlSec;
+    (void)p.sweep(later);
+    EXPECT_TRUE(p.lan_endpoints("dev1", later).empty());
+    r = p.record_local("dev1", later, lan);
+    EXPECT_TRUE(r.lan_changed);
+}
+
+// Gossiped presence carries the LAN endpoints the other server heard: the
+// entry that raises a device's time sets its list, dated at that time; an
+// older entry changes nothing; an entry without a list removes it; and the
+// list is never relayed as local presence.
+TEST(DevicePresenceTest, MergedLanEndpointsFollowTheNewestPresence) {
+    const std::vector<std::string> lan{"192.168.1.20:41234"};
+    const std::vector<std::string> other{"10.9.8.7:5000", "192.168.1.21:5000"};
+    DevicePresence p;
+    int calls = 0;
+    p.set_changed_hook([&calls] { ++calls; });
+
+    auto r = p.merge_remote({{"dev1", kNow - 2, lan}}, kNow);
+    EXPECT_EQ(r.merged, 1u);
+    EXPECT_TRUE(r.became_online);
+    EXPECT_TRUE(r.lan_changed);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(p.lan_endpoints("dev1", kNow), lan);
+    EXPECT_EQ(p.lan_endpoints("dev1", kNow - 2 + kDevicePresenceLanTtlSec - 1), lan);
+    EXPECT_TRUE(p.lan_endpoints("dev1", kNow - 2 + kDevicePresenceLanTtlSec).empty());
+    EXPECT_TRUE(p.local_online(kNow).empty()) << "a gossiped list counted as local";
+
+    // Older presence, even with another list, changes nothing.
+    r = p.merge_remote({{"dev1", kNow - 5, other}}, kNow);
+    EXPECT_EQ(r.merged, 0u);
+    EXPECT_FALSE(r.lan_changed);
+    EXPECT_EQ(p.lan_endpoints("dev1", kNow), lan);
+
+    // The same presence again is not a change; a newer one with the same
+    // list is not a change either, but restarts the TTL.
+    r = p.merge_remote({{"dev1", kNow - 2, lan}}, kNow);
+    EXPECT_FALSE(r.lan_changed);
+    r = p.merge_remote({{"dev1", kNow, lan}}, kNow);
+    EXPECT_EQ(r.merged, 1u);
+    EXPECT_FALSE(r.lan_changed);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(p.lan_endpoints("dev1", kNow + kDevicePresenceLanTtlSec - 1), lan);
+
+    // The server that heard the device last decides: a newer presence with
+    // another list replaces it, and one without a list removes it.
+    r = p.merge_remote({{"dev1", kNow + 3, other}}, kNow + 3);
+    EXPECT_TRUE(r.lan_changed);
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(p.lan_endpoints("dev1", kNow + 3), other);
+    r = p.merge_remote({{"dev1", kNow + 6}}, kNow + 6);
+    EXPECT_TRUE(r.lan_changed);
+    EXPECT_EQ(calls, 3);
+    EXPECT_TRUE(p.lan_endpoints("dev1", kNow + 6).empty());
+
+    // A list that arrives with a presence already past the TTL is not listed.
+    r = p.merge_remote({{"dev2", kNow - kDevicePresenceLanTtlSec, lan}}, kNow);
+    EXPECT_EQ(r.merged, 1u);
+    EXPECT_FALSE(r.lan_changed);
+    EXPECT_TRUE(p.lan_endpoints("dev2", kNow).empty());
+
+    // A local heartbeat and a newer gossiped presence: the newest wins both ways.
+    (void)p.record_local("dev3", kNow, lan);
+    (void)p.merge_remote({{"dev3", kNow + 1, other}}, kNow + 1);
+    EXPECT_EQ(p.lan_endpoints("dev3", kNow + 1), other);
+    (void)p.record_local("dev3", kNow + 2, lan);
+    EXPECT_EQ(p.lan_endpoints("dev3", kNow + 2), lan);
+}
+
+// The LAN endpoint rule: private IPv4 "a.b.c.d:port" only, loopback only
+// when allowed.
+TEST(DevicePresenceTest, LanEndpointRule) {
+    for (const char* ok : {"10.0.0.1:1", "10.255.255.255:65535", "172.16.0.1:7", "172.31.255.254:7",
+                           "192.168.0.1:41234", "100.64.0.1:9", "100.127.255.255:9"}) {
+        EXPECT_TRUE(presence_lan_endpoint_valid(ok, false)) << ok;
+    }
+    for (const char* bad : {"", "8.8.8.8:1", "203.0.113.5:1", "169.254.1.1:1", "172.32.0.1:1",
+                            "100.128.0.1:1", "256.1.1.1:1", "192.168.1.20:0", "192.168.1.20:65536",
+                            "192.168.1.20", "192.168.01.20:1", "192.168.1.20:041", "192.168.1.20:1 ",
+                            "192.168.1.20:+1", "192.168.1:1", "192.168.1.2.3:1", "[fd00::1]:1",
+                            "192.168.1.20:1:2", "garbage"}) {
+        EXPECT_FALSE(presence_lan_endpoint_valid(bad, true)) << bad;
+    }
+    EXPECT_FALSE(presence_lan_endpoint_valid("127.0.0.1:9", false));
+    EXPECT_TRUE(presence_lan_endpoint_valid("127.0.0.1:9", true));
+}
+
+// PresenceSync carries a device's LAN endpoints as `lan`, only when it has
+// any; a sender from before the field is decoded with none; and a list that
+// fails the heartbeat rules refuses the payload, since a gossip peer is not
+// the device.
+TEST(PresenceSyncCodecTest, LanEndpointsRoundTripAndInvalidOnesAreRefused) {
+    const std::vector<std::string> lan{"192.168.1.20:41234", "10.0.0.5:41234"};
+    const std::vector<PresenceEntry> entries{{"dev1", kNow, lan}, {"dev2", kNow - 1}};
+    const auto pages = encode_presence_sync(entries);
+    ASSERT_EQ(pages.size(), 1u);
+    const auto decoded = decode_presence_sync(pages[0]);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(*decoded, entries);
+    const auto doc = nlohmann::json::from_msgpack(pages[0]);
+    EXPECT_EQ(doc["entries"][0]["lan"], nlohmann::json(lan));
+    EXPECT_FALSE(doc["entries"][1].contains("lan")) << "an empty list was sent";
+
+    // Loopback never goes on the wire, and the count is capped.
+    std::vector<std::string> many{"127.0.0.1:1"};
+    for (int i = 1; i <= static_cast<int>(kDevicePresenceMaxLanEndpoints) + 1; ++i) {
+        many.push_back("10.0.0." + std::to_string(i) + ":1");
+    }
+    const auto capped = decode_presence_sync(encode_presence_sync({{"dev1", kNow, many}})[0]);
+    ASSERT_TRUE(capped.has_value());
+    ASSERT_EQ(capped->size(), 1u);
+    EXPECT_EQ((*capped)[0].lan.size(), kDevicePresenceMaxLanEndpoints);
+    EXPECT_EQ((*capped)[0].lan[0], "10.0.0.1:1");
+
+    // Every long id with a full list stays within the byte bound.
+    std::vector<PresenceEntry> long_ids;
+    for (int i = 0; i < 300; ++i) {
+        long_ids.push_back({std::string(120, 'a') + std::to_string(i), kNow,
+                            {"192.168.100.100:65535", "172.31.255.255:65535",
+                             "10.255.255.255:65535", "100.127.255.255:65535"}});
+    }
+    std::size_t total = 0;
+    for (const auto& page : encode_presence_sync(long_ids)) {
+        EXPECT_LE(page.size(), kPresenceSyncMaxPayloadBytes);
+        const auto one = decode_presence_sync(page);
+        ASSERT_TRUE(one.has_value());
+        total += one->size();
+    }
+    EXPECT_EQ(total, 300u);
+
+    const auto with_lan = [](const nlohmann::json& lan_value) {
+        return msgpack_of({{"entries", {{{"node_id", "dev1"}, {"seen", kNow}, {"lan", lan_value}}}}});
+    };
+    EXPECT_TRUE(decode_presence_sync(with_lan(nlohmann::json::array())));
+    EXPECT_TRUE(decode_presence_sync(with_lan({"10.0.0.1:1"})));
+    EXPECT_FALSE(decode_presence_sync(with_lan({"8.8.8.8:41234"})));       // public
+    EXPECT_FALSE(decode_presence_sync(with_lan({"127.0.0.1:41234"})));     // loopback
+    EXPECT_FALSE(decode_presence_sync(with_lan({"192.168.1.20:0"})));      // port 0
+    EXPECT_FALSE(decode_presence_sync(with_lan({"192.168.1.20"})));        // no port
+    EXPECT_FALSE(decode_presence_sync(with_lan({"[fd00::1]:41234"})));     // IPv6
+    EXPECT_FALSE(decode_presence_sync(with_lan({41234})));                 // not a string
+    EXPECT_FALSE(decode_presence_sync(with_lan("10.0.0.1:1")));            // not an array
+    EXPECT_FALSE(decode_presence_sync(with_lan({"10.0.0.1:1", "10.0.0.1:1"})));  // repeated
+    nlohmann::json too_many = nlohmann::json::array();
+    for (std::size_t i = 0; i <= kDevicePresenceMaxLanEndpoints; ++i) {
+        too_many.push_back("10.0.0." + std::to_string(i + 1) + ":1");
+    }
+    EXPECT_FALSE(decode_presence_sync(with_lan(too_many)));
+    // One bad list spoils the message, as one bad id does.
+    EXPECT_FALSE(decode_presence_sync(msgpack_of(
+        {{"entries", {{{"node_id", "dev1"}, {"seen", kNow}},
+                      {{"node_id", "dev2"}, {"seen", kNow}, {"lan", {"8.8.8.8:1"}}}}}})));
+}

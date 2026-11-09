@@ -132,6 +132,16 @@ the old binary as an invalid baseline.
   device's heartbeat and event socket presence at any Tier 1 server, so
   `last_seen` now advances with every heartbeat. An SDK of any release reads
   them as before.
+- **LAN endpoints in presence.** A `PresenceSync` entry may carry `lan`: the
+  `local_endpoints` of the device's latest heartbeat, at most four private
+  IPv4 `a.b.c.d:port` strings. A release from before the field ignores the
+  key, and a release with it accepts an entry without the key as a presence
+  with no LAN endpoints. A receiver validates each endpoint as the heartbeat
+  does, without the loopback exception, and refuses the message on a
+  failing entry. During a rollout, a device whose session is on an earlier
+  server shows its LAN endpoints only in the peer lists of that server, as
+  before; a device on an N+1 server shows them on every N+1 server. The peer
+  list field `local_endpoints` keeps its shape.
 - **Tree op link extension.** A `Join` with a link token and an
   `AcceptInvite` from N+1 append a link extension to the canonical op
   encoding. An op without it encodes exactly as before, and N+1

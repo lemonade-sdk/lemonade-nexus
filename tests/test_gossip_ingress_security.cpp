@@ -3148,10 +3148,11 @@ TEST_F(GossipIngressSecurityTest, AccountEnvelopesReplicateOverTheBackbone) {
 }
 
 // Device presence is shared between Tier 1 servers over the backbone only. A
-// device that reaches A is announced to B at once, and A repeats what it heard
-// on each round. Tier 2 neither receives nor sends it. The public socket, a
-// sender outside Tier 1, a malformed or oversized payload, and a time ahead
-// of the receiver's clock beyond the skew are refused.
+// device that reaches A is announced to B at once, with the LAN endpoints its
+// heartbeat reported, and A repeats what it heard on each round. Tier 2
+// neither receives nor sends it. The public socket, a sender outside Tier 1,
+// a malformed or oversized payload, a LAN endpoint that fails the heartbeat
+// rules, and a time ahead of the receiver's clock beyond the skew are refused.
 TEST_F(GossipIngressSecurityTest, DevicePresenceIsSharedBetweenTier1ServersOnly) {
     auto root_kp = kc->ed25519_keygen();
     auto a_kp    = kc->ed25519_keygen();
@@ -3264,6 +3265,24 @@ TEST_F(GossipIngressSecurityTest, DevicePresenceIsSharedBetweenTier1ServersOnly)
     gossip::GossipBallotTestAccess::send_presence_sync(*a.gossip);
     ASSERT_TRUE(pump_until([&] { return online(b, "dev2"); }));
 
+    // The LAN endpoints of a heartbeat ride with the presence: B lists what
+    // A heard, a changed list is announced at once, and the periodic round
+    // carries the list too.
+    const std::vector<std::string> lan{"192.168.1.20:41234", "10.0.0.5:41234"};
+    const auto lan_at = [&](Node& n, const std::string& device) {
+        return n.gossip->device_presence().lan_endpoints(device, now + 1);
+    };
+    EXPECT_TRUE(a.gossip->record_device_presence("dev12", now, lan));
+    ASSERT_TRUE(pump_until([&] { return lan_at(b, "dev12") == lan; }));
+    EXPECT_TRUE(b.gossip->device_presence().local_online(now).empty())
+        << "a gossiped list counted as heard locally, so B would relay it";
+    const std::vector<std::string> moved{"172.16.9.9:41234"};
+    EXPECT_FALSE(a.gossip->record_device_presence("dev12", now + 1, moved));
+    ASSERT_TRUE(pump_until([&] { return lan_at(b, "dev12") == moved; }));
+    (void)a.gossip->device_presence().record_local("dev2", now + 1, lan);
+    gossip::GossipBallotTestAccess::send_presence_sync(*a.gossip);
+    ASSERT_TRUE(pump_until([&] { return lan_at(b, "dev2") == lan; }));
+
     // Tier 2 shares nothing: C keeps a device that reaches it to itself.
     EXPECT_TRUE(c.gossip->record_device_presence("dev3", now));
     gossip::GossipBallotTestAccess::send_presence_sync(*c.gossip);
@@ -3288,10 +3307,30 @@ TEST_F(GossipIngressSecurityTest, DevicePresenceIsSharedBetweenTier1ServersOnly)
         return msgpack_of(doc);
     };
 
+    const auto presence_with_lan = [](const std::string& id, uint64_t seen,
+                                      const nlohmann::json& lan_value) {
+        return msgpack_of(nlohmann::json{
+            {"entries", {{{"node_id", id}, {"seen", seen}, {"lan", lan_value}}}}});
+    };
+
     // Positive control for the path below.
     over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
                   presence_of({{"dev4", now}}));
     ASSERT_TRUE(pump_until([&] { return online(b, "dev4"); }));
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  presence_with_lan("dev4", now + 1, nlohmann::json(lan)));
+    ASSERT_TRUE(pump_until([&] { return lan_at(b, "dev4") == lan; }));
+
+    // Refused: a LAN endpoint that fails the heartbeat rules (a public
+    // address, loopback, or more than the cap), even from Tier 1.
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  presence_with_lan("dev13", now, {"8.8.8.8:41234"}));
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  presence_with_lan("dev14", now, {"127.0.0.1:41234"}));
+    over_backbone(va, "172.16.0.1", a_port, a_kp, "172.16.0.2", b_port,
+                  presence_with_lan("dev15", now,
+                                    {"10.0.0.1:1", "10.0.0.2:1", "10.0.0.3:1", "10.0.0.4:1",
+                                     "10.0.0.5:1"}));
 
     // Refused: malformed (one bad id spoils the message), not msgpack, and
     // over the byte bound.
@@ -3313,6 +3352,9 @@ TEST_F(GossipIngressSecurityTest, DevicePresenceIsSharedBetweenTier1ServersOnly)
     inject(build_packet(a_kp, gossip::GossipMsgType::PresenceSync, presence_of({{"dev10", now}})),
            b);
     pump_for(std::chrono::milliseconds(400));
+    EXPECT_FALSE(online(b, "dev13"));
+    EXPECT_FALSE(online(b, "dev14"));
+    EXPECT_FALSE(online(b, "dev15"));
     EXPECT_FALSE(online(b, "dev5"));
     EXPECT_FALSE(online(b, "dev6"));
     EXPECT_EQ(b.gossip->device_presence().status("dev7", now).last_seen, 0u);
