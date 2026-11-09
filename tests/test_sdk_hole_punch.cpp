@@ -1385,6 +1385,94 @@ TEST_F(SdkHolePunchTest, APeerOnAnotherNetworkDoesNotWaitForTheLanWindow) {
     lan_relay.stop();
 }
 
+namespace {
+
+/// A LAN with a multihomed host on one side. Alice (single-homed) reaches Bob
+/// at `bob_face`; Bob, bound to 0.0.0.0, answers every datagram through its
+/// default-route interface, so its replies always appear to come from
+/// `bob_face` whichever same-subnet address they were sent to. This is the
+/// asymmetric-routing behavior of a box with two NICs on one subnet.
+class MultihomedLan {
+public:
+    MultihomedLan(asio::io_context& io, uint16_t alice_port, uint16_t bob_port)
+        : alice_face_(io, local0()),
+          bob_face_(io, local0()),
+          alice_(asio::ip::address_v4::loopback(), alice_port),
+          bob_(asio::ip::address_v4::loopback(), bob_port) {
+        pump(bob_face_, alice_face_, bob_, bbuf_, bfrom_);   // Alice -> Bob
+        pump(alice_face_, bob_face_, alice_, abuf_, afrom_); // Bob  -> Alice (via bob_face_)
+    }
+    ~MultihomedLan() {
+        asio::error_code ec;
+        alice_face_.close(ec);
+        bob_face_.close(ec);
+    }
+    std::string alice_face() const { return ep(alice_face_); }  // Bob's list of Alice
+    std::string bob_face() const { return ep(bob_face_); }      // Alice's list of Bob
+
+private:
+    static asio::ip::udp::endpoint local0() {
+        return asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0);
+    }
+    static std::string ep(const asio::ip::udp::socket& s) {
+        return "127.0.0.1:" + std::to_string(s.local_endpoint().port());
+    }
+    void pump(asio::ip::udp::socket& in, asio::ip::udp::socket& out, asio::ip::udp::endpoint to,
+              std::array<uint8_t, 2048>& buf, asio::ip::udp::endpoint& from) {
+        in.async_receive_from(asio::buffer(buf), from,
+            [this, &in, &out, to, &buf, &from](const asio::error_code& ec, std::size_t n) {
+                if (ec) return;
+                asio::error_code sec;
+                out.send_to(asio::buffer(buf.data(), n), to, 0, sec);
+                pump(in, out, to, buf, from);
+            });
+    }
+    asio::ip::udp::socket alice_face_, bob_face_;
+    asio::ip::udp::endpoint alice_, bob_;
+    std::array<uint8_t, 2048> bbuf_{}, abuf_{};
+    asio::ip::udp::endpoint bfrom_, afrom_;
+};
+
+}  // namespace
+
+// A direct LAN path forms to a multihomed peer. Bob advertises one address
+// per subnet (select_local_endpoints keeps the fastest), and answers from
+// that default-route interface whatever address a probe went to. The public
+// endpoints never answer. Both sides reach "lan" and carry traffic.
+TEST_F(SdkHolePunchTest, DirectPathFormsToAMultihomedPeer) {
+    UdpSink alice_public(io), bob_public(io);
+    MultihomedLan lan(io, alice.bound_port(), bob.bound_port());
+
+    lnsdk::HolePuncher alice_punch(alice, fast_punch());
+    lnsdk::HolePuncher bob_punch(bob, fast_punch());
+
+    std::vector<lnsdk::MeshPeer> alice_peers = {
+        peer(bob_keys.second, "10.64.0.3/32", bob_public.endpoint())};
+    std::vector<lnsdk::MeshPeer> bob_peers = {
+        peer(alice_keys.second, "10.64.0.2/32", alice_public.endpoint())};
+    alice_peers[0].local_endpoints = {lan.bob_face()};
+    bob_peers[0].local_endpoints = {lan.alice_face()};
+
+    const auto pass = [&] {
+        ASSERT_TRUE(alice.sync_peers(alice_peers).ok);
+        ASSERT_TRUE(bob.sync_peers(bob_peers).ok);
+        (void)alice_punch.maintain(alice_peers, {}, true);
+        (void)bob_punch.maintain(bob_peers, {}, true);
+    };
+    ASSERT_TRUE(eventually(
+        [&] {
+            const auto a = status_of(alice.mesh_status(), bob_keys.second);
+            const auto b = status_of(bob.mesh_status(), alice_keys.second);
+            return a && b && a->last_handshake > 0 && b->last_handshake > 0;
+        },
+        pass, 10s));
+    // The session runs over the LAN address the peer answered from, not the
+    // never-answering public endpoint.
+    EXPECT_EQ(status_of(alice.mesh_status(), bob_keys.second)->endpoint, lan.bob_face());
+    EXPECT_EQ(status_of(bob.mesh_status(), alice_keys.second)->endpoint, lan.alice_face());
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
+}
+
 // One initiation goes to every probe target, LAN endpoints first: separate
 // initiations would leave all but the newest two unanswerable.
 TEST_F(SdkHolePunchTest, OneProbeReachesEveryTarget) {

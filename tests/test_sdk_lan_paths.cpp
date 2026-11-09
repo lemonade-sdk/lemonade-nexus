@@ -25,6 +25,13 @@ lnsdk::InterfaceAddress itf(const std::string& name, const std::string& address,
     return a;
 }
 
+lnsdk::InterfaceAddress itf_speed(const std::string& name, const std::string& address,
+                                  uint32_t mbps, uint8_t prefix = 24) {
+    auto a = itf(name, address, prefix);
+    a.link_speed_mbps = mbps;
+    return a;
+}
+
 lnsdk::LocalEndpointRules mesh_rules() {
     lnsdk::LocalEndpointRules rules;
     rules.mesh_ranges = {"10.64.0.0/10"};
@@ -93,6 +100,45 @@ TEST(SdkLanPaths, CapsAndDeduplicates) {
     ASSERT_EQ(out.size(), lnsdk::kMaxLocalEndpoints);
     EXPECT_EQ(out.front(), "192.168.1.20:7");
     EXPECT_EQ(out.back(), "192.168.4.20:7");
+}
+
+// Several interfaces on different subnets are advertised fastest link first,
+// so a peer tries this device's fastest address before a slower one. An
+// interface that reports no speed (0, e.g. Wi-Fi) sorts after the ones that
+// do, and equal speeds keep the platform's list order.
+TEST(SdkLanPaths, OrdersAddressesByLinkSpeedDescending) {
+    const std::vector<lnsdk::InterfaceAddress> host = {
+        itf_speed("wlan0", "192.168.1.9", 0),       // Wi-Fi: unknown speed
+        itf_speed("eth0", "172.20.0.4", 1000, 20),  // 1 Gbit
+        itf_speed("eth1", "10.1.2.3", 25000, 16),   // 25 Gbit
+        itf_speed("eth2", "192.168.9.4", 1000),     // 1 Gbit, after eth0
+    };
+    EXPECT_EQ(lnsdk::select_local_endpoints(host, 5000, mesh_rules()),
+              (std::vector<std::string>{"10.1.2.3:5000", "172.20.0.4:5000", "192.168.9.4:5000",
+                                        "192.168.1.9:5000"}));
+}
+
+// Two interfaces on one subnet are redundant: a host bound to 0.0.0.0 answers
+// a probe from its default-route interface whatever address the probe went
+// to. Only the faster same-subnet address is advertised. Interfaces on
+// different subnets are all kept.
+TEST(SdkLanPaths, CollapsesSameSubnetInterfacesToTheFastest) {
+    const std::vector<lnsdk::InterfaceAddress> multihomed = {
+        itf_speed("wlp99s0", "10.0.0.202", 0),      // Wi-Fi on 10.0.0.0/24
+        itf_speed("enp98s0", "10.0.0.82", 1000),    // 1 Gbit on 10.0.0.0/24
+    };
+    EXPECT_EQ(lnsdk::select_local_endpoints(multihomed, 34817, mesh_rules()),
+              std::vector<std::string>{"10.0.0.82:34817"});
+
+    // Same subnet, different prefix spellings are distinct subnets and both
+    // kept; a true shared subnet keeps one.
+    const std::vector<lnsdk::InterfaceAddress> mixed = {
+        itf_speed("eth0", "192.168.5.10", 1000),
+        itf_speed("eth1", "192.168.5.11", 2500),   // same /24 as eth0, faster
+        itf_speed("eth2", "192.168.6.10", 1000),   // another subnet
+    };
+    EXPECT_EQ(lnsdk::select_local_endpoints(mixed, 7, mesh_rules()),
+              (std::vector<std::string>{"192.168.5.11:7", "192.168.6.10:7"}));
 }
 
 TEST(SdkLanPaths, LoopbackOnlyForASingleHostDeployment) {
