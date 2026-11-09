@@ -245,14 +245,22 @@ void TreeConsensus::receive_forwarded(const security::TreeOpSubmitMsg& message,
         std::lock_guard lock(mutex_);
         members = members_;
     }
-    if (members.empty()) return;
+    if (members.empty()) {
+        spdlog::debug("[TreeConsensus] dropped a forwarded op: no Tier 1 membership snapshot yet");
+        return;
+    }
     const auto verdict =
         tree_.validate_local_op(*op, policy_for(members), config_.wall_clock_ms() / 1000);
     if (!verdict.ok()) {
         spdlog::debug("[TreeConsensus] dropped a forwarded op: {}", verdict.reason);
         return;
     }
-    (void)pool_.add(std::move(*op), nullptr);
+    const auto id = op_id_hex(*op);
+    if (pool_.add(std::move(*op), nullptr) != TreeOpPool::Admit::Added) {
+        spdlog::debug("[TreeConsensus] dropped a forwarded op {}: the pending pool is full or "
+                      "already holds it",
+                      id);
+    }
 }
 
 std::optional<TreeOpOutcome> TreeConsensus::status(const std::string& op_id) const {

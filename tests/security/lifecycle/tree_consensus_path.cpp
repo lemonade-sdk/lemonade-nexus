@@ -480,5 +480,165 @@ TEST_F(TreeConsensusPath, ALaggingTier1MemberCatchesUpAcrossAnEpochChange) {
     EXPECT_EQ(late.consensus->log().height(), 4u);
 }
 
+
+// Forwarding (design A2): an op submitted at one member reaches every other
+// member's pool over the security plane, and a lost forward only costs the
+// views until the submitter leads.
+class TreeOpForwarding : public TreeConsensusPath {
+protected:
+    void SetUp() override {
+        TreeConsensusPath::SetUp();
+        bootstrap();
+        refresh_members();
+        const auto root = stack_of(founders[0]).submitter->submit_async(root_op());
+        ASSERT_TRUE(root.verdict.ok()) << root.verdict.reason;
+        ASSERT_TRUE(run_until([](TreeStack& s) { return s.tree->get_node("root").has_value(); }));
+    }
+
+    Node* current_leader() {
+        const auto* consensus = founders[0]->runtime->consensus();
+        const NodeId leader = consensus->leader_of(consensus->current_view());
+        for (Node* founder : founders) {
+            if (founder->id == leader) return founder;
+        }
+        return nullptr;
+    }
+
+    Node* a_non_leader() {
+        for (Node* founder : founders) {
+            if (founder != current_leader()) return founder;
+        }
+        return nullptr;
+    }
+
+    /// Steps until every founder holds `label`; the count, or -1 within `max_steps`.
+    int steps_until_committed(const std::string& label, int max_steps) {
+        for (int i = 1; i <= max_steps; ++i) {
+            step(1);
+            if (std::all_of(founders.begin(), founders.end(), [&](Node* f) {
+                    return stack_of(f).tree->get_node(label).has_value();
+                })) {
+                return i;
+            }
+        }
+        return -1;
+    }
+};
+
+TEST_F(TreeOpForwarding, AnOpSubmittedAtOneMemberReachesEveryPool) {
+    step(5);
+    Node* submitter = a_non_leader();
+    ASSERT_NE(submitter, nullptr);
+    const auto op = stack_of(submitter).submitter->submit_async(create_customer("acme"));
+    ASSERT_TRUE(op.verdict.ok()) << op.verdict.reason;
+    mesh.pump();
+    for (Node* founder : founders) {
+        const auto status = stack_of(founder).consensus->status(op.ticket->op_id());
+        ASSERT_TRUE(status.has_value()) << "op missing from a member's pool";
+        EXPECT_EQ(status->status, nexus::tree::TreeOpStatus::Pending);
+    }
+    // Five members at kIdleProposalIntervalMs per view: a few views.
+    EXPECT_GE(steps_until_committed("acme", 25), 0);
+}
+
+TEST_F(TreeOpForwarding, AnOpCommitsWhenEveryForwardIsLost) {
+    step(5);
+    Node* submitter = a_non_leader();
+    ASSERT_NE(submitter, nullptr);
+    // The broadcast reaches every node of the mesh, members or not.
+    mesh.drop_next[SecurityMessageKind::TreeOpSubmit] = static_cast<int>(mesh.nodes.size());
+    const auto op = stack_of(submitter).submitter->submit_async(create_customer("beta"));
+    ASSERT_TRUE(op.verdict.ok()) << op.verdict.reason;
+    mesh.pump();
+    for (Node* founder : founders) {
+        const bool pooled = stack_of(founder).consensus->status(op.ticket->op_id()).has_value();
+        EXPECT_EQ(pooled, founder == submitter);
+    }
+    // The submitter leads within one leader rotation, 5 views, and the block
+    // commits two views later: well inside 5 s.
+    const int steps = steps_until_committed("beta", 25);
+    EXPECT_GE(steps, 0) << "an op whose forwards were lost never committed";
+}
+
+// A stage transition that the quorum does not share (two of five members
+// derive another eligibility state) cannot certify. Every aged leader used to
+// propose it in every view it led, so each of those views ended on the
+// pacemaker timeout and tree writes waited minutes for a view led by a member
+// that proposed a payload instead. The leader now retries a failed stage
+// after kStageRetryIntervalMs and proposes payload or empty blocks between
+// the retries.
+class StageStarvation : public TreeOpForwarding {
+protected:
+    void SetUp() override {
+        TreeConsensusPath::SetUp();
+        bootstrap();
+        refresh_members();
+        // Two members never receive the others' observations, so their
+        // eligibility stage digest differs from the other three members'.
+        const NodeId fourth = founders[3]->id;
+        const NodeId fifth = founders[4]->id;
+        mesh.drop_if = [fourth, fifth](const Queued& item, const SecurityMessage& message) {
+            return message.kind == SecurityMessageKind::EligibilityObservation &&
+                   (item.to == fourth || item.to == fifth);
+        };
+        const auto root = stack_of(founders[0]).submitter->submit_async(root_op());
+        ASSERT_TRUE(root.verdict.ok()) << root.verdict.reason;
+        ASSERT_TRUE(run_until([](TreeStack& s) { return s.tree->get_node("root").has_value(); }));
+    }
+
+    /// The epoch ages on every member at once: each proposes its stage once.
+    void age_epoch() { mesh.now_ms += constants::kTargetEpochSeconds * 1000; }
+
+    /// Restarts `founder` as a process restart would: its epoch clock starts
+    /// again, so it is un-aged and proposes no stage for an hour.
+    void restart(Node* founder) {
+        auto& stack = stack_of(founder);
+        stack.submitter.reset();
+        stack.consensus.reset();
+        stack.tree->stop();
+        stack.tree.reset();
+        restart_node(*founder);
+        founder->driver->start(mesh.now_ms);
+        for (int i = 0; i < 200 && founder->driver->phase() != DriverPhase::Active; ++i) {
+            step(1);
+        }
+        ASSERT_EQ(founder->driver->phase(), DriverPhase::Active);
+        refresh_members();
+    }
+
+    /// An op submitted at `submitter` commits on every member within `bound_ms`.
+    void expect_commit_within(Node* submitter, const std::string& label, int bound_ms) {
+        const auto op = stack_of(submitter).submitter->submit_async(create_customer(label));
+        ASSERT_TRUE(op.verdict.ok()) << op.verdict.reason;
+        const int steps = steps_until_committed(label, bound_ms / 200);
+        EXPECT_GE(steps, 0) << label << " did not commit within " << bound_ms << " ms";
+    }
+};
+
+TEST_F(StageStarvation, TreeOpsCommitWhileEveryMemberIsAged) {
+    age_epoch();
+    // Each member proposes its stage once; those five views end on the
+    // pacemaker timeout, whose backoff makes this first rotation the slowest.
+    // Retries follow kStageRetryIntervalMs; the views between carry payload
+    // or empty blocks.
+    step(400);
+    expect_commit_within(a_non_leader(), "gamma", 10'000);
+    expect_commit_within(current_leader(), "delta", 10'000);
+}
+
+TEST_F(StageStarvation, TreeOpsCommitAfterTwoMembersRestartedIntoAnAgedEpoch) {
+    age_epoch();
+    step(5);
+    restart(founders[1]);
+    restart(founders[2]);
+    // The three aged members each propose their stage once after the restarts.
+    step(150);
+    // Submitted at an aged member and at a restarted one: both commit while
+    // the stage stays uncertifiable.
+    expect_commit_within(founders[0], "epsilon", 10'000);
+    expect_commit_within(founders[1], "zeta", 10'000);
+    expect_founders_agree();
+}
+
 }  // namespace
 }  // namespace lifecycle_test

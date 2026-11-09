@@ -18,6 +18,10 @@ namespace {
     return crypto::to_hex(std::span<const uint8_t>(node.bytes.data(), 8));
 }
 
+[[nodiscard]] std::string short_hex(const Digest& digest) {
+    return crypto::to_hex(std::span<const uint8_t>(digest.data(), 8));
+}
+
 [[nodiscard]] const char* phase_name(DriverPhase p) {
     switch (p) {
         case DriverPhase::Failed:            return "Failed";
@@ -1895,13 +1899,48 @@ bool SecurityDriver::accepts_transition(const Digest& transitions_digest) const 
     // independently arrived at. Its own epoch clock does not gate the vote:
     // the stage digests are mesh facts, and the leader's clock paced the
     // proposal.
-    for (const Digest pending : {pending_handoff_digest(), pending_readiness_digest(),
-                                 plan_stage_digest(), eligibility_stage_digest()}) {
+    const Digest handoff = pending_handoff_digest();
+    const Digest readiness = pending_readiness_digest();
+    const Digest plan = plan_stage_digest();
+    const Digest eligibility = eligibility_stage_digest();
+    for (const Digest pending : {handoff, readiness, plan, eligibility}) {
         if (pending != Digest{} && transitions_digest == pending) {
             return true;
         }
     }
+    if (refused_transition_logged_ != transitions_digest) {
+        // Once per foreign digest: which stage this node holds instead is what
+        // tells two members apart when neither can certify its own.
+        refused_transition_logged_ = transitions_digest;
+        std::string mine;
+        if (handoff != Digest{}) mine = "handoff " + short_hex(handoff);
+        else if (readiness != Digest{}) mine = "readiness " + short_hex(readiness);
+        else if (plan != Digest{}) mine = "plan " + short_hex(plan);
+        else if (eligibility != Digest{}) mine = "eligibility " + short_hex(eligibility);
+        else mine = "none";
+        spdlog::info("[security] transition {} is not a stage this node derived; this node's "
+                     "pending stage is {}{}",
+                     short_hex(transitions_digest), mine, eligibility_facts_summary());
+    }
     return false;
+}
+
+std::string SecurityDriver::eligibility_facts_summary() const {
+    const EpochManager* epochs = runtime_.epochs();
+    if (epochs == nullptr || eligibility_.finalized() != nullptr) {
+        return {};
+    }
+    // The inputs of the eligibility digest, per candidate, so the operator can
+    // see which fact differs between two members that do not agree on it.
+    std::string out = "; eligibility facts:";
+    for (const auto& record : eligibility_.compute_state(epochs->current().id + 1).records) {
+        out += " " + short_id(record.subject) + "[uptime=" + (record.uptime_valid ? "1" : "0") +
+               " health=" + (record.mesh_health_valid ? "1" : "0") +
+               " cert=" + (record.certificate_valid ? "1" : "0") +
+               " claims=" + short_hex(record.platform_claims) +
+               " faults=" + std::to_string(record.faults) + "]";
+    }
+    return out;
 }
 
 void SecurityDriver::maybe_propose(View view) {
@@ -1917,6 +1956,27 @@ void SecurityDriver::maybe_propose(View view) {
     if (transitions == Digest{}) transitions = pending_readiness_digest();
     if (transitions == Digest{}) transitions = pending_plan_digest();
     if (transitions == Digest{}) transitions = pending_eligibility_digest();
+    // A stage this node already proposed and that is still pending did not
+    // reach a quorum that derives it (a certified stage commits within a few
+    // views and stops being pending). Proposing it again at once would only
+    // end this view on the pacemaker timeout and hold back a pending payload;
+    // the retry waits for kStageRetryIntervalMs, or for new facts, and for a
+    // pacemaker back at its base timeout. A first attempt waits for neither.
+    if (transitions != Digest{} && transitions == stage_attempt_digest_) {
+        const bool retry_due = now_ms_ - stage_attempt_ms_ >= kStageRetryIntervalMs;
+        const bool chain_live =
+            pacemaker_.timeout() <= std::chrono::milliseconds(constants::kViewTimeoutBaseMs);
+        if (!stage_deferred_logged_) {
+            stage_deferred_logged_ = true;
+            spdlog::info("[security] stage {} proposed by this node did not certify; it is "
+                         "proposed again after {} ms or when its digest changes, and payload "
+                         "or empty blocks go first",
+                         short_hex(transitions), kStageRetryIntervalMs);
+        }
+        if (!retry_due || !chain_live) {
+            transitions = Digest{};
+        }
+    }
     // Stages keep priority: a payload block is proposed only when no stage is
     // pending, so a block never carries both.
     std::optional<ProposedPayload> payload;
@@ -1954,7 +2014,12 @@ void SecurityDriver::maybe_propose(View view) {
             proposed = root.digest();
         }
         auto made = consensus->make_proposal(previous, proposed, digest);
-        if (!std::holds_alternative<Proposal>(made)) {
+        if (const auto* failure = std::get_if<ConsensusFailure>(&made)) {
+            if (proposal_failure_logged_view_ != view) {
+                proposal_failure_logged_view_ = view;
+                spdlog::debug("[security] no proposal for view {}: consensus failure {}",
+                              view.underlying(), static_cast<uint16_t>(*failure));
+            }
             return std::nullopt;
         }
         ProposalMessage message{std::get<Proposal>(made), consensus->state().high_qc,
@@ -1981,6 +2046,13 @@ void SecurityDriver::maybe_propose(View view) {
         return;
     }
     last_proposed_view_ = view;
+    if (transitions != Digest{}) {
+        stage_attempt_digest_ = transitions;
+        stage_attempt_ms_ = now_ms_;
+        stage_deferred_logged_ = false;
+        spdlog::info("[security] proposing stage {} in view {}", short_hex(transitions),
+                     view.underlying());
+    }
     auto envelope = router_.compose(SecurityMessageKind::HotStuffProposal, *message, epoch);
     (void)router_.broadcast(envelope);
     (void)router_.deliver_local(std::move(envelope), now_ms_);
