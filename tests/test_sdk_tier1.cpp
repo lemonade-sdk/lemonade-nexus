@@ -16,9 +16,11 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 #include <sodium.h>
+#include <spdlog/spdlog.h>
 
 #include "support/tier1_chain.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -536,7 +538,8 @@ TEST_F(SdkTier1Test, AServerThatKeepsRateLimitingIsUnreachable) {
     ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
     const auto refreshed = dir.refresh(seed("t1a.example"));
     EXPECT_FALSE(refreshed.ok);
-    EXPECT_NE(refreshed.error.find("unreachable"), std::string::npos) << refreshed.error;
+    EXPECT_NE(refreshed.error.find("t1a.example:9100 HTTP 429"), std::string::npos)
+        << refreshed.error;
     EXPECT_EQ(asked, 31) << "one request and 30 waits";
 }
 
@@ -624,6 +627,43 @@ TEST_F(SdkTier1Test, AFailedProbeRoundNamesTheCandidatesItAsked) {
     EXPECT_NE(error.find("t1a.example:9100 unreachable"), std::string::npos) << error;
     EXPECT_NE(error.find("t1b.example:9100 unreachable"), std::string::npos) << error;
     EXPECT_EQ(error.find("old.example"), std::string::npos) << error;
+}
+
+TEST_F(SdkTier1Test, AFailedRefreshNamesWhyEachServerDidNotAnswer) {
+    // The transport reports why a GET brought no response (status 0 with the
+    // reason), or a server answers an error status: the failure names it
+    // next to the server, with a long reason cut and control characters
+    // replaced.
+    const std::string long_reason = std::string(100, 'x') + "\n";
+    auto dir = lnsdk::Tier1Directory(
+        [&](const lnsdk::ServerEndpoint& ep,
+            const std::string& path) -> std::optional<lnsdk::HttpReply> {
+            if (ep.host == "tls.example") {
+                return lnsdk::HttpReply{0, "", "SSL server\tverification failed"};
+            }
+            if (ep.host == "busy.example") return lnsdk::HttpReply{503, "{}"};
+            if (ep.host == "long.example") return lnsdk::HttpReply{0, "", long_reason};
+            std::lock_guard lock(mutex);
+            return net.get(ep, path);
+        });
+    net.servers["t1a.example"].down = true;
+    net.servers["t1b.example"].down = true;
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    const auto refreshed =
+        dir.refresh(hosts({"tls.example", "busy.example", "long.example", "t2.example"}));
+    EXPECT_FALSE(refreshed.ok);
+    EXPECT_EQ(refreshed.http_status, 0);
+    const auto& error = refreshed.error;
+    EXPECT_NE(error.find("tried: tls.example:9100 unreachable (SSL server verification failed); "
+                         "busy.example:9100 HTTP 503; long.example:9100 unreachable (" +
+                         std::string(64, 'x') + "...); t2.example:9100 advanced to epoch 2"),
+              std::string::npos)
+        << error;
+    EXPECT_NE(error.find("probed: tls.example:9100 unreachable (SSL server verification failed); "
+                         "busy.example:9100 HTTP 503"),
+              std::string::npos)
+        << error;
+    EXPECT_NE(error.find("t1a.example:9100 unreachable;"), std::string::npos) << error;
 }
 
 TEST_F(SdkTier1Test, AWithheldHandoffIsFetchedFromAMemberThatProvesTheNewerEpoch) {
@@ -894,6 +934,168 @@ TEST_F(SdkTier1Test, DiscoveryFailsClosedWithTooFewAgreeingServers) {
     EXPECT_FALSE(no_domain.ok);
     EXPECT_EQ(no_domain.http_status, 403);
     EXPECT_FALSE(dir.has_genesis_key());
+}
+
+TEST_F(SdkTier1Test, DiscoveryNamesWhatEachHostAnswered) {
+    // Too few hosts agree: the failure names each host asked and why it did
+    // not count, so an outage report shows which servers to look at.
+    serve_genesis_everywhere();
+    net.servers["t2.example"].down = true;
+    net.onboard_info["old.example"] = {429, R"({"error":"rate limited"})"};
+    net.servers["outside.test"] = FakeServer{std::nullopt, 0, &chain, 2, "", false};
+    net.onboard_info["outside.test"] = onboard_info(chain.genesis.public_key);
+    net.servers["quiet.example"] = FakeServer{std::nullopt, 0, &chain, 2, "", false};
+    net.onboard_info["quiet.example"] = {200, R"({"accepts_onboarding":true})"};
+    auto dir = lnsdk::Tier1Directory(
+        [&](const lnsdk::ServerEndpoint& ep,
+            const std::string& path) -> std::optional<lnsdk::HttpReply> {
+            if (ep.host == "tls.example") {
+                return lnsdk::HttpReply{0, "", "SSL server verification failed"};
+            }
+            std::lock_guard lock(mutex);
+            return net.get(ep, path);
+        });
+    const auto found = dir.discover_genesis_key(hosts({"t1a.example", "t2.example", "old.example",
+                                                       "outside.test", "quiet.example",
+                                                       "tls.example"}));
+    EXPECT_FALSE(found.ok);
+    EXPECT_EQ(found.http_status, 0);
+    EXPECT_NE(found.error.find(
+                  "found 1; asked 6 host(s): t1a.example:9100 agrees; "
+                  "t2.example:9100 unreachable; old.example:9100 HTTP 429; "
+                  "outside.test:9100 outside domain example; quiet.example:9100 no claim; "
+                  "tls.example:9100 unreachable (SSL server verification failed); "
+                  "set the Genesis key explicitly"),
+              std::string::npos)
+        << found.error;
+    EXPECT_FALSE(dir.has_genesis_key());
+}
+
+TEST_F(SdkTier1Test, DiscoveryWithFewKnownHostsAsksTheRegion) {
+    // One seed and no key: the client asks the configured region for more
+    // candidates before it gives up, and the failure names every host asked.
+    // Nothing here answers, so nothing is pinned.
+    lnsdk::ServerConfig cfg;
+    cfg.servers = {{"127.0.0.1", 1, true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    int calls = 0;
+    std::string domain, region;
+    uint16_t port = 0;
+    client.set_region_discovery([&](const std::string& d, const std::string& r, uint16_t p) {
+        ++calls;
+        domain = d;
+        region = r;
+        port = p;
+        lnsdk::Result<std::vector<lnsdk::DiscoveredServer>> result;
+        result.ok = true;
+        result.http_status = 200;
+        result.value = {{"localhost", 1, "127.0.0.1"}};
+        return result;
+    });
+
+    // No region is known: nothing to ask beyond the seed.
+    auto found = client.discover_genesis_key();
+    EXPECT_FALSE(found.ok);
+    EXPECT_EQ(found.http_status, 0);
+    EXPECT_EQ(calls, 0);
+    EXPECT_NE(found.error.find("asked 1 host(s): 127.0.0.1:1 unreachable ("), std::string::npos)
+        << found.error;
+
+    EXPECT_FALSE(client.set_discovery_target("example.test", "us.east").ok);
+    EXPECT_FALSE(client.set_discovery_target("exa mple.test", "us").ok);
+    EXPECT_FALSE(client.set_discovery_target("", "us").ok);
+    ASSERT_TRUE(client.set_discovery_target("example.test", "us").ok);
+    found = client.discover_genesis_key();
+    EXPECT_FALSE(found.ok);
+    EXPECT_EQ(found.http_status, 0);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(domain, "example.test");
+    EXPECT_EQ(region, "us");
+    EXPECT_EQ(port, 1);
+    EXPECT_NE(found.error.find("asked 2 host(s): 127.0.0.1:1 unreachable ("), std::string::npos)
+        << found.error;
+    EXPECT_NE(found.error.find("; localhost:1 unreachable ("), std::string::npos) << found.error;
+    // The region's servers join the pool only after discovery succeeds.
+    EXPECT_EQ(client.known_servers().size(), 1u);
+
+    // Three distinct known hosts: the region is not asked.
+    found = client.discover_genesis_key({{"localhost", 1, true}, {"0.0.0.0", 1, true}});
+    EXPECT_FALSE(found.ok);
+    EXPECT_EQ(calls, 1);
+    EXPECT_NE(found.error.find("asked 3 host(s)"), std::string::npos) << found.error;
+}
+
+TEST_F(SdkTier1Test, TheCApiSetsTheDiscoveryTarget) {
+    auto* c = ln_create_tls("127.0.0.1", 1);
+    ASSERT_NE(c, nullptr);
+    EXPECT_EQ(ln_set_discovery_target(nullptr, "example.test", "us"), LN_ERR_NULL_ARG);
+    EXPECT_EQ(ln_set_discovery_target(c, nullptr, "us"), LN_ERR_NULL_ARG);
+    EXPECT_EQ(ln_set_discovery_target(c, "example.test", nullptr), LN_ERR_NULL_ARG);
+    EXPECT_EQ(ln_set_discovery_target(c, "example.test", "us.east"), LN_ERR_REJECTED);
+    EXPECT_EQ(ln_set_discovery_target(c, "exa mple.test", "us"), LN_ERR_REJECTED);
+    EXPECT_EQ(ln_set_discovery_target(c, "", "us"), LN_ERR_REJECTED);
+    EXPECT_EQ(ln_set_discovery_target(c, "Example.Test.", "US-West"), LN_OK);
+    ln_destroy(c);
+}
+
+namespace {
+
+/// One line an ln_log_fn received.
+struct LogLine {
+    int         level;
+    std::string logger;
+    std::string message;
+};
+
+struct LogCapture {
+    std::mutex           mtx;
+    std::vector<LogLine> lines;
+
+    static void receive(int level, const char* logger, const char* message, void* user) {
+        auto* self = static_cast<LogCapture*>(user);
+        std::lock_guard lock(self->mtx);
+        self->lines.push_back({level, logger, message});
+    }
+    std::vector<LogLine> snapshot() {
+        std::lock_guard lock(mtx);
+        return lines;
+    }
+};
+
+}  // namespace
+
+TEST_F(SdkTier1Test, TheCApiRoutesLogLinesToACallback) {
+    // A discovery against a closed port logs the failed GET at warn level:
+    // the callback receives it with spdlog's level number and the SDK
+    // logger name, and the level in force does not change. A NULL callback
+    // puts the stdout logger back and the lines stop.
+    const auto level_before = spdlog::default_logger()->level();
+    LogCapture capture;
+    ASSERT_EQ(ln_set_log_callback(&LogCapture::receive, &capture), LN_OK);
+    EXPECT_EQ(spdlog::default_logger()->level(), level_before);
+
+    auto* c = ln_create_tls("127.0.0.1", 1);
+    ASSERT_NE(c, nullptr);
+    char* out = nullptr;
+    EXPECT_EQ(ln_discover_genesis_key(c, nullptr, &out), LN_ERR_CONNECT);
+    ln_free(out);
+    const auto lines = capture.snapshot();
+    const auto failed_get = std::find_if(lines.begin(), lines.end(), [](const LogLine& line) {
+        return line.message.find("[LemonadeNexusClient] GET https://127.0.0.1:1/api/onboard/info "
+                                 "failed: ") != std::string::npos;
+    });
+    ASSERT_NE(failed_get, lines.end()) << lines.size() << " line(s) received";
+    EXPECT_EQ(failed_get->level, 3) << "spdlog warn";
+    EXPECT_EQ(failed_get->logger, "lemonade-nexus-sdk");
+
+    ASSERT_EQ(ln_set_log_callback(nullptr, nullptr), LN_OK);
+    EXPECT_EQ(spdlog::default_logger()->level(), level_before);
+    const auto before = capture.snapshot().size();
+    EXPECT_EQ(ln_discover_genesis_key(c, nullptr, &out), LN_ERR_CONNECT);
+    ln_free(out);
+    EXPECT_EQ(capture.snapshot().size(), before);
+    ln_destroy(c);
 }
 
 TEST_F(SdkTier1Test, DiscoveryFailsClosedOnAMalformedKey) {

@@ -41,6 +41,31 @@ no kernel module, no TUN device, no elevated privileges, on every platform.
 The shared library exports only the `ln_*` C API (hidden visibility); the C++
 class and the Dart wrapper both sit on top of it.
 
+## Logging
+
+The SDK logs through one process-wide logger that writes to stdout. The level
+is info, or debug when `LN_DEBUG` is set in the environment at the first
+`ln_create` / `ln_create_tls`. A host whose stdout is lost (a Windows service,
+a mobile app) routes the lines to its own logger instead:
+
+```c
+static void on_log(int level, const char* logger, const char* message, void* user) {
+    /* level: 0 trace, 1 debug, 2 info, 3 warn, 4 error, 5 critical.
+       logger is "lemonade-nexus-sdk"; message has no timestamp or level
+       prefix. Both strings are valid only during this call. */
+}
+
+ln_set_log_callback(on_log, NULL);   /* before the first ln_create */
+ln_set_log_callback(NULL, NULL);     /* back to stdout */
+```
+
+The callback runs on SDK threads while the SDK holds internal locks: it must
+return quickly, must not throw, and must not call any `ln_*` function. Make
+the call before the first `ln_create`, or while no client exists; the logger
+swap is not synchronized against a log line in progress on another thread.
+The level in force stays as it is. The setting is process-wide, not per
+client.
+
 ## Tier 1 Servers
 
 Only Tier 1 servers hold the permission tree. A Tier 2 server refuses every
@@ -58,9 +83,15 @@ A client that has no stored key can discover it on first connect:
 Discovery runs only when no key is pinned. It asks each candidate server for
 `GET /api/onboard/info` over verified HTTPS: the hosts the caller passes (for
 example, servers found through DNS discovery), the configured servers, and the
-servers they list in `/api/servers`. It asks at most 16 distinct hosts. Each
-server reports its configured `genesis_pubkey` and the `network_id` that
-derives from it. The SDK pins the key only when all of these are true:
+servers they list in `/api/servers`. When those are fewer than 3 distinct
+hosts (one seed, or a seed whose `/api/servers` did not answer), it also asks
+the servers the region's SEIP records name (`<region>.seip.<domain>`; the
+region comes from `set_discovery_target` / `ln_set_discovery_target`,
+`ServerConfig::discovery_domain` and `discovery_region`, or a known server's
+SEIP FQDN). Those servers are candidates only. It asks at most 16 distinct
+hosts. Each server reports its configured `genesis_pubkey` and the
+`network_id` that derives from it. The SDK pins the key only when all of
+these are true:
 
 1. Every server that reports a key reports the same key, network id, and DNS
    base domain.
@@ -69,9 +100,13 @@ derives from it. The SDK pins the key only when all of these are true:
 
 A disagreement, a malformed key, a network id that does not derive from the
 key, or no DNS domain fails closed with `LN_ERR_REJECTED`. Fewer than 3
-agreeing hosts fails closed with `LN_ERR_CONNECT`. A network with fewer than 3
-reachable servers needs an explicit `set_genesis_key`. On success the key is
-pinned as with `set_genesis_key`, and the call returns
+agreeing hosts fails closed with `LN_ERR_CONNECT`; the error names each host
+asked and what it answered, for example
+`found 1; asked 3 host(s): sn01.example:9100 agrees; sn02.example:9100
+unreachable (SSL server verification failed); sn03.example:9100 HTTP 429`
+(the other outcomes are `no claim` and `outside domain <domain>`). A network
+with fewer than 3 reachable servers needs an explicit `set_genesis_key`. On
+success the key is pinned as with `set_genesis_key`, and the call returns
 `{"genesis_pubkey","network_id","dns_base_domain","hosts"}`. Store the key and
 pin it with `set_genesis_key` on later runs.
 
@@ -119,14 +154,17 @@ known server answers at all, the SDK resolves the region's SEIP records
 (`<region>.seip.<domain>`, the same records the first DNS discovery reads;
 see [DNS Discovery](DNS-Discovery)) and verifies the servers they name with
 the same chain walk and endpoint proofs before it uses one. The region comes
-from `ServerConfig::discovery_domain` and `discovery_region`, or from the
-session server's SEIP FQDN `<id>.<region>.seip.<domain>` when they are not
-set; without either, no fallback runs. The DNS step runs at most once a
-minute, so a long outage costs one lookup a minute rather than one per tree
-call; it supplies candidates only, and it never touches the pinned Genesis
-key. One info log line names what the lookup found. A refresh that still
-fails names every server it asked (`tried:` for the chain walk, `probed:` for
-the endpoint proofs).
+from `ServerConfig::discovery_domain` and `discovery_region`
+(`set_discovery_target` / `ln_set_discovery_target` sets them on a created
+client), or from the session server's SEIP FQDN `<id>.<region>.seip.<domain>`
+when they are not set; without either, no fallback runs and a warning log
+line says so. The DNS step runs at most once a minute, so a long outage costs
+one lookup a minute rather than one per tree call; it supplies candidates
+only, and it never touches the pinned Genesis key. One info log line names
+what the lookup found. A refresh that still fails names every server it asked
+(`tried:` for the chain walk, `probed:` for the endpoint proofs) and what each
+one answered: `unreachable` with the transport's reason (for example
+`unreachable (SSL server verification failed)`), or `HTTP <status>`.
 `refresh_tier1()` / `ln_tier1_refresh()` verifies now, and
 `tier1_membership()` / `ln_tier1_membership()` returns the last result.
 `tier1_walk_progress()` / `ln_tier1_progress()` reports the chain walk that
