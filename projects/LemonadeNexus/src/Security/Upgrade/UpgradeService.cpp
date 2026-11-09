@@ -339,8 +339,19 @@ void UpgradeService::on_verdict(const AttestationVerdict& verdict) {
     }
     if (!verdict.passed || verdict.evidence_digest == Digest{} ||
         !all_platform_claims_proved(verdict.claims)) {
-        spdlog::info("[upgrade] {} did not pass upgrade-health attestation",
-                     short_id(verdict.node_id));
+        // One line per verdict; the witness interval and the per-position
+        // attempt budget already pace them. Names only, no evidence.
+        std::string checks;
+        const auto failed = [&checks](std::string_view check) {
+            checks += checks.empty() ? "" : ", ";
+            checks += check;
+        };
+        if (!verdict.passed) failed("not passed");
+        if (verdict.evidence_digest == Digest{}) failed("no evidence digest");
+        if (!all_platform_claims_proved(verdict.claims)) failed("claims unproved");
+        spdlog::info("[upgrade] {} did not pass upgrade-health attestation: {} ({})",
+                     short_id(verdict.node_id), attestation_failure_name(verdict.failure),
+                     checks);
         return;
     }
     if (!runs_release(verdict, chain_->current()->approval)) {

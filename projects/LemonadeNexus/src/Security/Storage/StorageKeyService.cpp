@@ -347,7 +347,7 @@ void StorageKeyService::tick(uint64_t now_ms) {
         // from an earlier epoch is refused by the epoch check alone.
         seen_requests_.clear();
         seen_epoch_ = epoch;
-        std::erase_if(unlock_counts_, [epoch](const auto& entry) {
+        std::erase_if(unlock_budgets_, [epoch](const auto& entry) {
             return entry.first.first < epoch;
         });
     }
@@ -423,6 +423,45 @@ void StorageKeyService::drop(StorageDrop reason) {
     } else {
         ++it->second.suppressed;
     }
+}
+
+void StorageKeyService::log_unlock_refusal(const AttestationVerdict& verdict) {
+    // One line per requester and window, as drop() does per reason: the
+    // failure kind and the failed checks are what an operator needs to read
+    // the cause from a holder's log. Names and counts only, no evidence.
+    auto it = refusal_log_.find(verdict.node_id);
+    if (it == refusal_log_.end()) {
+        while (refusal_log_.size() >= 4 * constants::kStorageMaxPendingUnlocks) {
+            refusal_log_.erase(refusal_log_.begin());
+        }
+        it = refusal_log_.emplace(verdict.node_id, DropLogWindow{now_ms_, 0}).first;
+    } else if (now_ms_ - it->second.window_start_ms < kDropLogWindowMs) {
+        ++it->second.suppressed;
+        return;
+    }
+    std::string checks;
+    const auto failed = [&checks](std::string_view check) {
+        checks += checks.empty() ? "" : ", ";
+        checks += check;
+    };
+    if (!verdict.passed) failed("not passed");
+    if (verdict.evidence_digest == Digest{}) failed("no evidence digest");
+    if (!platform_claims_are_consistent(verdict.claims)) failed("claims inconsistent");
+    if (!all_platform_claims_proved(verdict.claims)) failed("claims unproved");
+    if (verdict.claims.profile_id != kTier1AttestationProfileId) {
+        failed(std::string("profile ") +
+               std::string(attestation_profile_id_name(verdict.claims.profile_id)));
+    }
+    if (verdict.claims.profile_ruleset != kAttestationProfileRulesetVersion) {
+        failed("ruleset " + std::to_string(verdict.claims.profile_ruleset));
+    }
+    spdlog::info("[storage] unlock attestation refused for {}: {} ({}){}",
+                 short_hex(verdict.node_id.span()), attestation_failure_name(verdict.failure),
+                 checks,
+                 it->second.suppressed > 0
+                     ? " (" + std::to_string(it->second.suppressed) + " suppressed)"
+                     : "");
+    it->second = DropLogWindow{now_ms_, 0};
 }
 
 bool StorageKeyService::expects_unlock_challenge(const NodeId& holder,
@@ -1838,8 +1877,13 @@ void StorageKeyService::on_unlock_request(const StorageUnlockRequestMsg& request
         drop(StorageDrop::PendingBusy);
         return;
     }
-    auto& count = unlock_counts_[{epoch, request.requester}];
-    if (count >= constants::kStorageUnlocksPerRequesterPerEpoch ||
+    // Served partials bound extraction; issued challenges bound the
+    // verifications and remembered digests one requester can cost this
+    // holder. A failed answer spends only the second, so a server whose
+    // evidence fails after a restart can still unlock once it passes.
+    auto& budget = unlock_budgets_[{epoch, request.requester}];
+    if (budget.served >= constants::kStorageUnlocksPerRequesterPerEpoch ||
+        budget.challenged >= constants::kStorageUnlockAttemptsPerRequesterPerEpoch ||
         pending_unlocks_.size() >= constants::kStorageMaxPendingUnlocks ||
         seen_requests_.size() >= constants::kStorageMaxRememberedRequests) {
         // A full replay set refuses rather than forgets: forgetting would
@@ -1857,7 +1901,7 @@ void StorageKeyService::on_unlock_request(const StorageUnlockRequestMsg& request
         return;
     }
     seen_requests_.insert(request_digest);
-    ++count;
+    ++budget.challenged;
     pending_unlocks_.insert_or_assign(
         request.requester,
         PendingUnlock{request, request_digest, context,
@@ -1888,6 +1932,7 @@ void StorageKeyService::on_verdict(const AttestationVerdict& verdict) {
                           verdict.claims.profile_ruleset == kAttestationProfileRulesetVersion;
     if (!approved) {
         drop(StorageDrop::AttestationFailed);
+        log_unlock_refusal(verdict);
         return;
     }
     const StorageFinalPlan* plan = live_plan(pending.request.plan_digest);
@@ -1919,6 +1964,7 @@ void StorageKeyService::on_verdict(const AttestationVerdict& verdict) {
     message.holder_id = own->holder_id;
     message.sealed_partial = std::move(*sealed);
     ++partials_sent_;
+    ++unlock_budgets_[{pending.request.epoch, pending.request.requester}].served;
     (void)router_.send(pending.request.requester,
                        router_.compose(SecurityMessageKind::StorageUnlockPartial, message,
                                        pending.request.epoch));

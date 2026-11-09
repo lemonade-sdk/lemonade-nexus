@@ -381,8 +381,8 @@ TEST(AttestationService, StorageUnlockChallengesHaveTheirOwnLaneAndBudget) {
     EXPECT_EQ(nexus::security::challenge_digest(*storage_lane),
               nexus::security::challenge_digest(*unlock));
 
-    // The unlock budget per node and epoch is spent independently.
-    for (uint32_t i = 1; i < constants::kStorageUnlocksPerRequesterPerEpoch; ++i) {
+    // The unlock attempt bound per node and epoch is spent independently.
+    for (uint32_t i = 1; i < constants::kStorageUnlockAttemptsPerRequesterPerEpoch; ++i) {
         EXPECT_TRUE(service
                         .create_challenge(node(0x11), key(0x11), 1, 9,
                                           AttestationPurpose::StorageUnlock, context)

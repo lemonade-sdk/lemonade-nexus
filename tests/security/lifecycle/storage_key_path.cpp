@@ -19,10 +19,14 @@
 #include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 
 #include <nlohmann/json.hpp>
+#include <spdlog/sinks/base_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <mutex>
+#include <string>
 
 namespace lifecycle_test {
 namespace {
@@ -607,9 +611,12 @@ TEST_F(StorageKeyPath, UnlockAndSessionBudgetsBind) {
     storage(holder).on_message(make(2));
     EXPECT_EQ(storage(holder).drops(StorageDrop::PendingBusy), busy + 1);
 
-    // Each accepted request spends the per-epoch budget until it runs out.
-    int accepted = 1;
-    for (uint8_t seed = 3; seed < 40; ++seed) {
+    // Each challenged request that expires unanswered spends the per-epoch
+    // attempt bound, not the partial budget: the holder keeps challenging
+    // past kStorageUnlocksPerRequesterPerEpoch and refuses only at the
+    // larger attempt bound.
+    uint32_t accepted = 1;
+    for (uint8_t seed = 3; seed < 120; ++seed) {
         mesh.now_ms += constants::kStorageUnlockPendingMs;
         storage(holder).tick(mesh.now_ms);
         const uint64_t exceeded = storage(holder).drops(StorageDrop::BudgetExceeded);
@@ -617,7 +624,8 @@ TEST_F(StorageKeyPath, UnlockAndSessionBudgetsBind) {
         if (storage(holder).drops(StorageDrop::BudgetExceeded) != exceeded) break;
         ++accepted;
     }
-    EXPECT_LE(accepted, static_cast<int>(constants::kStorageUnlocksPerRequesterPerEpoch));
+    EXPECT_GT(accepted, constants::kStorageUnlocksPerRequesterPerEpoch);
+    EXPECT_LE(accepted, constants::kStorageUnlockAttemptsPerRequesterPerEpoch);
     EXPECT_GT(storage(holder).drops(StorageDrop::BudgetExceeded), 0u);
 
     // A request for a plan the holder does not hold is refused outright.
@@ -640,6 +648,97 @@ TEST_F(StorageKeyPath, UnlockAndSessionBudgetsBind) {
     storage(holder).on_message(
         requester->router->compose(SecurityMessageKind::StorageKeyPackage, stray, 2));
     EXPECT_EQ(storage(holder).drops(StorageDrop::UnknownSession), unknown_session + 1);
+}
+
+/// Keeps the holder's rate-limited unlock-refusal info lines.
+struct RefusalSink : spdlog::sinks::base_sink<std::mutex> {
+    int lines = 0;
+    std::string last;
+
+protected:
+    void sink_it_(const spdlog::details::log_msg& msg) override {
+        const std::string_view text(msg.payload.data(), msg.payload.size());
+        if (msg.level == spdlog::level::info &&
+            text.find("unlock attestation refused") != std::string_view::npos) {
+            ++lines;
+            last.assign(text);
+        }
+    }
+    void flush_() override {}
+};
+
+TEST_F(StorageKeyPath, FailedUnlockAttestationsSpendNoPartialBudget) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    Node* requester = founders[0];
+    Node* holder = founders[1];
+    settle();
+    const Digest plan_digest = storage(holder).chain().current_digest;
+    const StoragePointBytes point = claimed_point(holder, requester);
+    uint8_t seed = 1;
+    // One request to the holder, answered by the injected verdict.
+    const auto ask = [&] {
+        StorageUnlockRequestMsg request;
+        request.requester = requester->id;
+        request.epoch = storage(holder).current_epoch();
+        request.plan_digest = plan_digest;
+        request.ephemeral_point = point;
+        request.nonce.fill(seed++);
+        storage(holder).on_message(requester->router->compose(
+            SecurityMessageKind::StorageUnlockRequest, request, request.epoch));
+        mesh.pump();
+        answer_storage_challenges();
+    };
+    auto sink = std::make_shared<RefusalSink>();
+    spdlog::set_level(spdlog::level::info);
+    spdlog::default_logger()->sinks().push_back(sink);
+
+    // Twice the partial budget in failed attestations: every one is refused,
+    // none is served, and the requester is not locked out.
+    refuse_attestation.insert(requester->id);
+    const uint64_t sent = storage(holder).partials_sent();
+    const uint64_t exceeded = storage(holder).drops(StorageDrop::BudgetExceeded);
+    const uint64_t refused = storage(holder).drops(StorageDrop::AttestationFailed);
+    for (uint32_t i = 0; i < 2 * constants::kStorageUnlocksPerRequesterPerEpoch; ++i) ask();
+    EXPECT_EQ(storage(holder).drops(StorageDrop::AttestationFailed),
+              refused + 2 * constants::kStorageUnlocksPerRequesterPerEpoch);
+    EXPECT_EQ(storage(holder).partials_sent(), sent);
+    EXPECT_EQ(storage(holder).drops(StorageDrop::BudgetExceeded), exceeded);
+
+    // The holder names the failure kind and the failed checks once per
+    // requester and window; the repeats inside the window are counted.
+    EXPECT_EQ(sink->lines, 1);
+    EXPECT_NE(sink->last.find("SnpInvalid"), std::string::npos) << sink->last;
+    EXPECT_NE(sink->last.find("not passed"), std::string::npos) << sink->last;
+    EXPECT_NE(sink->last.find("claims unproved"), std::string::npos) << sink->last;
+    mesh.now_ms += kDropLogWindowMs;
+    storage(holder).tick(mesh.now_ms);
+    ask();
+    EXPECT_EQ(sink->lines, 2);
+    EXPECT_NE(sink->last.find("suppressed)"), std::string::npos) << sink->last;
+    spdlog::default_logger()->sinks().pop_back();
+
+    // Served partials still spend the budget: the holder answers until the
+    // partial budget for this epoch is used, then refuses.
+    refuse_attestation.clear();
+    uint32_t served = 0;
+    for (uint32_t i = 0; i <= constants::kStorageUnlocksPerRequesterPerEpoch; ++i) {
+        const uint64_t before = storage(holder).partials_sent();
+        ask();
+        if (storage(holder).drops(StorageDrop::BudgetExceeded) != exceeded) break;
+        EXPECT_EQ(storage(holder).partials_sent(), before + 1);
+        ++served;
+    }
+    EXPECT_EQ(storage(holder).drops(StorageDrop::BudgetExceeded), exceeded + 1);
+    // The requester's own startup unlock may already have been served this
+    // epoch, so the loop serves at most the rest of the budget.
+    EXPECT_GE(served, 1u);
+    EXPECT_LE(served, constants::kStorageUnlocksPerRequesterPerEpoch);
+    EXPECT_EQ(storage(holder).partials_sent(), sent + served);
+    // Exhausted stays exhausted: no further partial this epoch.
+    ask();
+    EXPECT_EQ(storage(holder).drops(StorageDrop::BudgetExceeded), exceeded + 2);
+    EXPECT_EQ(storage(holder).partials_sent(), sent + served);
 }
 
 // --- Re-sharing (B5) -------------------------------------------------------------------

@@ -5,6 +5,8 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <set>
+#include <string_view>
 
 using nexus::security::AttestationChallenge;
 using nexus::security::AttestationEvidence;
@@ -199,6 +201,29 @@ TEST(AttestationDigests, ChallengeAndEvidenceLabelsSeparateDigests) {
     // challenge preimage from ever colliding with an evidence preimage.
     EXPECT_NE(challenge_digest(base_challenge()),
               evidence_signing_digest(base_evidence()));
+}
+
+TEST(AttestationFailureName, EveryEnumeratorHasItsOwnName) {
+    using nexus::security::AttestationFailure;
+    using nexus::security::attestation_failure_name;
+    // A holder's refusal line carries this name, so each kind must be told
+    // apart in a log and an out-of-range value must not be mistaken for one.
+    EXPECT_EQ(attestation_failure_name(AttestationFailure::None), "None");
+    EXPECT_EQ(attestation_failure_name(AttestationFailure::SnpInvalid), "SnpInvalid");
+    EXPECT_EQ(attestation_failure_name(AttestationFailure::VtpmBindingInvalid),
+              "VtpmBindingInvalid");
+    EXPECT_EQ(attestation_failure_name(AttestationFailure::CheckpointInvalid),
+              "CheckpointInvalid");
+    EXPECT_EQ(attestation_failure_name(AttestationFailure::TransferInvalid),
+              "TransferInvalid");
+    std::set<std::string_view> names;
+    const auto last = static_cast<uint16_t>(AttestationFailure::TransferInvalid);
+    for (uint16_t raw = 0; raw <= last; ++raw) {
+        const auto name = attestation_failure_name(static_cast<AttestationFailure>(raw));
+        EXPECT_NE(name, "Unknown") << raw;
+        EXPECT_TRUE(names.insert(name).second) << name;
+    }
+    EXPECT_EQ(attestation_failure_name(static_cast<AttestationFailure>(last + 1)), "Unknown");
 }
 
 }  // namespace
