@@ -669,8 +669,14 @@ Limits:
    memory. With fewer it retries with backoff and serves nothing that needs
    its files.
 
-Budgets: one pending unlock per requester per holder, and a per-epoch limit,
-like attestation budgets.
+Budgets: one pending unlock per requester per holder, and two per-epoch
+limits per requester, like attestation budgets. The first counts partials the
+holder served and bounds what one requester can extract. The second, larger
+one counts challenges the holder issued, served or not, and bounds the
+evidence verifications and remembered request digests one requester can cost
+a holder. A challenge whose attestation fails or expires spends only the
+second, so a server whose first answers fail after a restart is not locked
+out until the epoch changes.
 
 ### B8. Cold start
 
@@ -753,9 +759,11 @@ Always on, no setting (`Security/Storage/`):
   plan, or the retiring plan while it is live (B5a), only for an `R` in the
   requester's latest finalized claim, after a passing `StorageUnlock`
   attestation bound to that request.
-  Budgets: one pending request per requester, 8 per requester per epoch, 64
-  pending in all; a replayed request digest is refused. The partial is sealed
-  to the requester with the request digest bound inside the seal.
+  Budgets: one pending request per requester, 8 served partials and 64
+  issued challenges per requester per epoch, 64 pending in all; a replayed
+  request digest is refused. A failed attestation spends a challenge, never a
+  partial. The partial is sealed to the requester with the request digest
+  bound inside the seal.
 - **Data key.** `DataKeyService` creates the DEK, wraps it to `S`, claims
   the wrap, proves the unwrap through the holders, unlocks at startup, and
   stages, proves, and then commits a rewrap after a rotation.

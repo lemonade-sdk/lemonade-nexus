@@ -138,8 +138,11 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
             upgrade_attempts_.erase(upgrade_attempts_.begin());
         }
     } else if (purpose == AttestationPurpose::StorageUnlock) {
+        // Challenges issued, served or not: the holder counts served partials
+        // separately (StorageKeyService), so a failed answer here never
+        // spends the extraction budget, only this attempt bound.
         auto& used = storage_attempts_[{epoch, node}];
-        if (used >= constants::kStorageUnlocksPerRequesterPerEpoch) {
+        if (used >= constants::kStorageUnlockAttemptsPerRequesterPerEpoch) {
             return std::nullopt;
         }
         ++used;

@@ -14,6 +14,42 @@ inline constexpr std::string_view kAttestationContextDomain =
     "lemonade-nexus/attestation-context:v1";
 }
 
+std::string_view attestation_failure_name(AttestationFailure failure) {
+    switch (failure) {
+        case AttestationFailure::None: return "None";
+        case AttestationFailure::ChallengeMismatch: return "ChallengeMismatch";
+        case AttestationFailure::IdentityMismatch: return "IdentityMismatch";
+        case AttestationFailure::IdentitySignatureInvalid: return "IdentitySignatureInvalid";
+        case AttestationFailure::RulesetMismatch: return "RulesetMismatch";
+        case AttestationFailure::SnpInvalid: return "SnpInvalid";
+        case AttestationFailure::TcbTooOld: return "TcbTooOld";
+        case AttestationFailure::VtpmBindingInvalid: return "VtpmBindingInvalid";
+        case AttestationFailure::TpmQuoteInvalid: return "TpmQuoteInvalid";
+        case AttestationFailure::BootMeasurementInvalid: return "BootMeasurementInvalid";
+        case AttestationFailure::ImaMeasurementInvalid: return "ImaMeasurementInvalid";
+        case AttestationFailure::BinaryMeasurementInvalid: return "BinaryMeasurementInvalid";
+        case AttestationFailure::RuntimeProfileInvalid: return "RuntimeProfileInvalid";
+        case AttestationFailure::IncarnationStale: return "IncarnationStale";
+        case AttestationFailure::EpochMismatch: return "EpochMismatch";
+        case AttestationFailure::EvidenceOversized: return "EvidenceOversized";
+        case AttestationFailure::ProfileIncomplete: return "ProfileIncomplete";
+        case AttestationFailure::ProviderUnknown: return "ProviderUnknown";
+        case AttestationFailure::ProviderUnsupported: return "ProviderUnsupported";
+        case AttestationFailure::ProfileIdMismatch: return "ProfileIdMismatch";
+        case AttestationFailure::ProfileRulesetMismatch: return "ProfileRulesetMismatch";
+        case AttestationFailure::EndorsementRevoked: return "EndorsementRevoked";
+        case AttestationFailure::NetworkMismatch: return "NetworkMismatch";
+        case AttestationFailure::PurposeMismatch: return "PurposeMismatch";
+        case AttestationFailure::ContextMismatch: return "ContextMismatch";
+        case AttestationFailure::ContextUnbound: return "ContextUnbound";
+        case AttestationFailure::ActivationRequired: return "ActivationRequired";
+        case AttestationFailure::CheckpointRequired: return "CheckpointRequired";
+        case AttestationFailure::CheckpointInvalid: return "CheckpointInvalid";
+        case AttestationFailure::TransferInvalid: return "TransferInvalid";
+    }
+    return "Unknown";
+}
+
 Digest eligibility_attestation_context(const NetworkId& network_id, EpochId epoch,
                                        const NodeId& node, IncarnationId incarnation) {
     CanonicalEncoder encoder(kAttestationContextDomain);

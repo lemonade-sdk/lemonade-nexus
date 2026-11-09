@@ -260,6 +260,10 @@ enum class AttestationFailure : uint16_t {
     TransferInvalid,
 };
 
+/// The enumerator name of `failure` for logs and diagnostics, or "Unknown"
+/// for a value outside the enum. Stable text, never parsed.
+[[nodiscard]] std::string_view attestation_failure_name(AttestationFailure failure);
+
 /// The bounded result of one verification. It states facts about one candidate
 /// under one policy; it does not decide eligibility or selection.
 struct AttestationVerdict {

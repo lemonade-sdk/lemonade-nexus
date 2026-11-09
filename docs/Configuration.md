@@ -435,8 +435,10 @@ How it works:
   that request, and answers only a passing verdict, with a partial sealed to
   the server (`StorageUnlockPartial`). A holder outside Tier 1 may challenge
   for this purpose only. Per holder: one pending request per requester, 8
-  requests per requester per epoch, 64 pending requests in all; replayed
-  requests are refused. With fewer than `t` partials the server retries with
+  served partials and 64 issued challenges per requester per epoch, 64
+  pending requests in all; replayed requests are refused. A failed
+  attestation spends a challenge, not a partial, so a holder logs which
+  attestation failure refused a requester and the requester can retry. With fewer than `t` partials the server retries with
   backoff (5 s to 60 s) and stays locked.
 - **Data key.** On first use the server creates a 32-byte data key, wraps it
   to the storage public key, and proves the unwrap through the holders. After

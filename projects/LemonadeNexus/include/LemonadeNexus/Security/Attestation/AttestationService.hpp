@@ -64,8 +64,9 @@ public:
     ///
     /// StorageUnlock challenges live in their own lane: one never replaces a
     /// pending eligibility or final-readiness challenge for the same node, and
-    /// the reverse. Their budget is kStorageUnlocksPerRequesterPerEpoch per
-    /// node and epoch.
+    /// the reverse. Their budget is kStorageUnlockAttemptsPerRequesterPerEpoch
+    /// challenges per node and epoch; the holder bounds served partials
+    /// separately.
     [[nodiscard]] std::optional<AttestationChallenge> create_challenge(
         const NodeId& node, const crypto::Ed25519PublicKey& node_key,
         IncarnationId incarnation, EpochId epoch, AttestationPurpose purpose,

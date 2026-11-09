@@ -384,19 +384,31 @@ private:
     std::string halt_reason_;
 
     std::map<NodeId, PendingUnlock> pending_unlocks_;
-    std::map<std::pair<EpochId, NodeId>, uint32_t> unlock_counts_;
+    /// Per requester and epoch (B7): challenges issued, bounded by
+    /// kStorageUnlockAttemptsPerRequesterPerEpoch, and partials served,
+    /// bounded by kStorageUnlocksPerRequesterPerEpoch. A failed or expired
+    /// challenge counts as an attempt only.
+    struct UnlockBudget {
+        uint32_t challenged = 0;
+        uint32_t served = 0;
+    };
+    std::map<std::pair<EpochId, NodeId>, UnlockBudget> unlock_budgets_;
     std::set<Digest> seen_requests_;
     EpochId seen_epoch_{};
     uint64_t partials_sent_ = 0;
 
     std::map<StorageDrop, uint64_t> drops_;
-    /// Rate limit of the per-reason drop log line (one per kDropLogWindowMs).
+    /// Rate limit of the per-reason drop log line (one per the security
+    /// router's kDropLogWindowMs).
     struct DropLogWindow {
         uint64_t window_start_ms = 0;
         uint64_t suppressed = 0;
     };
-    static constexpr uint64_t kDropLogWindowMs = 60'000;
     std::map<StorageDrop, DropLogWindow> drop_log_;
+    /// Same window per requester for the line that names why its unlock
+    /// attestation was refused. Size-capped like pending_unlocks_.
+    std::map<NodeId, DropLogWindow> refusal_log_;
+    void log_unlock_refusal(const AttestationVerdict& verdict);
 };
 
 }  // namespace nexus::security
