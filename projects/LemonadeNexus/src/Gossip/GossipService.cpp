@@ -4029,12 +4029,16 @@ void GossipService::load_account_replica() {
 // Device presence (backbone only, Tier 1 to Tier 1)
 // ---------------------------------------------------------------------------
 
-bool GossipService::record_device_presence(const std::string& node_id, uint64_t now) {
-    const auto result = presence_.record_local(node_id, now);
-    if (!result.locally_new || !self_is_tier1()) return result.became_online;
-    // A device that arrives here is announced at once, so a peer on another
-    // Tier 1 server sees it within one round trip instead of one interval.
-    auto payloads = encode_presence_sync({{node_id, now}});
+bool GossipService::record_device_presence(const std::string& node_id, uint64_t now,
+                                           std::optional<std::vector<std::string>> lan) {
+    const auto result = presence_.record_local(node_id, now, std::move(lan));
+    if ((!result.locally_new && !result.lan_changed) || !self_is_tier1()) {
+        return result.became_online;
+    }
+    // A device that arrives here, or changes its LAN endpoints, is announced
+    // at once, so a peer on another Tier 1 server sees it within one round
+    // trip instead of one interval.
+    auto payloads = encode_presence_sync({{node_id, now, presence_.lan_endpoints(node_id, now)}});
     auto targets = backbone_targets(true);
     if (payloads.empty() || targets.empty()) return result.became_online;
     // Called from HTTP threads; the socket and peer sends belong to the io

@@ -256,10 +256,15 @@ cryptography is involved, and a punch grants no authority:
   address) with its dataplane port. The server accepts them only from the
   node's own management key on the private API, refuses public, loopback
   (unless the server itself is on loopback), link-local, and malformed
-  entries, and keeps them in memory for 120 seconds, not in the tree. It
-  returns them only in the `GET /api/mesh/peers` entries of callers that
-  already list the node, that is, peers that may connect to it. The public
-  API never returns them, and an unauthenticated caller never sees them.
+  entries, and keeps them in memory for 120 seconds, not in the tree. They
+  travel with the device's presence to the other Tier 1 servers
+  (`PresenceSync`, backbone only, Tier 1 to Tier 1); a receiving server
+  applies the same rules again without the loopback exception and refuses
+  the whole message on a failing entry, since the sender is a server and
+  not the device. Every server returns them only in the
+  `GET /api/mesh/peers` entries of callers that already list the node, that
+  is, peers that may connect to it. The public API never returns them, and
+  an unauthenticated caller never sees them.
   What this discloses: the private addresses of a device's LAN interfaces to
   the peers that may already open a BoringTun session with it and that
   already see its public endpoint. A private address is not routable from

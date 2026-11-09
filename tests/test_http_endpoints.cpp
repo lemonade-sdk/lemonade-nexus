@@ -2951,6 +2951,86 @@ TEST_F(MeshPresenceTest, PeerListReportsPresenceFromAnotherServer) {
     EXPECT_EQ(status_online_count(), 1u);
 }
 
+// A device's LAN endpoints travel with its presence: a list that another
+// Tier 1 server heard in a heartbeat (gossiped presence with `lan`) is listed
+// here, for kMeshLocalEndpointTtlSec from that presence, to callers that list
+// the device only. It changes peers_revision and answers a held long-poll;
+// a newer presence without a list removes it.
+TEST_F(MeshPresenceTest, PeerListReportsLanEndpointsFromAnotherServer) {
+    add("mc_peer", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    add("mc_stale", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_private"}}});
+    const auto outsider = principal();
+    add("mc_outsider", "mc_group", tree::NodeType::Endpoint, {{outsider, {"read"}}});
+    const std::vector<std::string> lan{"192.168.1.20:41234", "10.0.0.5:41234"};
+    const auto now = api::epoch_seconds();
+
+    // Online without a list: the baseline.
+    (void)presence().merge_remote({{"mc_peer", now}}, now);
+    std::string online;
+    auto peer = entry_of("mc_peer", &online);
+    ASSERT_TRUE(peer.is_object());
+    EXPECT_EQ(peer["is_online"], true);
+    EXPECT_EQ(peer["local_endpoints"], json::array());
+
+    // A held long-poll is answered when the gossiped list arrives.
+    std::atomic<int> status{0};
+    std::string next;
+    std::thread waiter([&] {
+        httplib::Client cli("127.0.0.1", mesh_port);
+        cli.set_read_timeout(30);
+        auto res = cli.Get("/api/mesh/peers/mc_self?wait_revision=" + online + "&timeout=20",
+                           httplib::Headers{{"Authorization", "Bearer " + make_jwt(caller)}});
+        status = res ? res->status : 0;
+        if (res && res->status == 200) next = json::parse(res->body)["peers_revision"];
+    });
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (mesh_handler->peer_waiters().waiting() == 0 && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(mesh_handler->peer_waiters().waiting(), 1u) << "the long-poll was not held";
+    const auto start = std::chrono::steady_clock::now();
+    (void)presence().merge_remote({{"mc_peer", now + 1, lan}}, now + 1);
+    waiter.join();
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+    EXPECT_EQ(status.load(), 200);
+    std::string with_lan;
+    peer = entry_of("mc_peer", &with_lan);
+    EXPECT_EQ(peer["local_endpoints"], json(lan)) << peer.dump();
+    EXPECT_NE(with_lan, online) << "a gossiped LAN list left peers_revision as it was";
+    EXPECT_EQ(next, with_lan);
+    EXPECT_TRUE(presence().local_online(now + 1).empty()) << "a gossiped list counted as local";
+
+    // Not to a caller that does not list the device.
+    httplib::Client cli("127.0.0.1", mesh_port);
+    auto res = cli.Get("/api/mesh/peers/mc_outsider",
+                       httplib::Headers{{"Authorization",
+                                         "Bearer " + owner_token("mc_outsider", outsider)}});
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_EQ(res->body.find("192.168.1.20"), std::string::npos) << res->body;
+    EXPECT_EQ(res->body.find("mc_peer"), std::string::npos) << res->body;
+
+    // The TTL counts from the presence that carried the list. A list past
+    // it is not listed; one within it is, also for a device offline by now.
+    (void)presence().merge_remote({{"mc_stale", now - api::kMeshLocalEndpointTtlSec, lan}}, now);
+    EXPECT_EQ(entry_of("mc_stale")["local_endpoints"], json::array());
+    (void)presence().merge_remote({{"mc_stale", now - api::kMeshLocalEndpointTtlSec + 5, lan}},
+                                  now);
+    const auto stale = entry_of("mc_stale");
+    EXPECT_EQ(stale["local_endpoints"], json(lan)) << stale.dump();
+    EXPECT_EQ(stale["is_online"], false);
+
+    // The server that heard the device last decides: a newer presence
+    // without a list removes it, and the revision is the baseline again.
+    (void)presence().merge_remote({{"mc_peer", now + 2}}, now + 2);
+    std::string removed;
+    peer = entry_of("mc_peer", &removed);
+    EXPECT_EQ(peer["local_endpoints"], json::array());
+    EXPECT_EQ(peer["is_online"], true);
+    (void)presence().merge_remote({{"mc_stale", now + 2}}, now + 2);
+    EXPECT_EQ(entry_of("mc_stale")["local_endpoints"], json::array());
+}
+
 // peers_revision changes when a listed peer goes online or offline, and not
 // when an online peer's presence time is renewed (the change that a handshake
 // renewal was) or when an unlisted device's presence changes. Going offline

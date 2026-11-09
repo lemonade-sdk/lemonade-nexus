@@ -345,9 +345,11 @@ public endpoints. They connect over the LAN instead:
   `local_endpoints` (HTTP `400`). The SDK then sends the heartbeat again
   without them, so the endpoint and the device's presence still reach the
   server.
-  Clients without the field change nothing. A server keeps the LAN endpoints of the devices whose
-  heartbeats reach it; two devices with sessions on different Tier 1 servers
-  do not see each other's LAN endpoints.
+  Clients without the field change nothing. Tier 1 servers share the LAN
+  endpoints with device presence, so two devices with sessions on different
+  Tier 1 servers see each other's LAN endpoints. A server from before that
+  sharing lists only the LAN endpoints of the devices whose heartbeats reach
+  it.
 
 ## Relay Fallback
 
