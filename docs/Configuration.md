@@ -438,8 +438,13 @@ How it works:
   served partials and 64 issued challenges per requester per epoch, 64
   pending requests in all; replayed requests are refused. A failed
   attestation spends a challenge, not a partial, so a holder logs which
-  attestation failure refused a requester and the requester can retry. With fewer than `t` partials the server retries with
-  backoff (5 s to 60 s) and stays locked.
+  attestation failure refused a requester and the requester can retry. A
+  served partial is charged when the holder sends it, so the server waits for
+  the holders' pending window (30 s) plus margin before an attempt times out,
+  keeps a timed-out request usable for late partials for one more window, and
+  sends no new request while a holder may still hold the previous one
+  pending. With fewer than `t` partials the server retries with backoff (5 s
+  to 60 s) and stays locked.
 - **Data key.** On first use the server creates a 32-byte data key, wraps it
   to the storage public key, and proves the unwrap through the holders. After
   a rotation it rewraps the key from memory. A key wrapped to the previous

@@ -667,7 +667,11 @@ Limits:
    gets no partial for it.
 5. With `t` valid partials the server unwraps its DEK and opens its files in
    memory. With fewer it retries with backoff and serves nothing that needs
-   its files.
+   its files. An attempt waits at least for the holders' pending window
+   before it times out, and the partials of a timed-out request still count
+   while a holder may answer it: the holder charges a served partial when it
+   sends it, so a late one is used, not wasted. The server sends no new
+   request while a holder may still hold the previous one pending.
 
 Budgets: one pending unlock per requester per holder, and two per-epoch
 limits per requester, like attestation budgets. The first counts partials the

@@ -19,7 +19,12 @@
 //   StorageUnlockRequest to every holder of the plan whose S the wrapped key
 //   names, collects t verified partials, and unwraps the DEK into guarded
 //   memory. With fewer it retries with backoff and stays locked: nothing that
-//   needs the DEK may run (fail closed).
+//   needs the DEK may run (fail closed). An attempt waits at least as long as
+//   a holder may still answer its request (kStorageUnlockPendingMs), and the
+//   partials of a timed-out request stay usable for that window: a holder
+//   charges a served partial against this server's per-epoch budget when it
+//   sends it, so none is wasted. No new request goes out while a holder may
+//   still hold the previous one pending.
 // - Rotation: when the current plan's S differs from the S the wrapped key
 //   names and the DEK is in memory, rewrap() stages the DEK wrapped to the new
 //   S in data-key.next.json, claims it, and proves through the new plan's
@@ -51,6 +56,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace nexus::security {
 
@@ -132,8 +138,17 @@ public:
 
     /// Requests sent in total (tests and diagnostics).
     [[nodiscard]] uint64_t attempts() const { return attempts_; }
+    /// Partials that arrived after their attempt timed out and still counted
+    /// toward that request (tests and diagnostics).
+    [[nodiscard]] uint64_t late_partials() const { return late_partials_; }
+    /// Partials for a request this service no longer holds: not live, not
+    /// kept after its timeout, and not answered within the last holder
+    /// pending window. Each one spent a served partial at its holder for
+    /// nothing (tests and diagnostics).
+    [[nodiscard]] uint64_t stray_partials() const { return stray_partials_; }
 
-    /// The digest of the live attempt's request, or nullopt.
+    /// The digest of the live attempt's request, or nullopt. A timed-out
+    /// request kept for late partials is not live.
     [[nodiscard]] std::optional<Digest> live_request() const;
 
 private:
@@ -153,6 +168,9 @@ private:
         crypto::StoragePeerBytesMap partials;
         uint64_t started_ms = 0;
         bool verify_only = false;
+        /// Set when the attempt timed out: the request stays usable for late
+        /// partials until this time (io thread steady clock).
+        uint64_t keep_until_ms = 0;
     };
 
     void set_state(DataKeyState next);
@@ -164,6 +182,14 @@ private:
     void start_attempt(const StorageFinalPlan& plan, const Digest& plan_digest, bool verify_only,
                        uint64_t now_ms, Target target = Target::Current);
     void finish_attempt();
+    /// Unwraps with the attempt's t partials and applies the result. `live`
+    /// is false for a request that had already timed out; its failure then
+    /// leaves the live attempt and the backoff alone.
+    void complete_attempt(Attempt attempt, bool live);
+    /// Drops the live attempt and the kept timed-out ones that `which`
+    /// selects: the question they asked no longer stands.
+    void forget_attempts(const std::function<bool(const Attempt&)>& which);
+    void note_stray_partial(const NodeId& holder);
     void fail_attempt();
     [[nodiscard]] bool store(const crypto::StorageWrappedDataKey& wrapped);
     [[nodiscard]] static std::string encode_wrapped(const crypto::StorageWrappedDataKey& wrapped);
@@ -196,10 +222,27 @@ private:
 
     bool loaded_ = false;
     std::optional<Attempt> attempt_;
+    /// Timed-out attempts whose request a holder may still answer, each
+    /// until its keep_until_ms. Bounded by time: attempts start at least one
+    /// attempt timeout apart and are kept for one holder pending window.
+    std::vector<Attempt> late_attempts_;
+    /// Requests answered with t partials, each until the time a holder may
+    /// still send one more: the surplus partials of a finished round trip
+    /// are expected, not stray.
+    std::vector<std::pair<Digest, uint64_t>> answered_requests_;
     uint64_t next_attempt_ms_ = 0;
+    /// No request before this time: a holder may still hold the previous
+    /// request pending and would refuse a new one (PendingBusy).
+    uint64_t holders_pending_until_ms_ = 0;
     uint64_t backoff_ms_ = 0;
     uint64_t now_ms_ = 0;
     uint64_t attempts_ = 0;
+    uint64_t late_partials_ = 0;
+    uint64_t stray_partials_ = 0;
+    /// Rate limit of the stray-partial info line, as StorageKeyService::drop()
+    /// limits its lines (one per kDropLogWindowMs, repeats counted).
+    uint64_t stray_log_window_ms_ = 0;
+    uint64_t stray_log_suppressed_ = 0;
     std::function<void(DataKeyState)> on_state_;
 };
 
