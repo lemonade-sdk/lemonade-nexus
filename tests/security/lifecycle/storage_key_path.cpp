@@ -741,6 +741,115 @@ TEST_F(StorageKeyPath, FailedUnlockAttestationsSpendNoPartialBudget) {
     EXPECT_EQ(storage(holder).partials_sent(), sent + served);
 }
 
+/// Keeps the requester's info lines about its unlock attempts.
+struct AttemptSink : spdlog::sinks::base_sink<std::mutex> {
+    int timeouts = 0;
+    int stray = 0;
+    std::string last_timeout;
+
+protected:
+    void sink_it_(const spdlog::details::log_msg& msg) override {
+        const std::string_view text(msg.payload.data(), msg.payload.size());
+        if (msg.level != spdlog::level::info) return;
+        if (text.find("unlock attempt") != std::string_view::npos &&
+            text.find("timed out") != std::string_view::npos) {
+            ++timeouts;
+            last_timeout.assign(text);
+        } else if (text.find("arrived for a request this server no longer holds") !=
+                   std::string_view::npos) {
+            ++stray;
+        }
+    }
+    void flush_() override {}
+};
+
+TEST_F(StorageKeyPath, LatePartialsOfATimedOutUnlockStillCountAndSpendNoMoreBudget) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_EQ(current_plan().threshold, 4);
+    const StorageFinalPlan plan = current_plan();
+    const Digest plan_digest = storage(founders.front()).chain().current_digest;
+    Node* requester = founders[0];
+    const auto data_key = data_key_bytes(requester);
+    settle();
+    const auto served_by_holders = [&] {
+        uint64_t sent = 0;
+        for (Node* holder : founders) {
+            if (holder != requester) sent += storage(holder).partials_sent();
+        }
+        return sent;
+    };
+
+    // The holders answer, but no partial reaches the requester in time, as
+    // when the attestation round trip outlasts the attempt: every request the
+    // requester sends is recorded, every partial to it is lost in transit.
+    const NodeId who = requester->id;
+    mesh.drop_if = [this, who](const Queued& item, const SecurityMessage& message) {
+        if (const auto* request = std::get_if<StorageUnlockRequestMsg>(&message.body);
+            request != nullptr && item.from == who) {
+            captured_requests.push_back(*request);
+        }
+        return message.kind == SecurityMessageKind::StorageUnlockPartial && item.to == who;
+    };
+    auto sink = std::make_shared<AttemptSink>();
+    spdlog::set_level(spdlog::level::info);
+    spdlog::default_logger()->sinks().push_back(sink);
+
+    // Each of the four other holders serves one partial for the first
+    // request after the restart and charges it.
+    const uint64_t served_before = served_by_holders();
+    build_storage(*requester);
+    ASSERT_TRUE(run_storage_until([&] { return live_request_of(requester).has_value(); }, 50));
+    const StorageUnlockRequestMsg request = *live_request_of(requester);
+    ASSERT_TRUE(run_storage_until([&] { return served_by_holders() >= served_before + 4; }, 50));
+    EXPECT_EQ(served_by_holders(), served_before + 4);
+    const uint64_t attempts = storage(requester).data_keys().attempts();
+
+    // The attempt times out with only the requester's own partial. The
+    // request is no longer live, no new request has gone out yet, and the
+    // server stays locked.
+    ASSERT_TRUE(run_storage_until(
+        [&] { return !storage(requester).data_keys().live_request().has_value(); }, 400));
+    EXPECT_EQ(sink->timeouts, 1);
+    EXPECT_NE(sink->last_timeout.find("1 of 5 partials"), std::string::npos)
+        << sink->last_timeout;
+    EXPECT_NE(sink->last_timeout.find("late partials so far: 0 counted, 0 discarded"),
+              std::string::npos)
+        << sink->last_timeout;
+    EXPECT_EQ(storage(requester).data_keys().state(), DataKeyState::Locked);
+    EXPECT_EQ(storage(requester).data_keys().attempts(), attempts);
+
+    // The partials the holders already served arrive now: they count toward
+    // the request they answer, and the key unlocks without another request
+    // and without another served partial at any holder.
+    deliver_partial(founders[1], requester, request, plan, plan_digest, {});
+    deliver_partial(founders[2], requester, request, plan, plan_digest, {});
+    EXPECT_EQ(storage(requester).data_keys().state(), DataKeyState::Locked);
+    deliver_partial(founders[3], requester, request, plan, plan_digest, {});
+    EXPECT_EQ(storage(requester).data_keys().state(), DataKeyState::Unlocked);
+    EXPECT_EQ(data_key_bytes(requester), data_key);
+    EXPECT_EQ(storage(requester).data_keys().late_partials(), 3u);
+    // The surplus partial of the answered request is expected, not stray.
+    deliver_partial(founders[4], requester, request, plan, plan_digest, {});
+    EXPECT_EQ(storage(requester).data_keys().stray_partials(), 0u);
+    EXPECT_EQ(storage(requester).data_keys().late_partials(), 3u);
+
+    // Past a holder pending window: still no new request, no further served
+    // partial, and the answered request is forgotten. A partial for it now
+    // is counted and named, not used.
+    for (int i = 0; i < 160; ++i) storage_step();
+    EXPECT_EQ(storage(requester).data_keys().state(), DataKeyState::Unlocked);
+    EXPECT_EQ(storage(requester).data_keys().attempts(), attempts);
+    EXPECT_EQ(served_by_holders(), served_before + 4);
+    EXPECT_EQ(sink->timeouts, 1);
+    deliver_partial(founders[4], requester, request, plan, plan_digest, {});
+    EXPECT_EQ(storage(requester).data_keys().stray_partials(), 1u);
+    EXPECT_EQ(sink->stray, 1);
+    EXPECT_EQ(storage(requester).data_keys().late_partials(), 3u);
+    spdlog::default_logger()->sinks().pop_back();
+    mesh.drop_if = nullptr;
+}
+
 // --- Re-sharing (B5) -------------------------------------------------------------------
 
 TEST_F(StorageKeyPath, PerEpochRefreshKeepsSAndRetiresPreRefreshShares) {
@@ -1084,6 +1193,82 @@ TEST_F(StorageKeyPath, ARewrapReplacesTheStoredKeyOnlyAfterTheNewHoldersReproduc
     build_storage(*server);
     ASSERT_TRUE(run_storage_until(
         [&] { return storage(server).data_keys().state() == DataKeyState::Unlocked; }));
+    EXPECT_EQ(data_key_bytes(server), key);
+}
+
+TEST_F(StorageKeyPath, LatePartialsOfATimedOutRewrapVerificationStillCommitIt) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    const Digest first_digest = storage(founders.front()).chain().current_digest;
+    const auto first_key = current_plan().storage_public_key;
+    Node* server = reserves[1];
+    const auto key = data_key_bytes(server);
+    const auto next_file = server->dir / "storage" / "data-key.next.json";
+
+    // The new holders answer this server's verification of its staged wrap,
+    // but no partial reaches it in time: its requests are recorded and the
+    // partials to it are lost in transit.
+    const NodeId who = server->id;
+    mesh.drop_if = [this, who](const Queued& item, const SecurityMessage& message) {
+        if (const auto* request = std::get_if<StorageUnlockRequestMsg>(&message.body);
+            request != nullptr && item.from == who) {
+            captured_requests.push_back(*request);
+        }
+        return message.kind == SecurityMessageKind::StorageUnlockPartial && item.to == who;
+    };
+    wall_offset_ms += kDayMs;
+    ASSERT_TRUE(run_until_rotated_from(first_digest));
+    const StorageFinalPlan rotated = current_plan();
+    const Digest rotated_digest = storage(founders.front()).chain().current_digest;
+    const auto rotated_key = rotated.storage_public_key;
+    const auto holders = holders_of(rotated);
+    ASSERT_GE(holders.size(), rotated.threshold);
+    const auto served_by_holders = [&] {
+        uint64_t sent = 0;
+        for (Node* holder : holders) sent += storage(holder).partials_sent();
+        return sent;
+    };
+    ASSERT_TRUE(run_storage_until([&] {
+        const auto live = live_request_of(server);
+        return storage(server).data_keys().staged_to() == rotated_key && live.has_value() &&
+               live->plan_digest == rotated_digest;
+    }));
+    const StorageUnlockRequestMsg request = *live_request_of(server);
+    const uint64_t attempts = storage(server).data_keys().attempts();
+
+    // The verification times out; the stored key still names the old S and
+    // the staged wrap waits. By then every other server has rewrapped, so the
+    // holders serve nothing more unless this server asks again.
+    ASSERT_TRUE(run_storage_until(
+        [&] { return !storage(server).data_keys().live_request().has_value(); }, 400));
+    EXPECT_EQ(storage(server).data_keys().wrapped_to(), first_key);
+    EXPECT_EQ(storage(server).data_keys().staged_to(), rotated_key);
+    EXPECT_EQ(storage(server).data_keys().attempts(), attempts);
+    const uint64_t served_at_timeout = served_by_holders();
+
+    // t late partials for that request verify the staged wrap, and the stored
+    // key is replaced.
+    for (std::size_t i = 0; i < rotated.threshold; ++i) {
+        deliver_partial(holders[i], server, request, rotated, rotated_digest, {});
+    }
+    EXPECT_EQ(storage(server).data_keys().wrapped_to(), rotated_key);
+    EXPECT_FALSE(storage(server).data_keys().staged_to().has_value());
+    EXPECT_FALSE(std::filesystem::exists(next_file));
+    EXPECT_EQ(data_key_bytes(server), key);
+    EXPECT_EQ(storage(server).data_keys().late_partials(),
+              static_cast<uint64_t>(rotated.threshold));
+    // Past a holder pending window: no retry, so no further served partial.
+    for (int i = 0; i < 160; ++i) storage_step();
+    EXPECT_EQ(storage(server).data_keys().attempts(), attempts);
+    EXPECT_EQ(served_by_holders(), served_at_timeout);
+    EXPECT_EQ(storage(server).data_keys().wrapped_to(), rotated_key);
+    mesh.drop_if = nullptr;
+
+    // A restart unlocks under the new key.
+    build_storage(*server);
+    ASSERT_TRUE(run_storage_until(
+        [&] { return storage(server).data_keys().state() == DataKeyState::Unlocked; }));
+    EXPECT_EQ(storage(server).data_keys().wrapped_to(), rotated_key);
     EXPECT_EQ(data_key_bytes(server), key);
 }
 

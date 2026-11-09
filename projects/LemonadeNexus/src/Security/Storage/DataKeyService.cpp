@@ -2,8 +2,10 @@
 
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Security/DurableWrite.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Security/Storage/StorageKeyService.hpp>
 #include <LemonadeNexus/Security/Transport/PairwiseSeal.hpp>
+#include <LemonadeNexus/Security/Transport/SecurityRouter.hpp>
 
 #include <nlohmann/json.hpp>
 #include <sodium.h>
@@ -23,7 +25,15 @@ using json = nlohmann::json;
 constexpr int kFileFormat = 1;
 constexpr std::size_t kDataKeyBytes = 32;
 // Liveness pacing of unlock attempts. Never part of any validity rule.
-constexpr uint64_t kAttemptTimeoutMs = 15'000;
+//
+// A holder answers a request up to kStorageUnlockPendingMs after it received
+// it, and the attestation round trip runs inside that window, so an attempt
+// waits for the whole window plus transit: a shorter wait abandons partials
+// the holders have already charged to this server's per-epoch budget.
+constexpr uint64_t kAttemptTimeoutMs = constants::kStorageUnlockPendingMs + 15'000;
+// A timed-out request keeps its partials this long past the timeout: an
+// answer that left a holder inside its window still arrives and still counts.
+constexpr uint64_t kLatePartialWindowMs = constants::kStorageUnlockPendingMs;
 constexpr uint64_t kFirstBackoffMs = 5'000;
 constexpr uint64_t kMaxBackoffMs = 60'000;
 constexpr uint64_t kClaimResendMs = 5'000;
@@ -249,9 +259,9 @@ void DataKeyService::request_verification() {
     }
     // A round trip already in flight started before this request; it does not
     // count.
-    if (attempt_.has_value() && attempt_->target == Target::Current && attempt_->verify_only) {
-        attempt_.reset();
-    }
+    forget_attempts([](const Attempt& attempt) {
+        return attempt.target == Target::Current && attempt.verify_only;
+    });
     next_attempt_ms_ = now_ms_;
 }
 
@@ -345,9 +355,9 @@ bool DataKeyService::commit_staged() {
         next_verified_ = false;
         next_rewrap_ = false;
     }
-    if (attempt_.has_value() && attempt_->target == Target::Replacement) {
-        attempt_.reset();
-    }
+    // The stored key changed: no round trip about the previous one, live or
+    // kept, proves anything about it.
+    forget_attempts([](const Attempt&) { return true; });
     return true;
 }
 
@@ -371,23 +381,20 @@ void DataKeyService::discard_staged() {
         next_verified_ = false;
         next_rewrap_ = false;
     }
-    if (attempt_.has_value() && attempt_->target == Target::Replacement) {
-        attempt_.reset();
-    }
+    forget_attempts([](const Attempt& attempt) { return attempt.target == Target::Replacement; });
 }
 
 void DataKeyService::on_chain_changed() {
-    // The live attempt may name a plan that is no longer live; the next tick
+    // An attempt may name a plan that is no longer live; the next tick
     // decides with the new chain.
-    if (attempt_.has_value()) {
-        const auto& chain = service_.chain();
-        const bool still_live =
-            attempt_->plan_digest == chain.current_digest ||
-            (service_.retiring_live() && attempt_->plan_digest == chain.retiring_digest);
-        if (!still_live) {
-            attempt_.reset();
-            next_attempt_ms_ = now_ms_;
-        }
+    const auto& chain = service_.chain();
+    const bool had_live = attempt_.has_value();
+    forget_attempts([&](const Attempt& attempt) {
+        return attempt.plan_digest != chain.current_digest &&
+               !(service_.retiring_live() && attempt.plan_digest == chain.retiring_digest);
+    });
+    if (had_live && !attempt_.has_value()) {
+        next_attempt_ms_ = now_ms_;
     }
 }
 
@@ -438,14 +445,24 @@ void DataKeyService::tick(uint64_t now_ms) {
         return;
     }
 
+    std::erase_if(late_attempts_,
+                  [now_ms](const Attempt& attempt) { return now_ms >= attempt.keep_until_ms; });
+    std::erase_if(answered_requests_,
+                  [now_ms](const auto& answered) { return now_ms >= answered.second; });
     if (attempt_.has_value() && now_ms - attempt_->started_ms >= kAttemptTimeoutMs) {
         // One line per attempt: the backoff spaces them seconds apart, and a
         // server that never unlocks is otherwise silent about why.
         spdlog::info("[storage] unlock attempt {} timed out: {} of {} partials (threshold {}), "
-                     "{} holder(s) asked, epoch {}, plan {}",
+                     "{} holder(s) asked, epoch {}, plan {}; late partials so far: {} counted, "
+                     "{} discarded",
                      attempts_, attempt_->partials.size(), attempt_->plan.holders.size(),
                      attempt_->plan.threshold, attempt_->asked.size(),
-                     attempt_->request.epoch.underlying(), short_hex(attempt_->plan_digest));
+                     attempt_->request.epoch.underlying(), short_hex(attempt_->plan_digest),
+                     late_partials_, stray_partials_);
+        // A holder may still answer inside its pending window, and it charges
+        // the partial when it sends it: the request stays usable until then.
+        attempt_->keep_until_ms = now_ms + kLatePartialWindowMs;
+        late_attempts_.push_back(std::move(*attempt_));
         fail_attempt();
     }
 
@@ -575,9 +592,7 @@ bool DataKeyService::rewrap() {
         next_verified_ = false;
         next_rewrap_ = true;
     }
-    if (attempt_.has_value() && attempt_->target == Target::Current) {
-        attempt_.reset();
-    }
+    forget_attempts([](const Attempt& attempt) { return attempt.target == Target::Current; });
     next_attempt_ms_ = now_ms_;
     spdlog::info("[storage] data key staged under S {} (epoch {}); it replaces the stored key "
                  "once the holders reproduce it",
@@ -590,6 +605,12 @@ void DataKeyService::start_attempt(const StorageFinalPlan& plan, const Digest& p
                                    bool verify_only, uint64_t now_ms, Target target) {
     const EpochId epoch = service_.current_epoch();
     if (epoch == EpochId{}) {
+        return;
+    }
+    // Not while a holder may still hold the previous request pending: it would
+    // refuse the new one (PendingBusy), and its late answer to the previous
+    // one still counts. The callers try again on a later tick.
+    if (now_ms < holders_pending_until_ms_) {
         return;
     }
     std::optional<crypto::StorageWrappedDataKey> wrapped;
@@ -630,6 +651,7 @@ void DataKeyService::start_attempt(const StorageFinalPlan& plan, const Digest& p
     }
     ++attempts_;
     attempt_ = std::move(attempt);
+    holders_pending_until_ms_ = now_ms + constants::kStorageUnlockPendingMs;
     for (const auto& node : attempt_->asked) {
         service_.send_unlock_request(node, attempt_->request);
     }
@@ -637,60 +659,106 @@ void DataKeyService::start_attempt(const StorageFinalPlan& plan, const Digest& p
 }
 
 void DataKeyService::on_partial(const StorageUnlockPartialMsg& partial) {
-    if (!attempt_.has_value() || partial.request_digest != attempt_->request_digest ||
-        !attempt_->asked.contains(partial.holder)) {
+    // The live attempt, or a timed-out one whose request a holder may still
+    // answer: the holder charged this partial either way.
+    Attempt* attempt = nullptr;
+    bool live = false;
+    if (attempt_.has_value() && attempt_->request_digest == partial.request_digest) {
+        attempt = &*attempt_;
+        live = true;
+    } else {
+        const auto kept = std::find_if(
+            late_attempts_.begin(), late_attempts_.end(),
+            [&](const Attempt& a) { return a.request_digest == partial.request_digest; });
+        if (kept != late_attempts_.end()) {
+            attempt = &*kept;
+        }
+    }
+    if (attempt == nullptr) {
+        const bool answered = std::any_of(
+            answered_requests_.begin(), answered_requests_.end(),
+            [&](const auto& entry) { return entry.first == partial.request_digest; });
+        if (!answered) {
+            note_stray_partial(partial.holder);
+        }
+        return;
+    }
+    if (!attempt->asked.contains(partial.holder)) {
         return;
     }
     const auto holder = std::find_if(
-        attempt_->plan.holders.begin(), attempt_->plan.holders.end(),
+        attempt->plan.holders.begin(), attempt->plan.holders.end(),
         [&](const StorageHolder& h) { return h.node == partial.holder; });
-    if (holder == attempt_->plan.holders.end() || holder->holder_id != partial.holder_id ||
-        attempt_->partials.contains(partial.holder_id)) {
+    if (holder == attempt->plan.holders.end() || holder->holder_id != partial.holder_id ||
+        attempt->partials.contains(partial.holder_id)) {
         return;
     }
     auto opened =
-        service_.sealer().unseal_bound(attempt_->request_digest, partial.sealed_partial);
+        service_.sealer().unseal_bound(attempt->request_digest, partial.sealed_partial);
     if (!opened.has_value() || opened->size() != crypto::kStoragePartialSize) {
         return;
     }
-    const auto& wrapped = attempt_->wrapped;
+    const auto& wrapped = attempt->wrapped;
     // Each partial is checked as it arrives: a bad DLEQ proof, a partial for
     // another R, or one from a share outside this plan never counts.
     const auto context =
-        StorageKeyService::unlock_context(service_.config().network_id, attempt_->request);
-    if (crypto::StorageThreshold::verify_partial(attempt_->plan.key_plan, context,
+        StorageKeyService::unlock_context(service_.config().network_id, attempt->request);
+    if (crypto::StorageThreshold::verify_partial(attempt->plan.key_plan, context,
                                                  wrapped.ephemeral_point, partial.holder_id,
                                                  *opened) != crypto::StorageStatus::Ok) {
         spdlog::debug("[storage] a partial from holder {} failed verification",
                       partial.holder_id);
         return;
     }
-    attempt_->partials.emplace(partial.holder_id, std::move(*opened));
-    finish_attempt();
+    attempt->partials.emplace(partial.holder_id, std::move(*opened));
+    if (live) {
+        finish_attempt();
+        return;
+    }
+    ++late_partials_;
+    if (attempt->partials.size() < attempt->plan.threshold) {
+        return;
+    }
+    Attempt done = std::move(*attempt);
+    std::erase_if(late_attempts_,
+                  [&](const Attempt& a) { return a.request_digest == done.request_digest; });
+    complete_attempt(std::move(done), false);
 }
 
 void DataKeyService::finish_attempt() {
     if (!attempt_.has_value() || attempt_->partials.size() < attempt_->plan.threshold) {
         return;
     }
-    const auto context =
-        StorageKeyService::unlock_context(service_.config().network_id, attempt_->request);
-    auto unwrapped = crypto::StorageThreshold::unwrap_data_key(
-        service_.crypto(), attempt_->wrapped, attempt_->plan.key_plan, context,
-        attempt_->partials, server_id());
-    const bool verify_only = attempt_->verify_only;
-    const Target target = attempt_->target;
-    const StoragePointBytes attempt_wrapped_key = attempt_->wrapped.storage_public_key;
+    Attempt done = std::move(*attempt_);
     attempt_.reset();
+    complete_attempt(std::move(done), true);
+}
+
+void DataKeyService::complete_attempt(Attempt attempt, bool live) {
+    const auto context =
+        StorageKeyService::unlock_context(service_.config().network_id, attempt.request);
+    auto unwrapped = crypto::StorageThreshold::unwrap_data_key(
+        service_.crypto(), attempt.wrapped, attempt.plan.key_plan, context, attempt.partials,
+        server_id());
+    const bool verify_only = attempt.verify_only;
+    const Target target = attempt.target;
+    const StoragePointBytes attempt_wrapped_key = attempt.wrapped.storage_public_key;
     if (!unwrapped.ok()) {
         spdlog::warn("[storage] unwrapping the data key failed (status {})",
                      static_cast<int>(unwrapped.status));
         if (target == Target::Replacement) {
             discard_staged();
         }
-        fail_attempt();
+        if (live) {
+            fail_attempt();
+        }
         return;
     }
+    // This round trip answered the question; the live attempt and the kept
+    // ones for the same target asked it again. The holders beyond t may still
+    // answer this request; those partials are expected.
+    forget_attempts([target](const Attempt& other) { return other.target == target; });
+    answered_requests_.emplace_back(attempt.request_digest, now_ms_ + kLatePartialWindowMs);
     backoff_ms_ = 0;
     bool matches = true;
     bool commit_rewrap = false;
@@ -747,6 +815,31 @@ void DataKeyService::fail_attempt() {
     attempt_.reset();
     backoff_ms_ = backoff_ms_ == 0 ? kFirstBackoffMs : std::min(backoff_ms_ * 2, kMaxBackoffMs);
     next_attempt_ms_ = now_ms_ + backoff_ms_;
+}
+
+void DataKeyService::forget_attempts(const std::function<bool(const Attempt&)>& which) {
+    if (attempt_.has_value() && which(*attempt_)) {
+        attempt_.reset();
+    }
+    std::erase_if(late_attempts_, which);
+}
+
+void DataKeyService::note_stray_partial(const NodeId& holder) {
+    ++stray_partials_;
+    // One line per window, as StorageKeyService::drop() logs: the holder spent
+    // one of this server's served partials for this epoch on it.
+    if (stray_log_window_ms_ != 0 && now_ms_ - stray_log_window_ms_ < kDropLogWindowMs) {
+        ++stray_log_suppressed_;
+        return;
+    }
+    spdlog::info("[storage] a partial from holder {} arrived for a request this server no "
+                 "longer holds; the holder charged it to this server's budget{}",
+                 short_hex(holder.span()),
+                 stray_log_suppressed_ > 0
+                     ? " (" + std::to_string(stray_log_suppressed_) + " suppressed)"
+                     : "");
+    stray_log_window_ms_ = std::max<uint64_t>(now_ms_, 1);
+    stray_log_suppressed_ = 0;
 }
 
 bool DataKeyService::expects_challenge(const NodeId& holder, const Digest& context) const {
