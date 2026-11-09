@@ -110,6 +110,23 @@ The SDK then:
    [SDK Guide — Session moves](SDK-Guide#session-moves)).
 
 It verifies again every five minutes and after a server refuses a tree route.
+
+A refresh starts from the server pool: the configured seeds, the servers
+`/api/servers` listed on first connect, and, after a join, the session server
+first. The join keeps the other known servers behind the session server, so
+an outage of the session server leaves the client servers to ask. When no
+known server answers at all, the SDK resolves the region's SEIP records
+(`<region>.seip.<domain>`, the same records the first DNS discovery reads;
+see [DNS Discovery](DNS-Discovery)) and verifies the servers they name with
+the same chain walk and endpoint proofs before it uses one. The region comes
+from `ServerConfig::discovery_domain` and `discovery_region`, or from the
+session server's SEIP FQDN `<id>.<region>.seip.<domain>` when they are not
+set; without either, no fallback runs. The DNS step runs at most once a
+minute, so a long outage costs one lookup a minute rather than one per tree
+call; it supplies candidates only, and it never touches the pinned Genesis
+key. One info log line names what the lookup found. A refresh that still
+fails names every server it asked (`tried:` for the chain walk, `probed:` for
+the endpoint proofs).
 `refresh_tier1()` / `ln_tier1_refresh()` verifies now, and
 `tier1_membership()` / `ln_tier1_membership()` returns the last result.
 `tier1_walk_progress()` / `ln_tier1_progress()` reports the chain walk that

@@ -306,6 +306,9 @@ protected:
     std::atomic<bool> join_answers_membership{false};
     // The stand-in acts as a server from before GET /api/tree/devices.
     std::atomic<bool> devices_route_missing{false};
+    // The join answer names the server's SEIP FQDN ("localhost" here), as
+    // servers do; the SDK then leads its pool with that name.
+    std::atomic<bool> join_names_seip_fqdn{false};
 
     std::vector<std::string> join_hostnames() {
         std::lock_guard lock(join_mtx);
@@ -1000,6 +1003,7 @@ protected:
             j["tunnel_ip"]           = "10.64.0.3/32";
             j["server_tunnel_ip"]    = "10.64.0.1";
             j["server_private_fqdn"] = "localhost";
+            if (join_names_seip_fqdn.load()) j["server_seip_fqdn"] = "localhost";
             j["private_api_port"]    = kPrivPort;
             j["mesh_server_pubkey"]  = server_keys.second;
             j["mesh_endpoint"]       = "127.0.0.1:" + std::to_string(server_mesh.bound_port());
@@ -2850,6 +2854,179 @@ TEST_F(SdkMeshPrivateApiTest, MembersThatRefusedAnInviteAreNotAskedAgain) {
     EXPECT_EQ(joins_with_link_token(), (std::vector<bool>{true, true}));
     EXPECT_EQ(third_auth_posts.load(), 0);
     EXPECT_FALSE(client.is_mesh_active());
+}
+
+// Fallback discovery: when no known server answers a Tier 1 refresh, the
+// SDK asks the region's SEIP records for servers and verifies them. The DNS
+// step is a stand-in here; the endpoint proofs are real.
+namespace {
+
+/// A region discovery stand-in that records its calls and answers `servers`.
+struct RegionLookup {
+    std::mutex                           mtx;
+    int                                  calls{0};
+    std::string                          domain;
+    std::string                          region;
+    uint16_t                             port{0};
+    std::vector<lnsdk::DiscoveredServer> servers;  // empty: the lookup fails
+
+    lnsdk::LemonadeNexusClient::RegionDiscovery hook() {
+        return [this](const std::string& d, const std::string& r, uint16_t p) {
+            std::lock_guard lock(mtx);
+            ++calls;
+            domain = d;
+            region = r;
+            port   = p;
+            lnsdk::Result<std::vector<lnsdk::DiscoveredServer>> result;
+            if (servers.empty()) {
+                result.error = r + ".seip." + d + " resolved to no IPv4 address";
+                return result;
+            }
+            result.ok          = true;
+            result.http_status = 200;
+            result.value       = servers;
+            return result;
+        };
+    }
+    int count() {
+        std::lock_guard lock(mtx);
+        return calls;
+    }
+};
+
+std::vector<uint16_t> ports_of(const std::vector<lnsdk::Tier1Server>& servers) {
+    std::vector<uint16_t> out;
+    for (const auto& s : servers) out.push_back(s.port);
+    return out;
+}
+
+std::vector<uint16_t> ports_of(const std::vector<lnsdk::ServerEndpoint>& servers) {
+    std::vector<uint16_t> out;
+    for (const auto& s : servers) out.push_back(s.port);
+    return out;
+}
+
+}  // namespace
+
+TEST_F(SdkMeshPrivateApiTest, AClientWhoseOnlyKnownServerIsDownRediscoversTheRegion) {
+    // The only known server goes down. The refresh finds nothing to ask,
+    // resolves the configured region, and verifies the server it names;
+    // that server then stays in the pool, so the next refresh needs no DNS.
+    lnsdk::ServerConfig cfg;
+    cfg.servers          = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover    = false;
+    cfg.discovery_domain = "example.test";
+    cfg.discovery_region = "us";
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    RegionLookup lookup;
+    lookup.servers = {{"localhost", static_cast<uint16_t>(pub2_port), "127.0.0.1"}};
+    client.set_region_discovery(lookup.hook());
+
+    const auto first = client.refresh_tier1();
+    ASSERT_TRUE(first.ok) << first.error;
+    EXPECT_EQ(ports_of(first.value.servers), std::vector<uint16_t>{static_cast<uint16_t>(pub_port)});
+    EXPECT_EQ(lookup.count(), 0);
+
+    stop_public_listener();
+    const auto again = client.refresh_tier1();
+    ASSERT_TRUE(again.ok) << again.error;
+    EXPECT_EQ(ports_of(again.value.servers), std::vector<uint16_t>{static_cast<uint16_t>(pub2_port)});
+    EXPECT_EQ(lookup.count(), 1);
+    EXPECT_EQ(lookup.domain, "example.test");
+    EXPECT_EQ(lookup.region, "us");
+    EXPECT_EQ(lookup.port, pub_port);
+    EXPECT_EQ(ports_of(client.known_servers()),
+              (std::vector<uint16_t>{static_cast<uint16_t>(pub_port),
+                                     static_cast<uint16_t>(pub2_port)}));
+
+    const auto third = client.refresh_tier1();
+    ASSERT_TRUE(third.ok) << third.error;
+    EXPECT_EQ(lookup.count(), 1);
+}
+
+TEST_F(SdkMeshPrivateApiTest, AClientWithNoDiscoverySourceFailsAndNamesTheServerItTried) {
+    // No discovery domain is configured and no known server has a SEIP name:
+    // there is nothing to resolve, and the failure names the server asked.
+    lnsdk::ServerConfig cfg;
+    cfg.servers       = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    RegionLookup lookup;
+    lookup.servers = {{"localhost", static_cast<uint16_t>(pub2_port), "127.0.0.1"}};
+    client.set_region_discovery(lookup.hook());
+    ASSERT_TRUE(client.refresh_tier1().ok);
+
+    stop_public_listener();
+    const auto failed = client.refresh_tier1();
+    EXPECT_FALSE(failed.ok);
+    EXPECT_EQ(failed.http_status, 0);
+    EXPECT_NE(failed.error.find("no verified Tier 1 server is reachable"), std::string::npos)
+        << failed.error;
+    EXPECT_NE(failed.error.find("tried: localhost:" + std::to_string(pub_port) + " unreachable"),
+              std::string::npos)
+        << failed.error;
+    EXPECT_NE(failed.error.find("probed: localhost:" + std::to_string(pub_port) + " unreachable"),
+              std::string::npos)
+        << failed.error;
+    EXPECT_EQ(lookup.count(), 0);
+    EXPECT_TRUE(client.tier1_membership().servers.empty());
+}
+
+TEST_F(SdkMeshPrivateApiTest, AFallbackDiscoveryThatFindsNothingIsNotRepeatedAtOnce) {
+    // DNS finds nothing during the outage: the refresh fails with the servers
+    // it tried, and the next refresh does not resolve again within a minute.
+    lnsdk::ServerConfig cfg;
+    cfg.servers          = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover    = false;
+    cfg.discovery_domain = "example.test";
+    cfg.discovery_region = "us";
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    RegionLookup lookup;  // no servers: the lookup fails
+    client.set_region_discovery(lookup.hook());
+    ASSERT_TRUE(client.refresh_tier1().ok);
+
+    stop_public_listener();
+    const auto failed = client.refresh_tier1();
+    EXPECT_FALSE(failed.ok);
+    EXPECT_EQ(failed.http_status, 0);
+    EXPECT_NE(failed.error.find("localhost:" + std::to_string(pub_port)), std::string::npos)
+        << failed.error;
+    EXPECT_EQ(lookup.count(), 1);
+    EXPECT_FALSE(client.refresh_tier1().ok);
+    EXPECT_EQ(lookup.count(), 1);
+}
+
+TEST_F(SdkMeshPrivateApiTest, AJoinKeepsTheKnownServersBehindTheSessionServer) {
+    // The pool starts with a server that answers every challenge 421, so the
+    // identity sign-in and the session land on the second one. After the
+    // join the session server leads the pool and the other server stays:
+    // when the session server goes down, the refresh still has a server to
+    // ask.
+    join_names_seip_fqdn = true;
+    lnsdk::ServerConfig cfg;
+    cfg.servers       = {{"localhost", static_cast<uint16_t>(pub3_port), true},
+                         {"localhost", static_cast<uint16_t>(pub_port), true}};
+    cfg.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(cfg);
+    ASSERT_TRUE(client.set_genesis_key(nexus::crypto::to_base64(chain.genesis.public_key)).ok);
+    lnsdk::Identity identity;
+    identity.generate();
+    client.set_identity(identity);
+    const auto joined = client.join_network("user", "password");
+    ASSERT_TRUE(joined.ok) << joined.error;
+    EXPECT_EQ(third_auth_posts.load(), 0);
+    EXPECT_EQ(ports_of(client.known_servers()),
+              (std::vector<uint16_t>{static_cast<uint16_t>(pub_port),
+                                     static_cast<uint16_t>(pub3_port)}));
+
+    stop_public_listener();
+    const auto refreshed = client.refresh_tier1();
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    EXPECT_EQ(ports_of(refreshed.value.servers),
+              std::vector<uint16_t>{static_cast<uint16_t>(pub3_port)});
 }
 
 // A JSON mesh config (ln_mesh_enable_config) keeps the MeshConfig default of
