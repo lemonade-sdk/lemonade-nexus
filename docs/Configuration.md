@@ -264,8 +264,8 @@ runs the merge once, after every server runs a release with tree operations.
   changes. The log height continues across epochs. A snapshot is written
   every 1,000 heights. At startup the server verifies the log, and restores the
   tree from the log when an apply was interrupted.
-- **Wait, then pending.** A write route waits up to 10 s for the commit.
-  After 10 s the route answers `202` with `{"status": "pending", "op_id":
+- **Wait, then pending.** A write route waits up to 8 s for the commit.
+  After 8 s the route answers `202` with `{"status": "pending", "op_id":
   ...}`; the client polls `GET /api/tree/op/{op_id}` (`pending`, `committed`,
   or `refused` with a reason). A pending join answers `202` without a tunnel
   address; the client joins again after the commit. A heartbeat does not wait.

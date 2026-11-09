@@ -78,7 +78,7 @@ constexpr int     kMeshConnectTimeoutSec  = 3;
 // The read timeout must exceed the server's tree-op commit wait: a private
 // tree route (POST /api/tree/node/update, for example) answers only after the
 // op commits through Tier 1 consensus or that wait ends, which is
-// nexus::tree::kTreeOpCommitWaitMs (10 s, TreeConsensus.hpp) plus the
+// nexus::tree::kTreeOpCommitWaitMs (8 s, TreeConsensus.hpp) plus the
 // request's own round trips. A shorter timeout reports NO RESPONSE for an op
 // the server then commits anyway.
 constexpr int     kMeshReadTimeoutSec     = 15;

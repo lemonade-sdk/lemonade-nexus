@@ -69,7 +69,7 @@ FROST, the epoch signing key, does not change.
 | Key rotation | Storage secret daily (rewraps data keys); each server's data key monthly and after a suspected compromise (re-encrypts files) |
 | Recovery | No offline recovery key. Re-sharing restores full tolerance while at least the threshold stays online. |
 | Tree versions | Nodes hold their versions. The existing sync library (`nexus::sync`) replicates committed changes; consensus orders them. |
-| Saving a change | The API waits up to 10 s for the commit, then reports the change as pending |
+| Saving a change | The API waits up to 8 s for the commit, then reports the change as pending |
 | Re-share authority | Needs 65% of the current holders, not only a consensus quorum |
 | FROST and consensus | Unchanged in role, threshold, and storage |
 | Endpoint tiers | Tier 3 = inference node, Tier 4 = client (see [Security](Security#server-roles)) |
@@ -206,7 +206,7 @@ TreeOp {
    [A7](#a7-tier-2-and-lagging-servers)).
 2. Each Tier 1 server keeps a bounded pending pool, keyed by `op_id`, with
    per-author limits.
-3. The API answers when the op commits or is refused, waiting up to 10 s.
+3. The API answers when the op commits or is refused, waiting up to 8 s.
    After that it returns `202` with the `op_id`, the app shows the change as
    pending, and polls until it commits.
 
@@ -960,7 +960,7 @@ Each phase adds tests for the valid path and these rejection cases:
 Decided: libraries for `storage-threshold` (B3), with an external review of
 the unaudited paths before Phase 5; a threshold change rotates the key
 instead of re-sharing to a new threshold (B5); no offline recovery key (B8); nodes hold per-node versions and the
-sync library replicates (A7); the API waits up to 10 s, then reports pending
+sync library replicates (A7); the API waits up to 8 s, then reports pending
 (A2); holder counts (B4, B5, B10): the storage key is created only with at
 least 5 eligible, attested holders; after holders are lost, Tier 1 refreshes
 or rotates promptly while at least 3 holders remain (a refresh when `t` stays

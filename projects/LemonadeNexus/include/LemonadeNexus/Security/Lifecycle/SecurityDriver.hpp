@@ -50,6 +50,21 @@ inline constexpr uint64_t kParticipationRepublishMs = 60'000;
 /// Liveness tuning, not a protocol rule.
 inline constexpr uint64_t kIdleProposalIntervalMs = 500;
 
+/// Shortest time before a leader proposes the same stage transition again
+/// after a stage block it proposed did not certify. A replica votes for a
+/// stage only when it derived the same digest, so a stage the quorum does not
+/// share fails every view its proposer leads: the view ends on the pacemaker
+/// timeout and a pending payload waits behind it. Until the retry this node
+/// proposes payload and empty blocks, so tree writes commit while the
+/// members' facts converge; a stage whose digest changed is proposed at once,
+/// because new facts are what can certify it. A retry also waits for the
+/// pacemaker to be back at its base timeout, so one failed view does not
+/// double the cost of the next; a first attempt never waits for that, or an
+/// offline member's timeouts would hold every boundary. Liveness tuning, not
+/// a protocol rule: what a stage asserts, and who may vote for it, is
+/// unchanged.
+inline constexpr uint64_t kStageRetryIntervalMs = 120'000;
+
 enum class DriverPhase : uint16_t {
     Failed,
     Idle,
@@ -251,6 +266,10 @@ public:
     /// one entry point consensus uses; it accepts exactly the four boundary
     /// stages this node derived itself and nothing else.
     [[nodiscard]] bool accepts_transition(const Digest& transitions_digest) const;
+    /// The per-candidate inputs of this node's eligibility stage digest, for
+    /// the log line that names a transition this node did not derive. Empty
+    /// once the stage is finalized.
+    [[nodiscard]] std::string eligibility_facts_summary() const;
 
     /// Adds the handler for one block payload kind (BlockPayload.hpp). The
     /// handler proposes that kind when this node leads and no stage is
@@ -507,6 +526,17 @@ private:
     /// first tick that finds the store dirty writes it.
     uint64_t last_eligibility_flush_ms_ = 0;
     View last_proposed_view_ = 0;
+    /// The stage transition this node proposed last and when: the retry gate
+    /// in maybe_propose (kStageRetryIntervalMs).
+    Digest stage_attempt_digest_{};
+    uint64_t stage_attempt_ms_ = 0;
+    bool stage_deferred_logged_ = false;
+    /// The view whose failed make_proposal was logged, so a stuck leader logs
+    /// once per view rather than once per tick.
+    View proposal_failure_logged_view_ = 0;
+    /// The foreign transition this node last refused to vote for, so the
+    /// comparison with its own pending stage is logged once per digest.
+    mutable Digest refused_transition_logged_{};
     /// When this node last published a participation observation about each
     /// subject, for the current eligibility epoch.
     std::map<NodeId, uint64_t> participation_published_ms_;

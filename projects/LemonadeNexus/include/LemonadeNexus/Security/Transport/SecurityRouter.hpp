@@ -245,6 +245,7 @@ private:
     /// with this node on both sides.
     bool reply(const NodeId& to, SecurityMessage message, uint64_t now_ms);
     RouteResult route_proposal(const ProposalMessage& message, const NodeId& from);
+    void note_withheld_vote(const Proposal& proposal);
     RouteResult route_vote(const Vote& vote);
     RouteResult route_timeout(const TimeoutVote& vote);
     RouteResult route_dkg(DkgMessage& message);
@@ -310,6 +311,9 @@ private:
     // window only — a local message never advances it.
     std::map<DropReason, uint64_t> drop_counts_;
     std::map<std::pair<uint16_t, uint16_t>, DropLogWindow> drop_log_;
+    /// Votes this node withheld because it did not derive the proposal's
+    /// transition (route_proposal): one info line per window.
+    DropLogWindow withheld_log_;
     uint64_t drop_now_ms_ = 0;
 };
 

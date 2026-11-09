@@ -80,8 +80,10 @@ namespace nexus::tree {
 class PermissionTreeService;
 
 /// How long an API request waits for its op to commit before it answers
-/// "pending" (design A2).
-inline constexpr uint64_t kTreeOpCommitWaitMs = 10'000;
+/// "pending" (design A2). Below the SDK's default read timeout of 10 s
+/// (ServerConfig::read_timeout_sec), so the pending answer with its op id
+/// reaches the client instead of a read timeout.
+inline constexpr uint64_t kTreeOpCommitWaitMs = 8'000;
 
 /// Wire budget of one tree batch, leaving room in the proposal envelope for
 /// the header, the justify certificate at the largest population, and the

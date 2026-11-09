@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Security/Transport/SecurityRouter.hpp>
 
+#include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Consensus/QuorumValidation.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
@@ -720,6 +721,9 @@ RouteResult SecurityRouter::route_proposal(const ProposalMessage& message, const
         }
         return drop(DropReason::ServiceRejected, code(*result.rejected));
     }
+    if (result.transition_refused) {
+        note_withheld_vote(message.proposal);
+    }
     // The service validated the justify with the proposal, so its signers are
     // a proved fact every replica holds equally.
     events_.on_justify_quorum(message.justify);
@@ -743,6 +747,29 @@ RouteResult SecurityRouter::route_proposal(const ProposalMessage& message, const
         events_.on_commits(result.commits);
     }
     return delivered();
+}
+
+void SecurityRouter::note_withheld_vote(const Proposal& proposal) {
+    // Info, one line per window: a stage the quorum does not share fails
+    // every view its proposer leads, and nothing else names that here.
+    const auto leader = crypto::to_hex(std::span<const uint8_t>(proposal.leader.bytes.data(), 8));
+    const auto digest =
+        crypto::to_hex(std::span<const uint8_t>(proposal.transitions_digest.data(), 8));
+    if (withheld_log_.window_start_ms == 0 ||
+        drop_now_ms_ - withheld_log_.window_start_ms >= kDropLogWindowMs) {
+        if (withheld_log_.suppressed > 0) {
+            spdlog::info("[security] vote withheld in view {} from leader {}: this node did not "
+                         "derive transition {} ({} suppressed)",
+                         proposal.view.underlying(), leader, digest, withheld_log_.suppressed);
+        } else {
+            spdlog::info("[security] vote withheld in view {} from leader {}: this node did not "
+                         "derive transition {}",
+                         proposal.view.underlying(), leader, digest);
+        }
+        withheld_log_ = {drop_now_ms_, 0};
+    } else {
+        ++withheld_log_.suppressed;
+    }
 }
 
 RouteResult SecurityRouter::route_vote(const Vote& vote) {
