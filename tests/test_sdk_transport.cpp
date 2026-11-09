@@ -2966,10 +2966,11 @@ TEST_F(SdkMeshPrivateApiTest, AClientWithNoDiscoverySourceFailsAndNamesTheServer
     EXPECT_EQ(failed.http_status, 0);
     EXPECT_NE(failed.error.find("no verified Tier 1 server is reachable"), std::string::npos)
         << failed.error;
-    EXPECT_NE(failed.error.find("tried: localhost:" + std::to_string(pub_port) + " unreachable"),
+    // The transport's reason follows "unreachable" for the walk and the probe.
+    EXPECT_NE(failed.error.find("tried: localhost:" + std::to_string(pub_port) + " unreachable ("),
               std::string::npos)
         << failed.error;
-    EXPECT_NE(failed.error.find("probed: localhost:" + std::to_string(pub_port) + " unreachable"),
+    EXPECT_NE(failed.error.find("probed: localhost:" + std::to_string(pub_port) + " unreachable ("),
               std::string::npos)
         << failed.error;
     EXPECT_EQ(lookup.count(), 0);

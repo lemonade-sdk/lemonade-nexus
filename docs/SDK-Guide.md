@@ -145,8 +145,9 @@ deprecated stub that always fails; use an Ed25519 identity.
 |---|---|---|
 | `set_genesis_key(b64, min_epoch)` | `ln_set_genesis_key(client, b64, min_epoch)` | Pin the Genesis key and the lowest epoch to accept |
 | `set_epoch_floor(chain, min_epoch)` | `ln_set_epoch_floor(client, chain, min_epoch)` | The lowest epoch to accept for the stored chain; another chain under the key is reported as re-founded (`refounded`) |
-| `discover_genesis_key(hosts)` | `ln_discover_genesis_key(client, hosts_json, &json)` | First connect only: pin the key that at least 3 servers in the network domain agree on (trust on first use) |
+| `discover_genesis_key(hosts)` | `ln_discover_genesis_key(client, hosts_json, &json)` | First connect only: pin the key that at least 3 servers in the network domain agree on (trust on first use); with fewer than 3 known hosts it asks the region's SEIP records for more candidates first |
 | `discover_servers(domain, region, port)` | `ln_discover_servers(domain, region, port, &json)` | Bootstrap without a configured host: resolve `<region>.seip.<domain>` and read each server's certificate name; the names are candidates for `ln_create_tls`, not trusted servers |
+| `set_discovery_target(domain, region)` | `ln_set_discovery_target(client, domain, region)` | Name the region (`<region>.seip.<domain>`) that fallback discovery and `discover_genesis_key` resolve; both strings are copied |
 | `refresh_tier1()` | `ln_tier1_refresh(client, &json)` | Verify the membership now; when no known server answers, resolve the region's SEIP records first (see below) |
 | `tier1_membership()` | `ln_tier1_membership(client, &json)` | The last verified membership, no network I/O |
 | `known_servers()` | — | The server pool in order: after a join, the session server first |
@@ -162,11 +163,14 @@ A refresh starts from the server pool (the configured seeds, the servers
 keeps the other known servers behind it). When no known server answers, the
 SDK resolves `<region>.seip.<domain>` and verifies the servers the records
 name before it uses one. Set `ServerConfig::discovery_domain` and
-`discovery_region` to name the region; without them the SDK takes both from
-the session server's SEIP FQDN (`<id>.<region>.seip.<domain>`), and with
-neither no fallback runs. The lookup runs at most once a minute and supplies
-candidates only; the endpoint proofs decide, and the pinned Genesis key is
-never replaced. A refresh that still fails names every server it asked.
+`discovery_region`, or call `set_discovery_target` /
+`ln_set_discovery_target`, to name the region; without them the SDK takes
+both from the session server's SEIP FQDN (`<id>.<region>.seip.<domain>`), and
+with neither no fallback runs (a warning log line says so). The lookup runs
+at most once a minute and supplies candidates only; the endpoint proofs
+decide, and the pinned Genesis key is never replaced. A refresh that still
+fails names every server it asked and what it answered (`unreachable` with
+the transport's reason, or `HTTP <status>`).
 
 A session belongs to the Tier 1 server that issued it. Tier 1 rotates one
 member out at each epoch boundary. A member that the finalized next-epoch

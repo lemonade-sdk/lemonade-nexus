@@ -349,6 +349,54 @@ fn removing_egress_closes_only_its_loopback_listener() {
     unsafe { ns_destroy(stack) };
 }
 
+// An egress connection toward a peer that never answers (every packet is
+// dropped, as on a path that is not up) ends within EGRESS_CONNECT_TIMEOUT
+// instead of holding the loopback client until its own read timeout.
+#[test]
+fn an_egress_connect_that_gets_no_answer_ends_within_the_connect_timeout() {
+    let stack = unsafe { ns_create(1420, 65536, discard_packets, std::ptr::null_mut()) };
+    assert!(!stack.is_null());
+    let local = cs("10.0.0.1/8");
+    let src = cs("10.0.0.1");
+    let dst = cs("10.0.0.2");
+    unsafe {
+        assert_eq!(ns_add_local_ip(stack, local.as_ptr()), 0);
+    }
+    let port = unsafe { ns_add_tcp_egress(stack, dst.as_ptr(), 80, src.as_ptr()) };
+    assert_ne!(port, 0, "egress listener failed to bind");
+    std::thread::sleep(Duration::from_millis(100));
+
+    let started = std::time::Instant::now();
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut buf = [0u8; 16];
+    // Well inside the bound the connection is still open: a read only waits.
+    client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    match client.read(&mut buf) {
+        Err(e) if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) => {}
+        other => panic!("the connection ended before the connect timeout: {other:?}"),
+    }
+    // Then the stack gives up and the loopback side sees EOF or a reset.
+    client.set_read_timeout(Some(EGRESS_CONNECT_TIMEOUT * 2)).unwrap();
+    let ended = match client.read(&mut buf) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+    };
+    let elapsed = started.elapsed();
+    assert!(ended, "the loopback side stayed open past the connect timeout ({elapsed:?})");
+    assert!(
+        elapsed < EGRESS_CONNECT_TIMEOUT + Duration::from_secs(10),
+        "the connection ended only after {elapsed:?}"
+    );
+    unsafe { ns_destroy(stack) };
+}
+
 // A stack that cannot start must not hand back a handle. Before this check,
 // ns_create returned a non-null handle whose stack thread had already exited.
 #[test]
