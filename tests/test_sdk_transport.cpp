@@ -2909,6 +2909,7 @@ std::vector<uint16_t> ports_of(const std::vector<lnsdk::ServerEndpoint>& servers
 }  // namespace
 
 TEST_F(SdkMeshPrivateApiTest, AClientWhoseOnlyKnownServerIsDownRediscoversTheRegion) {
+    LN_REQUIRE_TEST_TRUST();
     // The only known server goes down. The refresh finds nothing to ask,
     // resolves the configured region, and verifies the server it names;
     // that server then stays in the pool, so the next refresh needs no DNS.
@@ -2946,6 +2947,7 @@ TEST_F(SdkMeshPrivateApiTest, AClientWhoseOnlyKnownServerIsDownRediscoversTheReg
 }
 
 TEST_F(SdkMeshPrivateApiTest, AClientWithNoDiscoverySourceFailsAndNamesTheServerItTried) {
+    LN_REQUIRE_TEST_TRUST();
     // No discovery domain is configured and no known server has a SEIP name:
     // there is nothing to resolve, and the failure names the server asked.
     lnsdk::ServerConfig cfg;
@@ -2975,6 +2977,7 @@ TEST_F(SdkMeshPrivateApiTest, AClientWithNoDiscoverySourceFailsAndNamesTheServer
 }
 
 TEST_F(SdkMeshPrivateApiTest, AFallbackDiscoveryThatFindsNothingIsNotRepeatedAtOnce) {
+    LN_REQUIRE_TEST_TRUST();
     // DNS finds nothing during the outage: the refresh fails with the servers
     // it tried, and the next refresh does not resolve again within a minute.
     lnsdk::ServerConfig cfg;
@@ -3000,6 +3003,7 @@ TEST_F(SdkMeshPrivateApiTest, AFallbackDiscoveryThatFindsNothingIsNotRepeatedAtO
 }
 
 TEST_F(SdkMeshPrivateApiTest, AJoinKeepsTheKnownServersBehindTheSessionServer) {
+    LN_REQUIRE_TEST_TRUST();
     // The pool starts with a server that answers every challenge 421, so the
     // identity sign-in and the session land on the second one. After the
     // join the session server leads the pool and the other server stays:
