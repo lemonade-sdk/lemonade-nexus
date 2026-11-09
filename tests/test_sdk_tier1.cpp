@@ -5,6 +5,7 @@
 // a Tier 2 server, and hostile servers.
 
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
+#include <LemonadeNexusSDK/ServerDiscovery.hpp>
 #include <LemonadeNexusSDK/Tier1Directory.hpp>
 #include <LemonadeNexusSDK/lemonade_nexus.h>
 
@@ -604,6 +605,27 @@ TEST_F(SdkTier1Test, AFailedSweepNamesTheSourcesItTried) {
     EXPECT_NE(refreshed.error.find("t1a.example"), std::string::npos) << refreshed.error;
 }
 
+TEST_F(SdkTier1Test, AFailedProbeRoundNamesTheCandidatesItAsked) {
+    // The chain verifies from the Tier 2 source, but both members are down:
+    // the failure names the source it walked from and what every probed
+    // candidate answered. A listed non-member is skipped, not probed.
+    net.servers["t1a.example"].down = true;
+    net.servers["t1b.example"].down = true;
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
+    const auto refreshed = dir.refresh(seed("t2.example"));
+    EXPECT_FALSE(refreshed.ok);
+    EXPECT_EQ(refreshed.http_status, 0);
+    const auto& error = refreshed.error;
+    EXPECT_NE(error.find("no verified Tier 1 server is reachable"), std::string::npos) << error;
+    EXPECT_NE(error.find("tried: t2.example:9100 advanced to epoch 2"), std::string::npos)
+        << error;
+    EXPECT_NE(error.find("probed: t2.example:9100 HTTP 421"), std::string::npos) << error;
+    EXPECT_NE(error.find("t1a.example:9100 unreachable"), std::string::npos) << error;
+    EXPECT_NE(error.find("t1b.example:9100 unreachable"), std::string::npos) << error;
+    EXPECT_EQ(error.find("old.example"), std::string::npos) << error;
+}
+
 TEST_F(SdkTier1Test, AWithheldHandoffIsFetchedFromAMemberThatProvesTheNewerEpoch) {
     // The seed withholds epoch 2; the members hold it.
     net.servers["t2.example"].known_epochs = 1;
@@ -955,4 +977,25 @@ TEST_F(SdkTier1Test, DiscoveryNeverReplacesAPinnedKey) {
               std::string::npos);
     ln_free(out);
     ln_destroy(c);
+}
+
+// Fallback discovery derives the region to resolve from a known server's
+// SEIP FQDN when none is configured.
+TEST(SeipName, ASeipFqdnNamesItsRegionAndDomain) {
+    const auto name = lnsdk::parse_seip_fqdn("SN01.us-west.seip.Lemonade-Nexus.io.");
+    ASSERT_TRUE(name.has_value());
+    EXPECT_EQ(name->id, "sn01");
+    EXPECT_EQ(name->region, "us-west");
+    EXPECT_EQ(name->domain, "lemonade-nexus.io");
+
+    const auto priv = lnsdk::parse_seip_fqdn("private.sn01.us.seip.example");
+    ASSERT_TRUE(priv.has_value());
+    EXPECT_EQ(priv->id, "private.sn01");
+    EXPECT_EQ(priv->region, "us");
+    EXPECT_EQ(priv->domain, "example");
+
+    for (const char* other : {"localhost", "us-west.seip.example", "sn01.us.seip.", "sn01.us.seip",
+                              ".us.seip.example", "sn01.us.seip.exa mple", "seip.example"}) {
+        EXPECT_FALSE(lnsdk::parse_seip_fqdn(other).has_value()) << other;
+    }
 }
