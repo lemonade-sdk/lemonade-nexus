@@ -75,6 +75,9 @@ std::optional<SecurityMeshStartup> start_security_mesh(
         mesh_config.next_boot_chain = security::boot_pcrs_from_approval(release->approval);
     }
     mesh_config.vault = storage.vault;
+    // The cached AMD CRLs expire on their signed nextUpdate; the server fetches
+    // replacements from KDS itself rather than wait for an operator.
+    mesh_config.amd_crl_fetch = security::fetch_amd_crl_https;
     auto startup = std::make_optional<SecurityMeshStartup>();
     startup->service =
         std::make_unique<security::SecurityMeshService>(io, mesh_config, gossip,

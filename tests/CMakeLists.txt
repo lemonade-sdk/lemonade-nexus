@@ -278,6 +278,7 @@ add_nexus_test(test_security_attestation
     security/attestation/service.cpp
     security/attestation/producer.cpp
     security/attestation/providers.cpp
+    security/attestation/revocation_refresh.cpp
     security/attestation/attestd_integration.cpp
     security/attestation/attestd_live.cpp
     security/attestation/svsm_service_live.cpp

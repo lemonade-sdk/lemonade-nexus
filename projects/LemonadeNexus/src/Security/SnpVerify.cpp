@@ -309,6 +309,29 @@ std::vector<X509Ptr> resolve_amd_chain(X509* vcek, std::string_view chain_pem,
     return chain;
 }
 
+/// AMD signs a product CRL with the ARK or the ASK depending on what it
+/// revokes. Either is acceptable BECAUSE both come from a chain that already
+/// had to root in a compiled-in AMD key. A list for another product verifies
+/// under neither, which is how the wrong product is rejected without anyone
+/// naming a product.
+bool crl_signed_by_chain(X509_CRL* crl, X509* ask, X509* ark) {
+    return X509_CRL_verify(crl, X509_get0_pubkey(ark)) == 1 ||
+           X509_CRL_verify(crl, X509_get0_pubkey(ask)) == 1;
+}
+
+/// Unix seconds of an ASN.1 time, or 0 when absent or unreadable.
+int64_t asn1_time_to_unix(const ASN1_TIME* when) {
+    if (when == nullptr) return 0;
+    struct tm t{};
+    if (ASN1_TIME_to_tm(when, &t) != 1) return 0;
+#if defined(_WIN32)
+    const time_t epoch = _mkgmtime(&t);
+#else
+    const time_t epoch = timegm(&t);
+#endif
+    return epoch > 0 ? static_cast<int64_t>(epoch) : 0;
+}
+
 /// True when `serial` appears in the CRL's revoked list.
 bool serial_is_revoked(X509_CRL* crl, const ASN1_INTEGER* serial) {
     if (!serial) return false;
@@ -466,6 +489,39 @@ std::string amd_crl_kds_url(std::string_view product) {
     return buf;
 }
 
+AmdCrlInspection inspect_amd_crl(std::string_view product, std::string_view crl_bytes) {
+    AmdCrlInspection out;
+    const auto refuse = [&out](std::string why) {
+        out.ok = false;
+        out.failure = std::move(why);
+        return out;
+    };
+    // The chain comes from this binary, never from the bytes under test, so an
+    // unknown product has nothing to check against and fails closed.
+    std::vector<X509Ptr> chain = parse_pem_chain(pinned_amd_chain(product));
+    if (chain.size() < 2) {
+        return refuse("no compiled-in AMD chain for product " + std::string(product));
+    }
+    CrlPtr crl = parse_crl(crl_bytes);
+    if (!crl) return refuse("the bytes are not a PEM or DER CRL");
+    out.parsed = true;
+    if (!crl_signed_by_chain(crl.get(), chain[0].get(), chain[1].get())) {
+        return refuse("the CRL is not signed by the compiled-in AMD chain for " +
+                      std::string(product));
+    }
+    out.this_update_unix = asn1_time_to_unix(X509_CRL_get0_lastUpdate(crl.get()));
+    out.next_update_unix = asn1_time_to_unix(X509_CRL_get0_nextUpdate(crl.get()));
+    if (STACK_OF(X509_REVOKED)* revoked = X509_CRL_get_REVOKED(crl.get()); revoked != nullptr) {
+        out.revoked_count = static_cast<std::size_t>(sk_X509_REVOKED_num(revoked));
+    }
+    // verify_snp_revocation refuses a list it cannot expire, so caching one
+    // would replace a usable list with one that never passes.
+    if (out.next_update_unix == 0) return refuse("the CRL carries no readable nextUpdate");
+    if (out.this_update_unix == 0) return refuse("the CRL carries no readable thisUpdate");
+    out.ok = true;
+    return out;
+}
+
 std::vector<std::string> amd_crl_revoked_serials(std::string_view crl_bytes) {
     std::vector<std::string> serials;
     CrlPtr crl = parse_crl(crl_bytes);
@@ -505,17 +561,11 @@ SnpVerifyResult verify_snp_revocation(std::span<const uint8_t> vcek_der,
     X509* ask = chain[0].get();
     X509* ark = chain[1].get();
 
-    // AMD signs the product CRL with the ARK or the ASK depending on what it
-    // revokes. Either is acceptable BECAUSE both came from the chain above,
-    // which already had to root in a compiled-in AMD key. A list for another
-    // product verifies under neither, which is how the wrong product is
-    // rejected without anyone naming a product.
     CrlPtr matching;
     for (const auto& bytes : state.crls) {
         CrlPtr crl = parse_crl(bytes);
         if (!crl) continue;
-        if (X509_CRL_verify(crl.get(), X509_get0_pubkey(ark)) == 1 ||
-            X509_CRL_verify(crl.get(), X509_get0_pubkey(ask)) == 1) {
+        if (crl_signed_by_chain(crl.get(), ask, ark)) {
             matching = std::move(crl);
             break;
         }
