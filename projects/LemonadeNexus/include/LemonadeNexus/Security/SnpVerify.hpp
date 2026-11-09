@@ -125,9 +125,36 @@ using AmdRevocationSource = std::function<AmdRevocationState()>;
                                                      std::string_view chain_pem,
                                                      const AmdRevocationState& state);
 
-/// The CRL for one product. Fetched and cached by the operator's tooling; the
-/// verifier never reaches the network itself.
+/// The CRL for one product. Fetched and cached by AmdRevocationRefresher or by
+/// the operator's tooling; the verifier never reaches the network itself.
 [[nodiscard]] std::string amd_crl_kds_url(std::string_view product);
+
+/// What a CRL fetched for one product is, before it is cached.
+struct AmdCrlInspection {
+    /// The bytes parse as a CRL and AMD's pinned ARK or ASK for `product`
+    /// signed them. False with `failure` set otherwise.
+    bool ok{false};
+    std::string failure;   // human-readable, safe to log
+    /// The bytes parsed as a PEM or DER CRL. True with ok == false means the
+    /// list is well formed but not AMD's, or lacks a validity window.
+    bool parsed{false};
+    /// The signed thisUpdate and nextUpdate, Unix seconds. Zero when absent
+    /// or unreadable; a CRL without nextUpdate is reported with ok == false
+    /// because the verifier refuses one.
+    int64_t this_update_unix{0};
+    int64_t next_update_unix{0};
+    std::size_t revoked_count{0};
+};
+
+/// Check that `crl_bytes` is a CRL signed by the compiled-in chain for
+/// `product`, and read its validity window. This is the acceptance test a
+/// fetched list must pass before it may replace a cached one; it applies the
+/// same signature rule as verify_snp_revocation. It does not compare the
+/// window with the clock: a list that is expired or not yet valid is still
+/// AMD's list, and the verifier judges freshness at the time of use. A product
+/// without pinned material fails closed.
+[[nodiscard]] AmdCrlInspection inspect_amd_crl(std::string_view product,
+                                               std::string_view crl_bytes);
 
 /// The serial numbers a CRL lists as revoked, uppercase hex, in file order.
 ///

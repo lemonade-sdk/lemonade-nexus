@@ -177,11 +177,21 @@ For a server to produce evidence the Tier 1 provider can verify:
   node, except on a host whose gossip identity is fully sealed: that server
   waits about 30 s for the helper and then stops rather than create a new
   identity.
-- AMD revocation data: `scripts/nexus-refresh-amd-crl` fetches a product's KDS
-  list and installs it atomically under
-  `<data_root>/security/revocation`. A fetch failure keeps the existing
-  entry; revocation data then expires on its own signed `nextUpdate`, after
-  which new Tier 1 attestation fails closed.
+- AMD revocation data under `<data_root>/security/revocation`, one
+  `<product>.crl` per compiled-in product. The server keeps it current itself
+  (`AmdRevocationRefresher`, started by `SecurityMeshService`): at start and
+  then once an hour it reads each cached list, and when no list is cached or
+  the cached `nextUpdate` is within 7 days or past, it fetches
+  `https://kdsintf.amd.com/vcek/v1/<product>/crl` off the io thread. The
+  fetched bytes replace the cached file only when they parse as a CRL, verify
+  under the compiled-in ARK/ASK for that product, and carry a `thisUpdate`
+  not older than the cached one. Any other answer keeps the cached file, logs
+  one warning that names the reason, and backs off (5 min doubling to 6 h).
+  A list still expires on its own signed `nextUpdate`, after which new Tier 1
+  attestation fails closed until a fetch succeeds; the refresh cannot make
+  verification pass without a valid list. `scripts/nexus-refresh-amd-crl`
+  seeds the same directory by hand for a host that must start without
+  outbound access to KDS.
 
 ## Fail-Closed Diagnostics
 
@@ -196,6 +206,9 @@ Expected log lines and what they mean:
 | `ProviderUnsupported` from the direct-boot provider | A candidate presented (or was configured for) an unimplemented provider shape. It stays ineligible. |
 | `ActivationRequired`, `CheckpointRequired`, `CheckpointInvalid` | The SVSM AK is not enrolled for this incarnation, or the IMA checkpoint does not match. The AK rotates on reboot, so a reboot re-runs enrollment. |
 | `Onboard: no platform evidence on this host` | The onboarding candidate could not produce evidence; it requests a Tier 2 certificate. Not a failure of the join. |
+| `[revocation] <product>: CRL refreshed from KDS; thisUpdate ..., nextUpdate ...` | A newer AMD-signed list replaced the cached one. |
+| `[revocation] <product>: CRL refresh failed (<reason>): ...; the cached list is valid until ... / expired at ...; next attempt at ...` | KDS did not answer, or answered with something that is not AMD's current list for the product (`fetch_failed`, `unparsable`, `signature_invalid`, `older_than_cached`, `store_failed`). The cached file is unchanged. Once it expires, verdicts record `EndorsementRevoked` for every candidate until a fetch succeeds. |
+| `[revocation] no KDS fetch configured` | The service was built without a fetch (tests). The assembled server always configures one. |
 | Missing helper / socket refused | The server runs without evidence capability. Mesh services work; Tier 1 is unreachable. |
 
 Missing, stale, invalid, unsupported, or incomplete evidence must never

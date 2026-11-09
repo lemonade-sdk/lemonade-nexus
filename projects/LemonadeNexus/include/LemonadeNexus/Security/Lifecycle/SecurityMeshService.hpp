@@ -12,6 +12,7 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Security/Attestation/AmdRevocationRefresher.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProducer.hpp>
 #include <LemonadeNexus/Security/Attestation/ReleaseChain.hpp>
@@ -31,9 +32,11 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace nexus::security {
@@ -97,6 +100,12 @@ struct SecurityMeshConfig {
     /// Files encrypted under the data key (Phase 7), or nullptr. Not owning;
     /// must outlive the service.
     StorageVault* vault = nullptr;
+    /// How the AMD CRL cache under `<data_root>/security/revocation` is kept
+    /// current (AmdRevocationRefresher). The assembled server sets
+    /// fetch_amd_crl_https. Unset runs no refresh: the cache then only holds
+    /// what was seeded, and new Tier 1 attestation fails closed once that
+    /// expires (tests).
+    AmdCrlFetch amd_crl_fetch;
 };
 
 class SecurityMeshService : public core::IService<SecurityMeshService> {
@@ -380,6 +389,17 @@ private:
     /// Installs the attestation profile of the newest accepted approval, or
     /// the incomplete compiled template when the chain holds none.
     void install_release_profile();
+
+    /// The AMD CRL refresh, or nullptr without a configured fetch. Shared with
+    /// the worker thread, which holds no other reference into this object.
+    std::shared_ptr<AmdRevocationRefresher> revocation_refresher_;
+    /// Runs one refresh pass off the io thread: a KDS fetch blocks for up to
+    /// its timeouts, and the driver tick must not. Joined on destruction.
+    std::thread revocation_worker_;
+    std::shared_ptr<std::atomic<bool>> revocation_refresh_in_flight_ =
+        std::make_shared<std::atomic<bool>>(false);
+    /// Starts a refresh pass when one is due and none is running. io thread.
+    void refresh_amd_revocation();
 
     asio::steady_timer timer_;
     std::chrono::steady_clock::time_point started_at_{};

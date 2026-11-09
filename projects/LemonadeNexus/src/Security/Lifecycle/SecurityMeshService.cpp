@@ -40,6 +40,13 @@ namespace {
     return id;
 }
 
+/// Wall-clock Unix seconds: what a CRL's validity window is compared with.
+[[nodiscard]] int64_t unix_now() {
+    return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count());
+}
+
 }  // namespace
 
 SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMeshConfig& config,
@@ -56,14 +63,11 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
           // The cache hands over whatever is on disk; verify_snp_revocation
           // decides whether it is any good. With nothing cached the state is
           // empty and new Tier 1 attestation fails closed on it, which never
-          // touches an already frozen epoch.
+          // touches an already frozen epoch. revocation_refresher_ keeps the
+          // directory current from KDS.
           .amd_revocation =
               AmdRevocationCache(config.data_root / "security" / "revocation")
-                  .source([] {
-                      return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
-                                 std::chrono::system_clock::now().time_since_epoch())
-                                                      .count());
-                  }),
+                  .source(unix_now),
           // Called only while consensus runs, long after the driver exists.
           .transition_validator =
               [this](const Digest& transitions_digest) {
@@ -259,6 +263,40 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
     // record, or an older package): no profile until a newer approval comes.
     upgrade_->set_release_floor_callback([this] { install_release_profile(); });
     upgrade_->attach();
+
+    if (config.amd_crl_fetch) {
+        revocation_refresher_ = std::make_shared<AmdRevocationRefresher>(
+            AmdRevocationRefresherConfig{
+                .directory = config.data_root / "security" / "revocation",
+                .fetch = config.amd_crl_fetch});
+    } else {
+        spdlog::warn("[revocation] no KDS fetch configured; cached AMD CRLs are not "
+                     "refreshed and new Tier 1 attestation fails closed once they expire");
+    }
+}
+
+void SecurityMeshService::refresh_amd_revocation() {
+    if (revocation_refresher_ == nullptr) return;
+    if (!revocation_refresher_->due(unix_now())) return;
+    if (revocation_worker_.joinable()) {
+        // due() stays true while a pass runs, until it records its outcomes.
+        if (revocation_refresh_in_flight_->load()) return;
+        revocation_worker_.join();
+    }
+    revocation_refresh_in_flight_->store(true);
+    // The worker owns shared copies only, so it cannot reach a destroyed
+    // service; the destructor still joins it so no fetch outlives the process.
+    revocation_worker_ = std::thread(
+        [refresher = revocation_refresher_, in_flight = revocation_refresh_in_flight_] {
+            // An exception on this thread would end the process; a failed pass
+            // is only a missed refresh, retried on the next due tick.
+            try {
+                refresher->tick(unix_now());
+            } catch (const std::exception& e) {
+                spdlog::warn("[revocation] CRL refresh pass failed: {}", e.what());
+            }
+            in_flight->store(false);
+        });
 }
 
 void SecurityMeshService::install_release_profile() {
@@ -275,6 +313,10 @@ void SecurityMeshService::install_release_profile() {
 SecurityMeshService::~SecurityMeshService() {
     if (vault_ != nullptr) {
         vault_->attach(nullptr);
+    }
+    // At most the fetch timeouts: the pass is a few short KDS requests.
+    if (revocation_worker_.joinable()) {
+        revocation_worker_.join();
     }
 }
 
@@ -312,6 +354,9 @@ void SecurityMeshService::on_start() {
     (void)upgrade_->start(now_ms());
     driver_.start(now_ms());
     refresh_members();
+    // A list that expired while the node was down is replaced before the
+    // first attestation needs it, not an hour later.
+    refresh_amd_revocation();
     arm_timer();
 }
 
@@ -395,6 +440,7 @@ void SecurityMeshService::arm_timer() {
                     .count()));
         }
         refresh_members();
+        refresh_amd_revocation();
         if (tick_hook_) tick_hook_();
         arm_timer();
     });
