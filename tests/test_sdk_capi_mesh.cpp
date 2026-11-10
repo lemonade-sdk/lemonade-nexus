@@ -86,6 +86,16 @@ TEST(SdkCapiMesh, InviteCallsWithoutAMeshFailAndReturnAnError) {
     EXPECT_NE(std::string(out).find("error"), std::string::npos);
     ln_free(out);
     out = nullptr;
+    // The link-token shorthand answers like ln_invite_create: the transport
+    // code here, and the server's status code (LN_ERR_AUTH for a refused
+    // caller) once a server answers, with the reason in out_json.
+    EXPECT_EQ(ln_link_token_create(nullptr, 600, &out), LN_ERR_NULL_ARG);
+    EXPECT_EQ(ln_link_token_create(client.c, 600, nullptr), LN_ERR_NULL_ARG);
+    EXPECT_EQ(ln_link_token_create(client.c, 600, &out), LN_ERR_CONNECT);
+    ASSERT_NE(out, nullptr);
+    EXPECT_NE(std::string(out).find("error"), std::string::npos);
+    ln_free(out);
+    out = nullptr;
     const std::string token = "lnk_" + std::string(64, 'a');
     EXPECT_EQ(ln_invite_accept(client.c, token.c_str(), &out), LN_ERR_CONNECT);
     ASSERT_NE(out, nullptr);
