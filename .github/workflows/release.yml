@@ -439,9 +439,14 @@ jobs:
               python3 rpm-build
           - container: archlinux:latest
             platform: linux-x86_64-arch
+            # Arch ships OpenSSL 4 as openssl; tpm2-tss 4.1.3 (tss2-fapi.cmake)
+            # does not build against it. The openssl-3 package keeps OpenSSL 3
+            # under /usr/lib/openssl-3 (runtime libcrypto.so.3 in /usr/lib), and
+            # PKG_CONFIG_PATH points FindOpenSSL and tpm2-tss's configure at it.
             cpack_generators: "TGZ"
             install_cmd: >-
-              pacman -Syu --noconfirm cmake ninja make gcc openssl pkgconf json-c curl util-linux-libs git python
+              pacman -Syu --noconfirm cmake ninja make gcc openssl openssl-3 pkgconf json-c curl util-linux-libs git python &&
+              echo "PKG_CONFIG_PATH=/usr/lib/openssl-3/pkgconfig" >> "$GITHUB_ENV"
           - container: amazonlinux:2023
             platform: linux-x86_64-amzn2023
             cpack_generators: "RPM"
