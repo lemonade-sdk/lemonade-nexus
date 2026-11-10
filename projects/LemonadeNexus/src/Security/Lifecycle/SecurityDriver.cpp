@@ -2606,13 +2606,15 @@ void SecurityDriver::maybe_request_chain() {
     }
     const EpochId have = authority_.has_value() ? authority_->epoch : 0;
     // An idle walker with a verified authority and no hint of anything newer
-    // has nothing to ask for. With none at all, the ask itself is the start.
-    // A syncing member keeps asking: silence from its own epoch is the very
-    // signal it is investigating.
-    if (idle_walker && authority_.has_value() && chain_hint_epoch_ <= have) {
-        return;
-    }
-    if (now_ms_ - chain_request_ms_ < config_.sync_window_ms) {
+    // asks on the slow cadence only: a mesh that ran boundaries while this
+    // node was away sent its hints to nobody, and a storage unlock that names
+    // the stale epoch is refused until the node catches up. With no
+    // authority at all, the ask itself is the start. A syncing member keeps
+    // asking: silence from its own epoch is the very signal it is
+    // investigating.
+    const bool unhinted = idle_walker && authority_.has_value() && chain_hint_epoch_ <= have;
+    const uint64_t interval = unhinted ? kIdleChainPollMs : config_.sync_window_ms;
+    if (now_ms_ - chain_request_ms_ < interval) {
         return;
     }
     chain_request_ms_ = now_ms_;

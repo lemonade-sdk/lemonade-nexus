@@ -50,6 +50,15 @@ inline constexpr uint64_t kParticipationRepublishMs = 60'000;
 /// Liveness tuning, not a protocol rule.
 inline constexpr uint64_t kIdleProposalIntervalMs = 500;
 
+/// How often an idle Tier 2 node that holds a verified authority and no hint
+/// of a newer epoch asks for the next chain page anyway. Hints come from
+/// boundary traffic (announcements, plans, handoffs) and from replicated tree
+/// blocks; a node that restarts behind the mesh while no boundary runs hears
+/// neither, and its storage unlock names its stale epoch until it catches up.
+/// A server with nothing newer stays silent, so a quiet mesh costs one small
+/// broadcast per interval. Liveness tuning, not a protocol rule.
+inline constexpr uint64_t kIdleChainPollMs = 30'000;
+
 /// Shortest time before a leader proposes the same stage transition again
 /// after a stage block it proposed did not certify. A replica votes for a
 /// stage only when it derived the same digest, so a stage the quorum does not

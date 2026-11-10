@@ -431,6 +431,11 @@ once a hint of a newer epoch outlives the sync window. It then continues as
 Tier 2 and adopts the next plan that names it. Nothing it prepared grants a
 role in the epoch it missed.
 
+An idle Tier 2 node also asks for the next chain page on a slow cadence
+without any hint, because a node that was away during a boundary heard none,
+and its storage unlock names its stale epoch until it catches up. A server
+with nothing newer stays silent.
+
 ## Genesis and Trust Continuity
 
 Genesis is a temporary bootstrap authority, not a permanent root:
