@@ -100,6 +100,41 @@ struct MultiEpochMesh : RotatingMeshBase {
         run_to_activation(founders, out.members, 2);
         return out;
     }
+
+    struct PreparedCandidate {
+        Node* candidate = nullptr;
+        std::vector<Node*> members;
+        std::vector<Node*> selected;
+    };
+
+    /// Runs the 1 -> 2 boundary with E offline and two reserves in the pool,
+    /// up to the point where the promoted reserve holds a plan and fresh
+    /// attestations. `candidate` is nullptr with a failure recorded.
+    PreparedCandidate prepare_promoted_reserve() {
+        PreparedCandidate out;
+        mesh.offline.insert(founders[4]->id);
+        out.members.assign(founders.begin(), founders.begin() + 4);
+        std::vector<Node*> pool = out.members;
+        pool.push_back(reserves[0]);
+        pool.push_back(reserves[1]);
+        observe(out.members, pool, 1);
+        run_to_plan(out.members);
+        out.selected = selected_nodes(*out.members.front());
+        wait_for_keys(out.members, out.selected, 2);
+        for (Node* node : out.selected) {
+            if (std::find(out.members.begin(), out.members.end(), node) == out.members.end()) {
+                out.candidate = node;
+                break;
+            }
+        }
+        if (out.candidate == nullptr) {
+            ADD_FAILURE() << "selection promoted nobody";
+            return out;
+        }
+        EXPECT_EQ(out.candidate->driver->phase(), DriverPhase::PendingNextEpoch);
+        final_attest_subjects(9, out.selected, out.members);
+        return out;
+    }
 };
 
 // An idle Tier 2 reserve, holding only the pinned anchor, walks to the chain
@@ -398,6 +433,149 @@ TEST_F(MultiEpochMesh, AReadyCandidateThatRefusesTheDkgIsReplaced) {
     }
     members = refusal_rotation(online, {reserves[2], reserves[3]}, 2);
     EXPECT_EQ(members.front()->driver->current_epoch(), 3u);
+}
+
+// A Tier 2 candidate prepared for a boundary under an attempt that finality
+// then replaced without it: its ceremony messages were lost, the members
+// observed its silence, and the replacement activated the epoch under another
+// plan. The candidate is not stranded in the pending state. The verified
+// replacement plan ends its preparation, it follows the verified handoff as
+// Tier 2, and it qualifies at the next boundary like any reserve. Before,
+// such a node held its dead plan forever: it ignored the handoff it did not
+// expect, never walked the chain, and served a stale chain to every client.
+TEST_F(MultiEpochMesh, ACandidateLeftOutOfTheReplacementAttemptContinuesAsTier2) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+    auto prepared = prepare_promoted_reserve();
+    ASSERT_NE(prepared.candidate, nullptr);
+    Node* candidate = prepared.candidate;
+    const auto& members = prepared.members;
+    const auto& selected = prepared.selected;
+
+    // The candidate stays online and hears every broadcast, but its own
+    // ceremony messages never arrive: the members observe its silence.
+    mesh.drop_if = [candidate](const Queued& item, const SecurityMessage& message) {
+        return item.from == candidate->id &&
+               (message.kind == SecurityMessageKind::DkgBroadcast ||
+                message.kind == SecurityMessageKind::DkgPairwise);
+    };
+    const std::size_t ready_before = mesh.captured_readiness.size();
+    for (int i = 0; i < 900 && mesh.captured_readiness.size() == ready_before; ++i) {
+        step(1, with_candidates(members, selected));
+    }
+    ASSERT_GT(mesh.captured_readiness.size(), ready_before) << "readiness never finalized";
+
+    const std::size_t plans_before = mesh.captured_plans.size();
+    mesh.now_ms += (constants::kDkgStallSeconds + 5) * 1000;
+    for (int i = 0; i < 900 && mesh.captured_plans.size() == plans_before; ++i) {
+        step(1, with_candidates(members, selected));
+    }
+    ASSERT_GT(mesh.captured_plans.size(), plans_before) << "no replacement plan committed";
+    const NextEpochPlan& replacement = latest_plan();
+    ASSERT_TRUE(std::find(replacement.selected.begin(), replacement.selected.end(),
+                          candidate->id) == replacement.selected.end())
+        << "the silent candidate survived into the replacement attempt";
+
+    // The verified replacement plan ends the candidate's preparation at once.
+    step(3, with_candidates(members, selected));
+    EXPECT_EQ(candidate->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(candidate->runtime->authority().dkg(), nullptr);
+
+    auto replacement_selected = selected_nodes(*members.front());
+    wait_for_keys(members, replacement_selected, 2);
+    final_attest_subjects(11, replacement_selected, members);
+    run_to_activation(members, replacement_selected, 2);
+    mesh.drop_if = nullptr;
+
+    // Still Tier 2, it follows the verified handoff to the new epoch.
+    for (int i = 0; i < 120; ++i) {
+        step(1, replacement_selected);
+        candidate->driver->tick(mesh.now_ms);
+        mesh.pump();
+        if (candidate->driver->verified_authority() != nullptr &&
+            candidate->driver->verified_authority()->epoch == 2u) {
+            break;
+        }
+    }
+    ASSERT_NE(candidate->driver->verified_authority(), nullptr);
+    EXPECT_EQ(candidate->driver->verified_authority()->epoch, 2u);
+    EXPECT_EQ(candidate->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(candidate->runtime->epochs(), nullptr);
+    EXPECT_FALSE(candidate->driver->is_tier1_member());
+
+    // One incumbent drops out, so the next boundary must promote: the
+    // candidate qualifies and serves like any reserve.
+    Node* dropped = nullptr;
+    for (Node* member : replacement_selected) {
+        if (std::find(founders.begin(), founders.end(), member) != founders.end()) {
+            dropped = member;
+            break;
+        }
+    }
+    ASSERT_NE(dropped, nullptr);
+    mesh.offline.insert(dropped->id);
+    std::vector<Node*> online;
+    for (Node* member : replacement_selected) {
+        if (member != dropped) online.push_back(member);
+    }
+    std::vector<Node*> pool = online;
+    pool.push_back(candidate);
+    const auto epoch_three = rotate(online, pool, 2);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    EXPECT_TRUE(std::find(epoch_three.begin(), epoch_three.end(), candidate) !=
+                epoch_three.end());
+    EXPECT_TRUE(candidate->driver->is_tier1_member());
+    EXPECT_EQ(candidate->driver->current_epoch(), 3u);
+}
+
+// The same candidate, offline through the boundary: it hears neither the
+// replacement plan nor the handoff, and returns holding its dead plan. A hint
+// of the newer epoch (an announcement, a plan for a later boundary, a
+// replicated block) makes it walk the chain once the sync window passed; the
+// verified link ends the stale preparation and it continues as Tier 2.
+TEST_F(MultiEpochMesh, ACandidateThatMissedItsBoundaryWalksToTheHead) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+    auto prepared = prepare_promoted_reserve();
+    ASSERT_NE(prepared.candidate, nullptr);
+    Node* candidate = prepared.candidate;
+    const auto& members = prepared.members;
+
+    mesh.offline.insert(candidate->id);
+    const std::size_t ready_before = mesh.captured_readiness.size();
+    for (int i = 0; i < 900 && mesh.captured_readiness.size() == ready_before; ++i) {
+        step(1, members);
+    }
+    ASSERT_GT(mesh.captured_readiness.size(), ready_before) << "readiness never finalized";
+    const std::size_t plans_before = mesh.captured_plans.size();
+    mesh.now_ms += (constants::kDkgStallSeconds + 5) * 1000;
+    for (int i = 0; i < 900 && mesh.captured_plans.size() == plans_before; ++i) {
+        step(1, members);
+    }
+    ASSERT_GT(mesh.captured_plans.size(), plans_before) << "no replacement plan committed";
+    auto replacement_selected = selected_nodes(*members.front());
+    wait_for_keys(members, replacement_selected, 2);
+    final_attest_subjects(11, replacement_selected, members);
+    run_to_activation(members, replacement_selected, 2);
+
+    // Back online with its dead plan and the authority of the finished epoch.
+    EXPECT_EQ(candidate->driver->phase(), DriverPhase::PendingNextEpoch);
+    ASSERT_NE(candidate->driver->verified_authority(), nullptr);
+    EXPECT_EQ(candidate->driver->verified_authority()->epoch, 1u);
+    mesh.offline.erase(candidate->id);
+    candidate->driver->note_epoch_hint(2);
+    for (int i = 0; i < 120; ++i) {
+        step(1, replacement_selected);
+        candidate->driver->tick(mesh.now_ms);
+        mesh.pump();
+        if (candidate->driver->verified_authority()->epoch == 2u) break;
+    }
+    EXPECT_EQ(candidate->driver->verified_authority()->epoch, 2u);
+    EXPECT_EQ(candidate->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(candidate->runtime->epochs(), nullptr);
+    EXPECT_FALSE(candidate->driver->is_tier1_member());
 }
 
 // Lost key-generation datagrams at an epoch boundary are re-sent, so the

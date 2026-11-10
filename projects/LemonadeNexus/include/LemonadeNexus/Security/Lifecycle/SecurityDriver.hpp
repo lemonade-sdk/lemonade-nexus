@@ -385,6 +385,12 @@ private:
     void maybe_propose(View view);
     void progress(uint64_t now_ms);
     void begin_sync(uint64_t now_ms);
+    /// Ends a candidate's preparation after finality moved its boundary past
+    /// the plan it adopted: a replacement attempt that leaves it out, a
+    /// verified handoff under another plan, or a chain walk past the planned
+    /// epoch. The node returns to Idle and walks the chain as Tier 2.
+    /// Liveness only; nothing is granted or kept.
+    void drop_adoption(const char* reason);
     void finish_sync();
     void run_epoch_cadence(uint64_t now_ms);
     /// Logs once per epoch when this boundary's exclusions leave the frozen
@@ -606,9 +612,10 @@ private:
     /// prompt a chain request; it never becomes state by itself.
     EpochId chain_hint_epoch_ = 0;
     uint64_t chain_request_ms_ = 0;
-    /// When an active epoch holder first saw a hint of a newer epoch. Its own
-    /// commit normally activates that epoch within the sync window; only a
-    /// holder still behind after the window asks for the chain.
+    /// When an active epoch holder or a pending candidate first saw a hint of
+    /// a newer epoch. Its own commit, or the handoff of its plan, normally
+    /// moves it within the sync window; only a node still behind after the
+    /// window asks for the chain.
     std::optional<uint64_t> behind_since_ms_;
     std::size_t consumed_equivocations_ = 0;
     /// Peers whose transport certificate the mesh verified. Tier 2 candidates
