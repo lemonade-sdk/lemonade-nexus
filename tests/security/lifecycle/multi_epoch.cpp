@@ -160,6 +160,51 @@ TEST_F(MultiEpochMesh, AnIdleReserveWalksToTheChainHead) {
     EXPECT_FALSE(reserve->driver->is_tier1_member());
 }
 
+// An idle Tier 2 node that heard nothing of a boundary (it was away, or every
+// hint of the new epoch was lost) still reaches the head: on its slow cadence
+// it asks for the next page without a hint, and the verified links move it.
+// Before, such a node waited for the next boundary's announcement, and a
+// restart meanwhile left its storage unlock naming the stale epoch for good.
+TEST_F(MultiEpochMesh, AnIdleReserveWithoutAHintStillWalksToTheHead) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+    Node* reserve = reserves[0];
+    for (int i = 0; i < 40; ++i) {
+        step(1, founders);
+        reserve->driver->tick(mesh.now_ms);
+        mesh.pump();
+        if (reserve->driver->verified_authority() != nullptr) break;
+    }
+    ASSERT_NE(reserve->driver->verified_authority(), nullptr);
+    ASSERT_EQ(reserve->driver->verified_authority()->epoch, 1u);
+
+    // The boundary runs while nothing that names epoch 2 reaches the reserve.
+    mesh.drop_if = [reserve](const Queued& item, const SecurityMessage& message) {
+        return item.to == reserve->id &&
+               (message.kind == SecurityMessageKind::EpochAnnouncement ||
+                message.kind == SecurityMessageKind::NextEpochPlanProof ||
+                message.kind == SecurityMessageKind::EpochHandoffProof);
+    };
+    const auto members = rotate(founders, founders, 1);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_EQ(members.front()->driver->current_epoch(), 2u);
+    EXPECT_EQ(reserve->driver->verified_authority()->epoch, 1u);
+
+    // Within one poll interval the reserve asks unprompted and walks to 2.
+    const uint64_t started = mesh.now_ms;
+    for (int i = 0; i < 400; ++i) {
+        step(1, members);
+        reserve->driver->tick(mesh.now_ms);
+        mesh.pump();
+        if (reserve->driver->verified_authority()->epoch == 2u) break;
+    }
+    EXPECT_EQ(reserve->driver->verified_authority()->epoch, 2u);
+    EXPECT_LE(mesh.now_ms - started, kIdleChainPollMs + 2000);
+    EXPECT_EQ(reserve->driver->phase(), DriverPhase::Idle);
+    EXPECT_FALSE(reserve->driver->is_tier1_member());
+}
+
 TEST_F(MultiEpochMesh, RestartAuthenticatesCompleteProofChainBeforeRestoringEpoch) {
     bootstrap();
     run_until_committed(1);
