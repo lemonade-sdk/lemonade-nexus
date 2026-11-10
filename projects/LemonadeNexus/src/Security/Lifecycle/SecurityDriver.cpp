@@ -2578,24 +2578,30 @@ void SecurityDriver::maybe_request_chain() {
     // An idle Tier 2 node walks toward the head; a member stuck in Syncing
     // asks too, because unanswered sync may mean the mesh moved past its
     // epoch. An active epoch holder is usually at the head, but it can miss
-    // an activation: its own commit then never moves it. It asks once a hint
-    // of a newer epoch outlived the sync window. Genesis is a one-shot
-    // authority, not a walker.
+    // an activation: its own commit then never moves it. A pending candidate
+    // can miss its boundary the same way: the attempt that named it was
+    // replaced, and the handoff that ended the epoch never reached it. Either
+    // asks once a hint of a newer epoch outlived the sync window. Genesis is
+    // a one-shot authority, not a walker.
     if (genesis_node() && (genesis_ == nullptr || !genesis_->finalized())) {
         return;
     }
     const EpochManager* epochs = runtime_.epochs();
     const bool idle_walker = epochs == nullptr && phase_ == DriverPhase::Idle;
     const bool stale_member = phase_ == DriverPhase::Syncing;
-    const bool behind = epochs != nullptr && phase_ == DriverPhase::Active &&
-                        chain_hint_epoch_ > epochs->current().id;
+    const bool holder_behind = epochs != nullptr && phase_ == DriverPhase::Active &&
+                               chain_hint_epoch_ > epochs->current().id;
+    const bool candidate_behind = epochs == nullptr &&
+                                  phase_ == DriverPhase::PendingNextEpoch &&
+                                  authority_.has_value() && chain_hint_epoch_ > authority_->epoch;
+    const bool behind = holder_behind || candidate_behind;
     if (!behind) {
         behind_since_ms_.reset();
     } else if (!behind_since_ms_.has_value()) {
         behind_since_ms_ = now_ms_;
     }
-    const bool stale_holder = behind && now_ms_ - *behind_since_ms_ >= config_.sync_window_ms;
-    if (!idle_walker && !stale_member && !stale_holder) {
+    const bool stale_behind = behind && now_ms_ - *behind_since_ms_ >= config_.sync_window_ms;
+    if (!idle_walker && !stale_member && !stale_behind) {
         return;
     }
     const EpochId have = authority_.has_value() ? authority_->epoch : 0;
@@ -2726,6 +2732,16 @@ void SecurityDriver::on_authority_chain_page(const AuthorityChainPage& page, con
             }
             continue;
         }
+        if (adoption_.has_value() && link.handoff.plan_digest == adoption_->plan_digest) {
+            // The handoff of this candidate's own plan, fetched because the
+            // broadcast never reached it: it activates the candidate exactly
+            // as the broadcast would. When it cannot (no DKG outcome yet),
+            // the link still advances the authority below.
+            on_epoch_handoff_proof(link);
+            if (runtime_.epochs() != nullptr) {
+                continue;
+            }
+        }
         auto advanced = advance_epoch_authority(*authority_, link.handoff, link.proof);
         auto* next = std::get_if<VerifiedEpochAuthority>(&advanced);
         if (next == nullptr) {
@@ -2737,6 +2753,11 @@ void SecurityDriver::on_authority_chain_page(const AuthorityChainPage& page, con
                                 link.handoff.to_epoch)),
             link.handoff.to_epoch.underlying());
         install_authority(std::move(*next));
+    }
+    if (runtime_.epochs() == nullptr && adoption_.has_value() &&
+        authority_->epoch > adoption_->plan.current_epoch) {
+        drop_adoption("the verified chain moved past the planned boundary; this node "
+                      "continues as Tier 2");
     }
     if (authority_->epoch > before) {
         if (genesis_node() && runtime_.epochs() == nullptr) {
@@ -2765,6 +2786,19 @@ bool SecurityDriver::candidate_verify_proof(const Digest& transitions_digest,
                                           adoption_->current_members.size())};
     return verify_commit_proof(transitions_digest, proof, context,
                                adoption_->current_vote_keys) == CommitProofFailure::None;
+}
+
+void SecurityDriver::drop_adoption(const char* reason) {
+    // Finality moved the boundary past the plan this candidate adopted, so
+    // its preparation is void. Nothing of the attempt survives, as nothing
+    // survives a member's abandon_boundary. The node is an idle Tier 2 walker
+    // again and adopts the next plan that names it.
+    adoption_.reset();
+    runtime_.authority().abandon_dkg();
+    pending_dkg_.reset();
+    dkg_outbox_.reset();
+    behind_since_ms_.reset();
+    set_phase(DriverPhase::Idle, reason);
 }
 
 void SecurityDriver::on_next_epoch_plan(const NextEpochPlanProof& package) {
@@ -2804,13 +2838,6 @@ void SecurityDriver::on_next_epoch_plan(const NextEpochPlanProof& package) {
         plan.next_epoch != plan.current_epoch + 1) {
         return;
     }
-    // The plan must name this node at its live incarnation.
-    const auto incarnation = plan.incarnations.find(config_.self);
-    const bool named = std::find(plan.selected.begin(), plan.selected.end(), config_.self) !=
-                       plan.selected.end();
-    if (!named || incarnation == plan.incarnations.end() || incarnation->second != 1) {
-        return;
-    }
     // A later attempt for the same boundary replaces a held plan; anything
     // else that differs from the held plan is stale or hostile and ignored.
     if (adoption_.has_value() && plan.attempt <= adoption_->plan.attempt) {
@@ -2818,7 +2845,9 @@ void SecurityDriver::on_next_epoch_plan(const NextEpochPlanProof& package) {
     }
 
     // The supplied listing is a hint; the verified authority decides. It must
-    // match exactly before a single certificate is judged.
+    // match exactly before a single certificate is judged, and the plan's
+    // commit proof is judged before the plan's content means anything: a
+    // forged plan neither starts a preparation nor ends one.
     std::map<NodeId, crypto::Ed25519PublicKey> keys;
     for (const auto& [node, key] : package.current_vote_keys) {
         keys[node] = key;
@@ -2826,18 +2855,34 @@ void SecurityDriver::on_next_epoch_plan(const NextEpochPlanProof& package) {
     if (keys != authority_->vote_keys) {
         return;
     }
+    const Digest plan_digest = next_epoch_plan_digest(plan);
+    const QcValidationContext context{constants::kConsensusRulesetVersion, plan.network_id,
+                                      plan.current_epoch, authority_->consensus_quorum};
+    if (verify_commit_proof(plan_digest, package.proof, context, authority_->vote_keys) !=
+        CommitProofFailure::None) {
+        return;
+    }
+
+    // The plan must name this node at its live incarnation.
+    const auto incarnation = plan.incarnations.find(config_.self);
+    const bool named = std::find(plan.selected.begin(), plan.selected.end(), config_.self) !=
+                       plan.selected.end();
+    if (!named || incarnation == plan.incarnations.end() || incarnation->second != 1) {
+        if (adoption_.has_value()) {
+            // Finality replaced the attempt this candidate prepared for with
+            // one that leaves it out. The boundary completes without it, and
+            // the chain walk follows the result.
+            drop_adoption("a later attempt for this boundary does not name this node; it "
+                          "continues as Tier 2");
+        }
+        return;
+    }
 
     CandidateAdoption adoption;
     adoption.plan = plan;
-    adoption.plan_digest = next_epoch_plan_digest(plan);
+    adoption.plan_digest = plan_digest;
     adoption.current_members = authority_->members;
     adoption.current_vote_keys = authority_->vote_keys;
-    const QcValidationContext context{constants::kConsensusRulesetVersion, plan.network_id,
-                                      plan.current_epoch, authority_->consensus_quorum};
-    if (verify_commit_proof(adoption.plan_digest, package.proof, context,
-                            adoption.current_vote_keys) != CommitProofFailure::None) {
-        return;
-    }
 
     adoption_ = std::move(adoption);
     runtime_.authority().abandon_dkg();
@@ -3007,8 +3052,34 @@ void SecurityDriver::on_epoch_handoff_proof(const EpochHandoffProofMsg& message)
     const EpochHandoff& handoff = message.handoff;
     if (handoff.network_id != adoption_->plan.network_id ||
         handoff.from_epoch != adoption_->plan.current_epoch ||
-        handoff.to_epoch != adoption_->plan.next_epoch ||
-        handoff.plan_digest != adoption_->plan_digest) {
+        handoff.to_epoch != adoption_->plan.next_epoch) {
+        return;
+    }
+    if (handoff.plan_digest != adoption_->plan_digest) {
+        // The boundary this candidate prepared for ended under another plan.
+        // Verified, the link is the step any Tier 2 walker takes, and the
+        // preparation it voids ends; unverified, it is a hint the walk
+        // checks. Nothing here grants a role.
+        if (!authority_.has_value() || authority_->epoch != handoff.from_epoch) {
+            return;
+        }
+        auto advanced = advance_epoch_authority(*authority_, handoff, message.proof);
+        auto* next = std::get_if<VerifiedEpochAuthority>(&advanced);
+        if (next == nullptr) {
+            chain_hint_epoch_ = std::max(chain_hint_epoch_, handoff.to_epoch);
+            return;
+        }
+        append_link_or_alert(
+            encode_security_message(router_.compose(SecurityMessageKind::EpochHandoffProof,
+                                                    message, handoff.to_epoch)),
+            handoff.to_epoch.underlying());
+        install_authority(std::move(*next));
+        drop_adoption("the boundary finished under another plan; this node continues as "
+                      "Tier 2");
+        chain_request_ms_ = now_ms_;
+        (void)router_.broadcast(router_.compose(SecurityMessageKind::AuthorityChainRequest,
+                                                AuthorityChainRequest{authority_->epoch},
+                                                authority_->epoch));
         return;
     }
     // Take the DKG result only when a completed session holds one; a handoff

@@ -386,10 +386,14 @@ TEST_F(SdkTier1Test, AvoidedMembersAreNotTried) {
 }
 
 TEST_F(SdkTier1Test, AForgedMembershipIsRefused) {
-    // Another Genesis key signs a chain that names the hostile servers.
+    // Another Genesis key signs a chain that names the hostile servers. The
+    // hostile server lists only itself; a hostile list that named genuine
+    // servers would lead the sweep to the genuine chain, verified from the
+    // pinned key like any other.
     auto forged = Chain::make({{new_identity(), new_identity(), new_identity(), new_identity()}});
     net.servers["evil.example"] = FakeServer{forged.epochs[0].identities.begin()->second, 1,
                                              &forged, 1, "", false};
+    net.server_list = {"evil.example"};
     auto dir = directory();
     ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
     const auto refreshed = dir.refresh(seed("evil.example"));
@@ -402,6 +406,7 @@ TEST_F(SdkTier1Test, AForgedMembershipIsRefused) {
     EXPECT_TRUE(log.hosts.empty());
 
     // A genuine source after the forged one still verifies.
+    net.server_list = {"t2.example", "t1a.example", "t1b.example", "old.example"};
     auto second = dir.refresh({{"evil.example", kPort, true}, {"t2.example", kPort, true}});
     EXPECT_TRUE(second.ok) << second.error;
 }
@@ -446,6 +451,29 @@ TEST_F(SdkTier1Test, AnEmptyFirstSourceDoesNotAbortTheSweep) {
     const auto refreshed = dir.refresh(hosts({"t2.example", "t1a.example", "t1b.example"}));
     ASSERT_TRUE(refreshed.ok) << refreshed.error;
     EXPECT_EQ(refreshed.value.epoch, 2u);
+}
+
+TEST_F(SdkTier1Test, ALoneStaleSourceWalksOnThroughTheServersItLists) {
+    // The only source the client remembers is a replica whose store stopped
+    // at epoch 1 (a Tier 2 server that fell behind), and the client's floor
+    // is epoch 2. The replica still lists the members: the sweep asks them
+    // for the rest of the chain instead of refusing the replica's copy as the
+    // last word.
+    net.servers["t2.example"].known_epochs = 1;
+    auto dir = directory();
+    ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key), 2));
+    const auto refreshed = dir.refresh(seed("t2.example"));
+    ASSERT_TRUE(refreshed.ok) << refreshed.error;
+    EXPECT_EQ(refreshed.value.epoch, 2u);
+
+    // With nobody listed, the stale copy is refused as before.
+    net.server_list.clear();
+    auto alone = directory();
+    ASSERT_TRUE(alone.set_genesis_key(b64(chain.genesis.public_key), 2));
+    const auto refused = alone.refresh(seed("t2.example"));
+    EXPECT_FALSE(refused.ok);
+    EXPECT_EQ(refused.http_status, 403);
+    EXPECT_NE(refused.error.find("stale"), std::string::npos) << refused.error;
 }
 
 TEST_F(SdkTier1Test, AStaleFirstSourceBelowTheFloorDoesNotAbortTheSweep) {
@@ -593,9 +621,11 @@ TEST_F(SdkTier1Test, AServerWithoutLargePagesStillServesTheChain) {
 
 TEST_F(SdkTier1Test, AFailedSweepNamesTheSourcesItTried) {
     // Every source withholds the chain: the failure keeps its stable message
-    // and names what each source offered.
+    // and names what each source offered. The sources list only each other,
+    // so the sweep has nowhere else to go.
     net.servers["t2.example"].chain = nullptr;
     net.servers["t1a.example"].chain = nullptr;
+    net.server_list = {"t2.example", "t1a.example"};
     auto dir = directory();
     ASSERT_TRUE(dir.set_genesis_key(b64(chain.genesis.public_key)));
     const auto refreshed = dir.refresh(hosts({"t2.example", "t1a.example"}));

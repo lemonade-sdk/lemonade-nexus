@@ -423,6 +423,14 @@ with its registered vote key and it holds the DKG outcome the handoff names.
 Otherwise it continues as Tier 2, as a restart would make it. A proof that
 does not verify changes nothing.
 
+A pending candidate can lose its boundary the same way: the attempt that
+named it is replaced by one that leaves it out, or the handoff of its plan
+never reaches it. Its preparation ends when it verifies the replacement plan,
+the finalized handoff under another plan, or the authority chain it requests
+once a hint of a newer epoch outlives the sync window. It then continues as
+Tier 2 and adopts the next plan that names it. Nothing it prepared grants a
+role in the epoch it missed.
+
 ## Genesis and Trust Continuity
 
 Genesis is a temporary bootstrap authority, not a permanent root:
