@@ -1775,19 +1775,24 @@ int main(int argc, char* argv[]) {
                              || result.error_message.find("429") != std::string::npos
                              || result.error_message.find("too many") != std::string::npos;
 
+            // The wait is the interval logged; the doubling applies to the
+            // one after it.
+            std::chrono::seconds wait{};
             if (rate_limited) {
                 current_interval = max_interval;
+                wait = current_interval;
                 spdlog::warn("Auto-TLS: rate limited by ACME provider -- backing off to {} minutes",
-                              std::chrono::duration_cast<std::chrono::minutes>(current_interval).count());
+                              std::chrono::duration_cast<std::chrono::minutes>(wait).count());
             } else {
-                auto mins = std::chrono::duration_cast<std::chrono::minutes>(current_interval).count();
+                wait = current_interval;
+                auto mins = std::chrono::duration_cast<std::chrono::minutes>(wait).count();
                 spdlog::warn("Auto-TLS: ACME retry failed for {} -- retrying in {} minutes", fqdn, mins);
                 auto doubled = current_interval * 2;
                 current_interval = doubled > max_interval ? max_interval : doubled;
             }
 
             for (auto e = std::chrono::seconds(0);
-                 e < current_interval && !acme_retry_stop.load();
+                 e < wait && !acme_retry_stop.load();
                  e += std::chrono::seconds(1))
                 std::this_thread::sleep_for(std::chrono::seconds(1));
 

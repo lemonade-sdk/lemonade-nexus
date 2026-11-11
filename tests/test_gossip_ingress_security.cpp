@@ -2566,8 +2566,11 @@ TEST_F(GossipIngressSecurityTest, SendFailureWarnsAreRateLimitedPerDestination) 
 // ---------------------------------------------------------------------------
 
 // A Tier 1 server changes its zone only on Tier 1 authority: the delivering
-// sender and the author must both be current members. A server that is not
-// Tier 1 keeps the enrolled-peer rule.
+// sender and the author must both be current members. The one exception is
+// a per-server SEIP record that its certified owner authored and delivered
+// itself: ownership is what the enrollment proves, and a server that
+// rejoined as Tier 2 publishes the ACME challenge for its own certificate
+// this way. A server that is not Tier 1 keeps the enrolled-peer rule.
 TEST_F(GossipIngressSecurityTest, Tier1AcceptsDnsOnlyFromTier1SendersAndAuthors) {
     auto root_kp = kc->ed25519_keygen();
     auto t1      = kc->ed25519_keygen();
@@ -2595,19 +2598,34 @@ TEST_F(GossipIngressSecurityTest, Tier1AcceptsDnsOnlyFromTier1SendersAndAuthors)
     const std::string seip = ".us-x.seip.lemonade-nexus.io";
     const std::string t1_name = "srv-t1" + seip;
     const std::string t2_name = "srv-t2" + seip;
+    const std::string t2_acme = "_acme-challenge.srv-t2" + seip;
+    const std::string shared_name = "shared.lemonade-nexus.io";
+    const auto serial_before = a.dns->soa_serial();
 
-    // Tier 2 author and sender.
+    // Tier 2 author and sender of a shared name.
     inject(build_packet(t2, gossip::GossipMsgType::DnsRecordSync,
-                        dns_delta_payload(t2, "t1g-1", t2_name, "10.2.0.1")), a);
+                        dns_delta_payload(t2, "t1g-1", shared_name, "10.2.0.1")), a);
     // Tier 1 author, Tier 2 relay.
     inject(build_packet(t2, gossip::GossipMsgType::DnsRecordSync,
                         dns_delta_payload(t1, "t1g-2", t1_name, "10.1.0.1")), a);
-    // Tier 2 author, Tier 1 relay.
+    // Tier 2 author, Tier 1 relay: the relay is not the owner.
     inject(build_packet(t1, gossip::GossipMsgType::DnsRecordSync,
                         dns_delta_payload(t2, "t1g-3", t2_name, "10.2.0.3")), a);
     pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.dns->soa_serial(), serial_before);
     EXPECT_FALSE(a.dns->resolve(t1_name).has_value());
     EXPECT_FALSE(a.dns->resolve(t2_name).has_value());
+
+    // The exception: the Tier 2 owner authors and delivers its own SEIP
+    // records, the name and its ACME challenge, and they land.
+    inject(build_packet(t2, gossip::GossipMsgType::DnsRecordSync,
+                        dns_delta_payload(t2, "t1g-6", t2_name, "10.2.0.6")), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(t2_name).has_value(); }));
+    EXPECT_EQ(a.dns->resolve(t2_name)->ipv4_address, "10.2.0.6");
+    const auto serial_before_acme = a.dns->soa_serial();
+    inject(build_packet(t2, gossip::GossipMsgType::DnsRecordSync,
+                        dns_delta_payload(t2, "t1g-7", t2_acme, "token", "TXT")), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->soa_serial() != serial_before_acme; }));
 
     // Positive control: Tier 1 author and sender.
     inject(build_packet(t1, gossip::GossipMsgType::DnsRecordSync,
@@ -2615,12 +2633,14 @@ TEST_F(GossipIngressSecurityTest, Tier1AcceptsDnsOnlyFromTier1SendersAndAuthors)
     ASSERT_TRUE(pump_until([&] { return a.dns->resolve(t1_name).has_value(); }));
     EXPECT_EQ(a.dns->resolve(t1_name)->ipv4_address, "10.1.0.4");
 
-    // The receiver leaves Tier 1: the enrolled-peer rule applies again.
+    // The receiver leaves Tier 1: the enrolled-peer rule applies again, and
+    // the Tier 2 author's record lands through a relay too.
     members.erase(a.pubkey_b64());
-    inject(build_packet(t2, gossip::GossipMsgType::DnsRecordSync,
-                        dns_delta_payload(t2, "t1g-5", t2_name, "10.2.0.5")), a);
-    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(t2_name).has_value(); }));
-    EXPECT_EQ(a.dns->resolve(t2_name)->ipv4_address, "10.2.0.5");
+    const std::string t2_backend = "backend.srv-t2" + seip;
+    inject(build_packet(t1, gossip::GossipMsgType::DnsRecordSync,
+                        dns_delta_payload(t2, "t1g-5", t2_backend, "10.2.0.5")), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(t2_backend).has_value(); }));
+    EXPECT_EQ(a.dns->resolve(t2_backend)->ipv4_address, "10.2.0.5");
 }
 
 // origin_seq is bound by seq_signature, orders changes within one second, and
@@ -2915,12 +2935,13 @@ TEST_F(GossipIngressSecurityTest, DnsCatchUpRunsOverTheBackbone) {
     }));
     EXPECT_FALSE(status_for(a, c_b64).value("tier1", true));
 
-    // Tier 2 does not change Tier 1: C's own record reaches A live and is
-    // refused, and C's digest makes A request nothing from C.
+    // Tier 2 changes nothing on Tier 1 beyond its own SEIP records: C's own
+    // record reaches A live and lands because C owns the name and delivered
+    // it itself, and C's digest makes A request nothing from C.
     ASSERT_TRUE(c.dns->set_record("srv-c" + seip, "A", "10.9.3.3", 300));
     gossip::GossipBallotTestAccess::send_sync_digests(*c.gossip);
-    pump_for(std::chrono::milliseconds(400));
-    EXPECT_FALSE(a.dns->resolve("srv-c" + seip).has_value());
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve("srv-c" + seip).has_value(); }));
+    EXPECT_EQ(a.dns->resolve("srv-c" + seip)->ipv4_address, "10.9.3.3");
 
     // B restarts with an empty zone and restores A's records from disk, with
     // no backbone and no peer contact.

@@ -548,6 +548,12 @@ private:
     [[nodiscard]] std::optional<std::string> dns_delta_authorship_error(
         const DnsRecordDelta& delta) const;
 
+    /// True when the delta names a per-server SEIP record whose owner label
+    /// is the author's certified server id, and the name carries no tier1
+    /// label. Ownership only; the author's enrollment and signature are
+    /// judged by dns_delta_authorship_error.
+    [[nodiscard]] bool dns_delta_names_author(const DnsRecordDelta& delta) const;
+
     /// Apply an authorized delta to the zone and the replica. Returns true
     /// when it changed the zone (not stale, not a duplicate).
     bool apply_dns_delta(const DnsRecordDelta& delta);
