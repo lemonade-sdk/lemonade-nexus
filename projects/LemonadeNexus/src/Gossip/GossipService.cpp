@@ -3357,8 +3357,16 @@ void GossipService::handle_dns_record_sync(const asio::ip::udp::endpoint& sender
 
         // A Tier 1 server's zone changes only on Tier 1 authority: both the
         // server that delivered the record and the server that authored it
-        // must be current Tier 1 members.
-        if (self_is_tier1() &&
+        // must be current Tier 1 members. One exception, as narrow as the
+        // ownership rule: a per-server SEIP record that its certified owner
+        // authored and delivered itself. The author's enrollment already
+        // proves it owns that name (dns_delta_authorship_error), and tier
+        // membership adds nothing to that proof. Without it a server that
+        // rejoined as Tier 2 could never publish the ACME challenge for its
+        // own certificate: the Tier 1 nameservers answered NXDOMAIN for it.
+        const bool owner_direct =
+            sender_pubkey == delta.signer_pubkey && dns_delta_names_author(delta);
+        if (self_is_tier1() && !owner_direct &&
             (!is_tier1(sender_pubkey) || !is_tier1(delta.signer_pubkey))) {
             if (denial_log_allowed("dns-non-tier1:" + sender_pubkey,
                                    std::chrono::steady_clock::now())) {
@@ -3388,6 +3396,37 @@ void GossipService::handle_dns_record_sync(const asio::ip::udp::endpoint& sender
         spdlog::warn("[{}] failed to parse DNS record delta from {}:{}: {}",
                       name(), sender.address().to_string(), sender.port(), e.what());
     }
+}
+
+namespace {
+
+// The owner test of a per-server SEIP record: `server_id` is one of the
+// labels strictly before ".seip." in the lowercase name.
+bool seip_owner_label(const std::string& fqdn_lower, const std::string& server_id) {
+    const auto seip_pos = fqdn_lower.find(".seip.");
+    if (seip_pos == std::string::npos || server_id.empty()) return false;
+    const std::string prefix = fqdn_lower.substr(0, seip_pos);
+    std::size_t start = 0;
+    while (start < prefix.size()) {
+        const auto dot = prefix.find('.', start);
+        const std::size_t len = dot == std::string::npos ? prefix.size() - start : dot - start;
+        if (prefix.compare(start, len, server_id) == 0) return true;
+        if (dot == std::string::npos) break;
+        start = dot + 1;
+    }
+    return false;
+}
+
+}  // namespace
+
+bool GossipService::dns_delta_names_author(const DnsRecordDelta& delta) const {
+    std::string fqdn_lower = delta.fqdn;
+    std::transform(fqdn_lower.begin(), fqdn_lower.end(), fqdn_lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    // A tier1 label asserts membership; ownership of the id says nothing
+    // about it, so it stays under the membership rules.
+    if (fqdn_lower.find(".tier1.") != std::string::npos) return false;
+    return seip_owner_label(fqdn_lower, certified_server_id(delta.signer_pubkey));
 }
 
 std::optional<std::string> GossipService::dns_delta_authorship_error(
@@ -3430,20 +3469,9 @@ std::optional<std::string> GossipService::dns_delta_authorship_error(
     // record that names another id (or no id at all) stays foreign.
     if (const auto seip_pos = fqdn_lower.find(".seip.");
         seip_pos != std::string::npos) {
-        const std::string prefix = fqdn_lower.substr(0, seip_pos);
         const std::string own_id = self_authored ? our_certificate_->server_id
                                                  : certified_server_id(delta.signer_pubkey);
-        bool owned = false;
-        std::size_t start = 0;
-        while (start < prefix.size() && !owned) {
-            const auto dot = prefix.find('.', start);
-            const std::size_t len =
-                dot == std::string::npos ? prefix.size() - start : dot - start;
-            owned = !own_id.empty() && prefix.compare(start, len, own_id) == 0;
-            if (dot == std::string::npos) break;
-            start = dot + 1;
-        }
-        if (!owned) {
+        if (!seip_owner_label(fqdn_lower, own_id)) {
             return "SEIP record '" + fqdn_lower + "': server id '" + own_id +
                    "' not found in the owner labels before .seip";
         }
