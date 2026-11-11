@@ -67,8 +67,19 @@ class LemonadeNexusSdk {
   ///
   /// [libraryPath] - Optional path to the C SDK dynamic library.
   /// If not provided, uses platform default naming.
-  LemonadeNexusSdk({String? libraryPath}) : _libraryPath = libraryPath {
+  /// [caBundlePath] - A PEM bundle of root certificates for the native SDK's
+  /// TLS, process-wide (the mobile trust store writes one; see
+  /// trust_store.dart); null keeps the platform's default trust. A native
+  /// library from before ln_set_ca_bundle_path ignores it.
+  LemonadeNexusSdk({String? libraryPath, String? caBundlePath})
+      : _libraryPath = libraryPath {
     _ffi = LemonadeNexusFfi(libraryPath: libraryPath);
+    if (caBundlePath != null) {
+      final error = _ffi.setCaBundlePath(caBundlePath);
+      if (error != null && error != LnError.success) {
+        throw SdkException(error, message: 'The root certificate bundle was refused');
+      }
+    }
   }
 
   /// Kept so a worker isolate can load the same library (see [_privateApiRaw]).

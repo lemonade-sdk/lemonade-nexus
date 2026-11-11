@@ -6,9 +6,15 @@
 /// iOS and Android do not, so every handshake failed there and the network
 /// looked unreachable. On those platforms the plugin ships Mozilla's root
 /// certificates (`assets/cacert.pem`, from https://curl.se/docs/caextract.html)
-/// and points OpenSSL at a copy through `SSL_CERT_FILE`. OpenSSL reads the
-/// variable whenever a client loads its default paths, so it covers every
-/// client the SDK creates afterwards.
+/// and writes a copy for the SDK. The copy reaches OpenSSL two ways:
+///
+/// - `SSL_CERT_FILE`, which OpenSSL reads whenever a client loads its default
+///   paths. It works on iOS. An Android app process runs with `AT_SECURE`
+///   set, so OpenSSL treats it as set-uid and ignores the variable; every
+///   handshake failed with "SSL server verification failed".
+/// - The path handed to the SDK (`ln_set_ca_bundle_path`, through the
+///   `caBundlePath` of `LemonadeNexusSdk`), which works on both platforms.
+///   [ensureMobileTrustStore] returns it for that call.
 library;
 
 import 'dart:ffi' as ffi;
@@ -19,15 +25,16 @@ import 'package:flutter/services.dart' show rootBundle;
 
 const _asset = 'packages/lemonade_nexus_sdk/assets/cacert.pem';
 
-Future<void>? _installed;
+Future<String?>? _installed;
 
-/// Installs the root certificates on iOS and Android; does nothing elsewhere.
+/// Installs the root certificates on iOS and Android and returns the path of
+/// the bundle, for the `caBundlePath` of `LemonadeNexusSdk`; null elsewhere.
 /// Runs once per process and must finish before the SDK's first connection.
 /// Call it on the root isolate (it reads a Flutter asset).
-Future<void> ensureMobileTrustStore() =>
+Future<String?> ensureMobileTrustStore() =>
     _installed ??= (Platform.isIOS || Platform.isAndroid) ? _install() : Future.value();
 
-Future<void> _install() async {
+Future<String?> _install() async {
   final pem = await rootBundle.load(_asset);
   final file = File('${Directory.systemTemp.path}/lemonade_nexus_cacert.pem');
   await file.writeAsBytes(
@@ -49,4 +56,5 @@ Future<void> _install() async {
     malloc.free(name);
     malloc.free(value);
   }
+  return file.path;
 }

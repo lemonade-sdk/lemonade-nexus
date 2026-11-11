@@ -66,6 +66,24 @@ swap is not synchronized against a log line in progress on another thread.
 The level in force stays as it is. The setting is process-wide, not per
 client.
 
+## TLS Trust
+
+The SDK verifies every server with OpenSSL's default trust: the system
+certificate paths on Linux, the keychain on macOS. A host without default
+trust gives the SDK a PEM bundle of root certificates instead:
+
+```c
+ln_set_ca_bundle_path("/path/to/cacert.pem");   /* before the first ln_create_tls */
+ln_set_ca_bundle_path("");                       /* back to the default trust */
+```
+
+The setting is process-wide and applies to clients opened after the call;
+the file is read when a client connects, so it must stay in place. iOS and
+Android need it: neither ships an OpenSSL certificate directory, and an
+Android app process runs with `AT_SECURE` set, so OpenSSL ignores
+`SSL_CERT_FILE` there as well. The Flutter plugin writes Mozilla's root
+certificates to the app's cache directory and passes that path.
+
 ## Tier 1 Servers
 
 Only Tier 1 servers hold the permission tree. A Tier 2 server refuses every
