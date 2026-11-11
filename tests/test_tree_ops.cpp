@@ -1847,6 +1847,84 @@ TEST_F(TreeInviteRedemptionTest, AnInviteMintedOnOneServerIsRedeemedThroughAnoth
     ASSERT_TRUE(accepted.ok()) << accepted.reason;
 }
 
+// A new device invited with a role gets the invite's permissions as its
+// group entry at placement, so the group's devices see them as soon as the
+// device is listed. Without the grant membership (a join from an earlier
+// release) the entry is read alone, as before.
+TEST_F(TreeInviteRedemptionTest, ALinkedJoinWritesTheInvitesPermissionsOnTheGroup) {
+    using Names = std::vector<std::string>;
+    const auto g = grant(server_kp, "alpha", pa, {"read", "connect_private", "svc:inference"});
+    const auto device = crypto_svc->ed25519_keygen();
+    auto op = linked_join(device, g);
+    op.body.grant_membership = true;
+    auto v = run(seal_by(op, server_b_kp));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    const auto id = tree::derive_join_node_id(*crypto_svc, principal_of(device));
+    auto nodes = tree_svc->nodes_snapshot();
+    const auto& entries = nodes.at("alpha").assignments;
+    const auto entry = std::find_if(entries.begin(), entries.end(), [&](const auto& a) {
+        return a.management_pubkey == principal_of(device);
+    });
+    ASSERT_NE(entry, entries.end());
+    EXPECT_EQ(entry->permissions, (Names{"connect_private", "read", "svc:inference"}));
+    EXPECT_EQ(tree::rules::peer_permissions(nodes, principal_of(device), nodes.at("alpha-dev")).names,
+              (Names{"connect_private", "read", "svc:inference"}));
+    EXPECT_TRUE(connects(principal_of(device), id, "alpha-dev"));
+    EXPECT_TRUE(connects(pa, "alpha-dev", id));
+
+    const auto g_old = grant(server_kp, "alpha", pa, {"read", "connect_private", "svc:inference"},
+                             "lnk_old_release");
+    const auto other = crypto_svc->ed25519_keygen();
+    v = run(seal_by(linked_join(other, g_old), server_b_kp));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    nodes = tree_svc->nodes_snapshot();
+    const auto& after = nodes.at("alpha").assignments;
+    const auto old_entry = std::find_if(after.begin(), after.end(), [&](const auto& a) {
+        return a.management_pubkey == principal_of(other);
+    });
+    ASSERT_NE(old_entry, after.end());
+    EXPECT_EQ(old_entry->permissions, (Names{"read"}));
+}
+
+// The inviter's authority at the block bounds the entry: a non-admin member
+// gives only what it holds, and a grant it cannot back refuses the join.
+TEST_F(TreeInviteRedemptionTest, AGrantMembershipNeedsTheInvitersAuthorityAtTheBlock) {
+    using Names = std::vector<std::string>;
+    auto member = run(next(accept_op("alpha", pb, pa,
+                                     {"read", "add_child", "connect_private", "svc:inference"})));
+    ASSERT_TRUE(member.ok()) << member.reason;
+
+    const auto held = grant(server_kp, "alpha", pb, {"read", "connect_private", "svc:inference"},
+                            "lnk_by_member");
+    const auto device = crypto_svc->ed25519_keygen();
+    auto op = linked_join(device, held);
+    op.body.grant_membership = true;
+    auto v = run(seal_by(op, server_kp));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    const auto nodes = tree_svc->nodes_snapshot();
+    EXPECT_EQ(tree::rules::peer_permissions(nodes, principal_of(device), nodes.at("alpha-dev")).names,
+              (Names{"connect_private", "read", "svc:inference"}));
+
+    const auto not_held = grant(server_kp, "alpha", pb, {"read", "connect_private", "svc:mcp"},
+                                "lnk_beyond_member");
+    const auto refused_device = crypto_svc->ed25519_keygen();
+    auto beyond = linked_join(refused_device, not_held);
+    beyond.body.grant_membership = true;
+    v = run(seal_by(beyond, server_kp));
+    EXPECT_EQ(v.refusal, TreeOpRefusal::Forbidden) << v.reason;
+    EXPECT_FALSE(tree_svc->get_node(
+        tree::derive_join_node_id(*crypto_svc, principal_of(refused_device))));
+
+    // The tag needs a linked join whose grant names permissions.
+    const auto empty = grant(server_kp, "alpha", pa, {}, "lnk_no_permissions");
+    auto no_names = linked_join(crypto_svc->ed25519_keygen(), empty);
+    no_names.body.grant_membership = true;
+    EXPECT_EQ(run(seal_by(no_names, server_kp)).refusal, TreeOpRefusal::Malformed);
+    auto plain = join_op(crypto_svc->ed25519_keygen(), "alpha", pa);
+    plain.body.grant_membership = true;
+    EXPECT_EQ(run(seal_by(plain, server_kp)).refusal, TreeOpRefusal::Malformed);
+}
+
 // Two servers submit ops that redeem the same invite. Whatever order
 // consensus fixes, every replica applies the first and refuses the second.
 TEST_F(TreeInviteRedemptionTest, ASecondRedemptionIsRefusedOnEveryReplica) {
@@ -1945,20 +2023,28 @@ TEST_F(TreeInviteRedemptionTest, TheLinkExtensionRoundTripsAndOldOpsKeepTheirEnc
     extended.body.link_extension = true;
     auto with_grant = extended;
     with_grant.body.invite_grant = g;
+    auto with_membership = with_grant;
+    with_membership.body.grant_membership = true;
 
     const auto plain_bytes = tree::encode_tree_op(plain);
     const auto extended_bytes = tree::encode_tree_op(extended);
     ASSERT_GT(extended_bytes.size(), plain_bytes.size());
     EXPECT_TRUE(std::equal(plain_bytes.begin(), plain_bytes.end(), extended_bytes.begin()))
         << "the extension only appends";
+    const auto grant_bytes = tree::encode_tree_op(with_grant);
+    const auto membership_bytes = tree::encode_tree_op(with_membership);
+    ASSERT_GT(membership_bytes.size(), grant_bytes.size());
+    EXPECT_TRUE(std::equal(grant_bytes.begin(), grant_bytes.end(), membership_bytes.begin()))
+        << "the grant membership tag only appends";
 
-    for (auto op : {plain, extended, with_grant}) {
+    for (auto op : {plain, extended, with_grant, with_membership}) {
         op = seal_by(op, server_kp);
         const auto decoded =
             tree::decode_tree_op(tree::encode_tree_op(op), *tree::tree_op_signature_bytes(op));
         ASSERT_TRUE(decoded.has_value());
         EXPECT_EQ(decoded->body.link_extension, op.body.link_extension);
         EXPECT_EQ(decoded->body.invite_grant, op.body.invite_grant);
+        EXPECT_EQ(decoded->body.grant_membership, op.body.grant_membership);
         EXPECT_EQ(tree::op_id_hex(*decoded), tree::op_id_hex(op));
     }
 

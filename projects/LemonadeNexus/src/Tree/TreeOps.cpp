@@ -406,6 +406,21 @@ bool grant_once(TreeNode& node, const Assignment& grant) {
     return true;
 }
 
+/// The group entry a linked join writes for the new device's key: `read`
+/// alone, or with TreeOpBody::grant_membership the invite grant's permissions
+/// with `read`, sorted and de-duplicated as replace_assignment stores an
+/// accepted invite.
+std::vector<std::string> join_membership_permissions(const TreeOp& op) {
+    std::vector<std::string> perms{"read"};
+    if (op.body.grant_membership && op.body.invite_grant) {
+        const auto& granted = op.body.invite_grant->permissions;
+        perms.insert(perms.end(), granted.begin(), granted.end());
+        std::sort(perms.begin(), perms.end());
+        perms.erase(std::unique(perms.begin(), perms.end()), perms.end());
+    }
+    return perms;
+}
+
 TreeOpVerdict plan_join(const TreeOp& op, Overlay& overlay) {
     const auto& js = op.body.join;
     const std::string& node_id = op.target;
@@ -552,14 +567,15 @@ TreeOpVerdict plan_join(const TreeOp& op, Overlay& overlay) {
                     });
                 if (!has_back) grant_once(overlay.edit(sibling_id), back);
             }
-            const Assignment group_read{.management_pubkey = norm, .permissions = {"read"}};
+            const Assignment group_entry{.management_pubkey = norm,
+                                         .permissions = join_membership_permissions(op)};
             const TreeNode* group = overlay.find(customer_id);
-            const bool has_read = std::any_of(
+            const bool has_entry = std::any_of(
                 group->assignments.begin(), group->assignments.end(),
                 [&](const Assignment& a) {
-                    return a.management_pubkey == group_read.management_pubkey;
+                    return a.management_pubkey == group_entry.management_pubkey;
                 });
-            if (!has_read) grant_once(overlay.edit(customer_id), group_read);
+            if (!has_entry) grant_once(overlay.edit(customer_id), group_entry);
         }
         return {};
     }
@@ -743,6 +759,7 @@ security::CanonicalEncoder op_encoder(const TreeOp& op) {
         add_bool(enc, op.body.invite_grant.has_value());
         if (op.body.invite_grant) add_link_event(enc, *op.body.invite_grant);
     }
+    if (op.body.grant_membership) enc.add_string(kTreeOpGrantMembershipTag);
     return enc;
 }
 
@@ -874,6 +891,15 @@ TreeOpVerdict invite_grant_verdict(crypto::SodiumCryptoService& crypto, const Tr
             js.link_owner_pubkey != grant.owner_pubkey) {
             return refuse(R::BadStatement, "join differs from the invite grant");
         }
+        // The grant's permissions become the new key's group entry, so the
+        // inviter must hold them on the group at the block, as an accepted
+        // invite requires.
+        if (op.body.grant_membership) {
+            if (auto ruling = rules::invite_refusal(state.nodes(), grant.group_node_id,
+                                                    grant.owner_pubkey, grant.permissions)) {
+                return ruling_verdict(*ruling);
+            }
+        }
     } else if (op.target != grant.group_node_id || op.body.inviter != grant.owner_pubkey ||
                op.body.invite_permissions != grant.permissions) {
         return refuse(R::BadStatement, "invite acceptance differs from the invite grant");
@@ -901,6 +927,12 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
     }
     if (op.body.invite_grant && !op.body.link_extension) {
         return refuse(R::Malformed, "an invite grant needs the link extension");
+    }
+    if (op.body.grant_membership &&
+        (op.kind != TreeOpKind::Join || !op.body.invite_grant ||
+         op.body.invite_grant->permissions.empty())) {
+        return refuse(R::Malformed,
+                      "a grant membership needs a linked join whose grant names permissions");
     }
 
     // 2. Network binding.
@@ -1519,6 +1551,10 @@ std::optional<TreeOp> decode_tree_op(std::span<const uint8_t> encoding,
             auth::LinkTokenEvent grant;
             ok = read_link_event(r, grant);
             if (ok) op.body.invite_grant = std::move(grant);
+        }
+        if (ok && !r.done() && op.kind == TreeOpKind::Join) {
+            ok = r.expect(kTreeOpGrantMembershipTag);
+            op.body.grant_membership = ok;
         }
     }
     if (!ok || !r.done()) return std::nullopt;

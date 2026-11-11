@@ -179,7 +179,12 @@ TreeOp {
   submitter of the block's epoch signed it, for this network, unexpired at
   the block time, bound to the op) and records its redemption id in the
   committed id set until the invite expires, so a second redemption on any
-  server is refused as `Replayed`. A linked `join` with the extension gives
+  server is refused as `Replayed`. A linked `join` of a new device whose
+  grant names permissions also carries the tag
+  `lemonade-nexus/tree-op-grant-membership:v1` (`grant_membership`): the
+  key's entry on the group is the grant's permissions with `read`, checked
+  against the inviter's authority at the block; without the tag the entry is
+  `read` alone. A linked `join` with the extension gives
   same-group sibling devices `read` and `connect_private` on the new device
   even when the sibling's key already holds an entry there
   (`rules::grant_link_peer_access`); a `join` without it keeps the earlier

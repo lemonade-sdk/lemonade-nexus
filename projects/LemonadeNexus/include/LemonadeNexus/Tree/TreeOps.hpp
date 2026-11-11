@@ -58,6 +58,12 @@ inline constexpr std::string_view kTreeTunnelDomain = "lemonade-nexus/tree-tunne
 /// as before the extension existed.
 inline constexpr std::string_view kTreeOpLinkExtensionTag =
     "lemonade-nexus/tree-op-link-extension:v1";
+/// Tag appended after the link extension of a Join op when the join writes
+/// the invite grant's permissions as the new key's group entry
+/// (TreeOpBody::grant_membership). An op without it encodes exactly as
+/// before the tag existed.
+inline constexpr std::string_view kTreeOpGrantMembershipTag =
+    "lemonade-nexus/tree-op-grant-membership:v1";
 /// Domain of an invite's redemption id (redemption_id_hex).
 inline constexpr std::string_view kTreeOpRedemptionDomain =
     "lemonade-nexus/tree-op-invite-redemption:v1";
@@ -168,6 +174,16 @@ struct TreeOpBody {
     /// The encoding carries the mint without its code binding (code_hash,
     /// code_signature); a submitter leaves those fields empty.
     std::optional<auth::LinkTokenEvent> invite_grant;
+    /// Join with link_extension and invite_grant, for a new device: the new
+    /// key's entry on the invite's group is the grant's permissions plus
+    /// `read`, so an invite for a user role gives the device its service
+    /// permissions at placement. Every replica checks that the inviter holds
+    /// those permissions on the group now (rules::invite_refusal) and refuses
+    /// the join otherwise. Without it, as a join from an earlier release, the
+    /// entry is `read` alone. A key that already holds an entry on the group
+    /// keeps it either way. Encoded as a tag after the link extension, only
+    /// when set.
+    bool                     grant_membership{false};
 };
 
 /// One signed change to the tree.

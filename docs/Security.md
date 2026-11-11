@@ -680,7 +680,13 @@ rules (`tree::rules::invite_refusal`) are:
   `connect_private`, reduced to what the inviter holds.
 
 A new device uses the token in `POST /api/join` and is placed under the
-target, as before. An identity that already joined uses the token in
+target. Its key's entry on the target is the invite's permissions with
+`read` (`TreeOpBody::grant_membership`), so a device invited with a role
+holds its service permissions as soon as it is listed; every replica checks
+at the block that the inviter still holds them on the target
+(`tree::rules::invite_refusal`) and refuses the join otherwise. A join from a
+release before this rule, or with a token minted without permissions, places
+the device with `read` alone. An identity that already joined uses the token in
 `POST /api/link/accept` (or `POST /api/join` from its existing device). It
 becomes a **member**: the server sets exactly the invite's permissions as the
 identity's entry on the target (`AcceptInvite`). Nothing the member owns
