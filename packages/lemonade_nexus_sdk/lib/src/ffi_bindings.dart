@@ -219,6 +219,10 @@ typedef _LnDiscoverGenesisKeyDart = int Function(
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 
+// TLS trust
+typedef _LnSetCaBundlePath = ffi.Int32 Function(ffi.Pointer<ffi.Char> path);
+typedef _LnSetCaBundlePathDart = int Function(ffi.Pointer<ffi.Char> path);
+
 // Device linking
 typedef _LnSetLinkToken = ffi.Int32 Function(
   LnClientHandle client,
@@ -1000,6 +1004,16 @@ class LemonadeNexusFfi {
       return null;
     }
   }();
+  // Not in requiredSymbols: a native library that predates it keeps the
+  // platform's default trust (setCaBundlePath returns null).
+  late final _LnSetCaBundlePathDart? _lnSetCaBundlePath = () {
+    try {
+      return _lib.lookupFunction<_LnSetCaBundlePath, _LnSetCaBundlePathDart>(
+          'ln_set_ca_bundle_path');
+    } on ArgumentError {
+      return null;
+    }
+  }();
   late final _lnDiscoverGenesisKey =
       _lib.lookupFunction<_LnDiscoverGenesisKey, _LnDiscoverGenesisKeyDart>(
           'ln_discover_genesis_key');
@@ -1462,6 +1476,19 @@ class LemonadeNexusFfi {
     if (call == null) return null;
     final text = chain.toNativeUtf8().cast<ffi.Char>();
     final result = call(client, text, minEpoch);
+    malloc.free(text);
+    return LnError.fromCode(result);
+  }
+
+  /// The PEM bundle every TLS client the native SDK opens verifies servers
+  /// against; process-wide, for clients opened after the call. An empty
+  /// [path] returns to the platform's default trust. Null when the native
+  /// library predates ln_set_ca_bundle_path.
+  LnError? setCaBundlePath(String path) {
+    final call = _lnSetCaBundlePath;
+    if (call == null) return null;
+    final text = path.toNativeUtf8().cast<ffi.Char>();
+    final result = call(text);
     malloc.free(text);
     return LnError.fromCode(result);
   }

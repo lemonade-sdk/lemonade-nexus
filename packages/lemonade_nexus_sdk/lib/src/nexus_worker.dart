@@ -40,11 +40,11 @@ class NexusWorker {
   /// [libraryPath] is passed to [LemonadeNexusSdk]; null uses the platform
   /// default. A library that fails to load fails each [run] call.
   static Future<NexusWorker> spawn({String? libraryPath}) async {
-    await ensureMobileTrustStore();
+    final caBundlePath = await ensureMobileTrustStore();
     final responses = ReceivePort();
     final isolate = await Isolate.spawn(
       _workerMain,
-      (responses.sendPort, libraryPath),
+      (responses.sendPort, libraryPath, caBundlePath),
       debugName: 'lemonade_nexus_sdk',
     );
     final ready = Completer<SendPort>();
@@ -182,15 +182,15 @@ class _Peek {
   final Object? Function(LemonadeNexusSdk sdk) read;
 }
 
-void _workerMain((SendPort, String?) args) {
-  final (out, libraryPath) = args;
+void _workerMain((SendPort, String?, String?) args) {
+  final (out, libraryPath, caBundlePath) = args;
   final commands = ReceivePort();
   out.send(commands.sendPort);
 
   LemonadeNexusSdk? sdk;
   Object? loadError;
   try {
-    sdk = LemonadeNexusSdk(libraryPath: libraryPath);
+    sdk = LemonadeNexusSdk(libraryPath: libraryPath, caBundlePath: caBundlePath);
     sdk.sessionMoves.listen(out.send);
     sdk.meshEvents.listen(out.send);
   } catch (e) {
