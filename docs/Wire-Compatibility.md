@@ -149,6 +149,13 @@ the old binary as an invalid baseline.
   the same tree on N and N+1. A release from before the extension refuses an
   op that carries it (trailing bytes), so it cannot vote for a block with
   one. Upgrade every Tier 1 server before clients redeem invites.
+- **Tree op grant membership tag.** A linked `Join` of a new device whose
+  invite names permissions appends `lemonade-nexus/tree-op-grant-membership:v1`
+  after the link extension, and the join writes those permissions (with
+  `read`) as the key's group entry. An op without the tag keeps its encoding
+  and places the device with `read` alone, as before. A release from before
+  the tag refuses an op that carries it (trailing bytes), so, as for the link
+  extension, upgrade every Tier 1 server before clients redeem invites.
 
 ## Tree operations always on
 
