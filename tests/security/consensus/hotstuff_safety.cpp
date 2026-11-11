@@ -127,16 +127,24 @@ TEST_F(HotStuffSafety, ACommitProofSkipsAChildThatNoCertificateExtends) {
     const Block& b1 = chain[0];
     const Block& b2 = chain[1];
     const auto qc_b2 = harness.qc_for(b2.proposal);
-    // The live child, at the view after the timeout.
-    const Block b3 = harness.make_block(3, 4, b2.digest, qc_b2, 0x70);
-    // The dead child: chosen so that it orders first in chain state, as it
-    // did on the fleet.
-    std::optional<Block> dead;
-    for (uint8_t seed = 0x80; seed < 0xF0 && !dead; seed = static_cast<uint8_t>(seed + 4)) {
-        Block candidate = harness.make_block(3, 3, b2.digest, qc_b2, seed);
-        if (candidate.digest < b3.digest) dead = candidate;
+    // The live child is at the view after the timeout, the dead child at the
+    // timed-out view. The dead one must order first in chain state, as it
+    // did on the fleet. Digests depend on the harness's fresh keys, so pick
+    // the live block with the largest digest among a few payload seeds and
+    // the dead block with the smallest, which always orders the two.
+    std::optional<Block> live;
+    for (uint8_t seed = 0x70; seed < 0x80; ++seed) {
+        Block candidate = harness.make_block(3, 4, b2.digest, qc_b2, seed);
+        if (!live || live->digest < candidate.digest) live = candidate;
     }
-    ASSERT_TRUE(dead.has_value());
+    std::optional<Block> dead;
+    for (uint8_t seed = 0x80; seed < 0xC0; ++seed) {
+        Block candidate = harness.make_block(3, 3, b2.digest, qc_b2, seed);
+        if (!dead || candidate.digest < dead->digest) dead = candidate;
+    }
+    ASSERT_TRUE(live.has_value() && dead.has_value());
+    ASSERT_TRUE(dead->digest < live->digest) << "no dead child orders before the live one";
+    const Block& b3 = *live;
     const Block b4 = harness.make_block(4, 5, b3.digest, harness.qc_for(b3.proposal), 0x74);
     const Block b5 = harness.make_block(5, 6, b4.digest, harness.qc_for(b4.proposal), 0x78);
 
