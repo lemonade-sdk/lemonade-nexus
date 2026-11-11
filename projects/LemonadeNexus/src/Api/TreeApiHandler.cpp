@@ -498,12 +498,14 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
     js.is_inference = is_inference;
     if (!existing && link) {
         js.link_group_id = link->group_node_id;
-        // The invite's permissions become the device's group entry at
-        // placement; a token minted without any keeps the read-only entry.
-        op.body.grant_membership = !link->permissions.empty();
         js.link_owner_pubkey = link->owner_pubkey;
         op.body.link_extension = true;
         op.body.invite_grant = signed_grant(*link);
+        // The invite's permissions become the device's group entry at
+        // placement. A token without a signed mint (an earlier release's)
+        // or minted without permissions keeps the read-only entry.
+        op.body.grant_membership =
+            op.body.invite_grant && !op.body.invite_grant->permissions.empty();
     }
 
     auto answer_refusal = [&](const tree::TreeOpVerdict& v) {
