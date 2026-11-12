@@ -1,5 +1,9 @@
 # 🍋 Lemonade Nexus
 
+[![Lemonade Nexus commercial: one link, your artificial intelligence everywhere](docs/media/commercial-poster.jpg)](https://github.com/lemonade-sdk/lemonade-nexus/releases/download/commercial-2026.11.12/lemonade-nexus-commercial-1080p.mp4)
+
+🎬 [Watch the 60-second commercial (1080p, 96 MB)](https://github.com/lemonade-sdk/lemonade-nexus/releases/download/commercial-2026.11.12/lemonade-nexus-commercial-1080p.mp4)
+
 **Your network. Your infrastructure.**
 
 A self-hosted userspace mesh VPN with encrypted peer-to-peer connections, cryptographic identity, and an attestation-based security protocol. This repository brings together the server, release updater, C++/C SDK, Flutter plugin, sidecar, and Flutter desktop client.
