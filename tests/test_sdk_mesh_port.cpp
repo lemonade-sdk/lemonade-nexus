@@ -206,11 +206,11 @@ protected:
     void TearDown() override { port.reset(); }
 
     void SetUp() override {
-        peer.server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) {
+        peer.server.Get("/v1/health", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"status":"ok","all_models_loaded":[{"model_name":"PeerModel","is_busy":false}]})",
                             "application/json");
         });
-        peer.server.Get("/api/v1/models", [this](const httplib::Request&, httplib::Response& res) {
+        peer.server.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
             ++peer_model_listings;
             res.set_content(R"({"object":"list","data":[{"id":"PeerModel"},{"id":"Shared"}]})", "application/json");
         });
@@ -237,8 +237,8 @@ protected:
                 res.set_content(body, "application/json");
             };
         };
-        slow.server.Get("/api/v1/health", delayed(R"({"status":"ok","all_models_loaded":[]})"));
-        slow.server.Get("/api/v1/models", delayed(R"({"object":"list","data":[{"id":"SlowModel"}]})"));
+        slow.server.Get("/v1/health", delayed(R"({"status":"ok","all_models_loaded":[]})"));
+        slow.server.Get("/v1/models", delayed(R"({"object":"list","data":[{"id":"SlowModel"}]})"));
         const auto keyed = [](const char* body) {
             return [body](const httplib::Request& req, httplib::Response& res) {
                 if (req.get_header_value("Authorization") != "Bearer right-key") {
@@ -249,8 +249,8 @@ protected:
                 res.set_content(body, "application/json");
             };
         };
-        guarded.server.Get("/api/v1/health", keyed(R"({"status":"ok","all_models_loaded":[{"model_name":"Guarded","is_busy":false}]})"));
-        guarded.server.Get("/api/v1/models", keyed(R"({"object":"list","data":[{"id":"Guarded"}]})"));
+        guarded.server.Get("/v1/health", keyed(R"({"status":"ok","all_models_loaded":[{"model_name":"Guarded","is_busy":false}]})"));
+        guarded.server.Get("/v1/models", keyed(R"({"object":"list","data":[{"id":"Guarded"}]})"));
         guarded.server.Post("/api/v1/chat/completions", keyed(R"({"served_by":"guarded"})"));
         peer.server.Post("/api/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
             ++peer_chats;
@@ -275,22 +275,22 @@ protected:
             res.set_content(json{{"served_by", "peer"}, {"model", body.value("model", "")}}.dump(), "application/json");
         });
         peer.start();
-        second.server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) {
+        second.server.Get("/v1/health", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"status":"ok","all_models_loaded":[{"model_name":"PeerModel","is_busy":false}]})",
                             "application/json");
         });
-        second.server.Get("/api/v1/models", [](const httplib::Request&, httplib::Response& res) {
+        second.server.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"object":"list","data":[{"id":"PeerModel"}]})", "application/json");
         });
         second.server.Post("/api/v1/chat/completions", [](const httplib::Request& req, httplib::Response& res) {
             const auto body = json::parse(req.body, nullptr, false);
             res.set_content(json{{"served_by", "second"}, {"model", body.value("model", "")}}.dump(), "application/json");
         });
-        stalled.server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) {
+        stalled.server.Get("/v1/health", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"status":"ok","all_models_loaded":[{"model_name":"PeerModel","is_busy":false}]})",
                             "application/json");
         });
-        stalled.server.Get("/api/v1/models", [](const httplib::Request&, httplib::Response& res) {
+        stalled.server.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"object":"list","data":[{"id":"PeerModel"}]})", "application/json");
         });
         stalled.server.Post("/api/v1/chat/completions", [this](const httplib::Request&, httplib::Response& res) {
@@ -300,11 +300,11 @@ protected:
             stalled_changed.wait_for(lock, std::chrono::seconds(20), [this] { return stalled_released; });
             res.status = 500;
         });
-        starting.server.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) {
+        starting.server.Get("/v1/health", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"status":"ok","all_models_loaded":[{"model_name":"PeerModel","is_busy":false}]})",
                             "application/json");
         });
-        starting.server.Get("/api/v1/models", [](const httplib::Request&, httplib::Response& res) {
+        starting.server.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"object":"list","data":[{"id":"PeerModel"}]})", "application/json");
         });
         starting.server.Post("/api/v1/chat/completions", [](const httplib::Request&, httplib::Response& res) {
@@ -312,7 +312,7 @@ protected:
             res.set_content(R"({"error":"service not ready"})", "application/json");
         });
 
-        local.server.Get("/api/v1/models", [](const httplib::Request&, httplib::Response& res) {
+        local.server.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"object":"list","data":[{"id":"LocalModel"}]})", "application/json");
         });
         local.server.Post("/api/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {

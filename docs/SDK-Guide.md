@@ -836,11 +836,11 @@ ln_mesh_port_stop(client);
   certificate renewer keeps the certificate current, and the port reloads each
   renewed certificate in place: the TLS listener and its connections stay up
   and each new handshake presents the new certificate.
-- With the `auto` selection, `/api/v1/models` merges the local models with
+- With the `auto` selection, `/v1/models` merges the local models with
   `<device>/<model>` entries from each reachable Tier 3 device. The devices are
   probed concurrently with a 3 s deadline and the result is cached for a few
   seconds. Each `<device>/<model>` entry carries `"loaded": true` or `false`
-  from that device's `/api/v1/health` `all_models_loaded`, and the status lists
+  from that device's `/v1/health` `all_models_loaded`, and the status lists
   `models_count` and `loaded_count` per device from the same probe, so an app
   can show every model with a loaded badge without another request. A model
   name that matches a local model ID exactly stays local, even
