@@ -844,8 +844,10 @@ ln_mesh_port_stop(client);
   `models_count` and `loaded_count` per device from the same probe, so an app
   can show every model with a loaded badge without another request. A model
   name that matches a local model ID exactly stays local, even
-  when it contains `/`; otherwise `<device>/<model>` names that device. A
-  device that answers 401 or 403 to the peer key is never chosen by `auto`.
+  when it contains `/`; otherwise `<device>/<model>` names that device. The
+  `auto` selection carries no peer key (a key belongs to one device, and
+  `set_selection` refuses `auto` with one); a device that answers 401 or 403 to
+  the keyless probe is never chosen by `auto`.
 - The TLS server name and the `Host` header must name the same host, otherwise
   the answer is 421. Another device's `<device>.<group-label>.lo.<base>` is
   forwarded over mesh egress to its lemond on mesh port 13305. That device must
