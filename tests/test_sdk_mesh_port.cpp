@@ -775,15 +775,17 @@ TEST_F(MeshPortTest, StopDoesNotReSendACancelledAutoRequest) {
     stalled_changed.notify_all();
 }
 
-TEST_F(MeshPortTest, AutoRouterSkipsDevicesThatRefuseTheKey) {
+TEST_F(MeshPortTest, AutoRouterNeverCarriesAPeerKey) {
     guarded.start();
     add_member("guarded", "Guarded box", "10.64.0.9");
     start();
-    ASSERT_EQ(port->set_selection("auto", "wrong-key"), 0);
+    EXPECT_EQ(port->set_selection("auto", "right-key"), 400) << "a key is one device's credential";
+    EXPECT_EQ(port->status()["selection"]["peer_key_set"], false) << "a refused selection keeps no key";
+    ASSERT_EQ(port->set_selection("auto", ""), 0);
     httplib::Client client("127.0.0.1", number);
     auto refused = chat(client, "Guarded");
     ASSERT_TRUE(refused);
-    EXPECT_EQ(refused->status, 404) << "a device that answers 401 to the peer key is never chosen";
+    EXPECT_EQ(refused->status, 404) << "a device that refuses the keyless probe is never chosen";
     EXPECT_NE(refused->body.find("Guarded box"), std::string::npos) << refused->body;
     auto listing = client.Get("/api/v1/models");
     ASSERT_TRUE(listing);
@@ -795,11 +797,11 @@ TEST_F(MeshPortTest, AutoRouterSkipsDevicesThatRefuseTheKey) {
     ASSERT_TRUE(still_peer);
     EXPECT_EQ(json::parse(still_peer->body)["served_by"], "peer");
 
-    ASSERT_EQ(port->set_selection("auto", "right-key"), 0);
+    ASSERT_EQ(port->set_selection("guarded", "right-key"), 0) << "the key goes with the device it belongs to";
     auto served = chat(client, "Guarded");
     ASSERT_TRUE(served);
     EXPECT_EQ(served->status, 200);
-    EXPECT_EQ(json::parse(served->body)["served_by"], "guarded") << "a new key probes the device again";
+    EXPECT_EQ(json::parse(served->body)["served_by"], "guarded");
 }
 
 TEST_F(MeshPortTest, PeerProbesRunConcurrently) {
