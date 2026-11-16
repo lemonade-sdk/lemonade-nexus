@@ -64,3 +64,5 @@ release-evidence/
 !.crew/graphs/
 !.crew/artifacts/.gitkeep
 !.crew/graphs/.gitkeep
+# Local media projects (commercial renders, footage); never committed
+/content/
