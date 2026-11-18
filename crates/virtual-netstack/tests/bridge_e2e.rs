@@ -603,3 +603,172 @@ fn create_returns_null_for_a_tcp_buffer_below_the_minimum() {
     assert!(!stack.is_null());
     unsafe { ns_destroy(stack) };
 }
+
+/// Bridges packets into the peer stack and records the largest packet seen
+/// and the length of the last ICMP echo reply.
+struct MeasuredWiring {
+    peer: Mutex<Option<*mut NsHandle>>,
+    max_len: std::sync::atomic::AtomicUsize,
+    echo_reply_len: std::sync::atomic::AtomicUsize,
+}
+unsafe impl Send for MeasuredWiring {}
+unsafe impl Sync for MeasuredWiring {}
+
+unsafe extern "C" fn forward_measured(ctx: *mut c_void, pkt: *const u8, len: usize) {
+    use std::sync::atomic::Ordering;
+    let wiring = &*(ctx as *const MeasuredWiring);
+    wiring.max_len.fetch_max(len, Ordering::Relaxed);
+    let bytes = std::slice::from_raw_parts(pkt, len);
+    if len >= 28 && bytes[9] == 1 && bytes[20] == 0 {
+        wiring.echo_reply_len.store(len, Ordering::Relaxed);
+    }
+    if let Some(peer) = *wiring.peer.lock().unwrap() {
+        ns_feed_inbound(peer, pkt, len);
+    }
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for chunk in bytes.chunks(2) {
+        let word = (u32::from(chunk[0]) << 8) | u32::from(*chunk.get(1).unwrap_or(&0));
+        sum += word;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// An IPv4 ICMP echo request from 10.0.0.1 to 10.0.0.2 of `total_len` bytes.
+fn echo_request(total_len: usize) -> Vec<u8> {
+    let mut pkt = vec![0u8; total_len];
+    pkt[0] = 0x45;
+    pkt[2] = (total_len >> 8) as u8;
+    pkt[3] = total_len as u8;
+    pkt[8] = 64;
+    pkt[9] = 1;
+    pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+    let header_sum = internet_checksum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&header_sum.to_be_bytes());
+    pkt[20] = 8;
+    pkt[24..26].copy_from_slice(&0x4d54u16.to_be_bytes());
+    pkt[26..28].copy_from_slice(&1u16.to_be_bytes());
+    let icmp_sum = internet_checksum(&pkt[20..]);
+    pkt[22..24].copy_from_slice(&icmp_sum.to_be_bytes());
+    pkt
+}
+
+fn run_echo_transfer(port: u16, payload: &[u8]) {
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let writer = {
+        let payload = payload.to_vec();
+        let mut c = client.try_clone().unwrap();
+        std::thread::spawn(move || {
+            c.write_all(&payload).unwrap();
+            c.shutdown(std::net::Shutdown::Write).unwrap();
+        })
+    };
+    let mut got = Vec::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        match client.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    writer.join().unwrap();
+    assert_eq!(got.len(), payload.len(), "echoed payload truncated");
+}
+
+// A stack answers an echo request of its full MTU, and ns_set_mtu bounds the
+// packets both stacks emit from then on: the stack's own by its device MTU,
+// the peer's by the segment size the stack advertises.
+#[test]
+fn echo_requests_are_answered_and_set_mtu_bounds_both_directions() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in echo.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let new_wiring = || {
+        Box::into_raw(Box::new(MeasuredWiring {
+            peer: Mutex::new(None),
+            max_len: AtomicUsize::new(0),
+            echo_reply_len: AtomicUsize::new(0),
+        }))
+    };
+    let wiring_a = new_wiring();
+    let wiring_b = new_wiring();
+    let stack_a = unsafe { ns_create(1420, 65536, forward_measured, wiring_a as *mut c_void) };
+    let stack_b = unsafe { ns_create(1420, 65536, forward_measured, wiring_b as *mut c_void) };
+    unsafe {
+        *(*wiring_a).peer.lock().unwrap() = Some(stack_b);
+        *(*wiring_b).peer.lock().unwrap() = Some(stack_a);
+        let a_ip = cs("10.0.0.1/8");
+        let b_ip = cs("10.0.0.2/8");
+        ns_add_local_ip(stack_a, a_ip.as_ptr());
+        ns_add_local_ip(stack_b, b_ip.as_ptr());
+        let target = cs(&format!("tcp:{echo_addr}"));
+        let b_vip = cs("10.0.0.2");
+        ns_add_tcp_forward(stack_b, b_vip.as_ptr(), 80, target.as_ptr());
+    }
+    let dst_ip = cs("10.0.0.2");
+    let src_ip = cs("10.0.0.1");
+    let port = unsafe { ns_add_tcp_egress(stack_a, dst_ip.as_ptr(), 80, src_ip.as_ptr()) };
+    assert_ne!(port, 0);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let request = echo_request(1420);
+    unsafe { ns_feed_inbound(stack_b, request.as_ptr(), request.len()) };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let b = unsafe { &*wiring_b };
+    while b.echo_reply_len.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(b.echo_reply_len.load(Ordering::Relaxed), 1420, "no full-size echo reply");
+
+    let payload = vec![b'x'; 200 * 1024];
+    run_echo_transfer(port, &payload);
+    let a = unsafe { &*wiring_a };
+    assert!(a.max_len.load(Ordering::Relaxed) > 1000, "transfer used small segments only");
+    assert!(b.max_len.load(Ordering::Relaxed) > 1000, "transfer used small segments only");
+
+    assert_eq!(unsafe { ns_set_mtu(stack_a, 600) }, 0);
+    assert_eq!(unsafe { ns_set_mtu(stack_a, 10) }, -1);
+    std::thread::sleep(Duration::from_millis(50));
+    a.max_len.store(0, Ordering::Relaxed);
+    b.max_len.store(0, Ordering::Relaxed);
+    run_echo_transfer(port, &payload);
+    assert!(a.max_len.load(Ordering::Relaxed) <= 600, "a emitted {} bytes", a.max_len.load(Ordering::Relaxed));
+    assert!(b.max_len.load(Ordering::Relaxed) <= 600, "b emitted {} bytes", b.max_len.load(Ordering::Relaxed));
+
+    unsafe {
+        ns_destroy(stack_a);
+        ns_destroy(stack_b);
+        drop(Box::from_raw(wiring_a));
+        drop(Box::from_raw(wiring_b));
+    }
+}
