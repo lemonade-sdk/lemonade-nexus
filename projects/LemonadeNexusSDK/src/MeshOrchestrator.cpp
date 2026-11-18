@@ -292,6 +292,8 @@ void MeshOrchestrator::run_loop() {
                 sent = mesh_.rehandshake_all();
                 client_.reset_private_transport();
             }
+            // The network may have changed with the suspension.
+            const auto mtu = mesh_.probe_tunnel_mtu();
             std::vector<std::string> all;
             {
                 std::lock_guard lock(mutex_);
@@ -301,8 +303,9 @@ void MeshOrchestrator::run_loop() {
             relay_fallback_->renew(all, false);
             relay_fallback_->reset_backoff();
             spdlog::info("[MeshOrchestrator] resumed after a suspension ({}): {} handshakes "
-                         "sent, checking {} peer paths",
-                         resume_requested ? "host call" : "wall-clock gap", sent, all.size());
+                         "sent, tunnel mtu {}, checking {} peer paths",
+                         resume_requested ? "host call" : "wall-clock gap", sent,
+                         mtu.value_or(0), all.size());
             // A device list change may have come while the process slept.
             notify_devices();
         }

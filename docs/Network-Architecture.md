@@ -85,6 +85,10 @@ sessions plus an in-process smoltcp netstack. Consequences:
 - Traffic addressed to the virtual addresses is delivered to in-process
   listeners; traffic for other peers is re-encrypted and forwarded in
   userspace.
+- The netstack answers ICMP echo requests at the server's tunnel address.
+  A client probes the tunnel with echo requests of several sizes when its
+  dataplane comes up and sizes its own MTU, and so the segment size it
+  advertises, to the largest one answered (docs/Client-SDK.md).
 
 ## Client Connection Flow
 

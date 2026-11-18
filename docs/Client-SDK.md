@@ -30,6 +30,16 @@ participate in the mesh VPN:
 The mesh dataplane is in-process userspace BoringTun plus a smoltcp netstack:
 no kernel module, no TUN device, no elevated privileges, on every platform.
 
+The tunnel MTU follows the path. When the dataplane comes up, and again
+after the process resumes from a suspension, the SDK sends echo requests of
+1420, 1340, 1280 and 1200 bytes to the session server's tunnel address and
+makes the largest size that comes back the netstack MTU; when none comes
+back within 2.5 s it uses 1280. The netstack advertises that MTU as its TCP
+segment size, so the server sizes its segments to the same path. A tunnel
+behind a corporate or carrier gateway that drops full-size packets therefore
+still carries every TLS handshake. `ln_mesh_status` reports the value as
+`tunnel_mtu` (0 while the mesh is down).
+
 ## Language Bindings
 
 | Language | Interface | Header |
