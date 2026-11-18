@@ -108,6 +108,7 @@ struct BoringtunMesh::Impl {
     std::map<std::pair<std::string, uint16_t>, uint16_t>  egress_cache;
 
     std::atomic<uint32_t>   tunnel_mtu{tunnel_mtu::kFull};
+    std::atomic<bool>       probe_unanswered{false};
     std::mutex              probe_run_mtx;  // one probe at a time
     std::mutex              probe_mtx;      // guards probe_ident and probe_answered
     std::condition_variable probe_cv;
@@ -218,6 +219,7 @@ bool BoringtunMesh::start(const BoringtunConfig& config) {
 
     dpcfg.mtu = tunnel_mtu::kFull;
     impl_->tunnel_mtu = tunnel_mtu::kFull;
+    impl_->probe_unanswered = false;
     NsHandle* ns = ns_create(dpcfg.mtu, kTcpBufferBytes, &mesh_output_trampoline, &impl_->dp);
     if (!ns) return false;
 
@@ -335,6 +337,7 @@ std::optional<uint32_t> BoringtunMesh::probe_tunnel_mtu(std::chrono::millisecond
         if (impl_->ns && mtu != impl_->tunnel_mtu.load()) ns_set_mtu(impl_->ns, mtu);
     }
     impl_->tunnel_mtu = mtu;
+    impl_->probe_unanswered = answered.empty();
     if (answered.empty()) {
         spdlog::warn("[BoringtunMesh] tunnel mtu: no echo reply from {} within {} ms, using {}",
                      impl_->started_cfg.server_tunnel_ip, budget.count(), mtu);
@@ -349,6 +352,10 @@ std::optional<uint32_t> BoringtunMesh::probe_tunnel_mtu(std::chrono::millisecond
 
 uint32_t BoringtunMesh::tunnel_mtu() const {
     return impl_->active.load() ? impl_->tunnel_mtu.load() : 0;
+}
+
+bool BoringtunMesh::tunnel_mtu_unanswered() const {
+    return impl_->active.load() && impl_->probe_unanswered.load();
 }
 
 void BoringtunMesh::stop() {

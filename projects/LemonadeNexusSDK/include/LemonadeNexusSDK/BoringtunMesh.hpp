@@ -167,6 +167,12 @@ public:
     /// 0 when inactive. Thread-safe.
     [[nodiscard]] uint32_t tunnel_mtu() const;
 
+    /// True when the last probe got no reply at all, so the MTU in use is
+    /// the failsafe and not a measurement; probe again once the server
+    /// peer's session is up. False after a probe that was answered, and
+    /// when inactive. Thread-safe.
+    [[nodiscard]] bool tunnel_mtu_unanswered() const;
+
     /// Unix seconds of the newest authenticated packet (keepalives included)
     /// or completed handshake from the session server's dataplane peer, as
     /// the dataplane records them: 0 when none arrived yet, nullopt when
