@@ -342,6 +342,14 @@ if(NEXUS_BUILD_FUZZERS)
     endforeach()
 endif()
 
+# Compiled test-only helpers (the fake gateway) that several tests share.
+add_library(nexus_test_support STATIC support/FakeGateway.cpp)
+target_compile_features(nexus_test_support PUBLIC cxx_std_20)
+target_include_directories(nexus_test_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(WIN32)
+    target_link_libraries(nexus_test_support PUBLIC ws2_32)
+endif()
+
 # --- SDK tests (link against LemonadeNexusSDK) ---
 function(add_sdk_test TEST_NAME)
     add_executable(${TEST_NAME} ${ARGN})
@@ -368,6 +376,8 @@ add_sdk_test(test_sdk_cert_renewal    test_sdk_cert_renewal.cpp)
 add_sdk_test(test_sdk_identity       test_sdk_identity.cpp)
 add_sdk_test(test_sdk_mesh_port      test_sdk_mesh_port.cpp)
 add_sdk_test(test_sdk_service_ingress test_sdk_service_ingress.cpp)
+add_sdk_test(test_sdk_natpmp          test_sdk_natpmp.cpp)
+target_link_libraries(test_sdk_natpmp PRIVATE nexus_test_support)
 add_sdk_test(test_sdk_dataplane_port test_sdk_dataplane_port.cpp)
 
 # --- Integration tests ---
