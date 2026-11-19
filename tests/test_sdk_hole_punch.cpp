@@ -1330,10 +1330,11 @@ TEST_F(SdkHolePunchTest, PeersBehindOneNatMeetOnTheLanAndFallBackToARelay) {
     EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
 }
 
-// A peer whose LAN endpoints are on another network is not a LAN candidate:
-// it has no LAN endpoints to probe, so a peer without a direct endpoint asks
-// for a relay in its first pass. A peer on this device's network whose LAN
-// endpoint does not answer gets its relay only after the LAN window.
+// A device without a usable LAN address (cellular only) behind another NAT
+// than the peer is not a LAN candidate: it keeps no LAN endpoints to probe,
+// so a peer without a direct endpoint asks for a relay in its first pass. A
+// peer whose kept LAN endpoint does not answer gets its relay only after the
+// LAN window.
 TEST_F(SdkHolePunchTest, APeerOnAnotherNetworkDoesNotWaitForTheLanWindow) {
     UdpSink silent_lan(io);
     std::atomic<int> tickets{0};
@@ -1349,11 +1350,11 @@ TEST_F(SdkHolePunchTest, APeerOnAnotherNetworkDoesNotWaitForTheLanWindow) {
         },
         candidates, timing);
 
-    // Another network: another public address and no shared subnet.
+    // Another network: another public address, and this device has no usable
+    // LAN address (an empty interface list, as a cellular-only phone yields).
     auto listed = peer(bob_keys.second, "10.64.0.3/32");
     listed.local_endpoints = {"192.168.77.5:41000"};
-    const std::vector<lnsdk::InterfaceAddress> own = {{"en0", "10.20.0.2", 24}};
-    listed.local_endpoints = lnsdk::lan_probe_targets(listed, "203.0.113.9:5000", own);
+    listed.local_endpoints = lnsdk::lan_probe_targets(listed, "203.0.113.9:5000", {});
     ASSERT_TRUE(listed.local_endpoints.empty());
     ASSERT_TRUE(alice.sync_peers({listed}).ok);
     (void)relay.maintain({listed}, true);
@@ -1383,6 +1384,57 @@ TEST_F(SdkHolePunchTest, APeerOnAnotherNetworkDoesNotWaitForTheLanWindow) {
     EXPECT_GE(std::chrono::steady_clock::now() - start, lnsdk::kLanAnswerWindow);
     EXPECT_GT(silent_lan.received(), 0) << "the LAN endpoint was not probed";
     lan_relay.stop();
+}
+
+// Two devices on two subnets of one site that routes between them, behind
+// different egress addresses: neither public endpoint answers, and no subnet
+// is shared. Each device has a LAN address of its own, so the peer refresh
+// keeps the peer's private endpoints; the handshake completes on the routed
+// private address and the path reads "lan".
+TEST_F(SdkHolePunchTest, PeersOnRoutedSubnetsMeetOnTheirPrivateAddresses) {
+    UdpSink alice_public(io), bob_public(io);
+    LanLink lan(io, alice.bound_port(), bob.bound_port());
+    lnsdk::HolePuncher alice_punch(alice, fast_punch());
+    lnsdk::HolePuncher bob_punch(bob, fast_punch());
+
+    // The peer refresh's filter, with the server on loopback: the listed
+    // private endpoints are usable, and own_lan holds the device's address on
+    // its own subnet.
+    const auto kept = [](lnsdk::MeshPeer p, const std::string& own_reflexive,
+                         const std::string& own_address) {
+        std::erase_if(p.local_endpoints, [](const std::string& endpoint) {
+            return !lnsdk::lan_endpoint_usable(endpoint, true);
+        });
+        const std::vector<lnsdk::InterfaceAddress> own_lan = {{"en0", own_address, 16}};
+        p.local_endpoints = lnsdk::lan_probe_targets(p, own_reflexive, own_lan);
+        return p;
+    };
+    auto bob_listed = peer(bob_keys.second, "10.64.0.3/32", bob_public.endpoint());
+    bob_listed.local_endpoints = {lan.bob_side()};
+    auto alice_listed = peer(alice_keys.second, "10.64.0.2/32", alice_public.endpoint());
+    alice_listed.local_endpoints = {lan.alice_side()};
+    std::vector<lnsdk::MeshPeer> alice_peers = {
+        kept(bob_listed, "203.0.113.10:41000", "10.10.5.20")};
+    std::vector<lnsdk::MeshPeer> bob_peers = {
+        kept(alice_listed, "198.51.100.20:41000", "10.20.7.30")};
+    ASSERT_EQ(alice_peers[0].local_endpoints, std::vector<std::string>{lan.bob_side()});
+    ASSERT_EQ(bob_peers[0].local_endpoints, std::vector<std::string>{lan.alice_side()});
+
+    const auto pass = [&] {
+        ASSERT_TRUE(alice.sync_peers(alice_peers).ok);
+        ASSERT_TRUE(bob.sync_peers(bob_peers).ok);
+        (void)alice_punch.maintain(alice_peers, {}, true);
+        (void)bob_punch.maintain(bob_peers, {}, true);
+        (void)monitor_pass(alice, alice_peers[0]);
+        (void)monitor_pass(bob, bob_peers[0]);
+    };
+    ASSERT_TRUE(eventually(
+        [&] { return alice_peers[0].path == "lan" && bob_peers[0].path == "lan"; }, pass, 10s));
+    EXPECT_EQ(status_of(alice.mesh_status(), bob_keys.second)->endpoint, lan.bob_side());
+    EXPECT_EQ(status_of(bob.mesh_status(), alice_keys.second)->endpoint, lan.alice_side());
+    EXPECT_EQ(ping_over_mesh(bob, "10.64.0.2"), "pong");
+    EXPECT_GT(alice_public.received() + bob_public.received(), 0)
+        << "the public endpoints were not probed alongside the private ones";
 }
 
 namespace {

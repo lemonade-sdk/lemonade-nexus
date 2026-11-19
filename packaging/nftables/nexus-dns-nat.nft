@@ -1,14 +1,16 @@
 #!/usr/sbin/nft -f
 #
-# Public DNS -> unprivileged Nexus DNS.
+# Public 53 and 443 -> unprivileged Nexus listeners.
 #
-# Nexus binds its DNS port as an unprivileged user and is never granted
-# CAP_NET_BIND_SERVICE. This mapping is what makes the public port reachable;
-# both UDP and TCP must reach the same unprivileged DNS listener.
+# Nexus binds its ports as an unprivileged user and is never granted
+# CAP_NET_BIND_SERVICE. This mapping is what makes the public ports reachable:
+# UDP and TCP 53 must reach the same unprivileged DNS listener, and TCP 443 is
+# an alias of the public HTTPS API port for clients behind networks that allow
+# only 443 out.
 #
 # Everything lives in one dedicated table, so `nft delete table inet nexus-dns`
 # removes exactly this and no other policy on the host. nft applies a -f file as
-# a single transaction, so a load either installs both rules or changes nothing:
+# a single transaction, so a load either installs every rule or changes nothing:
 # there is no half-configured state to inherit.
 #
 # Ports and interface come from the conf file, which nexus-bootstrap writes.
@@ -26,11 +28,11 @@ table inet nexus-dns {
         # The policy MUST be accept. The policy is the verdict for packets that
         # match no rule in the chain, and a drop verdict is terminal in every
         # chain type, including nat: with policy drop this chain discards all
-        # inbound traffic on the WAN interface except port 53 (SSH, ICMP, ...)
-        # and takes the host offline. This chain only exists to redirect port
-        # 53; everything else must pass through unmodified and keep flowing to
-        # the rest of the stack. Inbound filtering belongs in a filter chain,
-        # never in this nat chain.
+        # inbound traffic on the WAN interface except the redirected ports
+        # (SSH, ICMP, ...) and takes the host offline. This chain only exists
+        # to redirect ports 53 and 443; everything else must pass through
+        # unmodified and keep flowing to the rest of the stack. Inbound
+        # filtering belongs in a filter chain, never in this nat chain.
         type nat hook prerouting priority dstnat; policy accept;
 
         # systemd-resolved's stub listens on 127.0.0.53:53. Matching only the
@@ -41,5 +43,8 @@ table inet nexus-dns {
         # DNS port directly. Other firewall rules can still affect either path.
         iifname $nexus_wan_if udp dport $nexus_public_dns_port redirect to :$nexus_dns_port
         iifname $nexus_wan_if tcp dport $nexus_public_dns_port redirect to :$nexus_dns_port
+
+        # The server listens on $nexus_http_port; 443 is only this alias.
+        iifname $nexus_wan_if tcp dport 443 redirect to :$nexus_http_port
     }
 }

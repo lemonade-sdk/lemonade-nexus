@@ -127,8 +127,9 @@ compiled protocol rules, not settings.
 | `--mesh-interface <name>` | `SP_MESH_INTERFACE` | `mesh_interface` | `nexus0` | BoringTun dataplane instance name |
 
 All six service ports plus the private port must be unique. Every port the
-server binds is unprivileged; public `53` (and `443`, where used) is reached
-by firewall/NAT mapping, not by the server binding it.
+server binds is unprivileged; public `53` and `443` are reached by
+firewall/NAT mapping (`53 → dns_port`, `443 → http_port`), not by the server
+binding them.
 
 ## Identity and Auth
 
