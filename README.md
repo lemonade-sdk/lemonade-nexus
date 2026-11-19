@@ -56,6 +56,7 @@ The public API uses port **9100**. In the normal mesh configuration, the private
 | Port | Transport | Purpose | Exposure |
 |---|---|---|---|
 | `9100` | TCP | Public HTTPS API | Clients and joining servers |
+| `443` | TCP | Public HTTPS API alias | Map to `9100` on every server |
 | `51940` | UDP | Mesh transport **and hole punching** | Mesh servers and clients |
 | `9102` | UDP | Gossip and security protocol | Mesh servers |
 | `3478` | UDP | STUN | Peers using NAT discovery |
@@ -65,6 +66,8 @@ The public API uses port **9100**. In the normal mesh configuration, the private
 | `53` | UDP + TCP | Public authoritative DNS | Map to `5335` on DNS-serving nodes |
 
 Hole punching shares `51940`; a separate `51941` rule is not required by the current server. Configure source restrictions for your mesh and expose public DNS only where it is served. Mapping port `53` to `5335` does not replace the rest of your firewall policy.
+
+The server listens on `9100` and never binds `443`. The firewall maps `443` to `9100`, so clients on networks that allow only `443` can reach the API. Clients try the advertised port first and `443` as the fallback.
 
 ### Addressing and discovery
 
@@ -124,7 +127,7 @@ Bootstrap creates the node identities, pins the root and Genesis public keys, an
 - Configuration: `/var/lib/lemonade-nexus/lemonade-nexus.json`
 - Runtime state: `/var/lib/lemonade-nexus/data`
 
-`--install-dns-nat` maps public UDP/TCP `53` to the local DNS port `5335` with nftables. Use it if this host serves public authoritative DNS. It requires `nft` and `ip`; `--wan-interface` can select the external interface. You can also configure the mapping on your router.
+`--install-dns-nat` maps public UDP/TCP `53` to the local DNS port `5335` and public TCP `443` to the API port `9100` with nftables. Use it on every server; the DNS mapping serves a purpose only where the host serves public authoritative DNS. It requires `nft` and `ip`; `--wan-interface` can select the external interface. You can also configure both mappings on your router.
 
 `--release-signing-pubkey` and `--test-release-key` fill a legacy configuration field only. They do not grant release authority and do not change attestation requirements.
 

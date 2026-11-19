@@ -35,8 +35,10 @@ The normal Linux build compiles TPM2-TSS from source; you do not install a
 system TPM2-TSS package. See [Building](Building) for details.
 
 Open the ports listed in [Ports and Firewall](Ports-and-Firewall). In short:
-TCP `9100`, UDP `51940` (mesh and hole punching share this port), UDP `9102`,
-UDP `3478`, and, for DNS-serving nodes, UDP+TCP `53` mapped to local `5335`.
+TCP `9100` with public TCP `443` mapped to it, UDP `51940` (mesh and hole
+punching share this port), UDP `9102`, UDP `3478`, and, for DNS-serving
+nodes, UDP+TCP `53` mapped to local `5335`. The server listens on `9100`;
+clients try the advertised port first and `443` as the fallback.
 
 ## Build the server
 
@@ -110,10 +112,12 @@ The on-disk values:
 | `genesis_pubkey` | The node gossip public key (base64 Ed25519). It pins the Genesis bootstrap anchor, whose unilateral security authority ends at Epoch 1 activation. |
 | `release_signing_pubkey` | Deprecated and parse-only. Empty, or the value of `--release-signing-pubkey` / `--test-release-key`. The server never uses it as release authority. |
 
-`--install-dns-nat` maps public UDP/TCP `53` to `5335` with nftables. Use it
-if this host serves public authoritative DNS. That option requires `nft` and `ip`;
+`--install-dns-nat` maps public UDP/TCP `53` to `5335` and public TCP `443`
+to the API port (`--http-port`, default `9100`) with nftables. Use it on
+every server; the DNS mapping serves a purpose only where the host serves
+public authoritative DNS. That option requires `nft` and `ip`;
 `--wan-interface` selects the external interface when auto-detection is
-ambiguous. You can also configure the mapping on your router. See
+ambiguous. You can also configure both mappings on your router. See
 [Ports and Firewall](Ports-and-Firewall).
 
 Release authority does not come from bootstrap. Genesis delegates it to a
@@ -241,6 +245,9 @@ authority is established only by the epoch protocol described in
 - The public certificate target is the server's SEIP FQDN
   (`<id>.<region>.seip.<domain>`), so that name must resolve publicly to the
   server's public IP for ACME DNS-01 and for clients.
+- The public API listens on TCP `9100`. Public TCP `443` reaches it only
+  through a firewall/NAT mapping; the server never binds `443`. Clients try
+  the advertised port first and `443` as the fallback.
 - A server that serves public authoritative DNS listens on UDP+TCP `5335` as
   an unprivileged user. Public UDP+TCP `53` reaches it only through a
   firewall/NAT mapping. Verify the mapping on **both** transports and scope it

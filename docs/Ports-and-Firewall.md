@@ -18,6 +18,7 @@ title: Ports and Firewall
 | Port | Protocol | Direction | Source | Service |
 |------|----------|-----------|--------|---------|
 | **9100** | TCP | Inbound | Any | Public HTTPS API (discovery, auth, join, onboarding) |
+| **443** | TCP | Inbound | Any | Public HTTPS API alias (NAT-mapped to `9100` on every server) |
 | **51940** | UDP | Inbound | Any | Mesh transport **and hole punching** (shared) |
 | **9102** | UDP | Inbound | Mesh servers | Gossip and security protocol (signed envelopes) |
 | **3478** | UDP | Inbound | Peers | STUN (NAT discovery) |
@@ -28,6 +29,10 @@ title: Ports and Firewall
 
 Notes:
 
+- **`443` is an alias of `9100`.** The server listens on `9100` and never
+  binds `443`. The firewall maps `443` to `9100`, so clients on networks
+  that allow only `443` can reach the API. Clients try the advertised port
+  first and `443` as the fallback.
 - **Hole punching shares `51940`.** There is no separate hole-punch port;
   an older `51941` rule is not required and does nothing on the current
   server.
@@ -45,8 +50,8 @@ Notes:
   source — clients connect from unknown IPs. Clients query STUN (`3478`) to
   learn the address that peers punch toward, and fall back to the relay
   (`9103`). Gossip (`9102`) can be restricted to known mesh server IPs.
-- Mapping port `53` to `5335` does not replace the rest of your firewall
-  policy.
+- Mapping port `53` to `5335` or `443` to `9100` does not replace the rest
+  of your firewall policy.
 
 ### Client-side ports
 
@@ -75,14 +80,15 @@ Notes:
 
 ## Packet Order for DNS NAT
 
-A destination-NAT redirect (`53 → 5335`) is applied in the prerouting phase,
-**before** the packet is evaluated by the host's input filter chain. After
-the redirect, the packet's destination port is `5335`. Therefore:
+A destination-NAT redirect (`53 → 5335`, and `443 → 9100` in the same way)
+is applied in the prerouting phase, **before** the packet is evaluated by the
+host's input filter chain. After the redirect, the packet's destination port
+is `5335` (or `9100`). Therefore:
 
-- The input chain must accept **`5335`** (the port the daemon actually
-  binds), not `53`.
-- Nothing listens on local `53`, so accepting it in the input chain protects
-  nothing.
+- The input chain must accept **`5335`** and **`9100`** (the ports the
+  daemon actually binds), not `53` or `443`.
+- Nothing listens on local `53` or `443`, so accepting them in the input
+  chain protects nothing.
 - Scope the redirect to the external interface. Without that, the host's own
   stub resolver (systemd-resolved on `127.0.0.53:53`) is captured and the
   machine loses its own DNS.
@@ -95,6 +101,9 @@ the redirect, the packet's destination port is `5335`. Therefore:
 ```bash
 # Required on every server
 iptables -A INPUT -p tcp --dport 9100 -j ACCEPT   # Public HTTPS API
+# ... and redirect public 443 to it, on the external interface only
+# (replace <wan-if> with your external interface, e.g. eth0)
+iptables -t nat -A PREROUTING -i <wan-if> -p tcp --dport 443 -j REDIRECT --to-port 9100
 iptables -A INPUT -p udp --dport 51940 -j ACCEPT  # Mesh + hole punching
 iptables -A INPUT -p udp --dport 9102 -j ACCEPT   # Gossip + security
 iptables -A INPUT -p udp --dport 3478 -j ACCEPT   # STUN
@@ -105,13 +114,12 @@ iptables -A INPUT -p udp --dport 9103 -j ACCEPT   # Relay
 iptables -A INPUT -p udp --dport 5335 -j ACCEPT
 iptables -A INPUT -p tcp --dport 5335 -j ACCEPT
 # ... and redirect public 53 to it, on the external interface only
-# (replace <wan-if> with your external interface, e.g. eth0)
 iptables -t nat -A PREROUTING -i <wan-if> -p udp --dport 53 -j REDIRECT --to-port 5335
 iptables -t nat -A PREROUTING -i <wan-if> -p tcp --dport 53 -j REDIRECT --to-port 5335
 ```
 
-On a packaged install, `nexus-bootstrap --install-dns-nat` does the DNS
-mapping in its own nftables table (`inet nexus-dns`) behind
+On a packaged install, `nexus-bootstrap --install-dns-nat` does the `53` and
+`443` mappings in its own nftables table (`inet nexus-dns`) behind
 `nexus-dns-nat.service`, so it can be inspected with
 `nft list table inet nexus-dns` and removed with
 `systemctl disable --now nexus-dns-nat.service` without disturbing other
@@ -120,7 +128,7 @@ rules.
 ## UFW Rules
 
 ```bash
-ufw allow 9100/tcp   # Public HTTPS API
+ufw allow 9100/tcp   # Public HTTPS API (443 is redirected to it, see below)
 ufw allow 51940/udp  # Mesh + hole punching
 ufw allow 9102/udp   # Gossip + security
 ufw allow 3478/udp   # STUN
@@ -129,19 +137,25 @@ ufw allow 9103/udp   # Relay (optional)
 # DNS-serving nodes only
 ufw allow 5335/udp   # Local DNS listener
 ufw allow 5335/tcp
-# Public 53 mapping: UFW does not express interface-scoped prerouting
-# redirects cleanly; use the packaged nftables unit or the iptables rules
-# above for the 53 -> 5335 redirect.
+# Public 53 and 443 mappings: UFW does not express interface-scoped
+# prerouting redirects cleanly; use the packaged nftables unit or the
+# iptables rules above for the 53 -> 5335 and 443 -> 9100 redirects.
 ```
 
 ## nftables (Packaged DNS NAT)
 
 `--install-dns-nat` installs `/usr/lib/lemonade-nexus/nexus-dns-nat.nft`,
 driven by `/etc/lemonade-nexus/nexus-dns-nat.conf` (WAN interface, ports),
-loaded by `nexus-dns-nat.service`. The table holds exactly two redirects
-(UDP and TCP `53 → 5335`) in a purpose-built prerouting chain, so it cannot
-affect any other host traffic. The load is a single transaction: both rules
-install or nothing changes.
+loaded by `nexus-dns-nat.service`. The table holds exactly three redirects
+(UDP and TCP `53 → 5335`, TCP `443 → 9100`) in a purpose-built prerouting
+chain, so it cannot affect any other host traffic. The load is a single
+transaction: every rule installs or nothing changes.
+
+The conf file carries the ports as nft defines (`nexus_public_dns_port`,
+`nexus_dns_port`, `nexus_http_port`). A package upgrade adds a missing
+`nexus_http_port` define to an existing conf and reloads the unit when it is
+active; it does not enable the unit on a host that never ran
+`--install-dns-nat`.
 
 Verify:
 
@@ -163,6 +177,11 @@ Replace `<public-ip>` and `<server-ip>` with your addresses.
 /ip firewall filter add chain=forward action=accept protocol=udp dst-address=<server-ip> dst-port=9103 comment="NEXUS-RELAY"
 /ip firewall filter add chain=forward action=accept protocol=udp dst-address=<server-ip> dst-port=5335 comment="NEXUS-DNS"
 /ip firewall filter add chain=forward action=accept protocol=tcp dst-address=<server-ip> dst-port=5335 comment="NEXUS-DNS-TCP"
+```
+
+**NAT rules (every server):**
+```routeros
+/ip firewall nat add chain=dstnat action=dst-nat protocol=tcp dst-address=<public-ip> dst-port=443 to-addresses=<server-ip> to-ports=9100 comment="NEXUS-HTTPS-443"
 ```
 
 **NAT rules (DNS-serving nodes only):**

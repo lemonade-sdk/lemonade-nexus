@@ -31,6 +31,7 @@ class BootstrapTest(unittest.TestCase):
     def test_rejects_invalid_inputs_before_side_effects(self):
         for option, values in {
             "--dns-port": ["0", "53", "65536", "-1", "5335,", "1e3", "1;touch /tmp/oops"],
+            "--http-port": ["0", "443", "65536", "9100;"],
             "--public-dns-port": ["0", "65536", "2.5"],
             "--log-level": ["verbose", 'debug", "root_pubkey": "bad'],
             "--acme-provider": ["invalid"],
@@ -152,6 +153,7 @@ class BootstrapTest(unittest.TestCase):
                 else:
                     self.assertIn('define nexus_wan_if = "eth0"', conf.read_text())
                     self.assertIn("define nexus_dns_port = 5335", conf.read_text())
+                    self.assertIn("define nexus_http_port = 9100", conf.read_text())
                     self.assertEqual(calls[1][:2], ["nft", "-c"])
                     self.assertEqual(calls[-1], ["systemctl", "enable", "--now", "nexus-dns-nat.service"])
 
@@ -214,6 +216,9 @@ class BootstrapTest(unittest.TestCase):
         nat = (REPO / "packaging/nftables/nexus-dns-nat.nft").read_text()
         for transport in ("udp", "tcp"):
             self.assertIn(f"iifname $nexus_wan_if {transport} dport $nexus_public_dns_port redirect to :$nexus_dns_port", nat)
+        # 443 is an alias of the API port; the server never binds it.
+        self.assertIn("iifname $nexus_wan_if tcp dport 443 redirect to :$nexus_http_port", nat)
+        self.assertNotIn("CAP_NET_BIND_SERVICE=", unit)
 
     def test_dns_nat_ruleset_is_accept_by_default_and_uses_a_real_wan(self):
         nat = (REPO / "packaging/nftables/nexus-dns-nat.nft").read_text()
@@ -241,7 +246,8 @@ class BootstrapTest(unittest.TestCase):
                 conf = Path(directory) / "nexus-dns-nat.conf"
                 conf.write_text('define nexus_wan_if = "eth0"\n'
                                 "define nexus_public_dns_port = 53\n"
-                                "define nexus_dns_port = 5335\n")
+                                "define nexus_dns_port = 5335\n"
+                                "define nexus_http_port = 9100\n")
                 source = rules.read_text().replace(
                     "include \"/etc/lemonade-nexus/nexus-dns-nat.conf\"",
                     f'include "{conf}"')
@@ -402,6 +408,66 @@ class InitramfsRebuildTest(unittest.TestCase):
             files[4].unlink()
         with tempfile.TemporaryDirectory() as d:
             self.assertTrue(self.run_scripts(Path(d), self.write_all, remove))
+
+
+class NatConfUpgradeTest(unittest.TestCase):
+    # nexus-dns-nat.nft needs nexus_http_port. A conf from before that define
+    # existed must gain it on upgrade, or nft -f rejects the file and the DNS
+    # redirect is lost at the next reload or boot.
+    POSTINST = REPO / "packaging/debian/postinst"
+    OLD_CONF = ('define nexus_wan_if = "eth0"\n'
+                "define nexus_public_dns_port = 53\n"
+                "define nexus_dns_port = 5335\n")
+
+    def run_postinst_function(self, conf, config):
+        if not Path("/bin/bash").exists() or not shutil.which("python3"):
+            self.skipTest("needs bash and python3")
+        function = InitramfsRebuildTest.block(self.POSTINST.read_text(), "add_nat_http_port_define() {")
+        program = "set -e\n" + function + 'add_nat_http_port_define "$1" "$2"\n'
+        return subprocess.run(["/bin/bash", "-c", program, "test", str(conf), str(config)],
+                              capture_output=True, text=True)
+
+    def test_postinst_does_not_enable_the_nat_unit_and_reloads_only_an_active_one(self):
+        postinst = self.POSTINST.read_text()
+        self.assertNotIn("enable nexus-dns-nat", postinst)
+        self.assertNotIn("enable --now nexus-dns-nat", postinst)
+        self.assertNotIn("start nexus-dns-nat", postinst)
+        self.assertIn("if systemctl is-active --quiet nexus-dns-nat.service; then\n"
+                      "    systemctl reload nexus-dns-nat.service ||", postinst)
+        self.assertIn("add_nat_http_port_define /etc/lemonade-nexus/nexus-dns-nat.conf \\\n"
+                      "    /var/lib/lemonade-nexus/lemonade-nexus.json\n", postinst)
+
+    def test_an_old_conf_gains_the_configured_api_port(self):
+        for config_text, expected in [(None, 9100),
+                                      ("{}", 9100),
+                                      ('{"http_port": 8443}', 8443),
+                                      ('{"http_port": 70000}', 9100),
+                                      ('{"http_port": "9100"}', 9100),
+                                      ("not json", 9100)]:
+            with self.subTest(config=config_text), tempfile.TemporaryDirectory() as directory:
+                conf = Path(directory) / "nexus-dns-nat.conf"
+                config = Path(directory) / "lemonade-nexus.json"
+                conf.write_text(self.OLD_CONF)
+                if config_text is not None:
+                    config.write_text(config_text)
+                result = self.run_postinst_function(conf, config)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(conf.read_text(), self.OLD_CONF + f"define nexus_http_port = {expected}\n")
+
+    def test_a_conf_with_the_define_and_a_missing_conf_are_left_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "nexus-dns-nat.conf"
+            config = Path(directory) / "lemonade-nexus.json"
+            config.write_text('{"http_port": 8443}')
+            current = self.OLD_CONF + "define nexus_http_port = 9100\n"
+            conf.write_text(current)
+            result = self.run_postinst_function(conf, config)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(conf.read_text(), current)
+            conf.unlink()
+            result = self.run_postinst_function(conf, config)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(conf.exists())
 
 
 class ImaKernelReferenceTest(unittest.TestCase):
