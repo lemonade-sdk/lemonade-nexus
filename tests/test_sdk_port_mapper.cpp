@@ -1,16 +1,25 @@
 // The port mapper drives gateway discovery, PCP, and NAT-PMP to keep one
 // UDP mapping alive. It is checked against the fake gateway in
-// tests/support with an injected gateway route and clock.
+// tests/support with an injected gateway route and clock. The last test
+// runs it inside the mesh orchestrator.
 
 #include <gtest/gtest.h>
 
+#include <LemonadeNexusSDK/BoringtunMesh.hpp>
+#include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
+#include <LemonadeNexusSDK/MeshOrchestrator.hpp>
 #include <LemonadeNexusSDK/PortMapper.hpp>
 
 #include "support/FakeGateway.hpp"
 
+#include <sodium.h>
+
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 using lnsdk::AddressScope;
@@ -394,4 +403,82 @@ TEST(PortMapper, RejectsInternalPortZero) {
     EXPECT_FALSE(mapper.maintain(0));
     EXPECT_EQ(mapper.mapping().last_error, "internal port must not be 0");
     EXPECT_TRUE(h.fake.requests().empty());
+}
+
+// ---------------------------------------------------------------------------
+// Inside the mesh orchestrator
+// ---------------------------------------------------------------------------
+
+namespace {
+
+template <typename Pred>
+bool wait_for(Pred pred, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return pred();
+}
+
+}  // namespace
+
+// The orchestrator maps the dataplane's bound port once the dataplane is up
+// (STUN off) and reports the mapping in its status; a lease that ends at a
+// gateway that went silent clears the status. The client holds no session,
+// so every private request is refused locally and the loop runs its local
+// steps only.
+TEST(PortMapperOrchestrator, StatusCarriesTheMappingUntilTheLeaseEnds) {
+    ASSERT_GE(sodium_init(), 0);
+    Harness h;
+    ASSERT_NE(h.fake.port(), 0);
+    h.fake.pcp_enabled = true;
+    std::atomic<int64_t> clock{kStart};
+    auto options = h.options();
+    options.clock_unix = [&clock] { return clock.load(); };
+
+    lnsdk::ServerConfig server;
+    server.servers = {{"127.0.0.1", 1, true}};
+    server.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(server);
+
+    lnsdk::BoringtunMesh mesh;
+    const auto keys = lnsdk::BoringtunMesh::generate_keypair();
+    lnsdk::BoringtunConfig mesh_config;
+    mesh_config.private_key = keys.first;
+    mesh_config.public_key  = keys.second;
+    mesh_config.tunnel_ip   = "10.64.0.9/32";
+    mesh_config.allowed_ips = {"10.64.0.0/10"};
+    ASSERT_TRUE(mesh.start(mesh_config));
+    const uint16_t port = mesh.bound_port();
+    ASSERT_NE(port, 0);
+    {
+        lnsdk::MeshOrchestrator orchestrator(client, mesh, "node-self");
+        orchestrator.set_port_mapper_options(options);
+        lnsdk::MeshConfig cfg;
+        cfg.peer_refresh_interval_sec = 3600;
+        cfg.heartbeat_interval_sec    = 3600;
+        cfg.stun_refresh_interval_sec = 0;
+        orchestrator.start(cfg);
+
+        ASSERT_TRUE(wait_for([&] { return !orchestrator.status().mapped_endpoint.empty(); },
+                             std::chrono::seconds(10)))
+            << "the orchestrator did not map the dataplane port";
+        const auto mapped = orchestrator.status();
+        EXPECT_EQ(mapped.mapped_endpoint, "203.0.113.5:" + std::to_string(port));
+        EXPECT_EQ(mapped.mapping_protocol, "pcp");
+        EXPECT_EQ(h.fake.mapped_external_port(port), port);
+
+        // The gateway reboots and answers nothing more; the lease runs out.
+        h.fake.restart();
+        h.fake.drop_requests = true;
+        clock += 7200;
+        orchestrator.refresh_now();
+        EXPECT_TRUE(wait_for([&] { return orchestrator.status().mapped_endpoint.empty(); },
+                             std::chrono::seconds(20)))
+            << "the ended lease stayed in the status";
+        EXPECT_EQ(orchestrator.status().mapping_protocol, "");
+        orchestrator.stop();
+    }
+    mesh.stop();
 }

@@ -447,6 +447,17 @@ error; the SDK never takes another port in its place, because the forward
 points at the configured one. `mesh_status` / `ln_mesh_status` report the
 port in use as `dataplane_port` (`0` while the dataplane is down).
 
+The SDK also asks the default gateway for a mapping of that port by itself,
+with PCP first and NAT-PMP when the router does not speak PCP, and renews the
+lease before it ends. While the lease is live, the mapped endpoint replaces
+the STUN reflexive endpoint in the heartbeat, so peers punch toward the
+router's forward; when the lease ends, the reflexive endpoint returns. A
+changed endpoint goes out in a heartbeat at once. `mesh_status` /
+`ln_mesh_status` report the live mapping as `mapped_endpoint`
+(`"a.b.c.d:port"`) and `mapping_protocol` (`"pcp"` or `"natpmp"`), both
+empty without one. A router that speaks neither protocol changes nothing:
+the heartbeat carries the reflexive endpoint as before.
+
 ## Relay Fallback
 
 The SDK moves a peer onto a relay when the dataplane cannot reach it directly:

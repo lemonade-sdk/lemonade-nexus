@@ -522,11 +522,16 @@ ln_error_t ln_mesh_disable(ln_client_t* client);
 /** Get mesh tunnel status as JSON.
  *  Returns: {is_up, tunnel_ip, peer_count, online_count,
  *  total_rx_bytes, total_tx_bytes, peers: [...], needs_rejoin, tunnel_up,
- *  tunnel_mtu, dataplane_port}.
+ *  tunnel_mtu, dataplane_port, mapped_endpoint, mapping_protocol}.
  *  Each peer has the fields ln_mesh_peers documents.
  *  dataplane_port is the local UDP port the mesh dataplane socket is bound
  *  to (the listen_port of ln_mesh_enable_config when one is set, else the
  *  port the OS chose), read live; 0 while the dataplane is down.
+ *  mapped_endpoint is the "a.b.c.d:port" the router maps to that port with
+ *  PCP or NAT-PMP, published as this device's mesh endpoint while the lease
+ *  is live, and mapping_protocol is "pcp" or "natpmp"; both are "" while
+ *  no mapping is live (the router speaks neither protocol, refused, or the
+ *  lease ended).
  *  needs_rejoin is true when the Tier 1 server that issued the session left
  *  the verified membership and the SDK could not move the session by itself
  *  (no identity set, or the silent join failed; see

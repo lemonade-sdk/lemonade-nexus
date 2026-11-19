@@ -21,6 +21,7 @@
 #include <LemonadeNexus/Security/Epoch/Tier1Membership.hpp>
 #include <LemonadeNexus/Security/Transport/AuthorityChainCodec.hpp>
 
+#include "support/FakeGateway.hpp"
 #include "support/localhost_cert.hpp"
 #include "support/tier1_chain.hpp"
 
@@ -2569,6 +2570,75 @@ TEST_F(SdkMeshPrivateApiTest, HeartbeatWithoutStunSendsAnEmptyEndpoint) {
     ASSERT_TRUE(wait_for([&] { return heartbeats().size() >= 2; }, std::chrono::seconds(10)));
     client->disable_mesh();
     for (const auto& endpoint : heartbeats()) EXPECT_EQ(endpoint, "");
+}
+
+// The heartbeat publishes the router mapping while its lease is live and
+// returns to the reflexive endpoint (none here: STUN is off) when the lease
+// ends; a new lease goes out at once, and stop() releases it on the gateway.
+// The fake gateway on loopback answers PCP.
+TEST_F(SdkMeshPrivateApiTest, HeartbeatPublishesTheRouterMappingWhileItsLeaseIsLive) {
+    LN_REQUIRE_TEST_TRUST();
+    test_support::FakeGateway gateway;
+    ASSERT_NE(gateway.port(), 0);
+    gateway.pcp_enabled = true;
+    std::atomic<int64_t> clock{1'700'000'000};
+    lnsdk::PortMapperOptions options;
+    options.gateway_port   = gateway.port();
+    options.server_scope   = lnsdk::AddressScope::Public;
+    options.gateway_source = []() -> std::optional<lnsdk::GatewayRoute> {
+        return lnsdk::GatewayRoute{"127.0.0.1", "127.0.0.1", "lo0"};
+    };
+    options.clock_unix = [&clock] { return clock.load(); };
+
+    auto client = joined_client();
+    lnsdk::BoringtunMesh own;
+    const auto own_keys = lnsdk::BoringtunMesh::generate_keypair();
+    ASSERT_TRUE(own.start(mesh_config(own_keys, "10.64.0.9/32")));
+    const uint16_t port = own.bound_port();
+    const std::string mapped = "203.0.113.5:" + std::to_string(port);
+    {
+        lnsdk::MeshOrchestrator orchestrator(*client, own, kNodeId);
+        orchestrator.set_port_mapper_options(options);
+        lnsdk::MeshConfig cfg;
+        cfg.peer_refresh_interval_sec = 3600;
+        cfg.heartbeat_interval_sec    = 3600;
+        cfg.stun_refresh_interval_sec = 0;
+        orchestrator.start(cfg);
+
+        // The first heartbeat leaves before the mapping is asked for; the
+        // mapping goes out in the next one at once.
+        ASSERT_TRUE(wait_for([&] { return heartbeats().size() >= 2; }, std::chrono::seconds(10)));
+        auto sent = heartbeats();
+        EXPECT_EQ(sent[0], "");
+        EXPECT_EQ(sent[1], mapped);
+        EXPECT_EQ(orchestrator.status().mapped_endpoint, mapped);
+        EXPECT_EQ(orchestrator.status().mapping_protocol, "pcp");
+
+        // The gateway rebooted and refuses a new mapping once the lease ran
+        // out: the heartbeat returns to the reflexive endpoint.
+        gateway.restart();
+        gateway.pcp_result = test_support::FakeGateway::kPcpNotAuthorized;
+        clock += 7200;
+        orchestrator.refresh_now();
+        ASSERT_TRUE(wait_for([&] { return heartbeats().size() >= 3; }, std::chrono::seconds(10)))
+            << "the ended lease did not go out in a heartbeat";
+        EXPECT_EQ(heartbeats()[2], "");
+        EXPECT_TRUE(orchestrator.status().mapped_endpoint.empty());
+
+        // The gateway grants again after the retry backoff.
+        gateway.pcp_result = test_support::FakeGateway::kPcpSuccess;
+        clock += 30;
+        orchestrator.refresh_now();
+        ASSERT_TRUE(wait_for([&] { return heartbeats().size() >= 4; }, std::chrono::seconds(10)))
+            << "the new lease did not go out in a heartbeat";
+        EXPECT_EQ(heartbeats()[3], mapped);
+        EXPECT_EQ(gateway.mapped_external_port(port), port);
+
+        orchestrator.stop();
+        EXPECT_FALSE(gateway.mapped_external_port(port)) << "stop() left the lease behind";
+        EXPECT_TRUE(orchestrator.status().mapped_endpoint.empty());
+    }
+    own.stop();
 }
 
 // The heartbeat reports the device's LAN endpoints with the dataplane port.
