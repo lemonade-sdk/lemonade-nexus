@@ -381,6 +381,8 @@ target_link_libraries(test_sdk_natpmp PRIVATE nexus_test_support)
 add_sdk_test(test_sdk_dataplane_port test_sdk_dataplane_port.cpp)
 add_sdk_test(test_sdk_pcp             test_sdk_pcp.cpp)
 target_link_libraries(test_sdk_pcp PRIVATE nexus_test_support)
+add_sdk_test(test_sdk_port_mapper     test_sdk_port_mapper.cpp)
+target_link_libraries(test_sdk_port_mapper PRIVATE nexus_test_support)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)
