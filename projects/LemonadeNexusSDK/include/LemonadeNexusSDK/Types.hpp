@@ -16,6 +16,12 @@ namespace lnsdk {
 /// A single server endpoint. `host` should be the server's certificate FQDN —
 /// the public API is verified HTTPS by default and the cert can't be verified
 /// against a bare IP.
+/// A server's public API as advertised: its certificate FQDN and port. The
+/// SDK dials the advertised port first. When that port gets no response,
+/// the SDK dials the same host on port 443, which every server also serves
+/// its public API on, and keeps dialing 443 for that host until 443 gets no
+/// response. The endpoint the SDK reports and binds a session to is always
+/// the advertised one.
 struct ServerEndpoint {
     std::string host{"127.0.0.1"};
     uint16_t    port{9100};
