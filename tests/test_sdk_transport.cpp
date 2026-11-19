@@ -2641,6 +2641,47 @@ TEST_F(SdkMeshPrivateApiTest, HeartbeatPublishesTheRouterMappingWhileItsLeaseIsL
     own.stop();
 }
 
+// A gateway that answers nothing holds the mapper's first attempt for the
+// whole PCP and NAT-PMP budget (about 7.5 s). The exchange runs beside the
+// loop, so the heartbeats keep their one-second cadence meanwhile, with the
+// reflexive endpoint (none here: STUN is off).
+TEST_F(SdkMeshPrivateApiTest, ASilentGatewayDoesNotHoldTheHeartbeats) {
+    LN_REQUIRE_TEST_TRUST();
+    test_support::FakeGateway gateway;
+    ASSERT_NE(gateway.port(), 0);
+    gateway.drop_requests = true;
+    lnsdk::PortMapperOptions options;
+    options.gateway_port   = gateway.port();
+    options.gateway_source = []() -> std::optional<lnsdk::GatewayRoute> {
+        return lnsdk::GatewayRoute{"127.0.0.1", "127.0.0.1", "lo0"};
+    };
+
+    auto client = joined_client();
+    lnsdk::BoringtunMesh own;
+    const auto own_keys = lnsdk::BoringtunMesh::generate_keypair();
+    ASSERT_TRUE(own.start(mesh_config(own_keys, "10.64.0.9/32")));
+    {
+        lnsdk::MeshOrchestrator orchestrator(*client, own, kNodeId);
+        orchestrator.set_port_mapper_options(options);
+        lnsdk::MeshConfig cfg;
+        cfg.peer_refresh_interval_sec = 3600;
+        cfg.heartbeat_interval_sec    = 1;
+        cfg.stun_refresh_interval_sec = 0;
+        orchestrator.start(cfg);
+
+        // Four heartbeats take three seconds; a loop held by the exchange
+        // sends the second one only after the budget ran out.
+        EXPECT_TRUE(wait_for([&] { return heartbeats().size() >= 4; }, std::chrono::seconds(5)))
+            << "the heartbeats waited for the gateway: " << heartbeats().size() << " sent";
+        EXPECT_FALSE(gateway.requests().empty()) << "no mapping request reached the gateway";
+        EXPECT_TRUE(orchestrator.status().mapped_endpoint.empty());
+        for (const auto& endpoint : heartbeats()) EXPECT_EQ(endpoint, "");
+
+        orchestrator.stop();
+    }
+    own.stop();
+}
+
 // The heartbeat reports the device's LAN endpoints with the dataplane port.
 // The stand-in server is on loopback (a single-host deployment), so the
 // loopback address counts as a LAN address here; every entry is one the

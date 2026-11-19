@@ -143,10 +143,13 @@ inline constexpr std::chrono::seconds kTunnelAliveWindow{20};
 ///      NAT-PMP). The first attempt follows the first STUN answer, or the
 ///      first pass when STUN is off; later ones come when the mapper says
 ///      they are due, after a resume, and when the dataplane's bound port
-///      changed. The attempt runs at the end of a pass, after the pass's
-///      heartbeat, so its bounded wait never delays the join's first
-///      heartbeat and peer list. A router without either protocol changes
-///      nothing. stop() releases the mapping.
+///      changed. The loop only posts the attempt: the gateway exchange runs
+///      on a mapping thread of its own, so its bounded wait (about 11 s
+///      when no gateway answers) never delays steps 1-8. A heartbeat sent
+///      meanwhile carries the reflexive endpoint; a mapping that lands or
+///      ends goes out in a heartbeat at once. A router without either
+///      protocol changes nothing. stop() releases the mapping on the
+///      mapping thread before it returns.
 ///
 /// Some events make a pass run steps 1, 3, 5 and 7 at once instead of on
 /// their intervals, with a new punch burst for every peer still being probed:
@@ -306,11 +309,18 @@ private:
     /// report. Returns true when the reported list changed.
     bool do_lan_refresh();
 
-    /// Obtain or renew the router mapping for the dataplane's bound port
-    /// (PortMapper::maintain) and log a published or ended mapping. Blocks
-    /// for the mapper's bounded wait. Returns true when the published
-    /// endpoint changed.
-    bool do_port_mapping();
+    /// Hand `port` to the mapping thread: its next PortMapper::maintain
+    /// call obtains or renews the mapping for it. Loop thread only; a call
+    /// while an exchange runs replaces the port of the next one.
+    void request_port_mapping(uint16_t port);
+
+    /// True while the mapping thread has an exchange running or posted.
+    [[nodiscard]] bool port_mapping_in_flight() const;
+
+    /// Runs on mapping_thread_: serves the posted maintain requests, logs a
+    /// published or ended mapping, wakes the loop when the published
+    /// endpoint changed, and releases the mapping when stop() ends it.
+    void mapping_loop();
 
     /// The endpoint the heartbeat publishes: the mapped endpoint while the
     /// mapping is live, else the reflexive one (empty until learned).
@@ -430,10 +440,21 @@ private:
     std::unique_ptr<RelayFallback> relay_fallback_;      // used by the loop thread only
     std::unique_ptr<HolePuncher>   hole_puncher_;        // used by the loop thread only
     std::optional<PortMapperOptions> port_mapper_options_;  // set_port_mapper_options
-    // Created by start() and reset by stop(), both under mutex_; the loop
-    // thread calls maintain() and release() without it.
+    // Created by start() and reset by stop(), both under mutex_. Only the
+    // mapping thread calls maintain() and release(); mapping() and
+    // seconds_until_due() are thread-safe.
     std::unique_ptr<PortMapper>    port_mapper_;
-    uint16_t                       mapped_port_{0};      // last port given to maintain()
+    uint16_t                       mapped_port_{0};      // last port posted; loop thread only
+    bool                           mapping_changed_{false};  // set by the mapping thread; guarded by mutex_
+    std::thread                    mapping_thread_;      // runs mapping_loop()
+    // The mapping thread's inbox. `mapping_request_` is the port of the
+    // next maintain call (0: none posted); `mapping_busy_` is set while a
+    // maintain call runs; `mapping_quit_` ends the thread.
+    mutable std::mutex             mapping_mutex_;
+    std::condition_variable        mapping_cv_;
+    uint16_t                       mapping_request_{0};
+    bool                           mapping_busy_{false};
+    bool                           mapping_quit_{false};
 };
 
 } // namespace lnsdk

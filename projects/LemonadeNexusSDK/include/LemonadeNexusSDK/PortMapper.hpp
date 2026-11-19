@@ -67,7 +67,8 @@ struct PortMapperOptions {
 /// Obtains and maintains the mapping for one internal UDP port.
 ///
 /// maintain() and release() must be called from one thread (the
-/// orchestrator loop); they make synchronous, bounded gateway exchanges.
+/// orchestrator's mapping thread); they make synchronous, bounded gateway
+/// exchanges.
 /// mapping() may be called from any thread and returns a copy under a
 /// mutex. No method throws.
 class PortMapper {
