@@ -22,13 +22,13 @@
 #include <cstdio>
 #elif defined(__APPLE__)
 #include <TargetConditionals.h>
-#include <net/route.h>
-#include <sys/sysctl.h>
-// The media ioctl and its header exist in the macOS SDK only; iOS reports
-// no link speed through this path.
+// The media ioctl, its header and net/route.h exist in the macOS SDK only;
+// iOS reports no link speed and no default gateway through these paths.
 #if TARGET_OS_OSX
 #include <net/if_media.h>
+#include <net/route.h>
 #include <sys/ioctl.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 #endif
 #endif
@@ -180,7 +180,7 @@ std::optional<GatewayRoute> platform_default_gateway() {
     return parse_proc_net_route(text, list_interface_addresses());
 }
 
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && TARGET_OS_OSX
 
 /// The IPv4 address of the up interface named `name`, or empty.
 std::string address_of_interface(const std::vector<InterfaceAddress>& interfaces,
