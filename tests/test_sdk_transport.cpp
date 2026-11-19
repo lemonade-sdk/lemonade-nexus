@@ -2334,6 +2334,60 @@ TEST_F(SdkMeshPrivateApiTest, CApiPeerListCarriesPermissionsKeyAndTimestamps) {
     ln_mesh_disable(c);
 }
 
+// The listen_port of ln_mesh_enable_config reaches the dataplane: the join's
+// plane, up on a port the OS chose, moves to the fixed port, ln_mesh_status
+// reports it as dataplane_port, and a port outside the range is refused.
+TEST_F(SdkMeshPrivateApiTest, CApiListenPortMovesTheDataplaneToThatPort) {
+    LN_REQUIRE_TEST_TRUST();
+    ln_client_t* c = ln_create_tls("localhost", static_cast<uint16_t>(pub_port));
+    ASSERT_NE(c, nullptr);
+    struct Destroy {
+        ln_client_t* c;
+        ~Destroy() { ln_destroy(c); }
+    } destroy{c};
+    ASSERT_EQ(ln_set_genesis_key(c, nexus::crypto::to_base64(chain.genesis.public_key).c_str(), 0),
+              LN_OK);
+    ASSERT_EQ(ln_set_session_token(c, "session-token"), LN_OK);
+    char* out = nullptr;
+    ASSERT_EQ(ln_join_network(c, "user", "password", &out), LN_OK) << (out ? out : "");
+    ln_free(out);
+
+    const auto dataplane_port = [&] {
+        char* status = nullptr;
+        if (ln_mesh_status(c, &status) != LN_OK || !status) return -1;
+        const auto st = nlohmann::json::parse(status, nullptr, false);
+        ln_free(status);
+        return st.is_object() ? st.value("dataplane_port", -1) : -1;
+    };
+    const int joined_port = dataplane_port();
+    ASSERT_GT(joined_port, 0) << "the join brought the dataplane up";
+
+    // A port that was free a moment ago, from a scratch plane on any port.
+    uint16_t fixed = 0;
+    {
+        lnsdk::BoringtunMesh scratch;
+        lnsdk::BoringtunConfig scratch_cfg;
+        const auto keys = lnsdk::BoringtunMesh::generate_keypair();
+        scratch_cfg.private_key = keys.first;
+        scratch_cfg.public_key  = keys.second;
+        scratch_cfg.tunnel_ip   = "10.64.0.9/32";
+        ASSERT_TRUE(scratch.start(scratch_cfg));
+        fixed = scratch.bound_port();
+    }
+    ASSERT_NE(fixed, 0);
+    ASSERT_NE(fixed, joined_port);
+
+    const auto config = R"({"peer_refresh_interval_sec":3600,"heartbeat_interval_sec":3600,)"
+                        R"("listen_port":)" + std::to_string(fixed) + "}";
+    ASSERT_EQ(ln_mesh_enable_config(c, config.c_str()), LN_OK);
+    EXPECT_EQ(dataplane_port(), fixed);
+
+    EXPECT_EQ(ln_mesh_enable_config(c, R"({"listen_port":65536})"), LN_ERR_INTERNAL);
+    EXPECT_EQ(dataplane_port(), fixed) << "a refused config moves nothing";
+    ASSERT_EQ(ln_mesh_disable(c), LN_OK);
+    EXPECT_EQ(dataplane_port(), fixed) << "the dataplane outlives the orchestrator";
+}
+
 // The server's online bit says the peer is connected to the network; the
 // orchestrator's is_online says this device has a working path to it. A peer
 // the server lists online with no path yet is connecting, so the SDK keeps
