@@ -79,6 +79,33 @@ early_boot_inputs_changed() {
     [ "$recorded" != "$current" ]
 }
 
+# nexus-dns-nat.nft redirects public 443 to $nexus_http_port. A conf written
+# by an older nexus-bootstrap has no such define, and nft -f rejects the whole
+# file for one undefined symbol: the DNS redirect would be lost at the next
+# reload or boot. Append the define with the port the server is configured to
+# bind (default 9100). Only a conf that exists is touched, so a host that never
+# ran --install-dns-nat gets no rule from this.
+add_nat_http_port_define() {
+    local conf=$1 config=$2 http_port
+    [ -f "$conf" ] && [ ! -L "$conf" ] || return 0
+    ! grep -q '^define nexus_http_port ' "$conf" || return 0
+    http_port=$(python3 - "$config" <<'PYEOF'
+import json
+import sys
+port = 9100
+try:
+    with open(sys.argv[1]) as config:
+        value = json.load(config).get("http_port", port)
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65535:
+        port = value
+except (OSError, ValueError, AttributeError):
+    pass
+print(port)
+PYEOF
+    )
+    echo "define nexus_http_port = $http_port" >> "$conf"
+}
+
 # Create lemonade-nexus system user if it doesn't exist
 if ! id -u lemonade-nexus >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin \
@@ -188,10 +215,19 @@ rm -f "$EARLY_BOOT_DIGEST"
 # nexus-bootstrap runs; starting now would fail validation and trigger the
 # unit's failure-restart policy before bootstrap has had a chance to finish.
 #
-# nexus-dns-nat.service is deliberately left alone. Installing a package must not
-# change the host's firewall; its rules only appear once nexus-bootstrap
+# nexus-dns-nat.service is neither enabled nor started here. Installing a
+# package must not add firewall rules; they only appear once nexus-bootstrap
 # --install-dns-nat has written the conf its ConditionPathExists tests for.
+# Where the operator did opt in, the running table must match the packaged
+# ruleset, so an active unit is reloaded. nft -f is one transaction: a failed
+# reload keeps the previous table, and it must not fail the upgrade.
+add_nat_http_port_define /etc/lemonade-nexus/nexus-dns-nat.conf \
+    /var/lib/lemonade-nexus/lemonade-nexus.json
 systemctl daemon-reload
+if systemctl is-active --quiet nexus-dns-nat.service; then
+    systemctl reload nexus-dns-nat.service ||
+        echo "lemonade-nexus: nexus-dns-nat.service reload failed; the previous table is kept" >&2
+fi
 systemctl enable lemonade-nexus.service
 
 # Every OS change on a fleet server arrives through a release, so its PCR 8/9
@@ -239,9 +275,10 @@ echo ""
 echo "   sudo nexus-bootstrap --install-dns-nat"
 echo "   sudo systemctl start lemonade-nexus"
 echo ""
-echo " --install-dns-nat maps public 53/udp+tcp to the unprivileged DNS port."
-echo " Without it the advertised DNS port answers nothing. No firewall rule has"
-echo " been installed by this package."
+echo " --install-dns-nat maps public 53/udp+tcp to the unprivileged DNS port and"
+echo " public 443/tcp to the API port. Without it the advertised DNS port answers"
+echo " nothing and 443 is closed. No firewall rule has been installed by this"
+echo " package."
 echo ""
 echo " nexus-bootstrap --help explains the remaining options."
 echo ""

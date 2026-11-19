@@ -19,6 +19,7 @@ import tempfile
 @dataclass
 class BootstrapConfig:
     data_root: str
+    http_port: int = 9100
     dns_port: int = 5335
     public_dns_port: int = 53
     log_level: str = "info"
@@ -83,19 +84,22 @@ def parse_args(argv=None):
     parser.add_argument("--public-ip", type=ip_address)
     parser.add_argument("--log-level", choices=("trace", "debug", "info", "warn", "error"), default="info")
     parser.add_argument("--acme-provider", choices=("letsencrypt", "letsencrypt_staging", "zerossl"), default="letsencrypt")
+    parser.add_argument("--http-port", type=port, default=9100, help="public HTTPS API port; public 443 is mapped to it")
     parser.add_argument("--dns-port", type=port, default=5335)
     parser.add_argument("--public-dns-port", type=port, default=53)
     parser.add_argument("--region", type=region)
     parser.add_argument("--ddns-enabled", action="store_true")
-    parser.add_argument("--install-dns-nat", action="store_true", help="map public DNS to the local port over UDP and TCP using nftables")
+    parser.add_argument("--install-dns-nat", action="store_true",
+                        help="map public DNS (UDP and TCP) and public TCP 443 to the local ports using nftables")
     parser.add_argument("--wan-interface", type=interface)
     parser.add_argument("--force", action="store_true", help="replace an existing config")
     args = parser.parse_args(argv)
     args.public_ip = args.public_ip or ""
     args.region = args.region or ""
     args.wan_interface = args.wan_interface or ""
-    if args.dns_port < 1024:
-        parser.error("--dns-port must be unprivileged (1024..65535)")
+    for option in ("http_port", "dns_port"):
+        if getattr(args, option) < 1024:
+            parser.error(f"--{option.replace('_', '-')} must be unprivileged (1024..65535)")
     return args
 
 
@@ -138,10 +142,9 @@ def run(arguments, **kwargs):
 
 
 def dns_nat(args, gid):
-    if args.public_dns_port == args.dns_port:
-        return
     if not args.install_dns_nat:
-        print(f"Map public {args.public_dns_port}/udp+tcp to local {args.dns_port}, or use --install-dns-nat.")
+        print(f"Map public {args.public_dns_port}/udp+tcp to local {args.dns_port} and public 443/tcp "
+              f"to local {args.http_port}, or use --install-dns-nat.")
         return
     wan = args.wan_interface
     if not wan:
@@ -159,7 +162,8 @@ def dns_nat(args, gid):
         with os.fdopen(fd, "w") as out:
             out.write(f'define nexus_wan_if = "{wan}"\n'
                       f'define nexus_public_dns_port = {args.public_dns_port}\n'
-                      f'define nexus_dns_port = {args.dns_port}\n')
+                      f'define nexus_dns_port = {args.dns_port}\n'
+                      f'define nexus_http_port = {args.http_port}\n')
             os.fchmod(out.fileno(), 0o644)
         previous = conf.read_bytes() if conf.exists() else None
         os.replace(temporary, conf)
@@ -198,7 +202,7 @@ def bootstrap(args):
     data.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chown(data, account.pw_uid, account.pw_gid)
     data.chmod(0o700)
-    config = BootstrapConfig(str(data), args.dns_port, args.public_dns_port,
+    config = BootstrapConfig(str(data), args.http_port, args.dns_port, args.public_dns_port,
                              args.log_level, args.acme_provider, args.public_ip,
                              args.region, args.ddns_enabled,
                              release_signing_pubkey=args.release_signing_pubkey or "")
