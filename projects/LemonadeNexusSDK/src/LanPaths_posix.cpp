@@ -160,15 +160,6 @@ std::vector<InterfaceAddress> list_interface_addresses() {
 
 namespace {
 
-/// The IPv4 address of the up interface named `name`, or empty.
-std::string address_of_interface(const std::vector<InterfaceAddress>& interfaces,
-                                 const std::string& name) {
-    const auto itf = std::find_if(interfaces.begin(), interfaces.end(), [&](const auto& a) {
-        return a.up && a.name == name;
-    });
-    return itf == interfaces.end() ? std::string{} : itf->address;
-}
-
 #if defined(__linux__)
 
 std::optional<GatewayRoute> platform_default_gateway() {
@@ -190,6 +181,15 @@ std::optional<GatewayRoute> platform_default_gateway() {
 }
 
 #elif defined(__APPLE__)
+
+/// The IPv4 address of the up interface named `name`, or empty.
+std::string address_of_interface(const std::vector<InterfaceAddress>& interfaces,
+                                 const std::string& name) {
+    const auto itf = std::find_if(interfaces.begin(), interfaces.end(), [&](const auto& a) {
+        return a.up && a.name == name;
+    });
+    return itf == interfaces.end() ? std::string{} : itf->address;
+}
 
 /// Socket addresses in a routing message are aligned to 4 bytes; a zero
 /// sa_len still takes one slot (route(8) and netstat use this rule).
