@@ -60,11 +60,19 @@ TEST(TunnelMtu, EchoRequestCarriesValidChecksumsAndItsReplyIsRecognized) {
     EXPECT_EQ(mtu::echo_request(1, 2, 3, 4, 10).size(), 28u) << "never shorter than the headers";
 }
 
-TEST(TunnelMtu, ChooseTakesTheLargestAnsweredLadderSizeOrTheFailsafe) {
+TEST(TunnelMtu, ProbesBelowTheFullSizeCarryTheRelayHeaderAllowance) {
+    EXPECT_EQ(mtu::probe_size(1420), 1420u);
+    EXPECT_EQ(mtu::probe_size(1340), 1366u);
+    EXPECT_EQ(mtu::probe_size(1280), 1306u);
+    EXPECT_EQ(mtu::probe_size(1200), 1226u);
+}
+
+TEST(TunnelMtu, ChooseTakesTheLargestLadderSizeWhoseProbeWasAnsweredOrTheFailsafe) {
     EXPECT_EQ(mtu::choose({}), mtu::kFailsafe);
-    EXPECT_EQ(mtu::choose({1200}), 1200u);
-    EXPECT_EQ(mtu::choose({1200, 1280, 1340}), 1340u);
-    EXPECT_EQ(mtu::choose({1200, 1340, 1420}), 1420u);
+    EXPECT_EQ(mtu::choose({1226}), 1200u);
+    EXPECT_EQ(mtu::choose({1226, 1306, 1366}), 1340u);
+    EXPECT_EQ(mtu::choose({1226, 1366, 1420}), 1420u);
+    EXPECT_EQ(mtu::choose({1340}), mtu::kFailsafe) << "a bare ladder size is not a probe";
     EXPECT_EQ(mtu::choose({1000}), mtu::kFailsafe) << "a size outside the ladder is not a probe";
 }
 
@@ -199,11 +207,19 @@ TEST(TunnelMtu, AClearPathKeepsTheFullMtu) {
 
 TEST(TunnelMtu, APathThatDropsFullSizePacketsLowersTheMtuToWhatItCarries) {
     ASSERT_GE(sodium_init(), 0);
-    // 1400-byte datagrams pass: 1340 + 32 bytes of transport framing fit,
-    // 1420 + 32 do not.
+    // 1400-byte datagrams pass: 1340 + 26 bytes of relay header + 32 bytes of
+    // transport framing fit, 1420 + 32 do not.
     const auto outcome = probe_through(1400, "10.64.0.1");
     EXPECT_EQ(outcome.mtu, 1340u);
     EXPECT_LE(outcome.largest_forwarded, 1400u);
+}
+
+TEST(TunnelMtu, TheRelayedSizeDecidesBelowTheFullMtu) {
+    ASSERT_GE(sodium_init(), 0);
+    // 1390-byte datagrams pass: a direct 1340-byte packet (1372 bytes) would
+    // fit, a relayed one (1398 bytes) would not, so the next size wins.
+    const auto outcome = probe_through(1390, "10.64.0.1");
+    EXPECT_EQ(outcome.mtu, 1280u);
 }
 
 TEST(TunnelMtu, NoReplyAtAllFallsBackToTheFailsafe) {
