@@ -255,6 +255,8 @@ void to_json(json& j, const MeshTunnelStatus& s) {
         {"tunnel_up",      s.tunnel_up},
         {"tunnel_mtu",     s.tunnel_mtu},
         {"dataplane_port", s.dataplane_port},
+        {"mapped_endpoint",  s.mapped_endpoint},
+        {"mapping_protocol", s.mapping_protocol},
     };
 }
 
@@ -269,6 +271,8 @@ void from_json(const json& j, MeshTunnelStatus& s) {
     s.tunnel_up      = j.value("tunnel_up", false);
     s.tunnel_mtu     = j.value("tunnel_mtu", uint32_t{0});
     s.dataplane_port = j.value("dataplane_port", uint16_t{0});
+    s.mapped_endpoint  = j.value("mapped_endpoint", "");
+    s.mapping_protocol = j.value("mapping_protocol", "");
     if (j.contains("peers") && j["peers"].is_array()) {
         s.peers = j["peers"].get<std::vector<MeshPeer>>();
     }

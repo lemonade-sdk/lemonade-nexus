@@ -484,6 +484,14 @@ struct MeshTunnelStatus {
     /// MeshConfig::listen_port when one is set, or the port the OS chose.
     /// 0 while the dataplane is down.
     uint16_t    dataplane_port{0};
+    /// The "a.b.c.d:port" the router maps to the dataplane port (PCP or
+    /// NAT-PMP), published as this device's mesh endpoint while the lease
+    /// is live. Empty when no mapping is live: the router speaks neither
+    /// protocol, refused, or the lease ended.
+    std::string mapped_endpoint;
+    /// The protocol that obtained mapped_endpoint: "pcp" or "natpmp"; empty
+    /// when no mapping is live.
+    std::string mapping_protocol;
 };
 
 /// One session move: the Tier 1 server that issued the session left the
