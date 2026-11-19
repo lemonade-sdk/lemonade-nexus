@@ -122,6 +122,10 @@ public:
     /// Result code of every PCP MAP response. An error response carries
     /// lifetime 0 and the request's nonce, protocol, and internal port.
     std::atomic<uint8_t> pcp_result{kPcpSuccess};
+    /// Answer every PCP MAP request with a nonce that differs from the
+    /// request's, as a reply meant for another client would; a correct
+    /// client ignores it.
+    std::atomic<bool> pcp_wrong_nonce{false};
     /// The longest lifetime granted; a longer request is cut to it.
     std::atomic<uint32_t> max_lifetime_sec{7200};
 

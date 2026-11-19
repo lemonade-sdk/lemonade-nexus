@@ -298,6 +298,7 @@ void FakeGateway::handle_pcp(const std::vector<uint8_t>& datagram, std::vector<u
     requests_.push_back(req);
     if (drop_requests) return;
     fields.epoch_sec = epoch_sec_locked();
+    if (pcp_wrong_nonce) fields.mapping_nonce[0] = static_cast<uint8_t>(~fields.mapping_nonce[0]);
 
     if (!pcp_enabled) {
         // A NAT-PMP-only gateway answers any other version with the RFC 6886
