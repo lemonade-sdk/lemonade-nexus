@@ -378,6 +378,7 @@ add_sdk_test(test_sdk_mesh_port      test_sdk_mesh_port.cpp)
 add_sdk_test(test_sdk_service_ingress test_sdk_service_ingress.cpp)
 add_sdk_test(test_sdk_natpmp          test_sdk_natpmp.cpp)
 target_link_libraries(test_sdk_natpmp PRIVATE nexus_test_support)
+add_sdk_test(test_sdk_dataplane_port test_sdk_dataplane_port.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)
