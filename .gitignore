@@ -64,3 +64,5 @@ release-evidence/
 !.crew/graphs/
 !.crew/artifacts/.gitkeep
 !.crew/graphs/.gitkeep
+# beads issue tracker store (local symlink into ~/.local/share/beads-rs)
+.beads/

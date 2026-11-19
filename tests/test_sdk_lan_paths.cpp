@@ -9,6 +9,8 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -271,4 +273,91 @@ TEST(SdkLanPaths, PeerPathNamesTheRoute) {
     EXPECT_FALSE(lnsdk::lan_path_lost("lan", "direct"));
     EXPECT_FALSE(lnsdk::lan_path_lost("direct", ""));
     EXPECT_FALSE(lnsdk::lan_path_lost("", ""));
+}
+
+// A captured /proc/net/route table: two default routes (the lower metric
+// wins whatever its position), a 10.0.0.0/8 route, and the subnet route.
+// Addresses are little-endian hex: 0101A8C0 is 192.168.1.1.
+TEST(SdkLanPaths, ProcNetRouteDefaultWithTheLowestMetric) {
+    const std::string table =
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+        "eth0\t00000000\t0100000A\t0003\t0\t0\t600\t00000000\t0\t0\t0\n"
+        "wlan0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+        "eth0\t0000000A\t00000000\t0001\t0\t0\t600\t000000FF\t0\t0\t0\n"
+        "wlan0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+    const std::vector<lnsdk::InterfaceAddress> host = {itf("eth0", "10.0.0.5", 8),
+                                                       itf("wlan0", "192.168.1.20")};
+    const auto route = lnsdk::parse_proc_net_route(table, host);
+    ASSERT_TRUE(route);
+    EXPECT_EQ(route->gateway, "192.168.1.1");
+    EXPECT_EQ(route->local_address, "192.168.1.20");
+    EXPECT_EQ(route->interface_name, "wlan0");
+
+    // The route's interface is not in the list: the gateway is known but
+    // the local address is not.
+    const auto unlisted = lnsdk::parse_proc_net_route(table, {itf("eth0", "10.0.0.5", 8)});
+    ASSERT_TRUE(unlisted);
+    EXPECT_EQ(unlisted->gateway, "192.168.1.1");
+    EXPECT_TRUE(unlisted->local_address.empty());
+}
+
+TEST(SdkLanPaths, ProcNetRouteWithoutADefaultRoute) {
+    const std::string table =
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+        "wlan0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n"
+        // A default route that is down, and one without RTF_GATEWAY.
+        "wlan0\t00000000\t0101A8C0\t0002\t0\t0\t100\t00000000\t0\t0\t0\n"
+        "wlan0\t00000000\t0101A8C0\t0001\t0\t0\t100\t00000000\t0\t0\t0\n";
+    EXPECT_FALSE(lnsdk::parse_proc_net_route(table, {itf("wlan0", "192.168.1.20")}));
+    EXPECT_FALSE(lnsdk::parse_proc_net_route("", {}));
+    EXPECT_FALSE(lnsdk::parse_proc_net_route("Iface\tDestination\n", {}));
+}
+
+TEST(SdkLanPaths, ProcNetRouteMalformedTableParsesToNothing) {
+    const std::string table =
+        "Iface\tDestination\n"
+        "wlan0\n"
+        "wlan0\t00000000\n"
+        "wlan0\t00000000\t0101A8C0\n"
+        "wlan0\t00000000\tZZZZZZZZ\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+        "wlan0\t00000000\t0101A8C\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+        "wlan0\t00000000\t0101A8C0\tnothex\t0\t0\t100\t00000000\t0\t0\t0\n"
+        "wlan0\t00000000\t0101A8C0\t0003\t0\t0\tnotanumber\t00000000\t0\t0\t0\n"
+        "wlan0\t00000000\t0101A8C0\t0003\t0\t0\t-1\t00000000\t0\t0\t0\n"
+        "\t\t\t\n"
+        "\x01\x02\xff garbage \r\n";
+    std::optional<lnsdk::GatewayRoute> route;
+    EXPECT_NO_THROW(route = lnsdk::parse_proc_net_route(table, {itf("wlan0", "192.168.1.20")}));
+    EXPECT_FALSE(route);
+}
+
+TEST(SdkLanPaths, GatewayMustBePrivateOrLinkLocal) {
+    for (const char* gateway : {"192.168.1.1", "10.0.0.1", "172.16.0.1", "169.254.1.1"}) {
+        EXPECT_TRUE(lnsdk::gateway_address_usable(gateway)) << gateway;
+    }
+    for (const char* gateway : {"8.8.8.8", "127.0.0.1", "0.0.0.0", "", "garbage", "192.168.1",
+                                "192.168.1.1:1", "192.168.1.0/24", "::1"}) {
+        EXPECT_FALSE(lnsdk::gateway_address_usable(gateway)) << gateway;
+    }
+}
+
+// The host's own default gateway: none, or a usable router reached from a
+// known local address. The value depends on the machine, so it is printed.
+TEST(SdkLanPaths, HostDefaultGatewayIsUsableOrAbsent) {
+    std::optional<lnsdk::GatewayRoute> route;
+    ASSERT_NO_THROW(route = lnsdk::default_gateway_ipv4());
+    if (!route) {
+        std::cout << "default_gateway_ipv4: none\n";
+        return;
+    }
+    std::cout << "default_gateway_ipv4: " << route->gateway << " from " << route->local_address
+              << " on \"" << route->interface_name << "\"\n";
+    EXPECT_TRUE(lnsdk::gateway_address_usable(route->gateway));
+    EXPECT_FALSE(route->local_address.empty());
+    EXPECT_NE(route->local_address, route->gateway);
+    bool listed = false;
+    for (const auto& a : lnsdk::list_interface_addresses()) {
+        listed = listed || a.address == route->local_address;
+    }
+    EXPECT_TRUE(listed) << route->local_address;
 }
