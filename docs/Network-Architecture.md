@@ -118,6 +118,27 @@ servers.
 The client selects the best server client-side after a health probe of each
 discovered candidate (latency plus load scoring), with region fallback.
 
+### Endpoint selection
+
+A device reaches a peer over the first path that answers, in this order:
+
+1. A LAN endpoint, when the peer is on the same network (`local_endpoints`).
+2. The peer's published endpoint, dialed directly or by hole punching. The
+   published endpoint is the router mapping while its lease is live, else
+   the STUN reflexive address.
+3. The relay (UDP `9103`), when neither direct path answers.
+
+Hole punching fails behind a symmetric NAT, which corporate gateways such as
+Zscaler use: the gateway assigns a new public port for every destination, so
+the port that STUN saw is not the port a peer must dial. A mapped endpoint
+fixes this because the far side dials out: a mapping on one side gives the
+other side a fixed port to send to, and the symmetric NAT lets that outbound
+flow through. The SDK asks the default gateway for the mapping with PCP first
+and NAT-PMP second (see [Client SDK](Client-SDK#direct-paths-hole-punching)).
+A gateway that offers neither changes nothing: the reflexive address stays
+published. The server needs no change, because the heartbeat's `endpoint`
+field already carries whichever endpoint the device publishes to its peers.
+
 ## Private API Delivery
 
 The delivery pattern (server side):

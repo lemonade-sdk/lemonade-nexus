@@ -48,6 +48,31 @@ Notes:
 - Mapping port `53` to `5335` does not replace the rest of your firewall
   policy.
 
+### Client-side ports
+
+An SDK client (a desktop app, a phone, or lemond) sends these flows from
+the device. They need no inbound rule on the device or on the server.
+
+| Port | Protocol | Direction | Peer | Service |
+|------|----------|-----------|------|---------|
+| **5351** | UDP | Outbound | Default gateway | PCP and NAT-PMP mapping requests; replies come from the gateway only |
+| *granted by the router* | UDP | Inbound (router forward) | Any | The mapped external port that forwards to the dataplane port |
+| **5350** | UDP | — | — | PCP/NAT-PMP announcements (multicast `224.0.0.1`); not used yet |
+
+Notes:
+
+- The client sends PCP first and NAT-PMP second to the default gateway on
+  `5351`, and reads only datagrams that come back from that gateway address
+  and port. A gateway that speaks neither protocol changes nothing.
+- The external UDP port is whatever the router grants; the client does not
+  choose it. `mesh_status` / `ln_mesh_status` report it as `mapped_endpoint`
+  with the protocol in `mapping_protocol`.
+- The dataplane binds an OS-chosen UDP port by default. For a manual port
+  forward, set `listen_port` in the mesh config so the dataplane binds a
+  fixed port, and forward the router's external port to it. The port in use
+  is `dataplane_port` in `mesh_status` / `ln_mesh_status`. See
+  [Client SDK](Client-SDK#direct-paths-hole-punching).
+
 ## Packet Order for DNS NAT
 
 A destination-NAT redirect (`53 → 5335`) is applied in the prerouting phase,
