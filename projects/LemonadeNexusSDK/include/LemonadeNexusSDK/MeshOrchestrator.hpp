@@ -171,17 +171,20 @@ inline constexpr std::chrono::seconds kTunnelAliveWindow{20};
 /// relay when it answers.
 ///
 /// LAN-direct paths: a peer refresh keeps a peer's listed LAN endpoints only
-/// when they pass lan_endpoint_usable and the peer is on this device's
-/// network (lan_probe_targets: the same public address, or a LAN endpoint
-/// inside one of this device's subnets). Such a peer is probed at its LAN
+/// when they pass lan_endpoint_usable and lan_probe_targets keeps them: this
+/// device has a usable LAN address of its own (do_lan_refresh,
+/// usable_lan_interfaces), or the peer's public address equals this device's
+/// reflexive address. A device with only cellular or virtual interfaces keeps
+/// none unless the addresses match. Such a peer is probed at its LAN
 /// endpoints together with its listed endpoint, and gets no relay before
 /// kLanAnswerWindow passed. A new LAN endpoint list renews the peer like a
 /// new listed endpoint. Each monitor pass records the peer's path
-/// (peer_path). A peer whose LAN path stops answering (no authenticated
-/// packet within the liveness window of peer_signal_fresh) is renewed at
-/// that pass: it gets a new punch burst, and a relay after the LAN window
-/// when no path answers. A relayed peer keeps getting upgrade probes at its
-/// LAN endpoints, so the LAN path returns when it answers again.
+/// (peer_path): "lan" for any kept LAN endpoint in use, also one on another
+/// subnet that the site routes. A peer whose LAN path stops answering (no
+/// authenticated packet within the liveness window of peer_signal_fresh) is
+/// renewed at that pass: it gets a new punch burst, and a relay after the LAN
+/// window when no path answers. A relayed peer keeps getting upgrade probes
+/// at its LAN endpoints, so the LAN path returns when it answers again.
 ///
 /// Peer endpoints come only from the verified server's peer list. Listed
 /// endpoints that fail peer_endpoint_usable are dropped before any use. A

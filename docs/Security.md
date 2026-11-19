@@ -272,9 +272,9 @@ cryptography is involved, and a punch grants no authority:
   The SDK skips VPN, tunnel, container, and cellular interfaces, so their
   addresses are not disclosed.
 - **A LAN endpoint only changes where packets go.** The SDK probes a peer's
-  LAN endpoints only when they are private addresses and the peer is on its
-  own network (the same public address, or a LAN endpoint inside one of its
-  subnets; `lan_probe_targets`). A probe is the same BoringTun handshake
+  LAN endpoints only when they are private addresses, and only when the SDK
+  itself has a usable LAN address or shares the peer's public address
+  (`lan_probe_targets`). A probe is the same BoringTun handshake
   initiation, sent to the LAN endpoints and the listed endpoint at once
   (`UserspaceDataplane::probe_endpoints`). The peer moves to a LAN address
   only when an authenticated handshake answers from it, so a device that

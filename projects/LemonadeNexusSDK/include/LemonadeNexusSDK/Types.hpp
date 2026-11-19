@@ -414,8 +414,9 @@ struct MeshPeer {
     std::string endpoint;               ///< Direct "ip:port" (from STUN/hole-punch)
     /// The peer's LAN endpoints ("a.b.c.d:port", private addresses) that this
     /// device probes: the server lists them from the peer's heartbeats, and
-    /// the mesh orchestrator keeps them only when the peer is on this
-    /// device's network (lan_probe_targets). Empty otherwise.
+    /// the mesh orchestrator keeps them only when this device has a usable
+    /// LAN address or shares the peer's public address (lan_probe_targets).
+    /// Empty otherwise.
     std::vector<std::string> local_endpoints;
     std::string relay_endpoint;         ///< Relay fallback "ip:port" (empty if not needed)
     /// The path the peer's traffic takes now, as the mesh orchestrator's

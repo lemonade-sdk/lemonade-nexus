@@ -506,8 +506,8 @@ std::vector<std::string> MeshOrchestrator::do_peer_refresh() {
                 endpoint->clear();
             }
         }
-        // LAN endpoints must be private addresses, and are probed only for
-        // a peer on this device's network.
+        // LAN endpoints must be private addresses, and are probed only when
+        // this device can reach a private address (lan_probe_targets).
         std::erase_if(peer.local_endpoints, [&](const std::string& endpoint) {
             if (lan_endpoint_usable(endpoint, server_scope == AddressScope::Loopback)) return false;
             spdlog::warn("[MeshOrchestrator] peer {} lists unusable LAN endpoint '{}'; ignored",

@@ -177,28 +177,63 @@ TEST(SdkLanPaths, ListedLanEndpointsMustBePrivate) {
     EXPECT_TRUE(lnsdk::lan_endpoint_usable("127.0.0.1:41234", true));
 }
 
-// A peer is on this device's network when both share one public address
-// (one NAT), or when one of its LAN endpoints is inside one of this device's
-// LAN subnets. Then every LAN endpoint of the peer is probed.
+// A device with a usable LAN address of its own probes every LAN endpoint of
+// a peer: the site may route between their subnets. A device that shares the
+// peer's public address (one NAT) probes them too. A device without a usable
+// LAN address and behind another NAT probes none.
 TEST(SdkLanPaths, SameNetworkDetection) {
     lnsdk::MeshPeer peer;
     peer.endpoint = "203.0.113.7:50001";
     peer.local_endpoints = {"192.168.1.30:50001", "10.20.0.5:50001"};
     const std::vector<lnsdk::InterfaceAddress> own = {itf("en0", "192.168.1.20", 24)};
 
-    // Same NAT.
+    // Same NAT, no LAN address of its own.
     EXPECT_EQ(lnsdk::lan_probe_targets(peer, "203.0.113.7:41000", {}), peer.local_endpoints);
     // Another NAT, but a shared subnet.
     EXPECT_EQ(lnsdk::lan_probe_targets(peer, "198.51.100.1:41000", own), peer.local_endpoints);
-    // Another NAT and no shared subnet: another network.
-    EXPECT_TRUE(lnsdk::lan_probe_targets(peer, "198.51.100.1:41000",
-                                         {itf("en0", "192.168.2.20", 24)})
-                    .empty());
-    // No reflexive address yet and no shared subnet.
-    EXPECT_TRUE(lnsdk::lan_probe_targets(peer, "", {itf("en0", "172.16.0.2", 16)}).empty());
+    // Another NAT and no shared subnet: two subnets of one routed site.
+    EXPECT_EQ(lnsdk::lan_probe_targets(peer, "198.51.100.1:41000",
+                                       {itf("en0", "192.168.2.20", 24)}),
+              peer.local_endpoints);
+    // No reflexive address yet, but a LAN address of its own.
+    EXPECT_EQ(lnsdk::lan_probe_targets(peer, "", {itf("en0", "172.16.0.2", 16)}),
+              peer.local_endpoints);
+    // No usable physical address and another NAT: nothing probed.
+    EXPECT_TRUE(lnsdk::lan_probe_targets(peer, "198.51.100.1:41000", {}).empty());
+    EXPECT_TRUE(lnsdk::lan_probe_targets(peer, "", {}).empty());
     // A peer without LAN endpoints has nothing to probe.
     peer.local_endpoints.clear();
     EXPECT_TRUE(lnsdk::lan_probe_targets(peer, "203.0.113.7:41000", own).empty());
+}
+
+// A phone on LTE has only cellular and VPN interfaces. usable_lan_interfaces
+// keeps none of them, so no probe leaves the cellular link toward a peer's
+// private addresses; the same NAT is the only exception.
+TEST(SdkLanPaths, CellularOnlyDeviceProbesNoLanEndpoint) {
+    lnsdk::MeshPeer peer;
+    peer.endpoint = "203.0.113.7:50001";
+    peer.local_endpoints = {"192.168.1.30:50001", "10.20.0.5:50001"};
+
+    const std::vector<lnsdk::InterfaceAddress> cellular = {
+        itf("rmnet0", "10.144.21.9", 29),
+        itf("pdp_ip0", "10.33.7.2", 32),
+        itf("utun2", "10.64.0.9", 32),
+    };
+    lnsdk::LocalEndpointRules rules = mesh_rules();
+    rules.reflexive = "198.51.100.1:41000";
+    const auto own_lan = lnsdk::usable_lan_interfaces(cellular, rules);
+    ASSERT_TRUE(own_lan.empty());
+    EXPECT_TRUE(lnsdk::lan_probe_targets(peer, rules.reflexive, own_lan).empty());
+
+    // The peer sits behind the same carrier NAT: its LAN endpoints are probed.
+    EXPECT_EQ(lnsdk::lan_probe_targets(peer, "203.0.113.7:41000", own_lan),
+              peer.local_endpoints);
+    // Wi-Fi comes up: the device has a LAN address and probes them.
+    auto with_wifi = cellular;
+    with_wifi.push_back(itf("wlan0", "172.16.4.8", 20));
+    EXPECT_EQ(lnsdk::lan_probe_targets(peer, rules.reflexive,
+                                       lnsdk::usable_lan_interfaces(with_wifi, rules)),
+              peer.local_endpoints);
 }
 
 // The host's own interface list: the call works and its entries parse. The
