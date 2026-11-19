@@ -436,6 +436,17 @@ public endpoints. They connect over the LAN instead:
   sharing lists only the LAN endpoints of the devices whose heartbeats reach
   it.
 
+The dataplane binds a UDP port the OS chooses at every start, so the NAT
+mapping comes only from STUN. A device behind a router mapping or a manual
+port forward sets `listen_port` in the mesh config (`MeshConfig::listen_port`,
+`ln_mesh_enable_config` key `listen_port`, default `0`). The SDK then binds
+that port, exclusively, at every start and rebind: the join, `enable_mesh`
+(a port other than the one in use restarts the dataplane), and `resume`. A
+port that cannot be bound is an error, logged with the port and the OS
+error; the SDK never takes another port in its place, because the forward
+points at the configured one. `mesh_status` / `ln_mesh_status` report the
+port in use as `dataplane_port` (`0` while the dataplane is down).
+
 ## Relay Fallback
 
 The SDK moves a peer onto a relay when the dataplane cannot reach it directly:
