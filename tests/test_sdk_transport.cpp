@@ -2677,7 +2677,10 @@ TEST_F(SdkMeshPrivateApiTest, ASilentGatewayDoesNotHoldTheHeartbeats) {
         EXPECT_TRUE(orchestrator.status().mapped_endpoint.empty());
         for (const auto& endpoint : heartbeats()) EXPECT_EQ(endpoint, "");
 
+        // stop() ends the exchange instead of waiting out its budget.
+        const auto stop_started = std::chrono::steady_clock::now();
         orchestrator.stop();
+        EXPECT_LT(std::chrono::steady_clock::now() - stop_started, std::chrono::seconds(3));
     }
     own.stop();
 }

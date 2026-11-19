@@ -406,6 +406,38 @@ TEST(PortMapper, RejectsInternalPortZero) {
     EXPECT_TRUE(h.fake.requests().empty());
 }
 
+// cancel() ends a first attempt toward a silent gateway long before its
+// budget, without counting a failure; release() still reaches the gateway
+// after it.
+TEST(PortMapper, CancelEndsASilentAttemptAtOnce) {
+    Harness h;
+    ASSERT_NE(h.fake.port(), 0);
+    h.fake.pcp_enabled = true;
+    PortMapper mapper(h.options());
+    ASSERT_TRUE(mapper.maintain(kPort));
+    ASSERT_EQ(h.fake.mapped_external_port(kPort), kPort);
+
+    // The renewal finds the gateway silent.
+    h.fake.drop_requests = true;
+    h.pass(3600);
+    bool changed = true;
+    std::thread attempt([&] { changed = mapper.maintain(kPort); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const auto cancelled_at = std::chrono::steady_clock::now();
+    mapper.cancel();
+    attempt.join();
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelled_at, std::chrono::seconds(2));
+    EXPECT_FALSE(changed);
+    const auto state = mapper.mapping();
+    EXPECT_EQ(state.protocol, MappingProtocol::Pcp) << "the cancelled renewal dropped the mapping";
+    EXPECT_TRUE(state.last_error.empty()) << state.last_error;
+    EXPECT_EQ(mapper.seconds_until_due(), 0) << "the cancelled attempt set a retry";
+
+    h.fake.drop_requests = false;
+    mapper.release();
+    EXPECT_FALSE(h.fake.mapped_external_port(kPort)) << "release() after cancel() left the lease";
+}
+
 // ---------------------------------------------------------------------------
 // Inside the mesh orchestrator
 // ---------------------------------------------------------------------------
@@ -540,7 +572,11 @@ TEST(PortMapperOrchestrator, ASilentGatewayDoesNotHoldTheLoop) {
         }, std::chrono::seconds(2)))
             << "the refresh pass waited for the gateway";
         EXPECT_TRUE(orchestrator.status().mapped_endpoint.empty());
+
+        // stop() ends the exchange instead of waiting out its budget.
+        const auto stop_started = std::chrono::steady_clock::now();
         orchestrator.stop();
+        EXPECT_LT(std::chrono::steady_clock::now() - stop_started, std::chrono::seconds(3));
     }
     mesh.stop();
 }

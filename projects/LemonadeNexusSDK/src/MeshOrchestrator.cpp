@@ -163,14 +163,15 @@ void MeshOrchestrator::stop() {
     // check and its wait.
     { std::lock_guard lock(mutex_); }
     cv_.notify_all();
-    // The mapping thread gives the lease back and ends; an exchange in
-    // progress finishes first (bounded by the mapper's budgets) while the
-    // other threads are joined.
+    // The mapping thread ends its exchange in progress, gives the lease back
+    // (bounded by the release budget) and ends, while the other threads are
+    // joined.
     {
         std::lock_guard lock(mapping_mutex_);
         mapping_quit_ = true;
     }
     mapping_cv_.notify_all();
+    port_mapper_->cancel();
     // A held long-poll ends when its connection closes.
     client_.cancel_mesh_peer_wait();
     if (poll_thread_.joinable()) poll_thread_.join();

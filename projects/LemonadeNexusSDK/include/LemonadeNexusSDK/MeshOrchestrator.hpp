@@ -148,8 +148,9 @@ inline constexpr std::chrono::seconds kTunnelAliveWindow{20};
 ///      when no gateway answers) never delays steps 1-8. A heartbeat sent
 ///      meanwhile carries the reflexive endpoint; a mapping that lands or
 ///      ends goes out in a heartbeat at once. A router without either
-///      protocol changes nothing. stop() releases the mapping on the
-///      mapping thread before it returns.
+///      protocol changes nothing. stop() ends an exchange in progress
+///      (PortMapper::cancel) and releases the mapping on the mapping thread
+///      before it returns.
 ///
 /// Some events make a pass run steps 1, 3, 5 and 7 at once instead of on
 /// their intervals, with a new punch burst for every peer still being probed:
