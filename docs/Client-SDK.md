@@ -26,6 +26,12 @@ participate in the mesh VPN:
 - **Latency monitoring** — probe servers, auto-switch to the best one
 - **Tier 1 verification** — tree, session, and private-API traffic goes only
   to Tier 1 servers the SDK verifies from the pinned Genesis key
+- **Port 443 fallback** — the SDK dials a server's advertised public port
+  (9100 by default) first. When that port gets no response, it sends the
+  request once more to the same host on 443, which every server also serves,
+  and keeps 443 for that host until 443 gets no response. An HTTP error
+  status is a response and causes no fallback. The endpoint the SDK reports
+  and binds a session to is always the advertised one.
 
 The mesh dataplane is in-process userspace BoringTun plus a smoltcp netstack:
 no kernel module, no TUN device, no elevated privileges, on every platform.

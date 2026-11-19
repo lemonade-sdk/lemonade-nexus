@@ -45,7 +45,7 @@ The server separates mesh transport, application services, and the security prot
 
 ### Public and private APIs
 
-The public API uses port **9100**. In the normal mesh configuration, the private API uses virtual mesh addresses on port **9101**, forwarded internally to a loopback listener by the userspace netstack. Server startup withholds HTTPS listeners until usable certificates are available.
+The public API uses port **9100**. Every server is also reachable on TCP **443**, an alias of the public API for clients on networks that allow only 443 out. The SDK dials the advertised port first and falls back to 443 when that port gets no response. In the normal mesh configuration, the private API uses virtual mesh addresses on port **9101**, forwarded internally to a loopback listener by the userspace netstack. Server startup withholds HTTPS listeners until usable certificates are available.
 
 **Current fallback:** If no private listener is created, the server registers private routes on the public listener. Route authentication still applies, but network isolation does not. Check startup logs and listener configuration before exposing a server.
 

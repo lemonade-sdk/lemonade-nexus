@@ -50,7 +50,7 @@ same offset (see [IP Ranges](IP-Ranges#server-tunnel-ips)).
 
 | Traffic | Port | Purpose |
 |---------|------|---------|
-| Public HTTPS API | TCP `9100` (`443` NAT-mapped alias) | Discovery, health, auth, join, onboarding. HTTPS or withheld — never plaintext. The server binds `9100`; the firewall maps `443` to it. |
+| Public HTTPS API | TCP `9100` | Discovery, health, auth, join, onboarding. HTTPS or withheld — never plaintext. TCP `443` is mapped to it as an alias; the SDK falls back to `443` when the advertised port gets no response. |
 | Mesh + hole punching (BoringTun) | UDP `51940` | Client tunnels, server backbone, and NAT traversal — one shared socket |
 | Gossip + security protocol | UDP `9102` | Signed server messages; state sync; security envelopes |
 | STUN | UDP `3478` | External address discovery |

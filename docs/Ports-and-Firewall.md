@@ -18,7 +18,7 @@ title: Ports and Firewall
 | Port | Protocol | Direction | Source | Service |
 |------|----------|-----------|--------|---------|
 | **9100** | TCP | Inbound | Any | Public HTTPS API (discovery, auth, join, onboarding) |
-| **443** | TCP | Inbound | Any | Public HTTPS API alias (NAT-mapped to `9100` on every server) |
+| **443** | TCP | Inbound | Any | Public HTTPS API alias, mapped to `9100` (SDK fallback when `9100` gets no response) |
 | **51940** | UDP | Inbound | Any | Mesh transport **and hole punching** (shared) |
 | **9102** | UDP | Inbound | Mesh servers | Gossip and security protocol (signed envelopes) |
 | **3478** | UDP | Inbound | Peers | STUN (NAT discovery) |
@@ -29,10 +29,10 @@ title: Ports and Firewall
 
 Notes:
 
-- **`443` is an alias of `9100`.** The server listens on `9100` and never
-  binds `443`. The firewall maps `443` to `9100`, so clients on networks
-  that allow only `443` can reach the API. Clients try the advertised port
-  first and `443` as the fallback.
+- **`443` is an alias of `9100`.** Map it to `9100` with the firewall or
+  NAT; the server does not bind it. The SDK dials a server's advertised
+  port first. When that port gets no response, it dials the same host on
+  `443` and keeps `443` for that host until `443` gets no response.
 - **Hole punching shares `51940`.** There is no separate hole-punch port;
   an older `51941` rule is not required and does nothing on the current
   server.
