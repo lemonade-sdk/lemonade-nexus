@@ -1354,7 +1354,9 @@ TEST(MeshPortCApi, ArgumentsAndLifecycle) {
     auto status = status_of(client.c);
     EXPECT_EQ(status["running"], true);
     EXPECT_EQ(status["port"], number);
-    EXPECT_EQ(ln_mesh_port_set_selection(client.c, "auto", "key"), LN_OK);
+    EXPECT_EQ(ln_mesh_port_set_selection(client.c, "auto", "key"), LN_ERR_REJECTED)
+        << "auto routing carries no peer key";
+    EXPECT_EQ(ln_mesh_port_set_selection(client.c, "auto", nullptr), LN_OK);
     EXPECT_EQ(ln_mesh_port_set_selection(client.c, "local", nullptr), LN_ERR_REJECTED);
     EXPECT_EQ(ln_mesh_port_set_selection(client.c, "no-such-node", nullptr), LN_ERR_NOT_FOUND);
     EXPECT_EQ(status_of(client.c)["selection"]["target"], "auto");
