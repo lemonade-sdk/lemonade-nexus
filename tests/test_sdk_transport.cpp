@@ -2642,7 +2642,7 @@ TEST_F(SdkMeshPrivateApiTest, HeartbeatPublishesTheRouterMappingWhileItsLeaseIsL
 }
 
 // A gateway that answers nothing holds the mapper's first attempt for the
-// whole PCP and NAT-PMP budget (about 7.5 s). The exchange runs beside the
+// whole PCP and NAT-PMP budget (about 11 s). The exchange runs beside the
 // loop, so the heartbeats keep their one-second cadence meanwhile, with the
 // reflexive endpoint (none here: STUN is off).
 TEST_F(SdkMeshPrivateApiTest, ASilentGatewayDoesNotHoldTheHeartbeats) {

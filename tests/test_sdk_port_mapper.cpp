@@ -485,7 +485,7 @@ TEST(PortMapperOrchestrator, StatusCarriesTheMappingUntilTheLeaseEnds) {
 }
 
 // A gateway that answers nothing holds the first attempt for the whole PCP
-// and NAT-PMP budget (about 7.5 s). The exchange runs on the mapping thread,
+// and NAT-PMP budget (about 11 s). The exchange runs on the mapping thread,
 // so a refresh request meanwhile still runs its pass at once: the changed
 // LAN address list is read within a second, not after the budget.
 TEST(PortMapperOrchestrator, ASilentGatewayDoesNotHoldTheLoop) {
