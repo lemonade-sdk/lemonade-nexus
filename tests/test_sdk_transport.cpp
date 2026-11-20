@@ -3056,7 +3056,12 @@ TEST_F(SdkMeshPrivateApiTest, OnlyADeviceWithALanAddressWaitsForTheLanWindow) {
         auto client = joined_client();
         lnsdk::BoringtunMesh own;
         const auto own_keys = lnsdk::BoringtunMesh::generate_keypair();
-        EXPECT_TRUE(own.start(mesh_config(own_keys, "10.64.0.9/32")));
+        // The session server is on loopback, as after a join through the
+        // stand-in, so a loopback LAN endpoint counts as reachable.
+        auto own_cfg              = mesh_config(own_keys, "10.64.0.9/32");
+        own_cfg.server_public_key = server_keys.second;
+        own_cfg.server_endpoint   = "127.0.0.1:" + std::to_string(server_mesh.bound_port());
+        EXPECT_TRUE(own.start(own_cfg));
         bool                       asked = false;
         std::vector<lnsdk::MeshPeer> peers;
         {
