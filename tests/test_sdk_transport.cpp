@@ -2840,6 +2840,50 @@ TEST_F(SdkMeshPrivateApiTest, HeartbeatPublishesTheRouterMappingWhileItsLeaseIsL
     own.stop();
 }
 
+// A gateway that answers nothing holds the mapper's first attempt for the
+// whole PCP and NAT-PMP budget (about 11 s). The exchange runs beside the
+// loop, so the heartbeats keep their one-second cadence meanwhile, with the
+// reflexive endpoint (none here: STUN is off).
+TEST_F(SdkMeshPrivateApiTest, ASilentGatewayDoesNotHoldTheHeartbeats) {
+    LN_REQUIRE_TEST_TRUST();
+    test_support::FakeGateway gateway;
+    ASSERT_NE(gateway.port(), 0);
+    gateway.drop_requests = true;
+    lnsdk::PortMapperOptions options;
+    options.gateway_port   = gateway.port();
+    options.gateway_source = []() -> std::optional<lnsdk::GatewayRoute> {
+        return lnsdk::GatewayRoute{"127.0.0.1", "127.0.0.1", "lo0"};
+    };
+
+    auto client = joined_client();
+    lnsdk::BoringtunMesh own;
+    const auto own_keys = lnsdk::BoringtunMesh::generate_keypair();
+    ASSERT_TRUE(own.start(mesh_config(own_keys, "10.64.0.9/32")));
+    {
+        lnsdk::MeshOrchestrator orchestrator(*client, own, kNodeId);
+        orchestrator.set_port_mapper_options(options);
+        lnsdk::MeshConfig cfg;
+        cfg.peer_refresh_interval_sec = 3600;
+        cfg.heartbeat_interval_sec    = 1;
+        cfg.stun_refresh_interval_sec = 0;
+        orchestrator.start(cfg);
+
+        // Four heartbeats take three seconds; a loop held by the exchange
+        // sends the second one only after the budget ran out.
+        EXPECT_TRUE(wait_for([&] { return heartbeats().size() >= 4; }, std::chrono::seconds(5)))
+            << "the heartbeats waited for the gateway: " << heartbeats().size() << " sent";
+        EXPECT_FALSE(gateway.requests().empty()) << "no mapping request reached the gateway";
+        EXPECT_TRUE(orchestrator.status().mapped_endpoint.empty());
+        for (const auto& endpoint : heartbeats()) EXPECT_EQ(endpoint, "");
+
+        // stop() ends the exchange instead of waiting out its budget.
+        const auto stop_started = std::chrono::steady_clock::now();
+        orchestrator.stop();
+        EXPECT_LT(std::chrono::steady_clock::now() - stop_started, std::chrono::seconds(3));
+    }
+    own.stop();
+}
+
 // The heartbeat reports the device's LAN endpoints with the dataplane port.
 // The stand-in server is on loopback (a single-host deployment), so the
 // loopback address counts as a LAN address here; every entry is one the
@@ -2992,13 +3036,13 @@ TEST_F(SdkMeshPrivateApiTest, APeerOnTheLanIsReachedThereAndFallsBackWhenItGoesS
 // does not wait for the LAN window: without a direct endpoint it asks for a
 // relay in the pass that lists it. A peer on this device's network whose LAN
 // endpoint stays silent asks only after the LAN window.
-TEST_F(SdkMeshPrivateApiTest, OnlyAPeerOnThisNetworkWaitsForTheLanWindow) {
+TEST_F(SdkMeshPrivateApiTest, OnlyADeviceWithALanAddressWaitsForTheLanWindow) {
     LN_REQUIRE_TEST_TRUST();
     const auto first_ticket_delay = [&] {
         std::lock_guard lock(listed_peer_mtx);
         return *first_ticket_at - *first_peer_list_at;
     };
-    const auto run = [&](nlohmann::json lan) {
+    const auto run = [&](nlohmann::json lan, std::vector<lnsdk::InterfaceAddress> own_lan) {
         {
             std::lock_guard lock(listed_peer_mtx);
             first_peer_list_at.reset();
@@ -3010,28 +3054,48 @@ TEST_F(SdkMeshPrivateApiTest, OnlyAPeerOnThisNetworkWaitsForTheLanWindow) {
         set_listed_peer_endpoint("0.0.0.0:1");
         set_listed_peer_lan(std::move(lan));
         auto client = joined_client();
-        lnsdk::MeshConfig cfg;
-        cfg.peer_refresh_interval_sec = 3600;
-        cfg.heartbeat_interval_sec    = 3600;
-        cfg.stun_refresh_interval_sec = 0;
-        client->enable_mesh(cfg);
-        const bool asked =
-            wait_for([&] { return relay_ticket_posts.load() > 0; }, std::chrono::seconds(10));
-        const auto peers = client->get_mesh_peers();
-        client->disable_mesh();
+        lnsdk::BoringtunMesh own;
+        const auto own_keys = lnsdk::BoringtunMesh::generate_keypair();
+        // The session server is on loopback, as after a join through the
+        // stand-in, so a loopback LAN endpoint counts as reachable.
+        auto own_cfg              = mesh_config(own_keys, "10.64.0.9/32");
+        own_cfg.server_public_key = server_keys.second;
+        own_cfg.server_endpoint   = "127.0.0.1:" + std::to_string(server_mesh.bound_port());
+        EXPECT_TRUE(own.start(own_cfg));
+        bool                       asked = false;
+        std::vector<lnsdk::MeshPeer> peers;
+        {
+            lnsdk::MeshOrchestrator orchestrator(*client, own, kNodeId);
+            orchestrator.set_local_address_source([own_lan] { return own_lan; });
+            lnsdk::MeshConfig cfg;
+            cfg.peer_refresh_interval_sec = 3600;
+            cfg.heartbeat_interval_sec    = 3600;
+            cfg.stun_refresh_interval_sec = 0;
+            orchestrator.start(cfg);
+            asked = wait_for([&] { return relay_ticket_posts.load() > 0; },
+                             std::chrono::seconds(10));
+            peers = orchestrator.peers();
+            orchestrator.stop();
+        }
+        own.stop();
         EXPECT_TRUE(asked);
         return std::make_pair(asked, peers);
     };
 
-    const auto [other_asked, other_peers] = run(nlohmann::json::array({"172.31.254.254:9"}));
+    // Without a usable LAN address of its own the device probes no LAN
+    // endpoint, so the relay is asked at once.
+    const auto [other_asked, other_peers] = run(nlohmann::json::array({"172.31.254.254:9"}), {});
     ASSERT_TRUE(other_asked);
     EXPECT_LT(first_ticket_delay(), lnsdk::kLanAnswerWindow);
     ASSERT_EQ(other_peers.size(), 1u);
     EXPECT_TRUE(other_peers[0].local_endpoints.empty())
-        << "a LAN endpoint of another network was kept for probing";
+        << "a LAN endpoint was kept for probing by a device without a LAN address";
 
+    // With a LAN address the device probes the peer's LAN endpoint first,
+    // whatever its subnet, and waits the LAN window before the relay.
     UdpSink silent_lan;
-    const auto [lan_asked, lan_peers] = run(nlohmann::json::array({silent_lan.endpoint()}));
+    const auto [lan_asked, lan_peers] =
+        run(nlohmann::json::array({silent_lan.endpoint()}), {{"en0", "192.168.1.20", 24}});
     ASSERT_TRUE(lan_asked);
     EXPECT_GE(first_ticket_delay(), lnsdk::kLanAnswerWindow);
     EXPECT_GT(silent_lan.received(), 0);

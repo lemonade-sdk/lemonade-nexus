@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -405,6 +406,38 @@ TEST(PortMapper, RejectsInternalPortZero) {
     EXPECT_TRUE(h.fake.requests().empty());
 }
 
+// cancel() ends a first attempt toward a silent gateway long before its
+// budget, without counting a failure; release() still reaches the gateway
+// after it.
+TEST(PortMapper, CancelEndsASilentAttemptAtOnce) {
+    Harness h;
+    ASSERT_NE(h.fake.port(), 0);
+    h.fake.pcp_enabled = true;
+    PortMapper mapper(h.options());
+    ASSERT_TRUE(mapper.maintain(kPort));
+    ASSERT_EQ(h.fake.mapped_external_port(kPort), kPort);
+
+    // The renewal finds the gateway silent.
+    h.fake.drop_requests = true;
+    h.pass(3600);
+    bool changed = true;
+    std::thread attempt([&] { changed = mapper.maintain(kPort); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const auto cancelled_at = std::chrono::steady_clock::now();
+    mapper.cancel();
+    attempt.join();
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelled_at, std::chrono::seconds(2));
+    EXPECT_FALSE(changed);
+    const auto state = mapper.mapping();
+    EXPECT_EQ(state.protocol, MappingProtocol::Pcp) << "the cancelled renewal dropped the mapping";
+    EXPECT_TRUE(state.last_error.empty()) << state.last_error;
+    EXPECT_EQ(mapper.seconds_until_due(), 0) << "the cancelled attempt set a retry";
+
+    h.fake.drop_requests = false;
+    mapper.release();
+    EXPECT_FALSE(h.fake.mapped_external_port(kPort)) << "release() after cancel() left the lease";
+}
+
 // ---------------------------------------------------------------------------
 // Inside the mesh orchestrator
 // ---------------------------------------------------------------------------
@@ -479,6 +512,71 @@ TEST(PortMapperOrchestrator, StatusCarriesTheMappingUntilTheLeaseEnds) {
             << "the ended lease stayed in the status";
         EXPECT_EQ(orchestrator.status().mapping_protocol, "");
         orchestrator.stop();
+    }
+    mesh.stop();
+}
+
+// A gateway that answers nothing holds the first attempt for the whole PCP
+// and NAT-PMP budget (about 11 s). The exchange runs on the mapping thread,
+// so a refresh request meanwhile still runs its pass at once: the changed
+// LAN address list is read within a second, not after the budget.
+TEST(PortMapperOrchestrator, ASilentGatewayDoesNotHoldTheLoop) {
+    ASSERT_GE(sodium_init(), 0);
+    Harness h;
+    ASSERT_NE(h.fake.port(), 0);
+    h.fake.drop_requests = true;
+    auto options = h.options();
+    options.clock_unix = {};
+
+    lnsdk::ServerConfig server;
+    server.servers = {{"127.0.0.1", 1, true}};
+    server.auto_discover = false;
+    lnsdk::LemonadeNexusClient client(server);
+
+    lnsdk::BoringtunMesh mesh;
+    const auto keys = lnsdk::BoringtunMesh::generate_keypair();
+    lnsdk::BoringtunConfig mesh_config;
+    mesh_config.private_key = keys.first;
+    mesh_config.public_key  = keys.second;
+    mesh_config.tunnel_ip   = "10.64.0.9/32";
+    mesh_config.allowed_ips = {"10.64.0.0/10"};
+    ASSERT_TRUE(mesh.start(mesh_config));
+    const auto port = std::to_string(mesh.bound_port());
+    std::mutex lan_mtx;
+    std::vector<lnsdk::InterfaceAddress> lan = {{"en0", "192.168.1.20", 24}};
+    {
+        lnsdk::MeshOrchestrator orchestrator(client, mesh, "node-self");
+        orchestrator.set_port_mapper_options(options);
+        orchestrator.set_local_address_source([&] {
+            std::lock_guard lock(lan_mtx);
+            return lan;
+        });
+        lnsdk::MeshConfig cfg;
+        cfg.peer_refresh_interval_sec = 3600;
+        cfg.heartbeat_interval_sec    = 3600;
+        cfg.stun_refresh_interval_sec = 0;
+        orchestrator.start(cfg);
+
+        // The first pass posted the mapping attempt; the gateway got its
+        // first request and keeps quiet.
+        ASSERT_TRUE(wait_for([&] { return !h.fake.requests().empty(); }, std::chrono::seconds(5)));
+        EXPECT_EQ(orchestrator.local_endpoints(), std::vector<std::string>{"192.168.1.20:" + port});
+
+        {
+            std::lock_guard lock(lan_mtx);
+            lan = {{"wlan0", "10.0.5.7", 16}};
+        }
+        orchestrator.refresh_now();
+        EXPECT_TRUE(wait_for([&] {
+            return orchestrator.local_endpoints() == std::vector<std::string>{"10.0.5.7:" + port};
+        }, std::chrono::seconds(2)))
+            << "the refresh pass waited for the gateway";
+        EXPECT_TRUE(orchestrator.status().mapped_endpoint.empty());
+
+        // stop() ends the exchange instead of waiting out its budget.
+        const auto stop_started = std::chrono::steady_clock::now();
+        orchestrator.stop();
+        EXPECT_LT(std::chrono::steady_clock::now() - stop_started, std::chrono::seconds(3));
     }
     mesh.stop();
 }
