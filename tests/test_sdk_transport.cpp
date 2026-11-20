@@ -186,6 +186,205 @@ TEST_F(SdkTransportTest, ConcurrentCallsAndTokenChangesStayConsistent) {
 }
 
 // ---------------------------------------------------------------------------
+// The fallback port.
+//
+// Every server also serves its public API on TCP 443 for clients on networks
+// that allow only that port out. The SDK dials the advertised port first; a
+// request that gets no response there is sent once more to the fallback
+// port, which the host then keeps until a request there gets no response.
+// Tests cannot bind 443, so the client is given a free port as the fallback
+// (set_fallback_port). The stand-in servers trust the SDK through the CA
+// bundle (set_ca_bundle_path), so the cases run on every platform.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A stand-in public API on one port that counts its TCP connections and
+/// its requests, and answers /api/health with `status`.
+class StandInPort {
+public:
+    bool start(const fs::path& cert, const fs::path& key, int bind_port = 0) {
+        server = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
+        if (!server->is_valid()) return false;
+        server->Get("/api/health", [this](const httplib::Request& req, httplib::Response& res) {
+            {
+                std::lock_guard lock(mtx);
+                connections.insert(req.remote_port);
+                ++requests;
+            }
+            res.status = status.load();
+            res.set_content(R"({"status":"ok","service":"lemonade-nexus"})", "application/json");
+        });
+        if (bind_port == 0) {
+            port = server->bind_to_any_port("127.0.0.1");
+        } else {
+            if (!server->bind_to_port("127.0.0.1", bind_port)) return false;
+            port = bind_port;
+        }
+        if (port <= 0) return false;
+        thread = std::thread([this] { server->listen_after_bind(); });
+        server->wait_until_ready();
+        return true;
+    }
+
+    void stop() {
+        if (server) server->stop();
+        if (thread.joinable()) thread.join();
+        server.reset();
+    }
+
+    ~StandInPort() { stop(); }
+
+    std::size_t connection_count() {
+        std::lock_guard lock(mtx);
+        return connections.size();
+    }
+
+    int request_count() {
+        std::lock_guard lock(mtx);
+        return requests;
+    }
+
+    int              port{0};
+    std::atomic<int> status{200};
+
+private:
+    std::unique_ptr<httplib::SSLServer> server;
+    std::thread                         thread;
+    std::mutex                          mtx;
+    std::set<int>                       connections;
+    int                                 requests{0};
+};
+
+/// A loopback TCP port nothing listens on: a connection to it is refused.
+int closed_port() {
+    asio::io_context io;
+    asio::ip::tcp::acceptor acceptor(io, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    const int port = acceptor.local_endpoint().port();
+    acceptor.close();
+    return port;
+}
+
+class SdkPortFallbackTest : public ::testing::Test {
+protected:
+    fs::path    dir;
+    fs::path    cert;
+    fs::path    key;
+    StandInPort advertised;
+    StandInPort fallback;
+
+    void SetUp() override {
+        dir = fs::temp_directory_path() /
+              ("nexus_sdk_port_fallback_" +
+               std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" +
+               std::to_string(reinterpret_cast<uintptr_t>(this)));
+        fs::create_directories(dir);
+        cert = dir / "cert.pem";
+        key  = dir / "key.pem";
+        ASSERT_TRUE(make_localhost_cert(cert, key));
+        lnsdk::set_ca_bundle_path(cert.string());
+        ASSERT_TRUE(fallback.start(cert, key));
+    }
+
+    void TearDown() override {
+        lnsdk::set_ca_bundle_path("");
+        advertised.stop();
+        fallback.stop();
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+
+    /// A client whose only server is localhost:`advertised_port`, with the
+    /// stand-in fallback port in place of 443.
+    lnsdk::LemonadeNexusClient client_for(int advertised_port) {
+        lnsdk::ServerConfig cfg;
+        cfg.servers = {{"localhost", static_cast<uint16_t>(advertised_port), true}};
+        cfg.auto_discover = false;
+        lnsdk::LemonadeNexusClient client(cfg);
+        client.set_fallback_port(static_cast<uint16_t>(fallback.port));
+        return client;
+    }
+};
+
+}  // namespace
+
+TEST_F(SdkPortFallbackTest, AClosedAdvertisedPortFallsBackAndStaysOnTheFallbackPort) {
+    const int advertised_port = closed_port();
+    auto client = client_for(advertised_port);
+
+    auto first = client.check_health();
+    ASSERT_TRUE(first.ok) << first.error;
+    EXPECT_EQ(fallback.request_count(), 1);
+
+    auto second = client.check_health();
+    ASSERT_TRUE(second.ok) << second.error;
+    EXPECT_EQ(fallback.request_count(), 2);
+    // The second request dialed the fallback port directly, on the pooled
+    // connection: no new connection, and no dial of the advertised port
+    // first (a refused connect would have cost a visible delay but leaves no
+    // trace, so the connection count is the evidence).
+    EXPECT_EQ(fallback.connection_count(), 1u);
+
+    // Only the dial changed: the application still sees the advertised port.
+    const auto known = client.known_servers();
+    ASSERT_EQ(known.size(), 1u);
+    EXPECT_EQ(known[0].host, "localhost");
+    EXPECT_EQ(known[0].port, static_cast<uint16_t>(advertised_port));
+}
+
+TEST_F(SdkPortFallbackTest, AnAnsweringAdvertisedPortIsNeverReplacedByTheFallbackPort) {
+    ASSERT_TRUE(advertised.start(cert, key));
+    auto client = client_for(advertised.port);
+
+    for (int i = 0; i < 3; ++i) {
+        auto r = client.check_health();
+        ASSERT_TRUE(r.ok) << r.error;
+    }
+    EXPECT_EQ(advertised.request_count(), 3);
+    EXPECT_EQ(advertised.connection_count(), 1u);
+    EXPECT_EQ(fallback.request_count(), 0);
+    EXPECT_EQ(fallback.connection_count(), 0u);
+}
+
+TEST_F(SdkPortFallbackTest, AnHttpErrorStatusIsAResponseAndDialsNoFallbackPort) {
+    ASSERT_TRUE(advertised.start(cert, key));
+    advertised.status = 500;
+    auto client = client_for(advertised.port);
+
+    // The status reaches the caller; the request is not sent again anywhere.
+    auto r = client.check_health();
+    EXPECT_EQ(r.http_status, 500);
+    EXPECT_EQ(advertised.request_count(), 1);
+    EXPECT_EQ(fallback.request_count(), 0);
+    EXPECT_EQ(fallback.connection_count(), 0u);
+}
+
+TEST_F(SdkPortFallbackTest, AFallbackPortThatStopsAnsweringHandsTheHostBackToItsAdvertisedPort) {
+    const int advertised_port = closed_port();
+    auto client = client_for(advertised_port);
+
+    auto first = client.check_health();
+    ASSERT_TRUE(first.ok) << first.error;
+    EXPECT_EQ(fallback.request_count(), 1);
+
+    // The fallback port goes away and the advertised port comes back.
+    fallback.stop();
+    ASSERT_TRUE(advertised.start(cert, key, advertised_port));
+
+    // The request on the fallback port gets no response: it fails, and the
+    // host is back on its advertised port.
+    auto second = client.check_health();
+    EXPECT_FALSE(second.ok);
+    EXPECT_EQ(second.http_status, 0);
+    EXPECT_EQ(advertised.request_count(), 0);
+
+    auto third = client.check_health();
+    ASSERT_TRUE(third.ok) << third.error;
+    EXPECT_EQ(advertised.request_count(), 1);
+    EXPECT_EQ(advertised.connection_count(), 1u);
+}
+
+// ---------------------------------------------------------------------------
 // Private API over the mesh.
 //
 // A stand-in server: the public API answers the join, and the private API is
