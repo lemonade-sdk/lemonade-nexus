@@ -37,7 +37,7 @@ void main() {
       ]);
     });
 
-    test('an inference server is a server, never a client', () {
+    test('a Lemonade server is a server, never a client', () {
       const d = ClusterDevice(
           nodeId: 'n2', hostname: 'gpu', needsKey: false, isThisDevice: false, isInference: true);
       final kinds = _kinds(d);

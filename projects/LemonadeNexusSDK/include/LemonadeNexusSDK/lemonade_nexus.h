@@ -935,7 +935,7 @@ char* ln_get_node_id(ln_client_t* client);
  *  sent. */
 ln_error_t ln_set_link_token(ln_client_t* client, const char* token);
 
-/** Join as an inference node (Tier 3, nonzero) or a client (Tier 4, zero, the
+/** Join as a Lemonade server (Tier 3, nonzero) or a client (Tier 4, zero, the
  *  default). Applies to the next ln_join_network; the server records it when it
  *  creates this device's endpoint. */
 ln_error_t ln_set_inference_node(ln_client_t* client, int inference);

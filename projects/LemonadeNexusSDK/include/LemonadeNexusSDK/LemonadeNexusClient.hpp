@@ -711,7 +711,7 @@ public:
     /// value.
     bool set_link_token(const std::string& token);
 
-    /// Join as an inference node (Tier 3) instead of a client (Tier 4). Sent
+    /// Join as a Lemonade server (Tier 3) instead of a client (Tier 4). Sent
     /// with the next join_network; the server records it when it creates the
     /// endpoint and derives the routing identifier from it ("infer-..." vs
     /// "client-..."). Default false.

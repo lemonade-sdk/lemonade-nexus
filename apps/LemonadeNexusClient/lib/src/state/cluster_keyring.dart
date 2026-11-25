@@ -144,7 +144,7 @@ class ClusterDevice {
   /// who holds what in the group and on its devices.
   final bool isAdmin;
 
-  /// A Lemonade inference server; false for a client device.
+  /// The device runs Lemonade Server; false for a client device.
   final bool isInference;
 
   /// The device's identity joined [groupId] from its own network with an
