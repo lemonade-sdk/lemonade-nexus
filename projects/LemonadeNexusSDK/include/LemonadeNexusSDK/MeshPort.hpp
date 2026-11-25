@@ -40,7 +40,7 @@ struct MeshPortMember {
     std::string node_id;
     std::string device_name;    ///< Tree node hostname.
     std::string tunnel_ip;      ///< Mesh address, with or without a prefix length.
-    bool        is_inference{false};  ///< Tier 3 inference node. False is Tier 4.
+    bool        is_inference{false};  ///< Tier 3, a device that runs Lemonade Server. False is Tier 4.
     bool        is_online{false};     ///< This device, or a listed mesh peer that is online.
     /// This device's key holds connect_private, connect_shared or admin on the node.
     bool        can_connect{false};

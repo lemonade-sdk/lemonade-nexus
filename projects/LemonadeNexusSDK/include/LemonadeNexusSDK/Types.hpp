@@ -144,7 +144,7 @@ struct TreeNode {
     std::string              mesh_pubkey;
 
     // Endpoint identity, as the server records it. is_inference marks a
-    // Tier 3 inference node; false is a Tier 4 client.
+    // device that runs Lemonade Server (Tier 3); false is a Tier 4 client.
     std::string              endpoint_identifier;
     std::string              cpu_id;
     std::string              net_mac;
@@ -357,7 +357,7 @@ struct NetworkDevice {
     /// "member" (a network it joined with an invite). Set by
     /// list_network_devices; empty from get_group_devices.
     std::string group_role;
-    bool is_inference{false};  ///< a Lemonade inference server
+    bool is_inference{false};  ///< the device runs Lemonade Server
     /// The device joined group_id from its own network through an invite;
     /// it is placed in parent_id, outside group_id.
     bool member{false};

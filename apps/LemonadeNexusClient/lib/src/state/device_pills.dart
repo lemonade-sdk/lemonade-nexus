@@ -44,7 +44,7 @@ List<DevicePill> devicePills(ClusterDevice device, {required bool online}) {
           'The device this app runs on.'),
     if (device.isInference)
       const DevicePill(DevicePillKind.server, 'Server',
-          'A Lemonade inference server.')
+          'A device that runs Lemonade Server.')
     else
       const DevicePill(DevicePillKind.client, 'Client', 'A client device.'),
     if (online)

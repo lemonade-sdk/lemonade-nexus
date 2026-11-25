@@ -339,7 +339,7 @@ std::pair<int, std::string> forward_target(const std::vector<MeshPortMember>& me
     if (node_id == self_node_id) return {409, "Use this device's own service instead of forwarding to it"};
     const auto* target = find_member(members, node_id);
     if (!target) return {404, "That device is not in your group"};
-    if (!target->is_inference) return {409, "That device is not an inference server"};
+    if (!target->is_inference) return {409, "That device is not a Lemonade server"};
     if (!target->can_connect) return {403, "This device has no connect permission on that device"};
     if (!target->is_online) return {409, "That device is offline or not reachable from this device"};
     auto address = strip_prefix_length(target->tunnel_ip);
@@ -369,7 +369,7 @@ MeshPortAutoRoute auto_route(const std::string& model, const std::vector<MeshPor
         }
         for (const auto& member : members) {
             if (names_member(member, prefix)) {
-                return {"", model, 409, "That device is offline, not an inference server, or not reachable from this device"};
+                return {"", model, 409, "That device is offline, not a Lemonade server, or not reachable from this device"};
             }
         }
     }
